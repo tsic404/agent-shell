@@ -1,0 +1,12 @@
+[package]
+name = "agent-shell-compositor-wayland"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "agent-shell Wayland display server protocol layer (wlr bindings + registry probe)"
+
+[dependencies]
+agent-shell-core.workspace = true
+wayland-client = { version = "0.31", features = ["log"] }
+wayland-protocols-wlr = { version = "0.3", features = ["client"] }

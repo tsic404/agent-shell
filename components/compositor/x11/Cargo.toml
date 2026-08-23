@@ -1,0 +1,11 @@
+[package]
+name = "agent-shell-compositor-x11"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "agent-shell X11 display server protocol layer (EWMH atoms + XTest)"
+
+[dependencies]
+agent-shell-core.workspace = true
+x11rb = { version = "0.14", features = ["render", "xtest", "randr"] }
