@@ -1,0 +1,14 @@
+[package]
+name = "agent-shell-notification"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "agent-shell notification component: org.freedesktop.Notifications + portal Notification"
+
+[dependencies]
+agent-shell-core.workspace = true
+async-trait.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+zbus.workspace = true

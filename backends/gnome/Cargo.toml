@@ -1,0 +1,16 @@
+[package]
+name = "agent-shell-backend-gnome"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "agent-shell GNOME backend wrappers: gsd.Power / ScreenSaver / gsettings appearance"
+
+[dependencies]
+agent-shell-core.workspace = true
+agent-shell-power.workspace = true
+agent-shell-launcher.workspace = true
+async-trait.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+zbus.workspace = true

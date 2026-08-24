@@ -1,0 +1,17 @@
+[package]
+name = "agent-shell-backend-dde"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "agent-shell DDE backend wrappers: Power1/LockService1 (system bus) with DDE20/25 dual-name probe"
+
+[dependencies]
+agent-shell-core.workspace = true
+agent-shell-power.workspace = true
+agent-shell-launcher.workspace = true
+async-trait.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+zbus.workspace = true
+futures-util.workspace = true

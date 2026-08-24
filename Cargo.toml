@@ -8,6 +8,14 @@ members = [
     "components/systemd",
     "components/logind",
     "event",
+    "components/power",
+    "components/notification",
+    "components/appearance",
+    "components/launcher",
+    "components/clipboard",
+    "backends/kde",
+    "backends/dde",
+    "backends/gnome",
 ]
 
 [workspace.package]
@@ -23,7 +31,14 @@ agent-shell-compositor-x11 = { path = "components/compositor/x11" }
 agent-shell-compositor-kwin = { path = "components/compositor/kwin" }
 agent-shell-systemd = { path = "components/systemd" }
 agent-shell-logind = { path = "components/logind" }
-zbus = "5"
+agent-shell-power = { path = "components/power" }
+agent-shell-notification = { path = "components/notification" }
+agent-shell-appearance = { path = "components/appearance" }
+agent-shell-launcher = { path = "components/launcher" }
+agent-shell-clipboard = { path = "components/clipboard" }
+zbus = { version = "5", default-features = false, features = ["tokio"] }
+futures-util = "0.3"
+regex = "1"
 async-trait = "0.1"
 futures = "0.3"
 serde = { version = "1", features = ["derive"] }

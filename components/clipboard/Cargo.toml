@@ -1,0 +1,13 @@
+[package]
+name = "agent-shell-clipboard"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "agent-shell clipboard component: wl-clipboard (Wayland) / xclip (X11) wrappers"
+
+[dependencies]
+agent-shell-core.workspace = true
+async-trait.workspace = true
+tokio.workspace = true
+tracing.workspace = true

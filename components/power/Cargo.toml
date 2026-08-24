@@ -1,0 +1,14 @@
+[package]
+name = "agent-shell-power"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "agent-shell power component: UPower/login1 common wrappers + DePriorityRouter"
+
+[dependencies]
+agent-shell-core.workspace = true
+async-trait.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+zbus.workspace = true
