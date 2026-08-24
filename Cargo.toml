@@ -5,6 +5,8 @@ members = [
     "components/compositor/wayland",
     "components/compositor/x11",
     "components/compositor/kwin",
+    "components/systemd",
+    "components/logind",
 ]
 
 [workspace.package]
@@ -18,7 +20,9 @@ agent-shell-core = { path = "core" }
 agent-shell-compositor-wayland = { path = "components/compositor/wayland" }
 agent-shell-compositor-x11 = { path = "components/compositor/x11" }
 agent-shell-compositor-kwin = { path = "components/compositor/kwin" }
-
+agent-shell-systemd = { path = "components/systemd" }
+agent-shell-logind = { path = "components/logind" }
+zbus = "5"
 async-trait = "0.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
