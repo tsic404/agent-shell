@@ -11,7 +11,12 @@
 //!   回退 portal Wallpaper/Settings。
 //! - 启动器：DDE25 走 `dde-am` CLI；DDE20 未发现 Application1。两者皆失败 →
 //!   公共 `.desktop + gio launch`。
+//!
+//! 音频封装 [`DdeAudio`]：根对象无 SetVolume/SetMute，控制统一走 Sink 子对象
+//! （§21.36.1 实测矩阵）；小步探测服务名 → 对象 → 属性。
 
 pub mod dde_api;
+pub mod dde_audio;
 
 pub use agent_shell_power::{probe_first_existing, service_exists};
+pub use dde_audio::{AudioServiceVariant, DdeAudio};

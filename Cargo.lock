@@ -14,17 +14,36 @@ dependencies = [
 ]
 
 [[package]]
+name = "agent-shell-audio"
+version = "0.1.0"
+dependencies = [
+ "agent-shell-core",
+ "async-trait",
+ "futures-lite",
+ "serde",
+ "tokio",
+ "tracing",
+ "which",
+ "zbus",
+ "zbus_macros",
+ "zvariant",
+]
+
+[[package]]
 name = "agent-shell-backend-dde"
 version = "0.1.0"
 dependencies = [
+ "agent-shell-audio",
  "agent-shell-core",
  "agent-shell-launcher",
  "agent-shell-power",
  "async-trait",
  "futures-util",
+ "serde",
  "tokio",
  "tracing",
  "zbus",
+ "zvariant",
 ]
 
 [[package]]
@@ -133,6 +152,22 @@ dependencies = [
  "tokio",
  "tracing",
  "zbus",
+]
+
+[[package]]
+name = "agent-shell-network"
+version = "0.1.0"
+dependencies = [
+ "agent-shell-core",
+ "async-trait",
+ "futures-lite",
+ "serde",
+ "tokio",
+ "tracing",
+ "which",
+ "zbus",
+ "zbus_macros",
+ "zvariant",
 ]
 
 [[package]]
@@ -259,6 +294,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "75b325c5dbd37f80359721ad39aca5a29fb04c89279657cffdda8736d0c0b9d2"
 
 [[package]]
+name = "either"
+version = "1.18.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "252afb9ae5eaa683babdc6a068b3f5726eb19e05070c731f9b2a23a7c3e8ed34"
+
+[[package]]
 name = "endi"
 version = "1.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -284,6 +325,12 @@ dependencies = [
  "quote",
  "syn 2.0.119",
 ]
+
+[[package]]
+name = "env_home"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c7f84e12ccf0a7ddc17a6c41c93326024c42920d7ee630d04950e6926645c0fe"
 
 [[package]]
 name = "equivalent"
@@ -1125,6 +1172,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "which"
+version = "7.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "24d643ce3fd3e5b54854602a080f34fb10ab75e0b813ee32d00ca2b44fa74762"
+dependencies = [
+ "either",
+ "env_home",
+ "rustix",
+ "winsafe",
+]
+
+[[package]]
 name = "windows-link"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1147,6 +1206,12 @@ checksum = "23b97319f7b8343df12cc98938e5c3eb436064524c8d2b4e30a1d3a36eecdf81"
 dependencies = [
  "memchr",
 ]
+
+[[package]]
+name = "winsafe"
+version = "0.0.19"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d135d17ab770252ad95e9a872d365cf3090e3be864a34ab46f48555993efc904"
 
 [[package]]
 name = "x11rb"
