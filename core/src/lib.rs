@@ -7,8 +7,10 @@
 #![allow(missing_docs)]
 
 pub mod component;
+pub mod de_detection;
 pub mod error;
 pub mod event;
+pub mod fallback;
 pub mod registry;
 pub mod services;
 pub mod types;

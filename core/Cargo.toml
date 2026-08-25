@@ -14,3 +14,11 @@ thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 uuid.workspace = true
+
+[dev-dependencies]
+tracing-subscriber = { version = "0.3", features = ["fmt"] }
+
+[features]
+# 合成器后端装配（§16.2）。T1 合成器 crate 就绪后启用；
+# 未启用时 assemble_wm 返回 NotImplemented。
+assemble = []
