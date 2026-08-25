@@ -8,4 +8,5 @@ description = "agent-shell X11 display server protocol layer (EWMH + ICCCM + XTe
 
 [dependencies]
 agent-shell-core.workspace = true
-x11rb = { version = "0.14", features = ["render", "xtest", "randr"] }
+x11rb = { version = "0.14", features = ["render", "xtest", "randr", "shm"] }
+libc = "0.2"

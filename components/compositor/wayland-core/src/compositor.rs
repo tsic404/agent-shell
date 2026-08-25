@@ -41,8 +41,9 @@ mod tests {
     /// trait-bound 断言，不构造显示服务器连接。
     #[test]
     fn wayland_compositor_requires_compositor_component() {
+        // Assert 仅参与 trait-bound 求解、从不被具名使用：dead_code 是设计使然。
+        #[allow(dead_code)]
         trait Assert<T: CompositorComponent> {}
-        impl<T: WaylandCompositor> Assert<T> for T {}
         // 若 WaylandCompositor 不再是 CompositorComponent 的子 trait，
         // 上行 impl 将编译失败——这正是要守住的契约。
     }

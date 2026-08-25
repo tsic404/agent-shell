@@ -31,6 +31,6 @@ mod tests {
     #[test]
     fn seat_version_within_core_spec() {
         // wl_seat 当前规范最高 v9；绑最低 v1 永远可行。
-        assert!(protocol_versions::SEAT >= 1);
+        const { assert!(protocol_versions::SEAT >= 1) }
     }
 }

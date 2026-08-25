@@ -152,6 +152,7 @@ name = "agent-shell-displayserver-x11"
 version = "0.1.0"
 dependencies = [
  "agent-shell-core",
+ "libc",
  "x11rb",
 ]
 
