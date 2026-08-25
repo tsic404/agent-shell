@@ -1,0 +1,18 @@
+[package]
+name = "agent-shell-router"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "agent-shell semantic routing layer: Command model, Executor, resolve_target"
+
+[dependencies]
+agent-shell-core.workspace = true
+async-trait.workspace = true
+tokio.workspace = true
+glob-match.workspace = true
+tracing.workspace = true
+regex.workspace = true
+
+[dev-dependencies]
+parking_lot.workspace = true
