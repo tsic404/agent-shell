@@ -20,6 +20,7 @@ members = [
     "backends/dde",
     "backends/gnome",
     "components/network",
+    "components/a11y",
 ]
 
 [workspace.package]
@@ -46,6 +47,7 @@ agent-shell-appearance = { path = "components/appearance" }
 agent-shell-launcher = { path = "components/launcher" }
 agent-shell-clipboard = { path = "components/clipboard" }
 agent-shell-input = { path = "components/input" }
+agent-shell-a11y = { path = "components/a11y" }
 zbus = { version = "5", default-features = false, features = ["tokio"] }
 futures-util = "0.3"
 regex = "1"
