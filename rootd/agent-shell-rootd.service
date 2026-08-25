@@ -1,0 +1,13 @@
+[Unit]
+Description=agent-shell rootd (privileged proxy, polkit whitelist, §23.2)
+After=polkit.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/agent-shell-rootd
+# rootd 由系统 init 管理——生命周期独立于登录会话（§23.2）。
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

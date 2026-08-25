@@ -21,6 +21,10 @@ members = [
     "backends/gnome",
     "components/network",
     "components/a11y",
+    "cli",
+    "rpc",
+    "daemon",
+    "rootd",
 ]
 
 [workspace.package]
@@ -44,10 +48,14 @@ agent-shell-logind = { path = "components/logind" }
 agent-shell-power = { path = "components/power" }
 agent-shell-notification = { path = "components/notification" }
 agent-shell-appearance = { path = "components/appearance" }
+agent-shell-rpc = { path = "rpc" }
+agent-shell-daemon = { path = "daemon" }
+agent-shell-rootd = { path = "rootd" }
 agent-shell-launcher = { path = "components/launcher" }
 agent-shell-clipboard = { path = "components/clipboard" }
 agent-shell-input = { path = "components/input" }
 agent-shell-a11y = { path = "components/a11y" }
+clap = { version = "4", features = ["derive"] }
 zbus = { version = "5", default-features = false, features = ["tokio"] }
 futures-util = "0.3"
 regex = "1"

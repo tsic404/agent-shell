@@ -1,0 +1,21 @@
+[Unit]
+Description=agent-shell user-session daemon (persistent connections, §22.2 D1)
+# D-Bus session activation：首个需要 daemon 的操作自动拉起。
+# 由 agent-shell-daemon.service（dbus service 文件）按需激活；
+# 本 unit 定义常驻形态与失败重启策略。
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.cargo/bin/agent-shell-daemon --idle-timeout-secs 1800
+Restart=on-failure
+RestartSec=2
+# daemon 与 CLI 经 stdio JSON-RPC 互连时由调用方 fork/exec；
+# 常驻形态下 stdin/stdout 不承载协议，日志走 stderr → journal。
+StandardInput=null
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=graphical-session.target
