@@ -180,14 +180,21 @@ impl PowerComponent for KdePowerDevil {
             Ok(pct) => {
                 // 固化假设：powerdevil 已报出电量百分比 ⇒ 本机存在电池，
                 // UPower 补充读数失败时兜底 is_present=true、其余字段未知。
-                let base = self.login1.get_battery_status().await.unwrap_or(BatteryState {
+                let base = self
+                    .login1
+                    .get_battery_status()
+                    .await
+                    .unwrap_or(BatteryState {
+                        percentage: pct as f64,
+                        charging: false,
+                        time_to_empty: None,
+                        time_to_full: None,
+                        is_present: true,
+                    });
+                Ok(BatteryState {
                     percentage: pct as f64,
-                    charging: false,
-                    time_to_empty: None,
-                    time_to_full: None,
-                    is_present: true,
-                });
-                Ok(BatteryState { percentage: pct as f64, ..base })
+                    ..base
+                })
             }
             Err(_) => self.login1.get_battery_status().await,
         }

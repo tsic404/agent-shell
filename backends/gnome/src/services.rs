@@ -178,12 +178,7 @@ impl AppearanceComponent for GnomeAppearance {
         };
         for key in ["picture-uri", "picture-uri-dark"] {
             let out = tokio::process::Command::new("gsettings")
-                .args([
-                    "set",
-                    "org.gnome.desktop.background",
-                    key,
-                    uri.as_str(),
-                ])
+                .args(["set", "org.gnome.desktop.background", key, uri.as_str()])
                 .output()
                 .await
                 .map_err(|e| AgentShellError::Other(format!("gsettings: {e}").into()))?;

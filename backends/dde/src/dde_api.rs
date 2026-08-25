@@ -5,9 +5,7 @@ use agent_shell_core::component::{
     NotificationComponent, PowerComponent,
 };
 use agent_shell_core::error::{AgentShellError, Result};
-use agent_shell_core::services::{
-    AppInfo, AppTarget, BatteryState, ColorScheme, NotificationSpec,
-};
+use agent_shell_core::services::{AppInfo, AppTarget, BatteryState, ColorScheme, NotificationSpec};
 use agent_shell_power::{probe_first_existing, service_exists, UPowerComponent};
 use async_trait::async_trait;
 use zbus::{proxy, Connection};
@@ -23,8 +21,10 @@ fn average_battery_percentage(map: &std::collections::HashMap<String, f64>) -> f
     (sum / map.len() as f64).clamp(0.0, 100.0)
 }
 
-pub const DDE_LOCK_NAMES: [&str; 2] =
-    ["org.deepin.dde.LockService1", "com.deepin.daemon.LockService"];
+pub const DDE_LOCK_NAMES: [&str; 2] = [
+    "org.deepin.dde.LockService1",
+    "com.deepin.daemon.LockService",
+];
 pub const DDE_NOTIFICATION_NAMES: [&str; 2] = [
     "org.deepin.dde.Notification1",
     "com.deepin.daemon.Notification",
@@ -200,8 +200,7 @@ impl DesktopComponent for DdePower {
         {
             return ComponentHealth::Degraded(format!(
                 "neither {} nor {} present; battery via UPower fallback",
-                DDE_POWER_NAMES[0],
-                DDE_POWER_NAMES[1]
+                DDE_POWER_NAMES[0], DDE_POWER_NAMES[1]
             ));
         }
         ComponentHealth::Healthy
@@ -231,8 +230,7 @@ impl PowerComponent for DdePower {
                     .into(),
             )),
         };
-        lock_result
-        .map_err(|e| AgentShellError::DBus(format!("DDE LockNow: {e}")))
+        lock_result.map_err(|e| AgentShellError::DBus(format!("DDE LockNow: {e}")))
     }
 
     async fn logout(&self) -> Result<()> {
@@ -256,9 +254,10 @@ impl PowerComponent for DdePower {
 
     async fn get_battery_status(&self) -> Result<BatteryState> {
         if let Some(p) = &self.power_proxy {
-            let is_present = p.aggregate_present().await.map_err(|e| {
-                AgentShellError::DBus(format!("Power1 BatteryIsPresent: {e}"))
-            })?;
+            let is_present = p
+                .aggregate_present()
+                .await
+                .map_err(|e| AgentShellError::DBus(format!("Power1 BatteryIsPresent: {e}")))?;
             if !is_present {
                 return Ok(BatteryState {
                     percentage: 0.0,
@@ -448,7 +447,10 @@ macro_rules! impl_notify_methods {
     )*};
 }
 
-impl_notify_methods!(DdeNotificationServiceProxy<'_>, ComDeepinNotificationProxy<'_>);
+impl_notify_methods!(
+    DdeNotificationServiceProxy<'_>,
+    ComDeepinNotificationProxy<'_>
+);
 
 #[async_trait]
 impl DesktopComponent for DdeNotification {

@@ -1,0 +1,42 @@
+# GitHub Actions: PR Check
+# PR 时触发 lint + test + build，作为合入门禁（Rust 工作区）
+
+name: PR Check
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Lint (Rust)
+        run: |
+          cargo fmt --check
+          cargo clippy -- -D warnings
+
+      - name: Test (Rust)
+        run: cargo test
+
+      - name: Build (Rust)
+        run: cargo build --release
+

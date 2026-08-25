@@ -49,10 +49,7 @@ impl PortalAppearance {
     async fn read_color_scheme(&self) -> Result<ColorScheme> {
         let p = self.portal("org.freedesktop.portal.Settings").await?;
         let reply: zbus::zvariant::OwnedValue = p
-            .call(
-                "ReadOne",
-                &("org.freedesktop.appearance", "color-scheme"),
-            )
+            .call("ReadOne", &("org.freedesktop.appearance", "color-scheme"))
             .await
             .map_err(|e| AgentShellError::DBus(format!("Settings.ReadOne: {e}")))?;
         let v = u32::try_from(reply)
@@ -113,9 +110,15 @@ impl AppearanceComponent for PortalAppearance {
         let p = self.portal("org.freedesktop.portal.Wallpaper").await?;
         let mut options: std::collections::HashMap<String, zbus::zvariant::Value> =
             std::collections::HashMap::new();
-        options.insert("handle_token".into(), zbus::zvariant::Value::from("agent-shell".to_string()));
-        let arg: (&str, &str, std::collections::HashMap<String, zbus::zvariant::Value>) =
-            ("", uri.as_str(), options);
+        options.insert(
+            "handle_token".into(),
+            zbus::zvariant::Value::from("agent-shell".to_string()),
+        );
+        let arg: (
+            &str,
+            &str,
+            std::collections::HashMap<String, zbus::zvariant::Value>,
+        ) = ("", uri.as_str(), options);
         let _reply: () = p
             .call("SetWallpaperURI", &arg)
             .await
@@ -137,12 +140,7 @@ impl AppearanceComponent for PortalAppearance {
             ColorScheme::NoPreference => "default",
         };
         let out = tokio::process::Command::new("gsettings")
-            .args([
-                "set",
-                "org.gnome.desktop.interface",
-                "color-scheme",
-                value,
-            ])
+            .args(["set", "org.gnome.desktop.interface", "color-scheme", value])
             .output()
             .await;
         match out {

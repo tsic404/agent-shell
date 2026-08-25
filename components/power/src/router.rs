@@ -11,20 +11,17 @@ use agent_shell_core::error::{AgentShellError, Result};
 
 /// DDE 20/25 双服务名（§21.36.1）：DDE25 主名 org.deepin.dde.*，
 /// DDE20 仅 com.deepin.daemon.*；先探新名，失败退旧名。
-pub const DDE_POWER_NAMES: [&str; 2] =
-    ["org.deepin.dde.Power1", "com.deepin.daemon.Power"];
+pub const DDE_POWER_NAMES: [&str; 2] = ["org.deepin.dde.Power1", "com.deepin.daemon.Power"];
 
 /// 探测 bus 上是否存在指定服务名（NameHasOwner）。
-pub async fn service_exists(
-    conn: &zbus::Connection,
-    name: &str,
-) -> Result<bool> {
+pub async fn service_exists(conn: &zbus::Connection, name: &str) -> Result<bool> {
     use zbus::fdo::DBusProxy;
     let dbus = DBusProxy::new(conn)
         .await
         .map_err(|e| AgentShellError::DBus(format!("DBusProxy: {e}")))?;
-    let bus_name: zbus::names::BusName<'_> =
-        name.try_into().map_err(|e| AgentShellError::DBus(format!("bad bus name {name}: {e}")))?;
+    let bus_name: zbus::names::BusName<'_> = name
+        .try_into()
+        .map_err(|e| AgentShellError::DBus(format!("bad bus name {name}: {e}")))?;
     dbus.name_has_owner(bus_name)
         .await
         .map_err(|e| AgentShellError::DBus(format!("NameHasOwner({name}): {e}")))

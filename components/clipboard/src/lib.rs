@@ -92,9 +92,11 @@ impl WlClipboard {
                     .stdin
                     .take()
                     .ok_or_else(|| AgentShellError::Other("stdin unavailable".into()))?;
-                si.write_all(stdin.unwrap_or_default().as_bytes()).await.map_err(|e| {
-                    AgentShellError::Other(format!("clipboard stdin write: {e}").into())
-                })?;
+                si.write_all(stdin.unwrap_or_default().as_bytes())
+                    .await
+                    .map_err(|e| {
+                        AgentShellError::Other(format!("clipboard stdin write: {e}").into())
+                    })?;
                 // 关闭 stdin 后等待首进程退出（wl-copy 首进程写完即退出，
                 // fork 出的选区服务进程已与我们的管道无关）。
                 drop(si);
@@ -148,9 +150,7 @@ impl DesktopComponent for WlClipboard {
 
     async fn health(&self) -> ComponentHealth {
         match self.session {
-            SessionKind::Wayland => {
-                probe_tool("wl-paste", &["--version"]).await
-            }
+            SessionKind::Wayland => probe_tool("wl-paste", &["--version"]).await,
             SessionKind::X11 => probe_tool("xclip", &["-version"]).await,
             SessionKind::Unknown => ComponentHealth::Degraded(
                 "no graphical session detected (WAYLAND_DISPLAY/DISPLAY unset)".into(),

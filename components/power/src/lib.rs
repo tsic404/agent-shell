@@ -11,13 +11,13 @@
 //! （login1 `interactive=true` 触发 polkit 交互授权）。
 
 pub mod router;
-pub use router::{DDE_POWER_NAMES, probe_first_existing, service_exists};
 use agent_shell_core::component::{
     ComponentHealth, ComponentType, DesktopComponent, PowerComponent,
 };
 use agent_shell_core::error::{AgentShellError, Result};
 use agent_shell_core::services::BatteryState;
 use async_trait::async_trait;
+pub use router::{probe_first_existing, service_exists, DDE_POWER_NAMES};
 use zbus::proxy;
 
 /// login1 Manager 代理（system bus）。
@@ -172,7 +172,10 @@ impl PowerComponent for UPowerComponent {
     }
 
     async fn get_battery_status(&self) -> Result<BatteryState> {
-        let dev = self.upower().await.map_err(|e| AgentShellError::DBus(format!("UPower proxy: {e}")))?;
+        let dev = self
+            .upower()
+            .await
+            .map_err(|e| AgentShellError::DBus(format!("UPower proxy: {e}")))?;
         let is_present = dev.is_present().await.map_errdbus("IsPresent")?;
         if !is_present {
             return Ok(BatteryState {

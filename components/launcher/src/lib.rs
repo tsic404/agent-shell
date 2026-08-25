@@ -51,7 +51,11 @@ pub fn parse_desktop_file(path: &PathBuf) -> Option<AppInfo> {
             "Name" => name = Some(value.to_string()),
             "Icon" => icon = Some(value.to_string()),
             "Categories" => {
-                categories = value.split(';').filter(|s| !s.is_empty()).map(String::from).collect()
+                categories = value
+                    .split(';')
+                    .filter(|s| !s.is_empty())
+                    .map(String::from)
+                    .collect()
             }
             "Exec" => exec = Some(value.to_string()),
             "NoDisplay" => no_display = value.eq_ignore_ascii_case("true"),
@@ -117,7 +121,10 @@ impl DesktopFileLauncher {
         } else {
             format!("{id_or_path}.desktop")
         };
-        for dir in standard_dirs().into_iter().chain(self.extra_dirs.iter().cloned()) {
+        for dir in standard_dirs()
+            .into_iter()
+            .chain(self.extra_dirs.iter().cloned())
+        {
             let candidate = dir.join(&with_ext);
             if candidate.exists() {
                 return Some(candidate);
@@ -207,15 +214,15 @@ impl LauncherComponent for DesktopFileLauncher {
     async fn launch_app(&self, app: &AppTarget) -> Result<()> {
         match app {
             AppTarget::ByDesktopFile(id) => {
-                let path = self
-                    .find_desktop_file(id)
-                    .ok_or_else(|| AgentShellError::WindowNotFound(format!("desktop entry {id}")))?;
+                let path = self.find_desktop_file(id).ok_or_else(|| {
+                    AgentShellError::WindowNotFound(format!("desktop entry {id}"))
+                })?;
                 self.gio_launch(&path.to_string_lossy()).await
             }
             AppTarget::ByAppId(app_id) => {
-                let path = self.find_desktop_file(app_id).ok_or_else(|| {
-                    AgentShellError::WindowNotFound(format!("app id {app_id}"))
-                })?;
+                let path = self
+                    .find_desktop_file(app_id)
+                    .ok_or_else(|| AgentShellError::WindowNotFound(format!("app id {app_id}")))?;
                 self.gio_launch(&path.to_string_lossy()).await
             }
             AppTarget::ByCommand(command) => {
@@ -253,9 +260,8 @@ impl LauncherComponent for DesktopFileLauncher {
             {
                 let options: std::collections::HashMap<String, zbus::zvariant::Value> =
                     std::collections::HashMap::new();
-                let res: zbus::Result<zbus::zvariant::OwnedObjectPath> = portal
-                    .call("OpenURI", &("", uri, options))
-                    .await;
+                let res: zbus::Result<zbus::zvariant::OwnedObjectPath> =
+                    portal.call("OpenURI", &("", uri, options)).await;
                 if res.is_ok() {
                     return Ok(());
                 }
@@ -311,7 +317,8 @@ mod tests {
 
     #[test]
     fn parses_desktop_entry_fields() {
-        let dir = std::env::temp_dir().join(format!("agent-shell-launcher-test-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("agent-shell-launcher-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("firefox.desktop");
         std::fs::write(
@@ -331,10 +338,8 @@ mod tests {
     #[test]
     fn tolerates_empty_lines_and_extra_sections() {
         // 🔴1 回归：section 间空行/无 `=` 行不得让解析提前返回 None。
-        let dir = std::env::temp_dir().join(format!(
-            "agent-shell-launcher-blank-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("agent-shell-launcher-blank-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("multi.desktop");
         std::fs::write(
@@ -349,11 +354,18 @@ mod tests {
 
     #[test]
     fn skips_no_display_entries() {
-        let dir = std::env::temp_dir().join(format!("agent-shell-launcher-nodisp-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "agent-shell-launcher-nodisp-{}",
+            std::process::id()
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("hidden.desktop");
 
-        std::fs::write(&file, "[Desktop Entry]\nName=Hidden\nExec=x\nNoDisplay=true\n").unwrap();
+        std::fs::write(
+            &file,
+            "[Desktop Entry]\nName=Hidden\nExec=x\nNoDisplay=true\n",
+        )
+        .unwrap();
         assert!(parse_desktop_file(&file).is_none());
         std::fs::remove_dir_all(&dir).ok();
     }

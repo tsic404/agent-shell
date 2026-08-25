@@ -165,10 +165,7 @@ impl NotificationComponent for FreedesktopNotification {
 
     async fn close_notification(&self, id: u32) -> Result<()> {
         Self::map(
-            self.proxy()
-                .await?
-                .close_notification(id)
-                .await,
+            self.proxy().await?.close_notification(id).await,
             "CloseNotification",
         )
     }
@@ -247,10 +244,7 @@ impl DesktopComponent for PortalNotification {
             Ok(d) => d,
             Err(e) => return ComponentHealth::Degraded(format!("{e}")),
         };
-        match dbus
-            .name_has_owner(PORTAL_OWNER.try_into().unwrap())
-            .await
-        {
+        match dbus.name_has_owner(PORTAL_OWNER.try_into().unwrap()).await {
             Ok(true) => ComponentHealth::Healthy,
             Ok(false) => ComponentHealth::Unavailable,
             Err(e) => ComponentHealth::Degraded(format!("{e}")),
@@ -261,7 +255,9 @@ impl DesktopComponent for PortalNotification {
 #[async_trait]
 impl NotificationComponent for PortalNotification {
     async fn send_notification(&self, notif: &NotificationSpec) -> Result<u32> {
-        let id = self.counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let id = self
+            .counter
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let portal_id = format!("agent-shell-{id}");
         let body = Self::spec_to_portal_body(notif);
         let portal = self.portal().await?;
