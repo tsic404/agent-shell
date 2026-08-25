@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "agent-shell DDE backend: power/lock/notification/appearance/launcher wrappers + DdeAudio"
+description = "agent-shell DDE backend: DdeCompositor (deepin-kwin/Treeland/X11) + dde-api service wrappers"
 
 [dependencies]
 agent-shell-core.workspace = true
@@ -18,3 +18,8 @@ tracing.workspace = true
 zbus.workspace = true
 zvariant.workspace = true
 futures-util.workspace = true
+wayland-client = { version = "0.31", features = ["log"] }
+wayland-backend = "0.3"
+wayland-scanner = "0.31"
+agent-shell-displayserver-wayland.workspace = true
+agent-shell-compositor-kwin.workspace = true

@@ -34,7 +34,9 @@ name = "agent-shell-backend-dde"
 version = "0.1.0"
 dependencies = [
  "agent-shell-audio",
+ "agent-shell-compositor-kwin",
  "agent-shell-core",
+ "agent-shell-displayserver-wayland",
  "agent-shell-launcher",
  "agent-shell-power",
  "async-trait",
@@ -42,6 +44,9 @@ dependencies = [
  "serde",
  "tokio",
  "tracing",
+ "wayland-backend",
+ "wayland-client",
+ "wayland-scanner",
  "zbus",
  "zvariant",
 ]

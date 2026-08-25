@@ -15,8 +15,20 @@
 //! 音频封装 [`DdeAudio`]：根对象无 SetVolume/SetMute，控制统一走 Sink 子对象
 //! （§21.36.1 实测矩阵）；小步探测服务名 → 对象 → 属性。
 
+pub mod compositor;
 pub mod dde_api;
 pub mod dde_audio;
+pub mod protocol_gen;
+#[allow(clippy::module_inception)]
+pub mod treeland;
+pub mod version;
+
+mod dde_compositor;
+
+pub use compositor::{detect_compositor, CompositorKind};
+pub use dde_compositor::{Compositor, DdeCompositor};
+pub use treeland::{doctor_line as treeland_doctor_line, TreelandBindings};
+pub use version::DdeVersion;
 
 pub use agent_shell_power::{probe_first_existing, service_exists};
 pub use dde_audio::{AudioServiceVariant, DdeAudio};
