@@ -35,13 +35,59 @@ use crate::scripts::RESPONSE_SERVICE;
 pub const SCRIPT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// org.kde.KWin Scripting 服务常量（§3.5 调研记录）。
+///
+/// 兼容性注记（TSI-2374）：`Scripting` 单例在 KWin 内部构造完成前不会
+/// 注册 `/Scripting`（upstream `scripting.cpp` 构造尾部才 registerObject）。
+/// 会话早期探测可能返回 UnknownObject/UnknownInterface——这是时序现象，
+/// 不是接口被移除；调用方应重试或降级，而非判定能力缺失。所有
+/// Scripting 方法调用统一使用本服务名 + `/Scripting` 路径 +
+/// `org.kde.kwin.Scripting` 接口，不做版本分支。
 pub const SCRIPTING_SERVICE: &str = "org.kde.KWin";
 /// Scripting 对象路径（loadScript/loadedScripts 所在）。
 pub const SCRIPTING_PATH: &str = "/Scripting";
+
 /// 响应服务总线名。
 pub const RESPONSE_BUS_NAME: &str = RESPONSE_SERVICE;
 
-// ───────────────────────── 响应分发核心 ─────────────────────────
+/// 探测 Scripting 桥接可用性：对 `/Scripting` 做一次 introspect 并检查
+/// `org.kde.kwin.Scripting` 接口是否出现。
+///
+/// 供 doctor 与降级链在**不加载脚本**的前提下确认通道健康。注意上游
+/// `loadScript` 返回 int、`loadedScripts` 在部分版本不存在——探测刻意
+/// 不依赖任何具体方法签名。
+pub async fn probe_scripting(conn: &Connection) -> Result<()> {
+    let node = zbus::fdo::IntrospectableProxy::builder(conn)
+        .destination(SCRIPTING_SERVICE)
+        .expect("static service name")
+        .path(SCRIPTING_PATH)
+        .expect("static object path")
+        .build()
+        .await
+        .map_err(|e| KWinError::Scripting(format!("scripting probe build: {e}")))?;
+    let xml = node.introspect().await.map_err(|e| {
+        KWinError::Scripting(format!(
+            "scripting probe: {SCRIPTING_SERVICE}{SCRIPTING_PATH} unreachable: {e} \
+                 (KWin may still be starting; retry later)"
+        ))
+    })?;
+    if scripting_interface_advertised(&xml) {
+        Ok(())
+    } else {
+        Err(KWinError::Scripting(format!(
+            "scripting probe: org.kde.kwin.Scripting interface not advertised at \
+             {SCRIPTING_PATH} (introspection returned no such interface)"
+        )))
+    }
+}
+
+/// introspection XML 是否广告了 `org.kde.kwin.Scripting` 接口。
+///
+/// 只认精确的接口声明属性 `name="org.kde.kwin.Scripting"`（上游
+/// `Q_CLASSINFO("D-Bus Interface", ...)` 经 introspection 导出的唯一
+/// 形态）——裸子串会误匹配 `org.kde.kwin.Scripting.Foo` 等无关引用。
+fn scripting_interface_advertised(xml: &str) -> bool {
+    xml.contains("<interface name=\"org.kde.kwin.Scripting\"")
+}
 
 /// 按请求 id 分发回传的共享表（ResponseService 写、查询协程读删）。
 #[derive(Default)]
@@ -467,6 +513,46 @@ mod tests {
         // 事件队列必须为空（查询回传不污染事件流）。
         let router_now = router.lock().await;
         assert!(router_now.waiters.is_empty());
+    }
+
+    /// TSI-2374 回归：完整接口声明的 introspection XML 应被识别。
+    #[test]
+    fn probe_matches_full_interface_declaration() {
+        let xml = r#"<node>
+  <interface name="org.freedesktop.DBus.Introspectable">
+    <method name="Introspect"/>
+  </interface>
+  <interface name="org.kde.kwin.Scripting">
+    <method name="loadScript"/>
+  </interface>
+</node>"#;
+        assert!(scripting_interface_advertised(xml));
+    }
+
+    /// TSI-2374 回归：无 Scripting 接口的 XML（KWin 启动早期 / 对象缺失）
+    /// 必须判为不可用——旧实现的无条件 ✓ 会掩盖该状态。
+    #[test]
+    fn probe_rejects_xml_without_scripting_interface() {
+        let xml = r#"<node>
+  <interface name="org.freedesktop.DBus.Introspectable">
+    <method name="Introspect"/>
+  </interface>
+  <interface name="org.kde.KWin.VirtualDesktopManager"/>
+</node>"#;
+        assert!(!scripting_interface_advertised(xml));
+    }
+
+    /// 审查 🟡3 回归：`org.kde.kwin.Scripting.Foo` 等近似子串引用不得
+    /// 误判为接口已广告——匹配收窄到 `<interface name="...">` 精确声明。
+    #[test]
+    fn probe_rejects_near_miss_interface_references() {
+        let xml = r#"<node>
+  <interface name="org.kde.kwin.Scripting.Client">
+    <method name="ping"/>
+  </interface>
+  <annotation name="org.kde.kwin.Scripting.Debug" value="1"/>
+</node>"#;
+        assert!(!scripting_interface_advertised(xml));
     }
 
     /// push_event 与 send_result 的分界回归：长驻脚本推送绝不能带 req。

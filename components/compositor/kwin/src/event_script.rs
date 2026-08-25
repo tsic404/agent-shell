@@ -21,7 +21,10 @@ use crate::dbus_bridge::{KWinBridge, SCRIPT_TIMEOUT};
 use crate::error::Result;
 use crate::scripts::{ScriptTemplate, RESPONSE_IFACE, RESPONSE_PATH, RESPONSE_SERVICE};
 
-/// 长驻脚本等待 run 发起的宽限期（run 是异步 D-Bus 调用，无确认回执）。
+/// `/Scripting` 就绪探测的重试参数：KWin 启动早期 `Scripting` 单例可能
+/// 尚未注册对象（TSI-2374：UnknownObject/UnknownInterface 是时序现象），
+/// 以固定间隔重试至多 [`SCRIPT_TIMEOUT`]。
+const PROBE_INTERVAL: Duration = Duration::from_millis(200);
 const START_GRACE: Duration = Duration::from_millis(300);
 
 /// 长驻事件脚本句柄。
@@ -65,8 +68,23 @@ pub async fn ensure_event_script(bridge: &KWinBridge) -> Result<EventScriptHandl
     start_event_script(bridge.connection(), &js).await
 }
 
-/// 底层启动入口：loadScript + run，不 stop；返回句柄供后续 stop。
+/// 底层启动入口：确认 /Scripting 可达 → loadScript + run，不 stop；
+/// 返回句柄供后续 stop。
 async fn start_event_script(conn: &Connection, js: &str) -> Result<EventScriptHandle> {
+    // 先探测再加载（TSI-2374）：KWin 启动早期 Scripting 单例尚未注册
+    // /Scripting 时 load_script_via 会直接失败——以固定间隔重试探测至
+    // SCRIPT_TIMEOUT 覆盖该窗口；探测通过即 loadScript/run 的目标必然存在。
+    let deadline = tokio::time::Instant::now() + SCRIPT_TIMEOUT;
+    loop {
+        match crate::dbus_bridge::probe_scripting(conn).await {
+            Ok(()) => break,
+            Err(e) if tokio::time::Instant::now() + PROBE_INTERVAL <= deadline => {
+                tracing::debug!(error = %e, "scripting not ready yet; retrying");
+                tokio::time::sleep(PROBE_INTERVAL).await;
+            }
+            Err(e) => return Err(e),
+        }
+    }
     let path = crate::dbus_bridge::load_script_via(conn, js).await?;
     let script = crate::dbus_bridge::ScriptInstance::new(conn, &path).await?;
     script

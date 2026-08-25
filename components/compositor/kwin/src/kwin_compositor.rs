@@ -61,14 +61,21 @@ pub struct KWinCompositor {
     version: KWinVersion,
     /// 长驻事件脚本句柄（懒启动）。
     event_handle: AsyncMutex<Option<EventScriptHandle>>,
+    /// `/Scripting` 探测状态（TSI-2374）：0=未探测，1=失败（不缓存，
+    /// 允许重试），2=成功。原子而非锁——doctor_lines(&self) 同步读取。
+    scripting_probe: std::sync::atomic::AtomicU8,
 }
+
+/// `scripting_probe` 状态值（TSI-2374）。
+const PROBE_UNSET: u8 = 0;
+const PROBE_FAIL: u8 = 1;
+const PROBE_OK: u8 = 2;
 
 impl KWinCompositor {
     /// org_kde_* 私有协议通道引用（含派发队列）。
     fn protocols(&self) -> Option<&KWinProtocols> {
         self.protocols.as_ref()
     }
-
     /// WaylandCompositor 基类通道（§3.3：Wayland 系合成器共享的纯 core 层）。
     ///
     /// X11 会话无 Wayland 通道——此时合成器不经 `WaylandCompositor`
@@ -100,6 +107,7 @@ impl KWinCompositor {
             x11: None,
             version,
             event_handle: AsyncMutex::new(None),
+            scripting_probe: std::sync::atomic::AtomicU8::new(PROBE_UNSET),
         })
     }
 
@@ -120,6 +128,7 @@ impl KWinCompositor {
             x11: Some(x11),
             version,
             event_handle: AsyncMutex::new(None),
+            scripting_probe: std::sync::atomic::AtomicU8::new(PROBE_UNSET),
         })
     }
 
@@ -175,10 +184,16 @@ impl KWinCompositor {
                 v => format!("v{v}"),
             }
         ));
-        lines.push(format!(
-            "✓ D-Bus 桥接 : callDBus ready ({} templates, req-id routed)",
-            14
-        ));
+        // 桥接就绪以 /Scripting 探测为证据（TSI-2374）——不再无条件打 ✓。
+        lines.push(match self.scripting_probe_ok() {
+            Some(true) => "✓ D-Bus 桥接 : callDBus ready (14 templates, req-id routed; \
+                           /Scripting introspected)"
+                .to_string(),
+            Some(false) => "⚠ D-Bus 桥接 : /Scripting 未就绪（KWin 启动早期或不可达；\
+                            Scripting 调用将按需重试，Wayland 协议通道不受影响）"
+                .to_string(),
+            None => "⚠ D-Bus 桥接 : 未探测（调用 ensure_scripting_probe 后更新）".to_string(),
+        });
         if let Some(p) = &self.protocols {
             match &p.fake_input {
                 Some(fi) if fi.is_authenticated() => {
@@ -200,6 +215,36 @@ impl KWinCompositor {
             "⚠ 事件脚本    : not started (lazy; starts on first subscribe)".to_string()
         });
         lines
+    }
+
+    /// 探测并缓存 `/Scripting` 可用性（TSI-2374）。
+    ///
+    /// doctor 与降级链的证据来源：成功后 `doctor_lines` 的桥接行升级为
+    /// 确认态；失败写入 PROBE_FAIL（doctor 显示「未就绪」而非「未探测」），
+    /// 但不阻止下次调用重试——KWin 启动早期未就绪属时序现象，可自愈。
+    pub async fn ensure_scripting_probe(&self) -> Result<()> {
+        use std::sync::atomic::Ordering;
+        if self.scripting_probe.load(Ordering::Relaxed) == PROBE_OK {
+            return Ok(());
+        }
+        let result = crate::dbus_bridge::probe_scripting(self.bridge.connection()).await;
+        self.scripting_probe.store(
+            if result.is_ok() { PROBE_OK } else { PROBE_FAIL },
+            Ordering::Relaxed,
+        );
+        result
+    }
+
+    /// 探测状态读取端（doctor_lines 用）：Some(true)=已确认可用，
+    /// Some(false)=最近一次失败，None=尚未探测。
+    fn scripting_probe_ok(&self) -> Option<bool> {
+        use std::sync::atomic::Ordering;
+        match self.scripting_probe.load(Ordering::Relaxed) {
+            PROBE_OK => Some(true),
+            PROBE_FAIL => Some(false),
+            PROBE_UNSET => None,
+            _ => None,
+        }
     }
 
     // ───────────────────────── 内部辅助 ─────────────────────────
@@ -673,6 +718,9 @@ impl CompositorComponent for KWinCompositor {
         let stream = self.bridge.take_event_stream().await.ok_or_else(|| {
             AgentShellError::BackendUnavailable("kwin event stream already subscribed".to_string())
         })?;
+        // 订阅前刷新 /Scripting 探测（TSI-2374）：启动早期未就绪时由
+        // spawn_event_script 内部的重试探测兜底，这里只做缓存预热。
+        let _ = self.ensure_scripting_probe().await;
         let mut handle = self.event_handle.lock().await;
         if handle.is_none() {
             // 幂等启动；句柄保存在组件内直到 stop/drop。
