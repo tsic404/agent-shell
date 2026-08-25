@@ -1,7 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
-    "core",
+    "components/input",
     "components/displayserver/wayland",
     "components/displayserver/x11",
     "components/compositor/wayland-core",
@@ -45,6 +45,7 @@ agent-shell-notification = { path = "components/notification" }
 agent-shell-appearance = { path = "components/appearance" }
 agent-shell-launcher = { path = "components/launcher" }
 agent-shell-clipboard = { path = "components/clipboard" }
+agent-shell-input = { path = "components/input" }
 zbus = { version = "5", default-features = false, features = ["tokio"] }
 futures-util = "0.3"
 regex = "1"
