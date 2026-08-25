@@ -63,14 +63,14 @@ impl EventScriptHandle {
 /// 启动长驻 `event_monitor.js`：订阅 windowAdded/Removed/activeWindowChanged。
 ///
 /// 幂等：已有运行中的实例先停止再启动（handle 换新）。
-pub async fn ensure_event_script(bridge: &KWinBridge) -> Result<EventScriptHandle> {
-    let js = ScriptTemplate::EventMonitor.render(true, &[])?;
-    start_event_script(bridge.connection(), &js).await
+pub async fn ensure_event_script(bridge: &KWinBridge, v6: bool) -> Result<EventScriptHandle> {
+    let js = ScriptTemplate::EventMonitor.render(v6, &[])?;
+    start_event_script(bridge.connection(), &js, v6).await
 }
 
 /// 底层启动入口：确认 /Scripting 可达 → loadScript + run，不 stop；
 /// 返回句柄供后续 stop。
-async fn start_event_script(conn: &Connection, js: &str) -> Result<EventScriptHandle> {
+async fn start_event_script(conn: &Connection, js: &str, v6: bool) -> Result<EventScriptHandle> {
     // 先探测再加载（TSI-2374）：KWin 启动早期 Scripting 单例尚未注册
     // /Scripting 时 load_script_via 会直接失败——以固定间隔重试探测至
     // SCRIPT_TIMEOUT 覆盖该窗口；探测通过即 loadScript/run 的目标必然存在。
@@ -85,7 +85,8 @@ async fn start_event_script(conn: &Connection, js: &str) -> Result<EventScriptHa
             Err(e) => return Err(e),
         }
     }
-    let path = crate::dbus_bridge::load_script_via(conn, js).await?;
+    // TSI-2398：实例路径按版本分发（V6 /Scripting/Script<id>，V5 /<id>）。
+    let path = crate::dbus_bridge::load_script_via(conn, js, v6).await?;
     let script = crate::dbus_bridge::ScriptInstance::new(conn, &path).await?;
     script
         .run()
@@ -120,8 +121,8 @@ impl EventScriptHandle {
 ///
 /// 事件推送进入 bridge 的独立事件队列（`KWinBridge::take_event_stream`），
 /// 与一次性查询完全隔离；本模块只负责脚本生命周期。
-pub async fn spawn_event_monitor(bridge: &KWinBridge) -> Result<EventScriptHandle> {
-    let handle = ensure_event_script(bridge).await?;
+pub async fn spawn_event_monitor(bridge: &KWinBridge, v6: bool) -> Result<EventScriptHandle> {
+    let handle = ensure_event_script(bridge, v6).await?;
     // 冒烟验证：脚本注册后短窗口内应能收到首条推送（无窗口变化则超时属正常）。
     let _ = tokio::time::timeout(SCRIPT_TIMEOUT, async {
         tokio::time::sleep(Duration::from_millis(100)).await

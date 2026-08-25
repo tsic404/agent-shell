@@ -1,6 +1,8 @@
 //! D-Bus ↔ KWin Scripting 桥接（设计文档 §7.3 / §7.5，`dbus_bridge.rs`）。
 //!
-//! KWin Scripting 的 `loadScript` 返回 object path，但 `run` 无返回值——
+//! KWin 5.27 与 6 的 `loadScript` 均返回 int32 脚本 id（TSI-2398）；
+//! 实例注册路径因版本而异——V6 `/Scripting/Script<id>`，V5 `/<id>`。
+//! 但 `run` 无返回值——
 //! 结果回传采用策略 B/C 组合：
 //!
 //! 1. agent-shell 在 session bus 注册响应服务 `com.agent_shell.Response`
@@ -186,8 +188,8 @@ impl KWinBridge {
     /// 流程（§7.5）：注册按 id 等待 → loadScript(内联) → run →
     /// 等待回传（超时兜底 stop）。脚本执行于 compositor 进程内，
     /// 任何异常都只体现为「无回传」→ 超时。
-    pub async fn run_script(&self, script_name: &str, js: &str) -> Result<Value> {
-        let raw = self.run_script_raw(script_name, js).await?;
+    pub async fn run_script(&self, script_name: &str, v6: bool, js: &str) -> Result<Value> {
+        let raw = self.run_script_raw(script_name, v6, js).await?;
         serde_json::from_str(&raw)
             .map_err(|e| KWinError::InvalidScriptOutput(format!("{script_name}: {e}")))
     }
@@ -201,11 +203,11 @@ impl KWinBridge {
     ) -> Result<Value> {
         let name = tpl.file_name();
         let js = tpl.render(v6, args)?;
-        self.run_script(name, &js).await
+        self.run_script(name, v6, &js).await
     }
 
     /// 执行脚本并返回原始 JSON 字符串（不做解析）。
-    async fn run_script_raw(&self, script_name: &str, js: &str) -> Result<String> {
+    async fn run_script_raw(&self, script_name: &str, v6: bool, js: &str) -> Result<String> {
         // 每次查询一个请求 id：内联包装把结果包成 {"req": id, "result": ...}
         // 回传，响应服务按 id 路由——并发查询互不消费对方回传（🔴1）。
         let req_id = Uuid::new_v4().to_string();
@@ -215,7 +217,7 @@ impl KWinBridge {
         let scripting = ScriptingProxy::new(&self.conn)
             .await
             .map_err(|e| KWinError::Scripting(format!("scripting proxy: {e}")))?;
-        let path = match scripting.load_script(&wrapped).await {
+        let path = match scripting.load_script(&wrapped, v6).await {
             Ok(p) => p,
             Err(e) => {
                 // loadScript 失败：回收等待者再报错（await 版，无滞留）。
@@ -225,7 +227,7 @@ impl KWinBridge {
                 )));
             }
         };
-        let script = match ScriptInstance::new(&self.conn, path.as_str()).await {
+        let script = match ScriptInstance::new(&self.conn, &path).await {
             Ok(s) => s,
             Err(e) => {
                 self.router.lock().await.abandon(&req_id);
@@ -398,10 +400,16 @@ impl<'a> ScriptingProxy<'a> {
         })
     }
 
-    /// 加载脚本文本，返回 `/Scripting/Script<N>` 对象路径。
-    async fn load_script(&self, source: &str) -> zbus::Result<zbus::zvariant::OwnedObjectPath> {
+    /// 加载脚本文本，返回脚本实例的对象路径（TSI-2398）。
+    ///
+    /// KWin 5.27 与 6 的 `loadScript` **都**返回 int32 脚本 id；差异在
+    /// 实例注册路径（`src/scripting/scripting.cpp`）：KWin 6 注册于
+    /// `/Scripting/Script<id>`，KWin 5 注册于 `/<id>`。按 `v6` 分发构造，
+    /// 调用方拿到的路径可直接喂给 [`ScriptInstance::new`]。
+    async fn load_script(&self, source: &str, v6: bool) -> zbus::Result<String> {
         let reply = self.inner.call_method("loadScript", &(source,)).await?;
-        reply.body().deserialize()
+        let id: i32 = reply.body().deserialize()?;
+        Ok(script_object_path(id, v6))
     }
 
     #[allow(dead_code)]
@@ -440,15 +448,25 @@ impl<'a> ScriptInstance<'a> {
 }
 
 /// 供 event_script 复用：在指定连接上加载脚本文本，返回对象路径字符串。
-pub(crate) async fn load_script_via(conn: &Connection, js: &str) -> Result<String> {
+pub(crate) async fn load_script_via(conn: &Connection, js: &str, v6: bool) -> Result<String> {
     let scripting = ScriptingProxy::new(conn)
         .await
         .map_err(|e| KWinError::Scripting(format!("scripting proxy: {e}")))?;
-    let path = scripting
-        .load_script(js)
+    scripting
+        .load_script(js, v6)
         .await
-        .map_err(|e| KWinError::Scripting(format!("loadScript: {e}")))?;
-    Ok(path.to_string())
+        .map_err(|e| KWinError::Scripting(format!("loadScript: {e}")))
+}
+
+/// `loadScript` 返回的 int32 脚本 id → 实例对象路径（版本分发的单一来源）。
+///
+/// KWin 6：`/Scripting/Script<id>`；KWin 5：`/<id>`。
+fn script_object_path(id: i32, v6: bool) -> String {
+    if v6 {
+        format!("/Scripting/Script{id}")
+    } else {
+        format!("/{id}")
+    }
 }
 
 #[cfg(test)]
@@ -561,5 +579,56 @@ mod tests {
         let stmt = push_event("{ event: \"x\" }");
         assert!(!stmt.contains("req:"));
         assert!(!stmt.contains(crate::scripts::REQ_ID_TOKEN));
+    }
+
+    /// TSI-2398 回归：KWin 5.27 与 6 的 `loadScript` 都返回 int32 脚本
+    /// id，差异仅在实例注册路径——V6 `/Scripting/Script<id>`（此前按
+    /// OwnedObjectPath 反序列化直接 SignatureMismatch）、V5 `/<id>`。
+    #[test]
+    fn script_object_path_dispatches_by_version() {
+        // V6：`/Scripting/Script<id>`。
+        assert_eq!(script_object_path(0, true), "/Scripting/Script0");
+        assert_eq!(script_object_path(7, true), "/Scripting/Script7");
+        // V5：`/<id>`。
+        assert_eq!(script_object_path(0, false), "/0");
+        assert_eq!(script_object_path(7, false), "/7");
+    }
+
+    /// KWin `-1` 哨兵语义：loadScript 对「插件名已加载」返回 -1（无新
+    /// 实例）。产出的字符串是**故意非法**的对象路径——zvariant 只接受
+    /// 字母数字/`_`/`/`，`-` 被拒绝——因此 [`ScriptInstance::new`] 以
+    /// `bad path` 报错而非静默构造出错误实例。断言锁定该拒绝行为。
+    #[test]
+    fn sentinel_minus_one_yields_rejected_path() {
+        let path = script_object_path(-1, true);
+        assert_eq!(path, "/Scripting/Script-1");
+        assert!(
+            zbus::zvariant::ObjectPath::try_from(path.as_str()).is_err(),
+            "-1 sentinel must NOT form a valid object path"
+        );
+        assert_eq!(script_object_path(-1, false), "/-1");
+        assert!(
+            zbus::zvariant::ObjectPath::try_from("/-1").is_err(),
+            "v5 -1 sentinel must NOT form a valid object path either"
+        );
+    }
+
+    #[test]
+    fn int_reply_deserializes_as_i32_not_object_path() {
+        // KWin 5.27 与 6 的 loadScript 回复均为 int32 签名 "i"。按
+        // OwnedObjectPath 反序列化必须失败（SignatureMismatch）——这是
+        // TSI-2398 修复前的故障路径；随后按 i32 解析得到脚本 id。
+        let msg = zbus::message::Message::method_call("/Scripting", "loadScript")
+            .and_then(|b| b.build(&(42_i32,)))
+            .expect("marshal");
+        let body = msg.body();
+        assert!(
+            body.deserialize::<zbus::zvariant::OwnedObjectPath>()
+                .is_err(),
+            "int reply must NOT deserialize as OwnedObjectPath"
+        );
+        let id: i32 = body.deserialize().expect("int32 id");
+        assert_eq!(script_object_path(id, true), "/Scripting/Script42");
+        assert_eq!(script_object_path(id, false), "/42");
     }
 }

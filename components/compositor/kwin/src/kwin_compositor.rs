@@ -724,7 +724,8 @@ impl CompositorComponent for KWinCompositor {
         let mut handle = self.event_handle.lock().await;
         if handle.is_none() {
             // 幂等启动；句柄保存在组件内直到 stop/drop。
-            let h = crate::event_script::spawn_event_monitor(&self.bridge).await?;
+            let h = crate::event_script::spawn_event_monitor(&self.bridge, self.version.is_v6())
+                .await?;
             *handle = Some(EventScriptHandle::from_parts(
                 h.object_path().to_string(),
                 h.running_clone(),
