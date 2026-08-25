@@ -1,8 +1,9 @@
 //! `WlrWaylandCompositor`：wlroots 系合成器基类（设计文档 §3.3 / §11）。
 //!
 //! 继承 [`WaylandCompositor`]（组合纯 core 的 [`WaylandDisplayServer`]），
-//! 在其上叠加 **wlr 标准协议**绑定：foreign-toplevel-management /
-//! output-management / screencopy / virtual-pointer。
+//! 在其上叠加 **wlr 标准协议**与相关扩展协议绑定：foreign-toplevel-management /
+//! output-management / screencopy / virtual-pointer / ext-workspace /
+//! virtual-keyboard / data-control。
 //!
 //! 自身就是完整实现，可直接装配使用（未知 Wayland compositor 兜底，
 //! §3.3 调用优先级矩阵「WLRWayland」行）；Treeland / Hyprland / Sway
@@ -16,6 +17,9 @@ use agent_shell_core::component::{
 };
 use agent_shell_core::error::Result;
 use agent_shell_core::EventStream;
+use wayland_protocols::ext::data_control::v1::client::ext_data_control_manager_v1::ExtDataControlManagerV1;
+use wayland_protocols::ext::workspace::v1::client::ext_workspace_manager_v1::ExtWorkspaceManagerV1;
+use wayland_protocols_misc::zwp_virtual_keyboard_v1::client::zwp_virtual_keyboard_manager_v1::ZwpVirtualKeyboardManagerV1;
 use wayland_protocols_wlr::foreign_toplevel::v1::client::zwlr_foreign_toplevel_manager_v1::ZwlrForeignToplevelManagerV1;
 use wayland_protocols_wlr::output_management::v1::client::zwlr_output_manager_v1::ZwlrOutputManagerV1;
 use wayland_protocols_wlr::screencopy::v1::client::zwlr_screencopy_manager_v1::ZwlrScreencopyManagerV1;
@@ -65,6 +69,9 @@ inert_dispatch!(ZwlrForeignToplevelManagerV1);
 inert_dispatch!(ZwlrOutputManagerV1);
 inert_dispatch!(ZwlrScreencopyManagerV1);
 inert_dispatch!(ZwlrVirtualPointerManagerV1);
+inert_dispatch!(ExtWorkspaceManagerV1);
+inert_dispatch!(ZwpVirtualKeyboardManagerV1);
+inert_dispatch!(ExtDataControlManagerV1);
 
 /// WlrWaylandCompositor（§11.1）：纯 core 通道 + wlr 标准协议绑定。
 ///
@@ -73,7 +80,7 @@ inert_dispatch!(ZwlrVirtualPointerManagerV1);
 pub struct WlrWaylandCompositor {
     /// 基类协议通道（同一 `wl_display`，私有协议叠加复用）。
     display_server: WaylandDisplayServer,
-    /// wlr 标准协议绑定集合。
+    /// wlr 标准协议 + 扩展协议绑定集合。
     bindings: WlrBindings,
 }
 
@@ -145,6 +152,26 @@ impl WlrWaylandCompositor {
                 .push(("zwlr_virtual_pointer_manager_v1", e.to_string())),
         }
 
+        // TSI-2350：补齐设计文档 §5.2 预期的其余三个协议字段。
+        bind_protocol!(
+            ext_workspace,
+            "ext_workspace_manager_v1",
+            ExtWorkspaceManagerV1,
+            protocol_versions::EXT_WORKSPACE.0..=protocol_versions::EXT_WORKSPACE.1
+        );
+        bind_protocol!(
+            virtual_keyboard,
+            "zwp_virtual_keyboard_manager_v1",
+            ZwpVirtualKeyboardManagerV1,
+            protocol_versions::VIRTUAL_KEYBOARD.0..=protocol_versions::VIRTUAL_KEYBOARD.1
+        );
+        bind_protocol!(
+            data_control,
+            "ext_data_control_manager_v1",
+            ExtDataControlManagerV1,
+            protocol_versions::DATA_CONTROL.0..=protocol_versions::DATA_CONTROL.1
+        );
+
         // 冲刷初始 bind 序列并等待 compositor 确认（错误对象会在此浮现）。
         queue.roundtrip(&mut WlrState).map_err(|e| {
             agent_shell_core::error::AgentShellError::BackendUnavailable(format!(
@@ -178,12 +205,15 @@ impl WlrWaylandCompositor {
         &self.bindings.bind_failures
     }
 
-    /// 已绑定的 wlr 协议计数（doctor 报告「wlr 协议 : N/M」）。
+    /// 已绑定的协议计数（doctor 报告「wlr 协议 : N/7」）。
     pub fn bound_count(&self) -> usize {
         usize::from(self.bindings.foreign_toplevel.is_some())
             + usize::from(self.bindings.output_management.is_some())
             + usize::from(self.bindings.screencopy.is_some())
             + usize::from(self.bindings.virtual_pointer.is_some())
+            + usize::from(self.bindings.ext_workspace.is_some())
+            + usize::from(self.bindings.virtual_keyboard.is_some())
+            + usize::from(self.bindings.data_control.is_some())
     }
     /// 占位方法的统一错误（T3b / TSI-2314 落地前显式 NotImplemented）。
     fn not_impl(&self) -> agent_shell_core::error::AgentShellError {

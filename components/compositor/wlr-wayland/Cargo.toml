@@ -13,3 +13,5 @@ agent-shell-displayserver-wayland.workspace = true
 async-trait.workspace = true
 wayland-client = { version = "0.31", features = ["log"] }
 wayland-protocols-wlr = { version = "0.3", features = ["client"] }
+wayland-protocols = { version = "0.32", features = ["client", "staging"] }
+wayland-protocols-misc = { version = "0.3", features = ["client"] }
