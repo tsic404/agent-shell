@@ -8,8 +8,9 @@ description = "agent-shell KWin compositor component (org_kde_* Wayland protocol
 
 [dependencies]
 agent-shell-core.workspace = true
-agent-shell-compositor-wayland.workspace = true
-agent-shell-compositor-x11.workspace = true
+agent-shell-compositor-wayland-core.workspace = true
+agent-shell-displayserver-wayland.workspace = true
+agent-shell-displayserver-x11.workspace = true
 wayland-client = { version = "0.31", features = ["log"] }
 wayland-protocols-plasma = { version = "0.3", features = ["client"] }
 zbus = { version = "5", default-features = false, features = ["tokio"] }

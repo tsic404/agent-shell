@@ -2,8 +2,10 @@
 resolver = "2"
 members = [
     "core",
-    "components/compositor/wayland",
-    "components/compositor/x11",
+    "components/displayserver/wayland",
+    "components/displayserver/x11",
+    "components/compositor/wayland-core",
+    "components/compositor/wlr-wayland",
     "components/compositor/kwin",
     "components/systemd",
     "components/logind",
@@ -30,8 +32,10 @@ agent-shell-core = { path = "core" }
 agent-shell-audio = { path = "components/audio" }
 agent-shell-network = { path = "components/network" }
 agent-shell-backend-dde = { path = "backends/dde" }
-agent-shell-compositor-wayland = { path = "components/compositor/wayland" }
-agent-shell-compositor-x11 = { path = "components/compositor/x11" }
+agent-shell-displayserver-wayland = { path = "components/displayserver/wayland" }
+agent-shell-displayserver-x11 = { path = "components/displayserver/x11" }
+agent-shell-compositor-wayland-core = { path = "components/compositor/wayland-core" }
+agent-shell-compositor-wlr-wayland = { path = "components/compositor/wlr-wayland" }
 agent-shell-compositor-kwin = { path = "components/compositor/kwin" }
 agent-shell-systemd = { path = "components/systemd" }
 agent-shell-logind = { path = "components/logind" }

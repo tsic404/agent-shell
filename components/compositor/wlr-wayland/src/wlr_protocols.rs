@@ -21,8 +21,6 @@ pub mod protocol_versions {
     /// zwlr_virtual_pointer_manager_v1 接口规范最高 v2，绑定区间固定 2..=2。
     pub const VIRTUAL_POINTER_MIN: u32 = 2;
     pub const VIRTUAL_POINTER_MAX: u32 = 2;
-    /// wl_seat 仅作 activate 参数，绑最低 v1。
-    pub const SEAT: u32 = 1;
 }
 
 /// wlr 标准协议绑定集合（设计文档 §5.2）。
@@ -36,7 +34,7 @@ pub mod protocol_versions {
 /// 全部 wlr 协议缺失     → 全链路 portal 降级
 /// ```
 #[derive(Debug, Default)]
-pub struct WaylandBindings {
+pub struct WlrBindings {
     /// 窗口管理全功能（list/focus/minimize/maximize/close）
     pub foreign_toplevel: Option<ZwlrForeignToplevelManagerV1>,
     /// 输出配置（监视器布局）
@@ -45,6 +43,8 @@ pub struct WaylandBindings {
     pub screencopy: Option<ZwlrScreencopyManagerV1>,
     /// 虚拟指针输入注入
     pub virtual_pointer: Option<ZwlrVirtualPointerManagerV1>,
+    /// 绑定失败的协议名 → 错误描述（doctor 报告用）。
+    pub bind_failures: Vec<(&'static str, String)>,
 }
 
 #[cfg(test)]

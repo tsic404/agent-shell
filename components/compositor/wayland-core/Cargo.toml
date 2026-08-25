@@ -1,0 +1,12 @@
+[package]
+name = "agent-shell-compositor-wayland-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "agent-shell WaylandCompositor abstract base (pure Wayland core, no wlr bindings)"
+
+[dependencies]
+agent-shell-core.workspace = true
+agent-shell-displayserver-wayland.workspace = true
+async-trait.workspace = true

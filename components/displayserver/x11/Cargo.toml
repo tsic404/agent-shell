@@ -1,10 +1,10 @@
 [package]
-name = "agent-shell-compositor-x11"
+name = "agent-shell-displayserver-x11"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "agent-shell X11 display server protocol layer (EWMH atoms + XTest)"
+description = "agent-shell X11 display server protocol layer (EWMH + ICCCM + XTest)"
 
 [dependencies]
 agent-shell-core.workspace = true

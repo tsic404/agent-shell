@@ -14,8 +14,6 @@
 //! window_management 的 uuid/stacking-order 能力自 v12/v17 起，
 //! fake_input 的 keyboard_key 自 v4 起，运行时按公布版本门控请求。
 
-use std::sync::Arc;
-
 use wayland_client::globals::GlobalList;
 use wayland_client::protocol::wl_registry::WlRegistry;
 use wayland_client::Proxy as _;
@@ -30,8 +28,8 @@ use wayland_protocols_plasma::plasma_virtual_desktop::client::org_kde_plasma_vir
 use wayland_protocols_plasma::plasma_virtual_desktop::client::org_kde_plasma_virtual_desktop_management::OrgKdePlasmaVirtualDesktopManagement;
 
 use crate::error::KWinError;
-use agent_shell_compositor_wayland::WaylandDisplayServer;
 use agent_shell_core::error::Result;
+use agent_shell_displayserver_wayland::WaylandDisplayServer;
 
 /// 各私有协议的最低可用版本与生成绑定版本上限（§7.6 版本表 × scanner 上界）。
 ///
@@ -97,9 +95,11 @@ impl Dispatch<WlRegistry, wayland_client::globals::GlobalListContents> for KWinW
 /// 全字段可选：`None` 表示该通道不可用，操作按矩阵回退 Scripting。
 #[derive(Debug)]
 pub struct KWinProtocols {
-    /// 共享 wl_display 连接句柄（与 WaylandDisplayServer 同一连接）。
-    pub wl: Arc<WaylandDisplayServer>,
     /// 私有协议派发队列（probe 时创建，组件生命周期内保活）。
+    ///
+    /// 共享的 `wl_display` 由 `KWinCompositor` 的 `WaylandCompositor`
+    /// 基类通道持有（`wayland_core` 字段）——本结构只叠加 org_kde_*
+    /// 绑定，不拥有连接。
     queue: std::sync::Mutex<wayland_client::EventQueue<KWinWaylandState>>,
     /// 窗口管理（**仅一个客户端可绑定**——短绑失败即回退 Scripting，D8）。
     pub window_mgmt: Option<WindowManagement>,
@@ -115,7 +115,10 @@ impl KWinProtocols {
     /// 在既有 WaylandDisplayServer 连接上探测并绑定全部 org_kde_* globals。
     /// 不返回错误：单协议失败记录进 `bind_failures` 并置对应字段 `None`
     /// （回退语义），只有 registry 初始化本身失败才报错。
-    pub fn probe(wl: Arc<WaylandDisplayServer>) -> Result<Self> {
+    ///
+    /// 借用基类通道而非持有 `Arc`——连接生命周期归
+    /// `KWinCompositor::wayland_core`（WaylandCompositor 基类字段）所有。
+    pub fn probe(wl: &WaylandDisplayServer) -> Result<Self> {
         let globals = wl.globals();
 
         // 独立派发队列：私有协议的事件本层不消费；EventQueue 由 probe
@@ -130,7 +133,6 @@ impl KWinProtocols {
         let vd_mgmt = VirtualDesktopManagement::bind(globals, &queue_handle, &mut bind_failures);
 
         Ok(Self {
-            wl,
             queue: std::sync::Mutex::new(queue),
             window_mgmt,
             fake_input,

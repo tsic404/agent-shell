@@ -63,6 +63,8 @@ pub struct X11DisplayServer {
     screen_index: usize,
     root: x11rb::protocol::xproto::Window,
     atoms: EwmhAtoms,
+    /// ICCCM 协议原子（WM_PROTOCOLS/DELETE_WINDOW 等，§6 icccm 模块）。
+    pub(crate) wm_atoms: crate::icccm::WmProtocolAtoms,
     /// XTest 扩展可用性（连接时探测；XWayland 下通常不可用或被禁）。
     xtest_available: bool,
 }
@@ -93,6 +95,8 @@ impl X11DisplayServer {
 
         let atoms = EwmhAtoms::new(&conn).map_err(cerr)?.reply().map_err(rerr)?;
 
+        let wm_atoms = crate::icccm::WmProtocolAtoms::new(&conn)?;
+
         // XTest 可用性探测：查询扩展版本失败 → 输入注入走降级链。
         let xtest_available = conn
             .xtest_get_version(2, 2)
@@ -104,6 +108,7 @@ impl X11DisplayServer {
             screen_index,
             root,
             atoms,
+            wm_atoms,
             xtest_available,
         })
     }
@@ -126,6 +131,83 @@ impl X11DisplayServer {
     /// XTest 输入注入是否原生可用（§6.3；false 时上层降级 libei/ydotool）。
     pub fn is_xtest_available(&self) -> bool {
         self.xtest_available
+    }
+
+    // ───────────────────────── ICCCM 协议操作（§6 icccm 模块） ─────────────────────────
+
+    /// 探测目标窗口支持的 `WM_PROTOCOLS` 列表（ICCCM 4.1.2.7）。
+    pub fn get_wm_protocols(
+        &self,
+        window: x11rb::protocol::xproto::Window,
+    ) -> Result<Vec<crate::icccm::WmProtocol>> {
+        let reply = self
+            .conn
+            .get_property(
+                false,
+                window,
+                self.wm_atoms.wm_protocols,
+                x11rb::protocol::xproto::Atom::from(AtomEnum::ATOM),
+                0,
+                u32::MAX,
+            )
+            .map_err(cerr)?
+            .reply()
+            .map_err(rerr)?;
+        let atoms: Vec<u32> = reply.value32().into_iter().flatten().collect();
+        Ok(atoms.iter().map(|&a| self.wm_atoms.classify(a)).collect())
+    }
+
+    /// 窗口是否支持 `WM_DELETE_WINDOW`（优雅关闭可用性预判）。
+    pub fn supports_delete_window(&self, window: x11rb::protocol::xproto::Window) -> Result<bool> {
+        Ok(self
+            .get_wm_protocols(window)?
+            .iter()
+            .any(|p| matches!(p, crate::icccm::WmProtocol::DeleteWindow)))
+    }
+
+    /// 发送 `WM_DELETE_WINDOW` ClientMessage（ICCCM 4.2.8.1）。
+    ///
+    /// 客户端协议路径（区别于 EWMH `_NET_CLOSE_WINDOW`）：窗口未声明支持时
+    /// 返回错误，调用方降级 XKillClient / D-Bus 通道。直接发给目标窗口，
+    /// 不经 root 重定向。
+    pub fn delete_window(&self, window: x11rb::protocol::xproto::Window) -> Result<()> {
+        if !self.supports_delete_window(window)? {
+            return Err(AgentShellError::Input(format!(
+                "icccm: window {window} does not support WM_DELETE_WINDOW"
+            )));
+        }
+        self.send_wm_protocol(window, self.wm_atoms.wm_delete_window)
+    }
+
+    /// 发送任意 `WM_PROTOCOLS` ClientMessage（`WM_TAKE_FOCUS` / `WM_PING` 复用）。
+    pub fn send_wm_protocol(
+        &self,
+        window: x11rb::protocol::xproto::Window,
+        protocol: x11rb::protocol::xproto::Atom,
+    ) -> Result<()> {
+        let event = ClientMessageEvent::new(
+            32,
+            window,
+            self.wm_atoms.wm_protocols,
+            [protocol, 0, 0, 0, 0],
+        );
+        self.conn
+            .send_event(false, window, EventMask::NO_EVENT, event)
+            .map_err(cerr)?;
+        self.conn.flush().map_err(cerr)
+    }
+
+    /// 读经典 `WM_STATE` 状态码（属性缺失 → Withdrawn，ICCCM 4.1.3.1）。
+    pub fn get_wm_state(&self, window: x11rb::protocol::xproto::Window) -> Result<u32> {
+        Ok(self
+            .property_bytes(window, self.wm_atoms.wm_state, self.wm_atoms.wm_state)?
+            .and_then(|raw| raw.first_chunk::<4>().map(|c| u32::from_ne_bytes(*c)))
+            .unwrap_or(crate::icccm::wm_state::WITHDRAWN))
+    }
+
+    /// 底层 X 连接（ICCCM 等子模块协议操作复用同一连接）。
+    pub fn connection(&self) -> &RustConnection {
+        &self.conn
     }
 
     // ───────────────────────── 窗口列表与属性（§6.2） ─────────────────────────

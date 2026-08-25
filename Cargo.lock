@@ -86,9 +86,10 @@ dependencies = [
 name = "agent-shell-compositor-kwin"
 version = "0.1.0"
 dependencies = [
- "agent-shell-compositor-wayland",
- "agent-shell-compositor-x11",
+ "agent-shell-compositor-wayland-core",
  "agent-shell-core",
+ "agent-shell-displayserver-wayland",
+ "agent-shell-displayserver-x11",
  "async-trait",
  "serde",
  "serde_json",
@@ -102,20 +103,24 @@ dependencies = [
 ]
 
 [[package]]
-name = "agent-shell-compositor-wayland"
+name = "agent-shell-compositor-wayland-core"
 version = "0.1.0"
 dependencies = [
  "agent-shell-core",
- "wayland-client",
- "wayland-protocols-wlr",
+ "agent-shell-displayserver-wayland",
+ "async-trait",
 ]
 
 [[package]]
-name = "agent-shell-compositor-x11"
+name = "agent-shell-compositor-wlr-wayland"
 version = "0.1.0"
 dependencies = [
+ "agent-shell-compositor-wayland-core",
  "agent-shell-core",
- "x11rb",
+ "agent-shell-displayserver-wayland",
+ "async-trait",
+ "wayland-client",
+ "wayland-protocols-wlr",
 ]
 
 [[package]]
@@ -129,6 +134,22 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "agent-shell-displayserver-wayland"
+version = "0.1.0"
+dependencies = [
+ "agent-shell-core",
+ "wayland-client",
+]
+
+[[package]]
+name = "agent-shell-displayserver-x11"
+version = "0.1.0"
+dependencies = [
+ "agent-shell-core",
+ "x11rb",
 ]
 
 [[package]]

@@ -9,8 +9,6 @@
 //! 选择逻辑（§7.2 矩阵）：列表/聚焦/最小化/关闭优先协议；移动/缩放/
 //! 最大化协议不支持，始终走 Scripting。
 
-use std::sync::Arc;
-
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use tokio::sync::Mutex as AsyncMutex;
@@ -21,6 +19,7 @@ use crate::event_script::EventScriptHandle;
 use crate::scripts::ScriptTemplate;
 use crate::version::{self, KWinVersion};
 use crate::wayland::{FakeInput, KWinProtocols, WindowManagement};
+use agent_shell_compositor_wayland_core::WaylandCompositor;
 use agent_shell_core::component::{
     BackendCapabilities, ComponentHealth, ComponentType, CompositorComponent, DesktopComponent,
 };
@@ -29,6 +28,8 @@ use agent_shell_core::types::{
     MonitorId, MonitorInfo, Rect, WindowId, WindowInfo, WindowState, WorkspaceId, WorkspaceInfo,
 };
 use agent_shell_core::{DesktopEnvironment, EventStream};
+use agent_shell_displayserver_wayland::WaylandDisplayServer;
+use agent_shell_displayserver_x11::X11DisplayServer;
 
 /// KWin 会话类型（构造时确定，决定基础通道形态）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -39,16 +40,23 @@ pub enum SessionKind {
     X11,
 }
 
-/// KWin 合成器组件。
+/// KWin 合成器组件（§3.3：`KWinCompositor` 直接继承 `WaylandCompositor`）。
+///
+/// 继承表达：Wayland 会话下持有纯 core 的 [`WaylandDisplayServer`] 基类
+/// 通道（`display_server()` 返回它），叠加 org_kde_* 私有协议
+/// （[`KWinProtocols`]）；X11 会话下组合 [`X11DisplayServer`]（EWMH +
+/// ICCCM + XTest），Scripting 仍为共享补充通道。
 pub struct KWinCompositor {
-    /// Wayland 协议通道（仅 Wayland 会话为 Some）。
-    wayland: Option<KWinProtocols>,
+    /// 基类协议通道（仅 Wayland 会话为 Some；私有协议叠加其上）。
+    wayland_core: Option<WaylandDisplayServer>,
+    /// org_kde_* 私有协议通道（仅 Wayland 会话为 Some，叠加在基类之上）。
+    protocols: Option<KWinProtocols>,
     /// D-Bus / Scripting 补充通道（会话无关，共享）。
     bridge: KWinBridge,
-    /// X11 基础通道（仅 X11 会话为 Some；EWMH/XTest 操作由 T1g CLI 与
-    /// 输入组件经此通道路由，本组件保留引用以维持会话生命周期）。
+    /// X11 基础通道（仅 X11 会话为 Some；EWMH/ICCCM/XTest 操作由 T1g CLI
+    /// 与输入组件经此通道路由，本组件保留引用以维持会话生命周期）。
     #[allow(dead_code)]
-    x11: Option<agent_shell_compositor_x11::X11DisplayServer>,
+    x11: Option<X11DisplayServer>,
     /// 探测到的版本（决定脚本 API 形态）。
     version: KWinVersion,
     /// 长驻事件脚本句柄（懒启动）。
@@ -56,9 +64,18 @@ pub struct KWinCompositor {
 }
 
 impl KWinCompositor {
-    /// 协议通道引用（含派发队列）。
+    /// org_kde_* 私有协议通道引用（含派发队列）。
     fn protocols(&self) -> Option<&KWinProtocols> {
-        self.wayland.as_ref()
+        self.protocols.as_ref()
+    }
+
+    /// WaylandCompositor 基类通道（§3.3：Wayland 系合成器共享的纯 core 层）。
+    ///
+    /// X11 会话无 Wayland 通道——此时合成器不经 `WaylandCompositor`
+    /// 抽象使用（EWMH/ICCCM 基础通道为 `x11` 字段），与设计文档
+    /// 「KWinCompositor 组合 WaylandDisplayServer + X11DisplayServer」一致。
+    pub fn wayland_display_server(&self) -> Option<&WaylandDisplayServer> {
+        self.wayland_core.as_ref()
     }
 
     /// Wayland 会话装配（`KdeBackend::assemble` 约定签名）。
@@ -66,11 +83,9 @@ impl KWinCompositor {
     /// 连接 `$WAYLAND_DISPLAY`、绑定 org_kde_* globals、探测版本；
     /// 任一通道部分失败都保持可用（回退语义），只有两条通道全不可用才报错。
     pub async fn new_wayland() -> Result<Self> {
-        let wl = Arc::new(
-            agent_shell_compositor_wayland::WaylandDisplayServer::connect()
-                .map_err(|e| KWinError::Scripting(e.to_string()))?,
-        );
-        let protocols = KWinProtocols::probe(Arc::clone(&wl))?;
+        let wl =
+            WaylandDisplayServer::connect().map_err(|e| KWinError::Scripting(e.to_string()))?;
+        let protocols = KWinProtocols::probe(&wl)?;
         let bridge = KWinBridge::connect().await?;
         let version = version::detect_version(bridge.connection())
             .await
@@ -79,7 +94,8 @@ impl KWinCompositor {
                 major: crate::version::KWinMajor::V6,
             });
         Ok(Self {
-            wayland: Some(protocols),
+            wayland_core: Some(wl),
+            protocols: Some(protocols),
             bridge,
             x11: None,
             version,
@@ -89,8 +105,7 @@ impl KWinCompositor {
 
     /// X11 会话装配：连接 X server + D-Bus 桥接。
     pub async fn new_x11() -> Result<Self> {
-        let x11 = agent_shell_compositor_x11::X11DisplayServer::connect()
-            .map_err(|e| KWinError::Scripting(e.to_string()))?;
+        let x11 = X11DisplayServer::connect().map_err(|e| KWinError::Scripting(e.to_string()))?;
         let bridge = KWinBridge::connect().await?;
         let version = version::detect_version(bridge.connection())
             .await
@@ -99,7 +114,8 @@ impl KWinCompositor {
                 major: crate::version::KWinMajor::V6,
             });
         Ok(Self {
-            wayland: None,
+            wayland_core: None,
+            protocols: None,
             bridge,
             x11: Some(x11),
             version,
@@ -109,7 +125,7 @@ impl KWinCompositor {
 
     /// 会话类型。
     pub fn session_kind(&self) -> SessionKind {
-        if self.wayland.is_some() {
+        if self.wayland_core.is_some() {
             SessionKind::Wayland
         } else {
             SessionKind::X11
@@ -124,7 +140,7 @@ impl KWinCompositor {
     /// doctor 输出（§7.7 验证输出格式）。
     pub fn doctor_lines(&self) -> Vec<String> {
         let mut lines = Vec::new();
-        if let Some(p) = &self.wayland {
+        if let Some(p) = &self.protocols {
             let bound = p.bound_count();
             let detail = [
                 (
@@ -163,7 +179,7 @@ impl KWinCompositor {
             "✓ D-Bus 桥接 : callDBus ready ({} templates, req-id routed)",
             14
         ));
-        if let Some(p) = &self.wayland {
+        if let Some(p) = &self.protocols {
             match &p.fake_input {
                 Some(fi) if fi.is_authenticated() => {
                     lines.push("✓ 输入注入   : fake_input authenticated ✓".into())
@@ -190,12 +206,12 @@ impl KWinCompositor {
 
     /// window_management 短绑引用。
     fn window_mgmt(&self) -> Option<&WindowManagement> {
-        self.wayland.as_ref()?.window_mgmt.as_ref()
+        self.protocols.as_ref()?.window_mgmt.as_ref()
     }
 
     /// fake_input 引用（未 authenticate 视为不可用）。
     fn fake_input(&self) -> Option<&FakeInput> {
-        let fi = &self.wayland.as_ref()?.fake_input;
+        let fi = &self.protocols.as_ref()?.fake_input;
         fi.as_ref().filter(|f| f.is_authenticated())
     }
 
@@ -320,7 +336,9 @@ impl DesktopComponent for KWinCompositor {
     }
 
     async fn health(&self) -> ComponentHealth {
-        match (&self.wayland, self.window_mgmt()) {
+        // 以 org_kde_* 私有协议通道（KWinProtocols）的真实绑定失败记录为准——
+        // 基类通道 wayland_core 的 bind_failures 恒为空（纯 core 层无协议绑定）。
+        match (self.protocols.as_ref(), self.window_mgmt()) {
             (Some(p), Some(_)) if p.bind_failures().is_empty() => ComponentHealth::Healthy,
             (Some(_), Some(_)) => {
                 ComponentHealth::Degraded("protocol partial; scripting fallback active".into())
@@ -328,8 +346,21 @@ impl DesktopComponent for KWinCompositor {
             (Some(_), None) => {
                 ComponentHealth::Degraded("window_mgmt unbound; scripting fallback".into())
             }
-            (None, _) => ComponentHealth::Degraded("X11 session; EWMH + scripting".into()),
+            (None, _) => ComponentHealth::Degraded("X11 session; EWMH/ICCCM + scripting".into()),
         }
+    }
+}
+
+/// §3.3 继承层次落地：`KWinCompositor` 直接继承 `WaylandCompositor`
+/// （组合 `WaylandDisplayServer`，叠加 org_kde_* 私有协议）。
+///
+/// 仅 Wayland 会话满足本抽象——X11 会话下合成器的基础通道是
+/// `X11DisplayServer`（EWMH/ICCCM），不经 Wayland 系抽象使用。
+impl WaylandCompositor for KWinCompositor {
+    fn display_server(&self) -> &WaylandDisplayServer {
+        self.wayland_core
+            .as_ref()
+            .expect("WaylandCompositor is only implemented for Wayland sessions; check session_kind() first")
     }
 }
 
