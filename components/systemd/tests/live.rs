@@ -100,7 +100,12 @@ async fn live_systemd_daemon_reload_succeeds() {
 async fn live_logind_list_sessions_returns_current() {
     let c = LogindComponent::connect().await.unwrap();
     let sessions = c.list_sessions().await.unwrap();
-    assert!(!sessions.is_empty(), "ListSessions returned no sessions");
+    if sessions.is_empty() {
+        // CI runner / 无头容器可达 logind 但无任何 session（无人登录）——
+        // ListSessions 空是合法环境状态而非组件缺陷，按本文件 skip 约定放行。
+        skip("no logind sessions on this host (headless/CI)");
+        return;
+    }
     for s in &sessions {
         assert!(
             ["active", "online", "closing"].contains(&s.state.as_str()),

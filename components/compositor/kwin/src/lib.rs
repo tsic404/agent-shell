@@ -26,4 +26,4 @@ pub use error::{KWinError, Result};
 pub use kwin_compositor::{KWinCompositor, SessionKind};
 pub use scripts::ScriptTemplate;
 pub use version::{parse_support_information, KWinMajor, KWinVersion};
-pub use wayland::{FakeInput, KWinProtocols, WindowManagement};
+pub use wayland::{BindFailureKind, FakeInput, KWinProtocols, WindowManagement};

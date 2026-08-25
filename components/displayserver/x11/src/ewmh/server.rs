@@ -705,8 +705,10 @@ impl X11DisplayServer {
             return Ok(Vec::new());
         };
         Ok(raw
-            .chunks_exact(4)
-            .map(|c| u32::from_be_bytes(c.try_into().expect("4-byte chunk")))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| u32::from_be_bytes(*c))
             .collect())
     }
 

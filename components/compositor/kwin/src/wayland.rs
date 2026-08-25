@@ -9,10 +9,31 @@
 //! | `org_kde_kwin_fake_input` | 5（生成绑定上限） | 输入注入（需 authenticate） |
 //! | `org_kde_plasma_virtual_desktop_management` | 2 | 虚拟桌面 |
 //!
-//! 绑定策略（§7.2 / 决策 D8）：任一协议缺失/版本过低/被占用都不视为
 //! 致命错误——对应字段为 `None`，上层按通道选择矩阵回退 Scripting。
 //! window_management 的 uuid/stacking-order 能力自 v12/v17 起，
 //! fake_input 的 keyboard_key 自 v4 起，运行时按公布版本门控请求。
+//!
+//! # 曝露条件（KWin global 过滤）
+//!
+//! KWin 服务端**始终创建**这三个协议 global（`WaylandServer::start()` 无条件
+//! new `PlasmaWindowManagementInterface`；`FakeInputBackend::initialize()` 无条件
+//! `init`），但 `KWinDisplay::allowInterface`（wayland_server.cpp）按客户端
+//! 过滤 registry 广告：
+//!
+//! - **KWin ≤ 6.7.x**：`window_management` / `fake_input` 在
+//!   `interfacesBlackList` 中，仅当客户端可执行文件匹配某个 .desktop 且其
+//!   `X-KDE-Wayland-Interfaces=` 声明了该接口（KApplicationTrader 按
+//!   Exec 规范路径匹配）才广告；未声明 → registry 不出现（即
+//!   [`BindError::NotPresent`]）。无 .desktop 的裸进程一律被拒。
+//! - **KWin ≥ master（6.8+）**：commit f9bf0ee6 起改为仅按 systemd cgroup
+//!   判定沙箱（app.slice 下 flatpak/snap）才隐藏；普通进程全部可见。
+//! - `virtual_desktop_management` 从不在黑名单中——任何客户端可见。
+//!
+//! 因此「global 缺失」≠「协议不存在」：诊断时优先怀疑过滤而非版本。
+//! 测试/部署侧对策：将启动器 .desktop 声明 `X-KDE-Wayland-Interfaces=`，
+//! 或设 `KWIN_WAYLAND_NO_PERMISSION_CHECKS=1`（仅 ≤6.7.x 生效）。
+//! 绑定策略不变（§7.2 / 决策 D8）：任一协议缺失/版本过低/被占用都不视为
+//! 致命错误——对应字段为 `None`，上层按通道选择矩阵回退 Scripting。
 
 use wayland_client::globals::GlobalList;
 use wayland_client::protocol::wl_registry::WlRegistry;
@@ -174,6 +195,42 @@ fn make_queue(conn: &Connection) -> wayland_client::EventQueue<KWinWaylandState>
     conn.new_event_queue()
 }
 
+/// 绑定失败原因分类（doctor 报告与诊断日志用）。
+///
+/// KWin ≤6.7.x 的 `interfacesBlackList` 过滤（见模块文档）会让未声明
+/// `X-KDE-Wayland-Interfaces` 的客户端看到 `NotPresent`——这与「协议根本
+/// 不存在」同形不同因，必须区分，否则会把权限过滤误诊为版本/环境缺失。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BindFailureKind {
+    /// registry 中无此 global：≤6.7.x 下最常见为黑名单过滤（缺 .desktop 声明）。
+    NotAdvertised,
+    /// global 存在但公布版本低于运行时最低要求（`min_versions`）。
+    VersionTooLow,
+}
+
+impl BindFailureKind {
+    /// 从 wayland-client 的 [`BindError`] 归类失败原因。
+    fn of(e: wayland_client::globals::BindError) -> Self {
+        use wayland_client::globals::BindError as E;
+        match e {
+            E::NotPresent => Self::NotAdvertised,
+            E::UnsupportedVersion => Self::VersionTooLow,
+        }
+    }
+
+    /// 人类可读描述（含对策提示）。
+    pub fn describe(&self, interface: &str) -> String {
+        match self {
+            Self::NotAdvertised => format!(
+                "{interface}: global not advertised — KWin ≤6.7 hides blacklisted \
+                 interfaces (window_management/fake_input) from clients without an \
+                 X-KDE-Wayland-Interfaces .desktop entry; not a missing protocol"
+            ),
+            Self::VersionTooLow => format!("{interface}: advertised version below runtime minimum"),
+        }
+    }
+}
+
 /// window_management 协议句柄（v12+；uuid 寻址窗口）。
 #[derive(Debug)]
 pub struct WindowManagement {
@@ -202,11 +259,17 @@ impl WindowManagement {
             }
             Err(e) => {
                 // 单客户端被占用（任务栏已绑）是最常见路径——降级而非报错（D8）。
+                // NotPresent 在 ≤6.7.x 多为黑名单过滤而非协议缺失，分类记录。
+                let kind = BindFailureKind::of(e);
                 tracing::info!(
                     interface = "org_kde_plasma_window_management",
-                    "window management not bound, falling back to Scripting: {e}"
+                    kind = ?kind,
+                    "window management not bound, falling back to Scripting"
                 );
-                failures.push(("org_kde_plasma_window_management", e.to_string()));
+                failures.push((
+                    "org_kde_plasma_window_management",
+                    kind.describe("org_kde_plasma_window_management"),
+                ));
                 None
             }
         }
@@ -317,8 +380,13 @@ impl FakeInput {
                 authenticated: std::sync::atomic::AtomicBool::new(false),
             }),
             Err(e) => {
-                tracing::info!("fake_input not bound: {e}");
-                failures.push(("org_kde_kwin_fake_input", e.to_string()));
+                // ≤6.7.x 黑名单同样过滤 fake_input——NotPresent ≠ 协议缺失。
+                let kind = BindFailureKind::of(e);
+                tracing::info!(interface = "org_kde_kwin_fake_input", kind = ?kind, "fake_input not bound");
+                failures.push((
+                    "org_kde_kwin_fake_input",
+                    kind.describe("org_kde_kwin_fake_input"),
+                ));
                 None
             }
         }
@@ -397,8 +465,13 @@ impl VirtualDesktopManagement {
         ) {
             Ok(manager) => Some(Self { manager }),
             Err(e) => {
-                tracing::info!("virtual desktop management not bound: {e}");
-                failures.push(("org_kde_plasma_virtual_desktop_management", e.to_string()));
+                // 该协议从不在 KWin 黑名单中——NotPresent 在此即真缺失。
+                let kind = BindFailureKind::of(e);
+                tracing::info!(interface = "org_kde_plasma_virtual_desktop_management", kind = ?kind, "virtual desktop management not bound");
+                failures.push((
+                    "org_kde_plasma_virtual_desktop_management",
+                    kind.describe("org_kde_plasma_virtual_desktop_management"),
+                ));
                 None
             }
         }
@@ -422,5 +495,46 @@ impl VirtualDesktopManagement {
     /// 删除虚拟桌面。
     pub fn remove_virtual_desktop(&self, id: &str) {
         self.manager.request_remove_virtual_desktop(id.to_string());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wayland_client::globals::BindError;
+
+    #[test]
+    fn not_present_maps_to_not_advertised() {
+        // KWin ≤6.7.x 黑名单过滤与真缺失同形——都走 BindError::NotPresent。
+        assert_eq!(
+            BindFailureKind::of(BindError::NotPresent),
+            BindFailureKind::NotAdvertised
+        );
+    }
+
+    #[test]
+    fn unsupported_version_maps_to_version_too_low() {
+        assert_eq!(
+            BindFailureKind::of(BindError::UnsupportedVersion),
+            BindFailureKind::VersionTooLow
+        );
+    }
+
+    #[test]
+    fn not_advertised_description_names_the_permission_filter() {
+        let s = BindFailureKind::NotAdvertised.describe("org_kde_plasma_window_management");
+        assert!(s.contains("org_kde_plasma_window_management"));
+        assert!(s.contains("not advertised"), "got: {s}");
+        assert!(
+            s.contains("X-KDE-Wayland-Interfaces"),
+            "diagnosis must point at the .desktop entitlement, got: {s}"
+        );
+    }
+
+    #[test]
+    fn version_too_low_description_does_not_mention_entitlement() {
+        let s = BindFailureKind::VersionTooLow.describe("org_kde_kwin_fake_input");
+        assert!(s.contains("below runtime minimum"), "got: {s}");
+        assert!(!s.contains(".desktop"), "got: {s}");
     }
 }
