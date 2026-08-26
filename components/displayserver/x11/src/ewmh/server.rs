@@ -727,6 +727,17 @@ impl X11DisplayServer {
         Ok(reply.data)
     }
 
+    /// 窗口位深（GetGeometry 的 depth 字段；capture 侧行步长计算用）。
+    pub fn window_depth(&self, window: x11rb::protocol::xproto::Window) -> Result<u8> {
+        let reply = self
+            .conn
+            .get_geometry(window)
+            .map_err(cerr)?
+            .reply()
+            .map_err(rerr)?;
+        Ok(reply.depth)
+    }
+
     /// 计算窗口 Z_PIXMAP 行步长（bytes-per-row）：depth 决定 bpp，
     /// 每行按 32 位边界补齐。无法确定 bpp 时返回 None。
     fn window_stride(&self, window: x11rb::protocol::xproto::Window) -> Option<usize> {

@@ -1,0 +1,25 @@
+[package]
+name = "agent-shell-capture"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "agent-shell capture component: portal ScreenCast (PipeWire) / portal Screenshot / X11 MIT-SHM fallback chain"
+
+[dependencies]
+agent-shell-core.workspace = true
+agent-shell-displayserver-x11.workspace = true
+async-trait.workspace = true
+futures-lite.workspace = true
+x11rb = { version = "0.14", features = ["render", "xtest", "shm"] }
+tokio = { workspace = true, features = ["process", "sync", "time"] }
+tracing.workspace = true
+zbus.workspace = true
+zvariant.workspace = true
+libc.workspace = true
+ordered-stream.workspace = true
+pipewire.workspace = true
+rustix = { version = "1", features = ["fs", "mm", "shm"] }
+
+[dev-dependencies]
+tempfile = "3"

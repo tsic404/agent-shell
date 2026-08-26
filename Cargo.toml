@@ -25,6 +25,7 @@ members = [
     "rpc",
     "daemon",
     "rootd",
+    "modules/capture",
 ]
 
 [workspace.package]
@@ -55,6 +56,11 @@ agent-shell-launcher = { path = "components/launcher" }
 agent-shell-clipboard = { path = "components/clipboard" }
 agent-shell-input = { path = "components/input" }
 agent-shell-a11y = { path = "components/a11y" }
+agent-shell-capture = { path = "modules/capture" }
+libc = "0.2"
+ordered-stream = "0.2"
+pipewire = "0.10"
+tempfile = "3"
 clap = { version = "4", features = ["derive"] }
 zbus = { version = "5", default-features = false, features = ["tokio"] }
 futures-util = "0.3"

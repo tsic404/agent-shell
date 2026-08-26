@@ -45,7 +45,24 @@ pub fn capture_to_file(
     }
     // 区域裁剪：先校验非负（负坐标 as usize 回绕成巨大数 → 索引越界
     // panic，违反 dispatch 永不 panic 契约），再夹取到捕获边界。
-    let bpp = (data.len() / (geo.width as usize * geo.height as usize).max(1)).max(4);
+    //
+    // 行步长：capture_window 返回的原始数据按 X 协议 32 位扫描线对齐，
+    // stride = (width × bpp) 向上取整到 4 字节，可能大于 width × bpp。
+    // bpp 由 GetGeometry 的 depth 决定（24/32→4，16→2，8→1）；
+    // 反推法 data.len()/pixels 在有 padding 时会把 padding 摊进 bpp。
+    let depth = x.window_depth(target).map_err(capture_err)?;
+    let bytes_per_pixel = match depth {
+        24 | 32 => 4usize,
+        16 => 2,
+        8 => 1,
+        d => {
+            return Err((
+                RpcErrorCode::BackendError,
+                format!("unsupported x11 depth {d}"),
+            ));
+        }
+    };
+    let stride = (geo.width as usize * bytes_per_pixel).div_ceil(4) * 4;
     let [ax, ay, aw_raw, ah_raw] = area.unwrap_or([0, 0, geo.width, geo.height]);
     if ax < 0 || ay < 0 || aw_raw < 0 || ah_raw < 0 {
         return Err((
@@ -67,9 +84,10 @@ pub fn capture_to_file(
     let mut ppm = Vec::with_capacity((aw * ah * 3) as usize);
     ppm.extend_from_slice(format!("P6\n{aw} {ah}\n255\n").as_bytes());
     for row in 0..ah as usize {
-        let y_off = (ay as usize + row) * geo.width as usize + ax as usize;
+        // 行基址按 stride 跳过行尾 padding；列内按 bpp 取像素。
+        let row_base = (ay as usize + row) * stride + ax as usize * bytes_per_pixel;
         for col in 0..aw as usize {
-            let px = &data[(y_off + col) * bpp..(y_off + col) * bpp + 3];
+            let px = &data[row_base + col * bytes_per_pixel..row_base + col * bytes_per_pixel + 3];
             // Z_PIXMAP little-endian 通常为 BGRx。
             ppm.push(px[2]);
             ppm.push(px[1]);
@@ -93,7 +111,6 @@ fn capture_err(e: agent_shell_core::error::AgentShellError) -> (RpcErrorCode, St
 
 #[cfg(test)]
 mod tests {
-    use super::*;
 
     // capture_to_file 需要 X11 连接——纯逻辑部分经 pack 区域裁剪语义
     // 由集成测试覆盖；此处锚定参数校验契约（不触发 X 连接的分支）。
