@@ -317,10 +317,10 @@ struct ResponseService {
     router: SharedRouter,
     events: mpsc::UnboundedSender<Value>,
 }
-
 #[zbus::interface(name = "com.agent_shell.Response")]
 impl ResponseService {
     /// JS 侧 `callDBus(..., "sendResult", json)` 的接收端。
+    #[zbus(name = "sendResult")]
     async fn send_result(&self, payload: String) {
         let parsed: Result<Value, _> = serde_json::from_str(&payload);
         let value = match parsed {
@@ -341,6 +341,17 @@ impl ResponseService {
             None => {
                 let _ = self.events.send(value);
             }
+        }
+    }
+}
+
+#[cfg(test)]
+impl ResponseService {
+    fn for_test() -> Self {
+        let (events, _rx) = mpsc::unbounded_channel();
+        Self {
+            router: Arc::new(Mutex::new(ResponseRouter::default())),
+            events,
         }
     }
 }
@@ -774,5 +785,28 @@ mod tests {
         let id: i32 = body.deserialize().expect("int32 id");
         assert_eq!(script_object_path(id, true), "/Scripting/Script42");
         assert_eq!(script_object_path(id, false), "/42");
+    }
+
+    /// TSI-2436 回归：`send_result` 方法必须以 `sendResult`（camelCase）
+    /// 暴露在 D-Bus 上，与脚本模板 `RESPONSE_METHOD = "sendResult"` 对齐。
+    ///
+    /// zbus v5 默认将 Rust 方法名 `send_result` 导出为 PascalCase
+    /// `SendResult`，而 D-Bus 方法名大小写敏感 → 脚本 callDBus
+    /// `"sendResult"` 命中 UnknownMethod → 5s timeout。通过
+    /// `#[zbus(name = "sendResult")]` 显式对齐后，introspection XML
+    /// 必须广告 `sendResult` 且不含 `SendResult`。
+    #[test]
+    fn response_method_exposed_as_send_result() {
+        let service = ResponseService::for_test();
+        let mut xml = String::new();
+        zbus::object_server::Interface::introspect_to_writer(&service, &mut xml, 0);
+        assert!(
+            xml.contains(r#"method name="sendResult""#),
+            "introspection must advertise sendResult; got: {xml}"
+        );
+        assert!(
+            !xml.contains(r#"method name="SendResult""#),
+            "default PascalCase SendResult must NOT appear; got: {xml}"
+        );
     }
 }
