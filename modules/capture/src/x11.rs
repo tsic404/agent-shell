@@ -200,6 +200,9 @@ fn shm_capture(
         }
     }
     let _guard = UnmapGuard(map, seg_size as usize);
+    // shm_get_image 的回包在 server 写完共享内存段之后才发出：
+    // 等 reply 即完成同步（reply() 内部会 flush 并阻塞等待），
+    // 否则读到 ftruncate 后的全零段——帧永远全黑。
     conn.shm_get_image(
         drawable,
         0,
@@ -211,7 +214,9 @@ fn shm_capture(
         shmseg,
         0,
     )
-    .map_err(|e| format!("shm_get_image: {e}"))?;
+    .map_err(|e| format!("shm_get_image: {e}"))?
+    .reply()
+    .map_err(|e| format!("shm_get_image reply: {e}"))?;
 
     // 4. 从本地映射读出数据。
     let out = unsafe { std::slice::from_raw_parts(map.cast::<u8>(), seg_size as usize) };
