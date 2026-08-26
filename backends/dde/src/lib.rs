@@ -23,6 +23,7 @@ pub mod protocol_gen;
 pub mod treeland;
 pub mod version;
 
+mod assemble;
 mod dde_compositor;
 
 pub use compositor::{detect_compositor, CompositorKind};
@@ -31,4 +32,5 @@ pub use treeland::{doctor_line as treeland_doctor_line, TreelandBindings};
 pub use version::DdeVersion;
 
 pub use agent_shell_power::{probe_first_existing, service_exists};
+pub use assemble::{DdeBackend, SessionType};
 pub use dde_audio::{AudioServiceVariant, DdeAudio};

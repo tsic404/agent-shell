@@ -45,12 +45,21 @@ dependencies = [
 name = "agent-shell-backend-dde"
 version = "0.1.0"
 dependencies = [
+ "agent-shell-a11y",
+ "agent-shell-appearance",
  "agent-shell-audio",
+ "agent-shell-capture",
+ "agent-shell-clipboard",
  "agent-shell-compositor-kwin",
  "agent-shell-core",
  "agent-shell-displayserver-wayland",
+ "agent-shell-input",
  "agent-shell-launcher",
+ "agent-shell-logind",
+ "agent-shell-network",
+ "agent-shell-notification",
  "agent-shell-power",
+ "agent-shell-systemd",
  "async-trait",
  "futures-util",
  "serde",
@@ -64,12 +73,47 @@ dependencies = [
 ]
 
 [[package]]
+name = "agent-shell-backend-generic"
+version = "0.1.0"
+dependencies = [
+ "agent-shell-a11y",
+ "agent-shell-appearance",
+ "agent-shell-audio",
+ "agent-shell-capture",
+ "agent-shell-clipboard",
+ "agent-shell-compositor-wlr-wayland",
+ "agent-shell-compositor-x11",
+ "agent-shell-core",
+ "agent-shell-input",
+ "agent-shell-launcher",
+ "agent-shell-logind",
+ "agent-shell-network",
+ "agent-shell-notification",
+ "agent-shell-power",
+ "agent-shell-systemd",
+ "async-trait",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "agent-shell-backend-gnome"
 version = "0.1.0"
 dependencies = [
+ "agent-shell-a11y",
+ "agent-shell-appearance",
+ "agent-shell-audio",
+ "agent-shell-capture",
+ "agent-shell-clipboard",
+ "agent-shell-compositor-mutter",
  "agent-shell-core",
+ "agent-shell-input",
  "agent-shell-launcher",
+ "agent-shell-logind",
+ "agent-shell-network",
+ "agent-shell-notification",
  "agent-shell-power",
+ "agent-shell-systemd",
  "async-trait",
  "tokio",
  "tracing",
@@ -77,16 +121,86 @@ dependencies = [
 ]
 
 [[package]]
+name = "agent-shell-backend-hyprland"
+version = "0.1.0"
+dependencies = [
+ "agent-shell-a11y",
+ "agent-shell-appearance",
+ "agent-shell-audio",
+ "agent-shell-capture",
+ "agent-shell-clipboard",
+ "agent-shell-compositor-hyprland",
+ "agent-shell-core",
+ "agent-shell-input",
+ "agent-shell-launcher",
+ "agent-shell-logind",
+ "agent-shell-network",
+ "agent-shell-notification",
+ "agent-shell-power",
+ "agent-shell-systemd",
+ "async-trait",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "agent-shell-backend-kde"
 version = "0.1.0"
 dependencies = [
+ "agent-shell-a11y",
+ "agent-shell-appearance",
+ "agent-shell-audio",
+ "agent-shell-capture",
+ "agent-shell-clipboard",
+ "agent-shell-compositor-kwin",
  "agent-shell-core",
+ "agent-shell-input",
  "agent-shell-launcher",
+ "agent-shell-logind",
+ "agent-shell-network",
+ "agent-shell-notification",
  "agent-shell-power",
+ "agent-shell-systemd",
  "async-trait",
  "tokio",
  "tracing",
  "zbus",
+]
+
+[[package]]
+name = "agent-shell-backend-sway"
+version = "0.1.0"
+dependencies = [
+ "agent-shell-a11y",
+ "agent-shell-appearance",
+ "agent-shell-audio",
+ "agent-shell-capture",
+ "agent-shell-clipboard",
+ "agent-shell-compositor-sway",
+ "agent-shell-core",
+ "agent-shell-input",
+ "agent-shell-launcher",
+ "agent-shell-logind",
+ "agent-shell-network",
+ "agent-shell-notification",
+ "agent-shell-power",
+ "agent-shell-systemd",
+ "async-trait",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "agent-shell-backend-tty"
+version = "0.1.0"
+dependencies = [
+ "agent-shell-core",
+ "agent-shell-logind",
+ "agent-shell-network",
+ "agent-shell-systemd",
+ "async-trait",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -403,6 +517,22 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+]
+
+[[package]]
+name = "agent-shell-shell"
+version = "0.1.0"
+dependencies = [
+ "agent-shell-backend-dde",
+ "agent-shell-backend-generic",
+ "agent-shell-backend-gnome",
+ "agent-shell-backend-hyprland",
+ "agent-shell-backend-kde",
+ "agent-shell-backend-sway",
+ "agent-shell-backend-tty",
+ "agent-shell-core",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

@@ -1,0 +1,27 @@
+[package]
+name = "agent-shell-shell"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "agent-shell top-level: AgentShell struct + detect_and_assemble entry"
+
+[dependencies]
+agent-shell-core.workspace = true
+agent-shell-backend-kde = { workspace = true, optional = true }
+agent-shell-backend-dde = { workspace = true, optional = true }
+agent-shell-backend-gnome = { workspace = true, optional = true }
+agent-shell-backend-hyprland = { workspace = true, optional = true }
+agent-shell-backend-sway = { workspace = true, optional = true }
+agent-shell-backend-generic.workspace = true
+agent-shell-backend-tty.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[features]
+default = ["kde", "dde", "gnome", "hyprland", "sway"]
+kde = ["dep:agent-shell-backend-kde"]
+dde = ["dep:agent-shell-backend-dde"]
+gnome = ["dep:agent-shell-backend-gnome"]
+hyprland = ["dep:agent-shell-backend-hyprland"]
+sway = ["dep:agent-shell-backend-sway"]

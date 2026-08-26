@@ -1,14 +1,14 @@
 [package]
-name = "agent-shell-backend-gnome"
+name = "agent-shell-backend-sway"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "agent-shell GNOME backend: GnomeBackend assembler + gsd.Power/ScreenSaver/gsettings/gio wrappers"
+description = "agent-shell Sway backend assembler: SwayCompositor + UPower + portal three-piece set"
 
 [dependencies]
 agent-shell-core.workspace = true
-agent-shell-compositor-mutter.workspace = true
+agent-shell-compositor-sway.workspace = true
 agent-shell-power.workspace = true
 agent-shell-notification.workspace = true
 agent-shell-appearance.workspace = true
@@ -24,4 +24,3 @@ agent-shell-logind.workspace = true
 async-trait.workspace = true
 tokio.workspace = true
 tracing.workspace = true
-zbus.workspace = true

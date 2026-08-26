@@ -4,12 +4,23 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "agent-shell KDE backend wrappers: powerdevil / kscreenlocker / notification / appearance CLI / klauncher"
+description = "agent-shell KDE backend: KdeBackend assembler + powerdevil/kscreenlocker/appearance/launcher wrappers"
 
 [dependencies]
 agent-shell-core.workspace = true
+agent-shell-compositor-kwin.workspace = true
 agent-shell-power.workspace = true
+agent-shell-notification.workspace = true
+agent-shell-appearance.workspace = true
 agent-shell-launcher.workspace = true
+agent-shell-clipboard.workspace = true
+agent-shell-input.workspace = true
+agent-shell-a11y.workspace = true
+agent-shell-capture.workspace = true
+agent-shell-audio.workspace = true
+agent-shell-network.workspace = true
+agent-shell-systemd.workspace = true
+agent-shell-logind.workspace = true
 async-trait.workspace = true
 tokio.workspace = true
 tracing.workspace = true

@@ -1,18 +1,16 @@
 [package]
-name = "agent-shell-systemd"
+name = "agent-shell-backend-tty"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "agent-shell systemd init-system component (org.freedesktop.systemd1.Manager)"
+description = "agent-shell TTY backend assembler: SystemdComponent + LogindComponent only"
 
 [dependencies]
 agent-shell-core.workspace = true
+agent-shell-systemd.workspace = true
 agent-shell-logind.workspace = true
+agent-shell-network.workspace = true
 async-trait.workspace = true
 tokio.workspace = true
 tracing.workspace = true
-zbus.workspace = true
-
-[dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

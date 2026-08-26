@@ -8,9 +8,19 @@ description = "agent-shell DDE backend: DdeCompositor (deepin-kwin/Treeland/X11)
 
 [dependencies]
 agent-shell-core.workspace = true
+agent-shell-compositor-kwin.workspace = true
 agent-shell-power.workspace = true
 agent-shell-launcher.workspace = true
 agent-shell-audio.workspace = true
+agent-shell-a11y.workspace = true
+agent-shell-capture.workspace = true
+agent-shell-input.workspace = true
+agent-shell-clipboard.workspace = true
+agent-shell-logind.workspace = true
+agent-shell-appearance.workspace = true
+agent-shell-notification.workspace = true
+agent-shell-systemd.workspace = true
+agent-shell-network.workspace = true
 async-trait.workspace = true
 serde.workspace = true
 tokio.workspace = true
@@ -22,4 +32,3 @@ wayland-client = { version = "0.31", features = ["log"] }
 wayland-backend = "0.3"
 wayland-scanner = "0.31"
 agent-shell-displayserver-wayland.workspace = true
-agent-shell-compositor-kwin.workspace = true

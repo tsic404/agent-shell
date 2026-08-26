@@ -258,3 +258,29 @@ impl SystemComponent for SystemdComponent {
             .unwrap_or(UnitStatus::Unknown))
     }
 }
+
+/// 装配系统服务组件族（systemd + logind），返回 `(init_system, session_manager)`。
+///
+/// 所有 backend 共享的公共装配逻辑（§3.3 装配矩阵「系统服务」行）：
+/// systemd 与 logind 是唯一在所有 Linux 环境（含 TTY）均「必选」的组件族。
+/// 探测失败不 panic——返回 `None` 对应 slot，由 doctor 报告 Degraded/Unavailable。
+pub async fn assemble_system_services() -> (
+    Option<Box<dyn agent_shell_core::component::SystemComponent>>,
+    Option<Box<dyn agent_shell_core::component::SessionManagerComponent>>,
+) {
+    let init_system = match SystemdComponent::connect().await {
+        Ok(s) => Some(Box::new(s) as Box<dyn agent_shell_core::component::SystemComponent>),
+        Err(e) => {
+            tracing::warn!(error = %e, "systemd assembly failed");
+            None
+        }
+    };
+    let session_manager = match agent_shell_logind::LogindComponent::connect().await {
+        Ok(s) => Some(Box::new(s) as Box<dyn agent_shell_core::component::SessionManagerComponent>),
+        Err(e) => {
+            tracing::warn!(error = %e, "logind assembly failed");
+            None
+        }
+    };
+    (init_system, session_manager)
+}

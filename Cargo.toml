@@ -21,6 +21,11 @@ members = [
     "backends/kde",
     "backends/dde",
     "backends/gnome",
+    "backends/hyprland",
+    "backends/sway",
+    "backends/generic",
+    "backends/tty",
+    "shell",
     "components/network",
     "components/a11y",
     "cli",
@@ -41,6 +46,12 @@ agent-shell-core = { path = "core" }
 agent-shell-audio = { path = "components/audio" }
 agent-shell-network = { path = "components/network" }
 agent-shell-backend-dde = { path = "backends/dde" }
+agent-shell-backend-kde = { path = "backends/kde" }
+agent-shell-backend-gnome = { path = "backends/gnome" }
+agent-shell-backend-hyprland = { path = "backends/hyprland" }
+agent-shell-backend-sway = { path = "backends/sway" }
+agent-shell-backend-generic = { path = "backends/generic" }
+agent-shell-backend-tty = { path = "backends/tty" }
 agent-shell-displayserver-wayland = { path = "components/displayserver/wayland" }
 agent-shell-displayserver-x11 = { path = "components/displayserver/x11" }
 agent-shell-compositor-wayland-core = { path = "components/compositor/wayland-core" }
@@ -63,6 +74,7 @@ agent-shell-clipboard = { path = "components/clipboard" }
 agent-shell-input = { path = "components/input" }
 agent-shell-a11y = { path = "components/a11y" }
 agent-shell-capture = { path = "modules/capture" }
+which = "7"
 libc = "0.2"
 ordered-stream = "0.2"
 pipewire = "0.10"
@@ -85,7 +97,6 @@ uuid = { version = "1", features = ["v4", "serde"] }
 zvariant = "5.0"
 zbus_macros = "5.0"
 futures-lite = "2"
-which = "7"
 
 [profile.release]
 lto = true

@@ -1,17 +1,18 @@
 [package]
-name = "agent-shell-backend-gnome"
+name = "agent-shell-backend-generic"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "agent-shell GNOME backend: GnomeBackend assembler + gsd.Power/ScreenSaver/gsettings/gio wrappers"
+description = "agent-shell generic backends: X11Backend (X11Compositor) + WlrWaylandBackend (WlrWaylandCompositor)"
 
 [dependencies]
+agent-shell-appearance.workspace = true
 agent-shell-core.workspace = true
-agent-shell-compositor-mutter.workspace = true
+agent-shell-compositor-x11.workspace = true
+agent-shell-compositor-wlr-wayland.workspace = true
 agent-shell-power.workspace = true
 agent-shell-notification.workspace = true
-agent-shell-appearance.workspace = true
 agent-shell-launcher.workspace = true
 agent-shell-clipboard.workspace = true
 agent-shell-input.workspace = true
@@ -24,4 +25,3 @@ agent-shell-logind.workspace = true
 async-trait.workspace = true
 tokio.workspace = true
 tracing.workspace = true
-zbus.workspace = true
