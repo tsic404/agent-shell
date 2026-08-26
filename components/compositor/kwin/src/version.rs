@@ -77,16 +77,18 @@ fn leading_major(token: &str) -> Option<u32> {
 
 /// 通过 session bus 探测 KWin 版本。
 ///
-/// `supportInformation` 位于 `org.kde.KWin` 根对象，返回多行文本的字符串数组；
-/// 兼容单元素数组与非数组回复两种形态。
+/// `supportInformation` 挂在 `org.kde.KWin` 服务的对象路径 `/KWin`（非根路径 `/`，
+/// 根路径无 `org.kde.KWin` 接口），返回单个多行字符串（D-Bus 签名 `s`，非 `as`）；
+/// 直接交给 [`parse_support_information`] 解析。
 pub async fn detect_version(conn: &Connection) -> crate::error::Result<KWinVersion> {
     #[zbus::proxy(
         default_service = "org.kde.KWin",
-        default_path = "/",
+        default_path = "/KWin",
         interface = "org.kde.KWin"
     )]
     trait KWin {
-        fn support_information(&self) -> zbus::Result<Vec<String>>;
+        #[zbus(name = "supportInformation")]
+        fn support_information(&self) -> zbus::Result<String>;
     }
 
     let kwin = KWinProxy::new(conn)
@@ -96,8 +98,7 @@ pub async fn detect_version(conn: &Connection) -> crate::error::Result<KWinVersi
         .support_information()
         .await
         .map_err(|e| KWinError::Scripting(format!("supportInformation failed: {e}")))?;
-    let joined = info.join("\n");
-    parse_support_information(&joined)
+    parse_support_information(&info)
         .ok_or_else(|| KWinError::Scripting("supportInformation has no version line".into()))
 }
 
@@ -133,5 +134,39 @@ mod tests {
         let v6 = parse_support_information("KWin version: 6.0").unwrap();
         assert!(!v5.is_v6());
         assert!(v6.is_v6());
+    }
+
+    #[test]
+    fn parses_realistic_support_information_blob() {
+        // KWin 6.7.4 supportInformation — single multi-line string (D-Bus `s`).
+        let blob = "\
+KWin version: 6.7.4
+Qt Version: 6.7.2
+Qt Platform: wayland
+Build type: Release
+Build options: ...
+ ";
+        let v = parse_support_information(blob).unwrap();
+        assert_eq!(v.full, "6.7.4");
+        assert!(v.is_v6());
+    }
+
+    #[test]
+    fn parses_support_information_with_trailing_whitespace() {
+        let v = parse_support_information("KWin version:   5.27.11  \n").unwrap();
+        assert_eq!(v.full, "5.27.11");
+        assert!(!v.is_v6());
+    }
+
+    #[test]
+    fn parses_lowercase_version_prefix() {
+        let v = parse_support_information("version: 6.2.0\n").unwrap();
+        assert_eq!(v.full, "6.2.0");
+        assert!(v.is_v6());
+    }
+
+    #[test]
+    fn returns_none_for_non_numeric_version_token() {
+        assert!(parse_support_information("KWin version: unknown\n").is_none());
     }
 }
