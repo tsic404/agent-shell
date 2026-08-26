@@ -29,7 +29,6 @@ pub fn windows_entries_json(wins: &[WindowEntry]) -> String {
                 "title": w.title,
                 "app_id": w.app_id,
                 "pid": w.pid,
-                "from_cache": w.from_cache,
             })
         })
         .collect();
@@ -55,7 +54,6 @@ mod tests {
             title: title.into(),
             app_id: "org.kde.kate".into(),
             pid: 4242,
-            from_cache: false,
         }
     }
 

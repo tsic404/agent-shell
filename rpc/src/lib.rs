@@ -219,15 +219,16 @@ pub enum RpcErrorCode {
 
 // ───────────────────────── 载荷定义 ─────────────────────────
 
-/// windows.list 结果条目（daemon 缓存返回，含来源标注 §22.2 表格）。
+/// windows.list 结果条目（§22.2 表格）。
+///
+/// `from_cache` 是查询结果级别的属性（整批命中缓存与否），不在逐项条目中
+/// 重复——由响应外层的 `from_cache` 字段携带，避免逐项冗余与契约漂移。
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct WindowEntry {
     pub native_id: String,
     pub title: String,
     pub app_id: String,
     pub pid: u32,
-    /// 查询是否命中 WindowStateCache（事件驱动缓存，§22.2）。
-    pub from_cache: bool,
 }
 
 /// windows.op 参数。
@@ -323,6 +324,41 @@ mod tests {
             serde_json::from_value::<WindowOpKind>(json!("focus")).expect("de"),
             WindowOpKind::Focus
         );
+    }
+
+    /// 回归锚定（TSI-2439）：daemon windows_list 只发 native_id/title/app_id/pid
+    /// 逐项，from_cache 仅在响应外层。WindowEntry 必须能从 daemon 实际发送的
+    /// 逐项 JSON 反序列化——逐项 from_cache 字段会导致 missing field 反序列化失败。
+    #[test]
+    fn window_entry_deserializes_daemon_item_shape() {
+        let item = json!({
+            "native_id": "0x1200009",
+            "title": "Editor — main.rs",
+            "app_id": "org.kde.kate",
+            "pid": 4242
+        });
+        let w: WindowEntry = serde_json::from_value(item).expect("de");
+        assert_eq!(w.native_id, "0x1200009");
+        assert_eq!(w.pid, 4242);
+    }
+
+    /// 响应外层 from_cache 仍可解析——它是查询结果级别字段，不属于逐项条目。
+    #[test]
+    fn windows_list_response_carries_top_level_from_cache() {
+        let resp = json!({
+            "windows": [
+                {"native_id": "a", "title": "T", "app_id": "app", "pid": 1}
+            ],
+            "from_cache": true
+        });
+        #[derive(serde::Deserialize)]
+        struct W {
+            windows: Vec<WindowEntry>,
+            from_cache: bool,
+        }
+        let w: W = serde_json::from_value(resp).expect("de");
+        assert!(w.from_cache);
+        assert_eq!(w.windows.len(), 1);
     }
 
     #[test]

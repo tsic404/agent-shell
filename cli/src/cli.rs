@@ -365,7 +365,6 @@ mod tests {
             title: title.into(),
             app_id: "kate".into(),
             pid: 1000,
-            from_cache: false,
         }
     }
 }
