@@ -314,8 +314,9 @@ impl X11DisplayServer {
         {
             return Ok(name);
         }
-        self.get_property_string(window, AtomEnum::WM_NAME.into(), AtomEnum::STRING.into())?
-            .ok_or_else(|| AgentShellError::WindowNotFound(format!("window {window}: no name")))
+        Ok(self
+            .get_property_string(window, AtomEnum::WM_NAME.into(), AtomEnum::STRING.into())?
+            .unwrap_or_default())
     }
 
     /// `WM_CLASS`：应用类名（instance\0class\0），取 class 部分。
@@ -1099,6 +1100,49 @@ mod tests {
                 assert_eq!(data.len(), root_stride * root_geo.height as usize);
             }
         }
+        server.conn.destroy_window(win).unwrap();
+        let _ = server.conn.flush();
+    }
+
+    /// 无 `_NET_WM_NAME` / `WM_NAME` 的窗口（KWin-Xwayland InputOnly helper 等）
+    /// 应返回空标题而非 `WindowNotFound` 错误（TSI-2446）。
+    #[test]
+    fn get_window_name_returns_empty_for_unnamed_window() {
+        let Ok(server) = X11DisplayServer::connect() else {
+            eprintln!("skipped: no X11 display available");
+            return;
+        };
+
+        // 创建窗口但故意不设置 _NET_WM_NAME 或 WM_NAME。
+        let win = server.conn.generate_id().unwrap();
+        server
+            .conn
+            .create_window(
+                24,
+                win,
+                server.root_window(),
+                0,
+                0,
+                16,
+                16,
+                0,
+                x11rb::protocol::xproto::WindowClass::INPUT_OUTPUT,
+                0,
+                &Default::default(),
+            )
+            .unwrap();
+        let _ = server.conn.flush();
+        server.sync().unwrap();
+
+        // 无名窗口必须返回空串而非报错。
+        let name = server
+            .get_window_name(win)
+            .expect("unnamed window should not error");
+        assert_eq!(
+            name, "",
+            "unnamed window should yield empty title, not error"
+        );
+
         server.conn.destroy_window(win).unwrap();
         let _ = server.conn.flush();
     }
