@@ -34,16 +34,12 @@ pub struct EventScriptHandle {
     object_path: String,
     /// 是否仍在运行。
     running: Arc<Mutex<bool>>,
+    /// 脚本体暂存文件（TSI-2428）：KWin run 是异步读盘，句柄存活期间
+    /// 必须保留文件；Drop（或 stop 后）才删除。
+    staged: Option<crate::dbus_bridge::StagedScript>,
 }
 
 impl EventScriptHandle {
-    pub(crate) fn from_parts(object_path: String, running: Arc<Mutex<bool>>) -> Self {
-        Self {
-            object_path,
-            running,
-        }
-    }
-
     /// 脚本对象路径（诊断日志用）。
     pub fn object_path(&self) -> &str {
         &self.object_path
@@ -85,8 +81,9 @@ async fn start_event_script(conn: &Connection, js: &str, v6: bool) -> Result<Eve
             Err(e) => return Err(e),
         }
     }
-    // TSI-2398：实例路径按版本分发（V6 /Scripting/Script<id>，V5 /<id>）。
-    let path = crate::dbus_bridge::load_script_via(conn, js, v6).await?;
+    // TSI-2428：loadScript 走落盘文件——staged 必须随句柄存活（KWin run
+    // 是异步读盘，提前 Drop 会删掉脚本体）。
+    let (path, staged) = crate::dbus_bridge::load_script_via(conn, js, v6).await?;
     let script = crate::dbus_bridge::ScriptInstance::new(conn, &path).await?;
     script
         .run()
@@ -97,12 +94,14 @@ async fn start_event_script(conn: &Connection, js: &str, v6: bool) -> Result<Eve
     Ok(EventScriptHandle {
         object_path: path,
         running: Arc::new(Mutex::new(true)),
+        staged: Some(staged),
     })
 }
 
 impl EventScriptHandle {
-    /// 停止并卸载长驻脚本（组件关闭时调用；幂等）。
-    pub async fn stop(&self, conn: &Connection) -> Result<()> {
+    /// 停止并卸载长驻脚本（组件关闭时调用；幂等）。同时释放暂存文件
+    /// （TSI-2428）——stop 之后 KWin 不会再读盘。
+    pub async fn stop(&mut self, conn: &Connection) -> Result<()> {
         let mut running = self.running.lock().await;
         if !*running {
             return Ok(());
@@ -113,6 +112,10 @@ impl EventScriptHandle {
             tracing::warn!(path = %self.object_path, "event script stop failed: {e}");
         }
         *running = false;
+        // 释放暂存文件（Drop 删除磁盘脚本体）；stop 后 KWin 不再读盘。
+        if let Some(staged) = self.staged.take() {
+            drop(staged);
+        }
         Ok(())
     }
 }

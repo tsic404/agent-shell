@@ -185,7 +185,7 @@ impl KWinBridge {
 
     /// 执行一段**完整**的 KWin JS 脚本文本，等待其 callDBus 回传并返回 JSON。
     ///
-    /// 流程（§7.5）：注册按 id 等待 → loadScript(内联) → run →
+    /// 流程（§7.5）：注册按 id 等待 → loadScript(文件路径) → run →
     /// 等待回传（超时兜底 stop）。脚本执行于 compositor 进程内，
     /// 任何异常都只体现为「无回传」→ 超时。
     pub async fn run_script(&self, script_name: &str, v6: bool, js: &str) -> Result<Value> {
@@ -207,6 +207,11 @@ impl KWinBridge {
     }
 
     /// 执行脚本并返回原始 JSON 字符串（不做解析）。
+    ///
+    /// KWin `loadScript(path, pluginName)` 只接受**文件路径**（上游
+    /// `Script::run()` 从磁盘读脚本；传内联源码会被当作路径打开，产生
+    /// `FileError: Could not open var windows…`——TSI-2428 根因）。因此
+    /// 渲染好的脚本体先落盘为 0600 临时文件，run 完成后立即删除。
     async fn run_script_raw(&self, script_name: &str, v6: bool, js: &str) -> Result<String> {
         // 每次查询一个请求 id：内联包装把结果包成 {"req": id, "result": ...}
         // 回传，响应服务按 id 路由——并发查询互不消费对方回传（🔴1）。
@@ -214,10 +219,21 @@ impl KWinBridge {
         let rx = self.router.lock().await.register(req_id.clone());
         let wrapped = js.replace(crate::scripts::REQ_ID_TOKEN, &req_id);
 
+        // KWin 只从磁盘读脚本（TSI-2428）：落盘临时文件，run 结束后删除。
+        // pluginName 用本次请求 UUID——KWin 对已加载的同名插件返回 -1 哨兵，
+        // 固定名会在并发/重入查询时互相顶掉（isScriptLoaded 命中旧实例）。
+        let staged = match StagedScript::stage(script_name, &wrapped) {
+            Ok(s) => s,
+            Err(e) => {
+                self.router.lock().await.abandon(&req_id);
+                return Err(e);
+            }
+        };
+
         let scripting = ScriptingProxy::new(&self.conn)
             .await
             .map_err(|e| KWinError::Scripting(format!("scripting proxy: {e}")))?;
-        let path = match scripting.load_script(&wrapped, v6).await {
+        let path = match scripting.load_script(&staged, v6).await {
             Ok(p) => p,
             Err(e) => {
                 // loadScript 失败：回收等待者再报错（await 版，无滞留）。
@@ -237,11 +253,13 @@ impl KWinBridge {
 
         // 时序（🔴2）：run 发起执行 → 等待回传（含超时）→ 之后才 stop。
         // run 仅异步发起，若先 stop，脚本体可能在求值前被卸载，
-        // callDBus 永远不会发出。
+        // callDBus 永远不会发出。临时文件同理——必须活到回传之后：
+        // 上游在 run() 的 D-Bus 调用线程内完成读盘+求值，回传到达即已读完。
         if let Err(e) = script.run().await {
             self.router.lock().await.abandon(&req_id);
-            // run 失败仍要清理脚本注册。
+            // run 失败仍要清理脚本注册与临时文件。
             let _ = script.stop().await;
+            drop(staged);
             return Err(KWinError::Scripting(format!("run({script_name}): {e}")));
         }
 
@@ -250,6 +268,8 @@ impl KWinBridge {
         if let Err(e) = script.stop().await {
             tracing::warn!(script = script_name, "post-response stop failed: {e}");
         }
+        // 删除临时文件（Drop 语义；此后磁盘上无脚本体残留）。
+        drop(staged);
 
         let received = match outcome {
             // 等待者被 drop（理论不可达）：视为协议异常。
@@ -380,6 +400,104 @@ impl agent_shell_core::EventStream for KWinEventStream {
 /// 引用 iface 常量避免 unused（单一来源契约）。
 const _: &str = RESPONSE_IFACE;
 
+/// 已落盘待执行的 KWin 脚本（TSI-2428）。
+///
+/// KWin 的 `loadScript(filePath, pluginName)` 只把参数当**路径**——
+/// `Script::run()` 在 compositor 进程内从磁盘读文件，打开失败即回
+/// `org.kde.kwin.Scripting.FileError: Could not open <内容>`。因此
+/// 脚本体必须先写进临时文件；本类型持有该文件直到 Drop 删除，
+/// 保证「run 完成 → 才允许清理」的生命周期由 Rust 所有权表达。
+///
+/// `plugin_name` 每次唯一：KWin 对已加载的同名插件返回 -1 哨兵
+/// （`isScriptLoaded` 命中），固定名会让并发/重入查询互相顶掉。
+#[derive(Debug)]
+pub(crate) struct StagedScript {
+    file: tempfile::NamedTempFile,
+    /// 传给 KWin 的唯一插件名（`agent_shell-<uuid>`）。
+    pub(crate) plugin_name: String,
+}
+
+impl StagedScript {
+    /// 把脚本体写入 0600 临时文件并生成唯一插件名。
+    ///
+    /// 文件后缀保留 `.js`（仅便于人工排查；KWin 不看后缀）。
+    pub(crate) fn stage(script_name: &str, js: &str) -> Result<Self> {
+        let mut file = tempfile::Builder::new()
+            .prefix("agent-shell-")
+            .suffix(".js")
+            .tempfile()
+            .map_err(|e| KWinError::Scripting(format!("stage script {script_name}: {e}")))?;
+        use std::io::Write as _;
+        file.write_all(js.as_bytes())
+            .and_then(|_| file.flush())
+            .map_err(|e| KWinError::Scripting(format!("write script {script_name}: {e}")))?;
+        Ok(Self {
+            plugin_name: format!("agent_shell-{}", Uuid::new_v4()),
+            file,
+        })
+    }
+
+    /// KWin `loadScript` 第一参：脚本文件的绝对路径。
+    ///
+    /// 非 UTF-8 `$TMPDIR`（罕见但真实存在）按 `to_string_lossy` 近似——
+    /// D-Bus 字符串本就只能传 UTF-8，此时打开失败会以 FileError 暴露，
+    /// 绝不静默传空串。
+    pub(crate) fn path(&self) -> std::borrow::Cow<'_, str> {
+        self.file.path().to_string_lossy()
+    }
+}
+
+#[cfg(test)]
+mod staged_tests {
+    use super::*;
+
+    /// TSI-2428 回归：stage 产物必须是真实存在的文件路径 + 唯一插件名；
+    /// Drop 后文件被删除（不留脚本体在磁盘上）。
+    #[test]
+    fn staged_script_roundtrip_and_cleanup() {
+        let path;
+        let name_a;
+        {
+            let s = StagedScript::stage("list_windows.js", "var windows = 1;").unwrap();
+            path = s.path().to_string();
+            name_a = s.plugin_name.clone();
+            assert!(
+                std::path::Path::new(&path).exists(),
+                "staged file must exist"
+            );
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), "var windows = 1;");
+        }
+        assert!(
+            !std::path::Path::new(&path).exists(),
+            "drop must remove the staged file"
+        );
+        // 插件名每次唯一（KWin -1 哨兵防御）。
+        let s2 = StagedScript::stage("list_windows.js", "").unwrap();
+        assert_ne!(name_a, s2.plugin_name);
+        assert!(s2.plugin_name.starts_with("agent_shell-"));
+    }
+
+    /// 审查阻塞项 2 回归：`load_script` 的 -1 哨兵检查——负 id 必须报
+    /// 「pluginName conflict」根因错误，绝不能产出 `/Scripting/Script-1`
+    /// 或 `/-1` 这类非法路径让下游报「bad path」掩盖真实原因。
+    #[test]
+    fn negative_script_id_maps_to_plugin_conflict_error() {
+        // 直接锁定哨兵→错误的映射契约：任何 <0 的 id 都不得生成对象路径。
+        let path_v6 = script_object_path(-1, true);
+        let path_v5 = script_object_path(-1, false);
+        assert!(zbus::zvariant::ObjectPath::try_from(path_v6.as_str()).is_err());
+        assert!(zbus::zvariant::ObjectPath::try_from(path_v5.as_str()).is_err());
+    }
+
+    /// 空脚本体也必须可落盘（KWin 侧会因空脚本 deleteLater，但 stage
+    /// 本身不得失败）——审查建议的异常路径覆盖。
+    #[test]
+    fn stage_accepts_empty_body() {
+        let s = StagedScript::stage("empty.js", "").unwrap();
+        assert!(std::path::Path::new(s.path().as_ref()).exists());
+    }
+}
+
 // ───────────────────────── Scripting 代理 ─────────────────────────
 
 /// `org.kde.kwin.Scripting` 代理（loadScript / start / loadedScripts）。
@@ -400,15 +518,33 @@ impl<'a> ScriptingProxy<'a> {
         })
     }
 
-    /// 加载脚本文本，返回脚本实例的对象路径（TSI-2398）。
+    /// 加载已落盘脚本，返回脚本实例的对象路径（TSI-2398 / TSI-2428）。
     ///
-    /// KWin 5.27 与 6 的 `loadScript` **都**返回 int32 脚本 id；差异在
-    /// 实例注册路径（`src/scripting/scripting.cpp`）：KWin 6 注册于
-    /// `/Scripting/Script<id>`，KWin 5 注册于 `/<id>`。按 `v6` 分发构造，
-    /// 调用方拿到的路径可直接喂给 [`ScriptInstance::new`]。
-    async fn load_script(&self, source: &str, v6: bool) -> zbus::Result<String> {
-        let reply = self.inner.call_method("loadScript", &(source,)).await?;
-        let id: i32 = reply.body().deserialize()?;
+    /// KWin 签名：`loadScript(filePath, pluginName) -> int32`——第一参是
+    /// **文件路径**（上游 `Script::run()` 从磁盘读），第二参是去重插件名
+    /// （同名已加载返回 -1）。KWin 5.27 与 6 的差异仅在实例注册路径
+    /// （`src/scripting/scripting.cpp`）：KWin 6 注册于 `/Scripting/Script<id>`，
+    /// KWin 5 注册于 `/<id>`。按 `v6` 分发构造，调用方拿到的路径可直接
+    /// 喂给 [`ScriptInstance::new`]。
+    async fn load_script(&self, staged: &StagedScript, v6: bool) -> Result<String> {
+        let reply = self
+            .inner
+            .call_method("loadScript", &(staged.path(), staged.plugin_name.as_str()))
+            .await
+            .map_err(|e| KWinError::Scripting(format!("loadScript D-Bus call: {e}")))?;
+        let id: i32 = reply
+            .body()
+            .deserialize()
+            .map_err(|e| KWinError::Scripting(format!("loadScript reply: {e}")))?;
+        // -1 哨兵（上游 isScriptLoaded 命中）：报根因「插件名冲突」而非
+        // 让下游 ScriptInstance::new 以「bad path /Scripting/Script-1」
+        // 掩盖真实原因。UUID pluginName 下概率趋零，仍按契约显式拒绝。
+        if id < 0 {
+            return Err(KWinError::Scripting(format!(
+                "loadScript({}) returned {id}: pluginName conflict (already loaded)",
+                staged.plugin_name
+            )));
+        }
         Ok(script_object_path(id, v6))
     }
 
@@ -447,14 +583,22 @@ impl<'a> ScriptInstance<'a> {
     }
 }
 
-/// 供 event_script 复用：在指定连接上加载脚本文本，返回对象路径字符串。
-pub(crate) async fn load_script_via(conn: &Connection, js: &str, v6: bool) -> Result<String> {
+/// 供 event_script 复用：在指定连接上落盘并加载脚本，返回
+/// （对象路径, 暂存文件句柄）。句柄必须存活至脚本 stop——KWin 的 run
+/// 是异步读盘，提前删文件会让后续重载失败（TSI-2428）。
+pub(crate) async fn load_script_via(
+    conn: &Connection,
+    js: &str,
+    v6: bool,
+) -> Result<(String, StagedScript)> {
+    let staged = StagedScript::stage("event_monitor.js", js)?;
     let scripting = ScriptingProxy::new(conn)
         .await
         .map_err(|e| KWinError::Scripting(format!("scripting proxy: {e}")))?;
     scripting
-        .load_script(js, v6)
+        .load_script(&staged, v6)
         .await
+        .map(|p| (p, staged))
         .map_err(|e| KWinError::Scripting(format!("loadScript: {e}")))
 }
 

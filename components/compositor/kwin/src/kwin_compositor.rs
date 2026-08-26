@@ -723,13 +723,12 @@ impl CompositorComponent for KWinCompositor {
         let _ = self.ensure_scripting_probe().await;
         let mut handle = self.event_handle.lock().await;
         if handle.is_none() {
-            // 幂等启动；句柄保存在组件内直到 stop/drop。
-            let h = crate::event_script::spawn_event_monitor(&self.bridge, self.version.is_v6())
-                .await?;
-            *handle = Some(EventScriptHandle::from_parts(
-                h.object_path().to_string(),
-                h.running_clone(),
-            ));
+            // 幂等启动；句柄（含 StagedScript 暂存文件）原样保存在组件内
+            // 直到 stop/drop——不得重建副本，否则暂存文件被提前 Drop 删除。
+            *handle = Some(
+                crate::event_script::spawn_event_monitor(&self.bridge, self.version.is_v6())
+                    .await?,
+            );
         }
         Ok(Box::new(stream))
     }
