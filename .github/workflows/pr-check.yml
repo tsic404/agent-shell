@@ -42,4 +42,3 @@ jobs:
 
       - name: Build (Rust)
         run: cargo build --release
-

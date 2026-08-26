@@ -6,11 +6,11 @@ members = [
     "components/displayserver/x11",
     "components/compositor/wayland-core",
     "components/compositor/wlr-wayland",
+    "components/compositor/kwin",
+    "components/compositor/sway",
     "components/compositor/mutter",
     "components/systemd",
     "components/logind",
-    "event",
-    "components/power",
     "components/notification",
     "components/appearance",
     "components/launcher",
@@ -44,6 +44,7 @@ agent-shell-displayserver-x11 = { path = "components/displayserver/x11" }
 agent-shell-compositor-wayland-core = { path = "components/compositor/wayland-core" }
 agent-shell-compositor-wlr-wayland = { path = "components/compositor/wlr-wayland" }
 agent-shell-compositor-kwin = { path = "components/compositor/kwin" }
+agent-shell-compositor-sway = { path = "components/compositor/sway" }
 agent-shell-compositor-mutter = { path = "components/compositor/mutter" }
 agent-shell-systemd = { path = "components/systemd" }
 agent-shell-logind = { path = "components/logind" }

@@ -1,0 +1,19 @@
+[package]
+name = "agent-shell-compositor-sway"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "agent-shell SwayCompositor (WlrWaylandCompositor base + Sway IPC supplementary channel)"
+
+[dependencies]
+agent-shell-core.workspace = true
+agent-shell-compositor-wayland-core.workspace = true
+agent-shell-compositor-wlr-wayland.workspace = true
+agent-shell-displayserver-wayland.workspace = true
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+parking_lot = "0.12"
