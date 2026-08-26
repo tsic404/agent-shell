@@ -1,0 +1,18 @@
+[package]
+name = "agent-shell-compositor-mutter"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "agent-shell Mutter compositor component (org.gnome.Shell Eval/Extension dual path + Mutter.DisplayConfig)"
+
+[dependencies]
+agent-shell-core.workspace = true
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+futures-lite.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+zbus = { version = "5", default-features = false, features = ["tokio"] }
