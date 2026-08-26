@@ -14,6 +14,7 @@ path = "src/main.rs"
 agent-shell-core.workspace = true
 agent-shell-rpc.workspace = true
 agent-shell-compositor-kwin.workspace = true
+agent-shell-capture.workspace = true
 agent-shell-displayserver-x11.workspace = true
 x11rb = { version = "0.14", features = ["xtest"] }
 serde.workspace = true

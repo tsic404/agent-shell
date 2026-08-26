@@ -7,7 +7,7 @@
 use agent_shell_core::error::{AgentShellError, Result};
 use agent_shell_displayserver_x11::X11DisplayServer;
 
-use crate::portal_screencast::Frame;
+use crate::portal_screencast::{Frame, PixelFormat};
 
 /// X11 原生捕获器：持有独立连接，按需抓取根窗口/指定窗口。
 ///
@@ -87,10 +87,10 @@ fn capture_with(x: &X11DisplayServer, window: Option<u32>) -> Result<Frame> {
         .map_err(cerr2)?
         .reply()
         .map_err(cerr)?;
-    let bpp = match geom.depth {
-        24 | 32 => 4usize,
-        16 => 2,
-        8 => 1,
+    let format = match geom.depth {
+        24 | 32 => PixelFormat::Bgrx,
+        16 => PixelFormat::Rgb565,
+        8 => PixelFormat::Clut8,
         d => {
             return Err(AgentShellError::Capture(format!(
                 "unsupported x11 depth {d}"
@@ -98,7 +98,9 @@ fn capture_with(x: &X11DisplayServer, window: Option<u32>) -> Result<Frame> {
         }
     };
     // 行步长按 32 位边界补齐；段大小同步放大。
+    let bpp = format.bytes_per_pixel();
     let stride = (w as usize * bpp).div_ceil(4) * 4;
+
     let seg_size = (stride * h as usize) as u32;
 
     // MIT-SHM 探测 + fd-passing 段创建。
@@ -119,6 +121,7 @@ fn capture_with(x: &X11DisplayServer, window: Option<u32>) -> Result<Frame> {
                             width: w,
                             height: h,
                             stride,
+                            format,
                         });
                     }
                     Err(e) => {
@@ -148,6 +151,7 @@ fn capture_with(x: &X11DisplayServer, window: Option<u32>) -> Result<Frame> {
         width: w,
         height: h,
         stride,
+        format,
     })
 }
 

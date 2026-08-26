@@ -24,7 +24,7 @@ use agent_shell_core::error::{AgentShellError, Result};
 use async_trait::async_trait;
 
 pub use cache::CaptureCache;
-pub use portal_screencast::{CaptureTarget, Frame, ScreenCastCapture};
+pub use portal_screencast::{CaptureTarget, Frame, PixelFormat, ScreenCastCapture};
 pub use portal_screenshot::{ScreenshotPortal, SCREENSHOT_MAX_ATTEMPTS, SCREENSHOT_TIMEOUT};
 pub use x11::X11Capture;
 
@@ -83,6 +83,8 @@ pub struct CaptureDispatcher {
     active: std::sync::Mutex<Option<ActiveBackend>>,
     /// 已建立的 ScreenCast 流会话（daemon 复用，避免反复弹窗 §21.22）。
     session: tokio::sync::Mutex<Option<std::sync::Arc<ScreenCastCapture>>>,
+    /// X11 捕获器（惰性建连，daemon 复用连接——审查项 #5）。
+    x11: tokio::sync::OnceCell<X11Capture>,
 }
 
 impl CaptureDispatcher {
@@ -104,7 +106,18 @@ impl CaptureDispatcher {
             x11_present,
             active: std::sync::Mutex::new(None),
             session: tokio::sync::Mutex::new(None),
+            x11: tokio::sync::OnceCell::new(),
         })
+    }
+
+    /// 窗口直捕（X11-only；portal 无法定位 native window id）。
+    /// 连接经 `OnceCell` 惰性建立并复用。
+    pub async fn capture_window(&self, window: u32) -> Result<Frame> {
+        let x = self
+            .x11
+            .get_or_try_init(|| async { X11Capture::connect() })
+            .await?;
+        x.capture_window(window).await
     }
 
     /// 当前实际选中的后端（未捕获过则返回 None）。

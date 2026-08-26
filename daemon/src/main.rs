@@ -101,6 +101,11 @@ async fn serve_connection(mut daemon: Daemon, idle_timeout: Duration) {
         let resp = dispatch::dispatch(&mut daemon, &req).await;
         write_response(resp).await;
     }
+
+    // 退出前关闭 portal ScreenCast 会话（D-Bus Close，审查项 #6）。
+    if let Some(capture) = daemon.capture.as_ref() {
+        capture.shutdown().await;
+    }
 }
 
 async fn write_response(resp: Response) {

@@ -5,8 +5,8 @@
 
 use crate::state::Daemon;
 use agent_shell_rpc::{
-    method, A11yStatusResult, CaptureParams, CaptureResult, DoctorResult, InfoResult, InputParams,
-    Request, Response, RpcErrorCode, WindowOpKind,
+    method, A11yStatusResult, CaptureParams, DoctorResult, InfoResult, InputParams, Request,
+    Response, RpcErrorCode, WindowOpKind,
 };
 use serde_json::{json, Value};
 
@@ -21,7 +21,7 @@ pub async fn dispatch(daemon: &mut Daemon, req: &Request) -> Response {
         method::WORKSPACES_LIST => workspaces_list(daemon).await,
         method::WORKSPACE_SWITCH => workspace_switch(daemon, req).await,
         method::INPUT_SEND => blocking_input_send(req).await,
-        method::SCREENSHOT_CAPTURE => blocking_screenshot_capture(req).await,
+        method::SCREENSHOT_CAPTURE => screenshot_capture(daemon, req).await,
         method::A11Y_STATUS => a11y_status().await,
         other => {
             return Response::err(
@@ -65,6 +65,8 @@ async fn doctor(d: &mut Daemon) -> RpcResult {
     }
     // 3. AT-SPI Registry 可达性（busctl，与单进程版同口径）。
     lines.push(crate::a11y::atspi_line());
+    // 4. capture 组件（三级降级链状态，§13）。
+    lines.push(agent_shell_capture::doctor_line(d.capture.as_ref()).await);
     let healthy = !lines.iter().any(|l| l.starts_with('✗'));
     let r = DoctorResult { lines, healthy };
     Ok(serde_json::to_value(r).expect("DoctorResult serializable"))
@@ -81,20 +83,21 @@ async fn compositor_doctor_lines(d: &Daemon) -> Vec<String> {
 
 async fn info(d: &Daemon) -> RpcResult {
     let detection = agent_shell_core::de_detection::detect_report_for_doctor();
-    let capabilities = if d.has_compositor() {
+    let mut capabilities = if d.has_compositor() {
         vec![
             ("window_management".into(), true),
             ("workspace_management".into(), true),
             ("monitor_layout".into(), true),
-            ("window_events".into(), false),  // T3b
-            ("native_input".into(), false),   // T2a portal 会话
-            ("native_capture".into(), false), // T2b capture 组件
+            ("window_events".into(), false), // T3b
+            ("native_input".into(), false),  // T2a portal 会话
             ("virtual_desktops".into(), true),
             ("effects_control".into(), false),
         ]
     } else {
         Vec::new()
     };
+    // capture 组件独立于 compositor——纯 X11 会话仍可截图（审查项 #3）。
+    capabilities.push(("native_capture".into(), d.capture.is_some()));
     let r = InfoResult {
         detection,
         capabilities,
@@ -183,15 +186,20 @@ async fn blocking_input_send(req: &Request) -> RpcResult {
 
 // ───────────────────────── screenshot ─────────────────────────
 
-/// 截图捕获：X11 GetImage 同步调用，同样走 `spawn_blocking`。
-async fn blocking_screenshot_capture(req: &Request) -> RpcResult {
+/// 截图捕获：经 capture 模块三级降级链（portal ScreenCast → Screenshot →
+/// X11）；窗口直捕仅 X11。链路含 portal 弹窗授权等待——async 直调不占
+/// `spawn_blocking`（组件内部已对同步段做 spawn_blocking）。
+async fn screenshot_capture(daemon: &mut Daemon, req: &Request) -> RpcResult {
     let p: CaptureParams = serde_json::from_value(params_of(req)?.clone())
         .map_err(|e| (RpcErrorCode::InvalidParams, format!("bad params: {e}")))?;
-    let r: CaptureResult = tokio::task::spawn_blocking(move || {
-        crate::capture::capture_to_file(p.window.as_deref(), p.area, &p.output_path)
-    })
-    .await
-    .map_err(|e| (RpcErrorCode::InternalError, e.to_string()))??;
+    let capture = daemon.capture.as_ref().ok_or_else(|| {
+        (
+            RpcErrorCode::BackendUnavailable,
+            "capture unavailable (no portal backend and no DISPLAY)".into(),
+        )
+    })?;
+    let r = crate::capture::capture_to_file(capture, p.window.as_deref(), p.area, &p.output_path)
+        .await?;
     Ok(serde_json::to_value(r).expect("CaptureResult serializable"))
 }
 

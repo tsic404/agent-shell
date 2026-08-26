@@ -37,14 +37,42 @@ impl CaptureTarget {
     }
 }
 
+/// 帧像素布局（消费方据此做通道序与 bpp 解析）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PixelFormat {
+    /// 4 字节：B,G,R,x（X11 ZPixmap little-endian / PipeWire BGRA）。
+    Bgra,
+    /// 4 字节：B,G,R,x——x 未定义（PipeWire BGRx），与 Bgra 同序。
+    Bgrx,
+    /// 4 字节：R,G,B,A（PipeWire RGBA）。
+    Rgba,
+    /// 2 字节：RGB565 little-endian（X11 depth 16）。
+    Rgb565,
+    /// 1 字节调色板索引（X11 depth 8）。
+    Clut8,
+}
+
+impl PixelFormat {
+    /// 每像素字节数。
+    pub fn bytes_per_pixel(self) -> usize {
+        match self {
+            PixelFormat::Bgra | PixelFormat::Bgrx | PixelFormat::Rgba => 4,
+            PixelFormat::Rgb565 => 2,
+            PixelFormat::Clut8 => 1,
+        }
+    }
+}
+
 /// 一帧捕获结果：原始像素 + 帧元数据。
 #[derive(Clone, Debug)]
 pub struct Frame {
-    /// RGBA/BGRA 原始像素（格式见 [`Frame::format`]）。
+    /// 原始像素，布局由 [`Frame::format`] 描述。
     pub data: Vec<u8>,
     pub width: u32,
     pub height: u32,
     pub stride: usize,
+    /// 协商出的/源端像素格式。
+    pub format: PixelFormat,
 }
 
 /// 通过 ScreenCast portal 建立 PipeWire 流并持续取帧。
@@ -280,6 +308,8 @@ fn run_pipewire_node(
         format: spa::param::video::VideoInfoRaw,
         latest: std::sync::Arc<(std::sync::Mutex<Option<Frame>>, std::sync::Condvar)>,
         negotiated: bool,
+        /// 协商出的像素格式；None = 未协商或协商出不受支持格式。
+        pixel_format: Option<PixelFormat>,
     }
 
     let props = pw::properties::properties! {
@@ -296,6 +326,7 @@ fn run_pipewire_node(
         format: spa::param::video::VideoInfoRaw::new(),
         latest,
         negotiated: false,
+        pixel_format: None,
     };
 
     let listener = stream
@@ -309,10 +340,23 @@ fn run_pipewire_node(
                 return;
             }
             if user_data.format.parse(param).is_ok() {
+                user_data.pixel_format = match user_data.format.format() {
+                    pw::spa::param::video::VideoFormat::BGRA => Some(PixelFormat::Bgra),
+                    pw::spa::param::video::VideoFormat::BGRx => Some(PixelFormat::Bgrx),
+                    pw::spa::param::video::VideoFormat::RGBA => Some(PixelFormat::Rgba),
+                    other => {
+                        tracing::warn!("pipewire: unexpected negotiated format {other:?}");
+                        None
+                    }
+                };
                 user_data.negotiated = true;
             }
         })
         .process(|stream, user_data| {
+            // 未协商出受支持的格式时不产帧（消费方按 Frame.format 解析）。
+            let Some(pixel_format) = user_data.pixel_format else {
+                return;
+            };
             let Some(mut buffer) = stream.dequeue_buffer() else {
                 return;
             };
@@ -332,6 +376,7 @@ fn run_pipewire_node(
                 width: rect.width.max(1),
                 height: rect.height.max(1),
                 stride: (size / rect.height.max(1) as usize),
+                format: pixel_format,
             };
             let (lock, cvar) = &*user_data.latest;
             if let Ok(mut guard) = lock.lock() {

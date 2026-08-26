@@ -192,6 +192,7 @@ dependencies = [
 name = "agent-shell-daemon"
 version = "0.1.0"
 dependencies = [
+ "agent-shell-capture",
  "agent-shell-compositor-kwin",
  "agent-shell-core",
  "agent-shell-displayserver-x11",

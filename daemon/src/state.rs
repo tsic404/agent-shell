@@ -6,6 +6,7 @@
 //! - WindowStateCache（查询走缓存；T3b 事件归一化落地后改为事件驱动刷新，
 //!   当前以 TTL 短缓存近似——如实标注 `from_cache` 语义）
 
+use agent_shell_capture::CaptureDispatcher;
 use agent_shell_compositor_kwin::KWinCompositor;
 use agent_shell_core::component::CompositorComponent;
 use agent_shell_core::types::WindowInfo;
@@ -21,6 +22,8 @@ pub struct Daemon {
     cached_at: Option<Instant>,
     /// 空闲退出时限（§22.2：默认 30min，可配置）。
     pub idle_timeout: Duration,
+    /// capture 组件（三级降级链；None = 全后端探测失败，TTY 场景）。
+    pub capture: Option<CaptureDispatcher>,
 }
 
 impl Daemon {
@@ -43,6 +46,7 @@ impl Daemon {
         };
         Self {
             compositor,
+            capture: CaptureDispatcher::assemble().await,
             cache: Vec::new(),
             cached_at: None,
             idle_timeout,
