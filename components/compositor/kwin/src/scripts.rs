@@ -204,7 +204,7 @@ impl Compat {
                 send = send_result("result"),
             ),
             ScriptTemplate::FocusWindow => format!(
-                "var w = workspace.windowList().find(function(w) {{ return {gid} === \"%ID%\"; }});\n\
+                "var w = workspace.windowList().find(function(w) {{ return {gid} === %ID%; }});\n\
                  if (w) {{ workspace.activeWindow = w;\n\
                  \x20   {ok}\n}} else {{ {err}\n}}",
                 gid = gid,
@@ -213,10 +213,10 @@ impl Compat {
             ),
             // 协议不支持 set_geometry（§7.2），移动/缩放始终走本通道。
             ScriptTemplate::MoveWindow => format!(
-                "var w = workspace.windowList().find(function(w) {{ return {gid} === \"%ID%\"; }});\n\
+                "var w = workspace.windowList().find(function(w) {{ return {gid} === %ID%; }});\n\
                  if (w) {{\n\
                  \x20   var g = {geo};\n\
-                 \x20   w.frameGeometry = Qt.rect(%X%, %Y%, g.width, g.height);\n\
+                 \x20   w.frameGeometry = {{ x: %X%, y: %Y%, width: g.width, height: g.height }};\n\
                  \x20   {ok}\n}} else {{ {err}\n}}",
                 gid = gid,
                 geo = self.frame_geometry(),
@@ -224,10 +224,10 @@ impl Compat {
                 err = send_result("{ success: false, error: \"Window not found\" }"),
             ),
             ScriptTemplate::ResizeWindow => format!(
-                "var w = workspace.windowList().find(function(w) {{ return {gid} === \"%ID%\"; }});\n\
+                "var w = workspace.windowList().find(function(w) {{ return {gid} === %ID%; }});\n\
                  if (w) {{\n\
                  \x20   var g = {geo};\n\
-                 \x20   w.frameGeometry = Qt.rect(g.x, g.y, %W%, %H%);\n\
+                 \x20   w.frameGeometry = {{ x: g.x, y: g.y, width: %W%, height: %H% }};\n\
                  \x20   {ok}\n}} else {{ {err}\n}}",
                 gid = gid,
                 geo = self.frame_geometry(),
@@ -235,24 +235,24 @@ impl Compat {
                 err = send_result("{ success: false, error: \"Window not found\" }"),
             ),
             ScriptTemplate::CloseWindow => format!(
-                "var w = workspace.windowList().find(function(w) {{ return {gid} === \"%ID%\"; }});\n\
-                 if (w) {{ w.close();\n\
+                "var w = workspace.windowList().find(function(w) {{ return {gid} === %ID%; }});\n\
+                if (w) {{ w.closeWindow();\n\
                  \x20   {ok}\n}} else {{ {err}\n}}",
                 gid = gid,
                 ok = send_result("{ success: true }"),
                 err = send_result("{ success: false, error: \"Window not found\" }"),
             ),
             ScriptTemplate::SetWindowGeometry => format!(
-                "var w = workspace.windowList().find(function(w) {{ return {gid} === \"%ID%\"; }});\n\
+                "var w = workspace.windowList().find(function(w) {{ return {gid} === %ID%; }});\n\
                  if (w) {{\n\
-                 \x20   w.frameGeometry = Qt.rect(%X%, %Y%, %W%, %H%);\n\
+                 \x20   w.frameGeometry = {{ x: %X%, y: %Y%, width: %W%, height: %H% }};\n\
                  \x20   {ok}\n}} else {{ {err}\n}}",
                 gid = gid,
                 ok = send_result("{ success: true }"),
                 err = send_result("{ success: false, error: \"Window not found\" }"),
             ),
             ScriptTemplate::MinimizeWindow => format!(
-                "var w = workspace.windowList().find(function(w) {{ return {gid} === \"%ID%\"; }});\n\
+                "var w = workspace.windowList().find(function(w) {{ return {gid} === %ID%; }});\n\
                  if (w) {{ w.minimized = (%NUM% === 1);\n\
                  \x20   {ok}\n}} else {{ {err}\n}}",
                 gid = gid,
@@ -260,7 +260,7 @@ impl Compat {
                 err = send_result("{ success: false, error: \"Window not found\" }"),
             ),
             ScriptTemplate::MaximizeWindow => format!(
-                "var w = workspace.windowList().find(function(w) {{ return {gid} === \"%ID%\"; }});\n\
+                "var w = workspace.windowList().find(function(w) {{ return {gid} === %ID%; }});\n\
                  if (w) {{\n\
                  \x20   if (%NUM% === 1) {{ if (w.setMaximize !== undefined) {{ w.setMaximize(true, true); }} else {{ w.maximizeMode = 3; }} }}\n\
                  \x20   else {{ if (w.setMaximize !== undefined) {{ w.setMaximize(false, false); }} else {{ w.maximizeMode = 0; }} }}\n\
@@ -298,7 +298,7 @@ impl Compat {
             ScriptTemplate::SwitchWorkspace => {
                 if self.v6 {
                     format!(
-                        "var d = workspace.desktops.find(function(d) {{ return String(d.id) === \"%WS%\"; }});\n\
+                        "var d = workspace.desktops.find(function(d) {{ return String(d.id) === %WS%; }});\n\
                          if (d) {{ workspace.currentDesktop = d;\n\
                          \x20   {ok}\n}} else {{ {err}\n}}",
                         ok = send_result("{ success: true }"),
@@ -308,7 +308,7 @@ impl Compat {
                     // v5：桌面号为 int——校验范围后再赋值，无效输入报错
                     // 而非假成功（🟡4）。
                     format!(
-                        "var n = parseInt(\"%WS%\", 10);\n\
+                        "var n = parseInt(%WS%, 10);\n\
                          if (isNaN(n) || n < 1 || n > workspace.desktops) {{ {err}\n}} else {{\n\
                          \x20   workspace.currentDesktop = n;\n\
                          \x20   {ok}\n}}",
@@ -320,8 +320,8 @@ impl Compat {
             ScriptTemplate::MoveWindowToWorkspace => {
                 if self.v6 {
                     format!(
-                        "var w = workspace.windowList().find(function(w) {{ return {gid} === \"%ID%\"; }});\n\
-                         var d = workspace.desktops.find(function(d) {{ return String(d.id) === \"%WS%\"; }});\n\
+                        "var w = workspace.windowList().find(function(w) {{ return {gid} === %ID%; }});\n\
+                         var d = workspace.desktops.find(function(d) {{ return String(d.id) === %WS%; }});\n\
                          if (w && d) {{ w.desktops = [d];\n\
                          \x20   {ok}\n}} else {{ {err}\n}}",
                         gid = gid,
@@ -330,8 +330,8 @@ impl Compat {
                     )
                 } else {
                     format!(
-                        "var w = workspace.windowList().find(function(w) {{ return {gid} === \"%ID%\"; }});\n\
-                         if (w) {{ w.desktop = parseInt(\"%WS%\", 10);\n\
+                        "var w = workspace.windowList().find(function(w) {{ return {gid} === %ID%; }});\n\
+                         if (w) {{ w.desktop = parseInt(%WS%, 10);\n\
                          \x20   {ok}\n}} else {{ {err}\n}}",
                         gid = gid,
                         ok = send_result("{ success: true }"),
@@ -474,7 +474,7 @@ mod tests {
             &[("ID", json!("abcd")), ("X", json!(100)), ("Y", json!(50))],
         );
         assert!(script.contains("\"abcd\""));
-        assert!(script.contains("Qt.rect(100, 50"));
+        assert!(script.contains("x: 100, y: 50"));
         assert!(!script.contains("%ID%"));
     }
 
@@ -541,5 +541,120 @@ mod tests {
         assert!(ScriptTemplate::ListWindows
             .render(true, &[("NOPE", json!("x"))])
             .is_err());
+    }
+
+    /// TSI-2445 回归：模板 `"%ID%"` 外层引号 + `js_string` 二次引号 →
+    /// `""uuid""` JS 解析错误 → callDBus 永不发出 → 5s 超时。
+    /// 修复后 String 参数只出现一次引号（由 js_string 统一负责）。
+    #[test]
+    fn string_arg_not_double_quoted() {
+        let script = render_v6(ScriptTemplate::FocusWindow, &[("ID", json!("abc-123"))]);
+        // 期望 `=== "abc-123"`，而非 `=== ""abc-123""`。
+        assert!(
+            script.contains("=== \"abc-123\""),
+            "single-quoted string literal not found; script: {script}"
+        );
+        assert!(
+            !script.contains("\"\"abc-123\"\""),
+            "double-quoted string literal leaked through; script: {script}"
+        );
+    }
+
+    /// TSI-2445 回归：%WS% 同样受双重引号影响——v6 桌面 id 为字符串。
+    #[test]
+    fn workspace_arg_not_double_quoted_v6() {
+        let script = render_v6(ScriptTemplate::SwitchWorkspace, &[("WS", json!("desk-42"))]);
+        assert!(
+            script.contains("=== \"desk-42\""),
+            "single-quoted workspace id not found; script: {script}"
+        );
+        assert!(
+            !script.contains("\"\"desk-42\"\""),
+            "double-quoted workspace id leaked through; script: {script}"
+        );
+    }
+
+    /// TSI-2445 回归：v5 `parseInt("%WS%")` 同样被双重引号影响。
+    #[test]
+    fn workspace_arg_not_double_quoted_v5() {
+        let script = ScriptTemplate::SwitchWorkspace
+            .render(false, &[("WS", json!("3"))])
+            .unwrap();
+        assert!(
+            script.contains("parseInt(\"3\", 10)"),
+            "single-quoted parseInt arg not found; script: {script}"
+        );
+        assert!(
+            !script.contains("parseInt(\"\"3\"\", 10)"),
+            "double-quoted parseInt arg leaked through; script: {script}"
+        );
+    }
+
+    /// TSI-2445 回归：KWin 6 loadScript 上下文无 `Qt` 全局对象，
+    /// `Qt.rect(...)` 报 `Qt is not defined` → 脚本异常 → 5s 超时。
+    /// 修复后用纯 JS 对象 `{x, y, width, height}` 赋值 frameGeometry，
+    /// KWin 6 注册了 QJSValue→RectF 转换器读取这四个属性。
+    #[test]
+    fn geometry_templates_use_plain_object_not_qt_rect() {
+        let move_script = render_v6(
+            ScriptTemplate::MoveWindow,
+            &[("ID", json!("w1")), ("X", json!(10)), ("Y", json!(20))],
+        );
+        assert!(
+            move_script.contains("frameGeometry = { x: 10, y: 20"),
+            "move must use plain JS object; script: {move_script}"
+        );
+        assert!(
+            !move_script.contains("Qt.rect"),
+            "move must not use Qt.rect; script: {move_script}"
+        );
+
+        let resize_script = render_v6(
+            ScriptTemplate::ResizeWindow,
+            &[("ID", json!("w1")), ("W", json!(800)), ("H", json!(600))],
+        );
+        assert!(
+            resize_script.contains("frameGeometry = { x: g.x, y: g.y, width: 800, height: 600 }"),
+            "resize must use plain JS object; script: {resize_script}"
+        );
+        assert!(
+            !resize_script.contains("Qt.rect"),
+            "resize must not use Qt.rect; script: {resize_script}"
+        );
+
+        let set_geom = render_v6(
+            ScriptTemplate::SetWindowGeometry,
+            &[
+                ("ID", json!("w1")),
+                ("X", json!(0)),
+                ("Y", json!(0)),
+                ("W", json!(1920)),
+                ("H", json!(1080)),
+            ],
+        );
+        assert!(
+            set_geom.contains("frameGeometry = { x: 0, y: 0, width: 1920, height: 1080 }"),
+            "set_geometry must use plain JS object; script: {set_geom}"
+        );
+        assert!(
+            !set_geom.contains("Qt.rect"),
+            "set_geometry must not use Qt.rect; script: {set_geom}"
+        );
+    }
+
+    /// TSI-2445 回归：KWin 6 `XdgToplevelWindow` 无 `close()` 方法，
+    /// 报 `Property 'close' is not a function` → 5s 超时。
+    /// KWin 6 `Window` 基类的 `public Q_SLOTS` 中是 `closeWindow()`。
+    #[test]
+    fn close_template_uses_closewindow_not_close() {
+        let script = render_v6(ScriptTemplate::CloseWindow, &[("ID", json!("w1"))]);
+        assert!(
+            script.contains("w.closeWindow()"),
+            "close must use closeWindow(); script: {script}"
+        );
+        assert!(
+            !script.contains("w.close()"),
+            "close must not use w.close(); script: {script}"
+        );
     }
 }
