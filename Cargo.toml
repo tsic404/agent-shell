@@ -10,6 +10,7 @@ members = [
     "components/compositor/sway",
     "components/compositor/hyprland",
     "components/compositor/mutter",
+    "components/compositor/x11",
     "components/systemd",
     "components/logind",
     "components/notification",
@@ -48,6 +49,7 @@ agent-shell-compositor-hyprland = { path = "components/compositor/hyprland" }
 agent-shell-compositor-kwin = { path = "components/compositor/kwin" }
 agent-shell-compositor-sway = { path = "components/compositor/sway" }
 agent-shell-compositor-mutter = { path = "components/compositor/mutter" }
+agent-shell-compositor-x11 = { path = "components/compositor/x11" }
 agent-shell-systemd = { path = "components/systemd" }
 agent-shell-logind = { path = "components/logind" }
 agent-shell-power = { path = "components/power" }

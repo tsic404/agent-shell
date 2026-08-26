@@ -1,0 +1,16 @@
+[package]
+name = "agent-shell-compositor-x11"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "agent-shell X11Compositor (generic X11 fallback compositor: EWMH/XTest native + xdotool/wmctrl CLI fallback)"
+
+[dependencies]
+agent-shell-core.workspace = true
+agent-shell-displayserver-x11.workspace = true
+async-trait.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+which.workspace = true
+x11rb = "0.14"

@@ -825,7 +825,7 @@ impl X11DisplayServer {
         self.conn.flush().map_err(cerr)
     }
 
-    fn property_bytes(
+    pub fn property_bytes(
         &self,
         window: x11rb::protocol::xproto::Window,
         property: u32,
@@ -844,7 +844,7 @@ impl X11DisplayServer {
         }
     }
 
-    fn get_property_u32(
+    pub fn get_property_u32(
         &self,
         window: x11rb::protocol::xproto::Window,
         property: u32,
@@ -857,11 +857,11 @@ impl X11DisplayServer {
             .as_chunks::<4>()
             .0
             .iter()
-            .map(|c| u32::from_be_bytes(*c))
+            .map(|c| u32::from_ne_bytes(*c))
             .collect())
     }
 
-    fn get_property_string(
+    pub fn get_property_string(
         &self,
         window: x11rb::protocol::xproto::Window,
         property: u32,
