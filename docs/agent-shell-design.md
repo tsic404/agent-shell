@@ -5643,14 +5643,14 @@ impl AgentShell {
   agent-shell daemon 注册 D-Bus 服务 com.agent_shell.Response
   路径 /com/agent_shell/response
   接口 com.agent_shell.Response
-  方法 SendResult(s: String)   ← KWin 脚本调用这里
+  方法 sendResult(s: String)   ← KWin 脚本调用这里
 
 每次执行:
   cli.eval(js):
     1. 设置 oneshot channel 等待
     2. loadScript("data:text/plain,<js>")   ← 内联或临时文件
     3. Script.run()
-    4. KWin 脚本执行 js，结果 JSON.stringify → callDBus SendResult
+    4. KWin 脚本执行 js，结果 JSON.stringify → callDBus sendResult
     5. daemon 收到 → 通过 channel 返回
     6. Script.stop()
 ```
