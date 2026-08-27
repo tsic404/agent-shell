@@ -99,39 +99,22 @@ impl DaemonClient {
     }
 }
 
-/// 在 PATH 与 cargo target 目录定位 daemon 二进制。
+/// 定位 daemon 二进制（委托 agent-shell-rpc::daemon_bin）。
+///
+/// workspace target 目录用 `CARGO_MANIFEST_DIR` 拼绝对路径，不依赖 CWD
+/// （TSI-2471 审查 #2）。
 fn find_daemon_binary() -> Result<String, String> {
-    const NAME: &str = "agent-shell-daemon";
-    if let Ok(path) = which(NAME) {
-        return Ok(path);
-    }
-    // 开发环境兜底：workspace target 目录。
-    for candidate in ["target/debug", "target/release"] {
-        let p = format!("{candidate}/{NAME}");
-        if std::path::Path::new(&p).exists() {
-            return Ok(p);
-        }
-    }
-    Err(format!(
-        "daemon binary `{NAME}` not found in PATH or ./target/{{debug,release}} — install agent-shell-daemon"
-    ))
+    // cli/ 上一级是 workspace 根，target/ 在根下。
+    let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("CARGO_MANIFEST_DIR has no parent");
+    let target_debug = workspace_root.join("target/debug");
+    let target_release = workspace_root.join("target/release");
+    agent_shell_rpc::daemon_bin::find_daemon_binary(&[
+        &target_debug.to_string_lossy(),
+        &target_release.to_string_lossy(),
+    ])
 }
-
-/// 极简 which（避免引入外部依赖）：扫描 PATH。
-fn which(name: &str) -> Result<String, ()> {
-    let path = std::env::var("PATH").map_err(|_| ())?;
-    for dir in path.split(':') {
-        if dir.is_empty() {
-            continue;
-        }
-        let candidate = std::path::Path::new(dir).join(name);
-        if candidate.is_file() {
-            return Ok(candidate.to_string_lossy().into_owned());
-        }
-    }
-    Err(())
-}
-
 // ───────────────────────── 高层操作封装 ─────────────────────────
 
 impl DaemonClient {
@@ -238,5 +221,34 @@ impl DaemonClient {
     pub async fn a11y_status(&mut self) -> Result<agent_shell_rpc::A11yStatusResult, String> {
         let v = self.call0(method::A11Y_STATUS).await?;
         serde_json::from_value(v).map_err(|e| e.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    /// CLI 注入的 target 目录用 CARGO_MANIFEST_DIR 拼绝对路径——CWD 无关
+    /// （TSI-2471 审查 #2）。验证候选目录列表中包含基于
+    /// CARGO_MANIFEST_DIR 的 target/debug 与 target/release 绝对路径。
+    #[test]
+    fn target_dirs_are_absolute_via_cargo_manifest_dir() {
+        let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("CARGO_MANIFEST_DIR has no parent");
+        let dbg = workspace_root.join("target/debug");
+        let rel = workspace_root.join("target/release");
+        let dirs = agent_shell_rpc::daemon_bin::candidate_dirs(&[
+            &dbg.to_string_lossy(),
+            &rel.to_string_lossy(),
+        ]);
+        assert!(!dirs.is_empty(), "candidate_dirs must not be empty");
+        assert!(
+            dirs.iter().any(|d| d == &*dbg.to_string_lossy()),
+            "target/debug (absolute) must be a candidate: {dirs:?}"
+        );
+        assert!(
+            dirs.iter().any(|d| d == &*rel.to_string_lossy()),
+            "target/release (absolute) must be a candidate: {dirs:?}"
+        );
     }
 }

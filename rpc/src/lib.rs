@@ -435,6 +435,140 @@ pub struct EventsReplayResult {
     pub events: Vec<Value>,
 }
 
+/// daemon 二进制定位（CLI 与 MCP 共享，TSI-2471）。
+pub mod daemon_bin {
+    /// daemon 二进制名。
+    pub const NAME: &str = "agent-shell-daemon";
+
+    /// 定位 daemon 二进制。
+    ///
+    /// 查找顺序（优先级递减）：
+    /// 1. 同目录下——CLI/MCP 与 daemon 并列安装时命中；
+    /// 2. workspace target 目录——开发构建产物，优先于 PATH，避免
+    ///    `~/.local/bin` 等位置已安装的旧版遮蔽本次构建的新二进制
+    ///    （TSI-2471）；
+    /// 3. PATH——已安装（systemd user unit / 包管理器安装）兜底。
+    ///
+    /// `extra_target_dirs` 由调用方注入（cli 与 mcp 的 workspace 相对
+    /// 层级不同），避免在本模块硬编码 crate 位置。
+    pub fn find_daemon_binary(extra_target_dirs: &[&str]) -> Result<String, String> {
+        let dirs = candidate_dirs(extra_target_dirs);
+        for dir in &dirs {
+            let p = std::path::Path::new(dir).join(NAME);
+            if p.is_file() {
+                return Ok(p.to_string_lossy().into_owned());
+            }
+        }
+        Err(format!(
+            "daemon binary `{NAME}` not found in candidate dirs: {}",
+            dirs.join(", ")
+        ))
+    }
+
+    /// 查找目录候选列表（顺序即优先级）。
+    pub fn candidate_dirs(extra_target_dirs: &[&str]) -> Vec<String> {
+        let mut dirs: Vec<String> = Vec::new();
+        // 1. 同目录下（调用方自身所在目录）。
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(d) = exe.parent() {
+                dirs.push(d.to_string_lossy().into_owned());
+            }
+        }
+        // 2. workspace target 目录（开发构建产物，优先于 PATH）。
+        //    extra_target_dirs 由调用方提供，指向 workspace 根下的 target。
+        for candidate in extra_target_dirs {
+            dirs.push(candidate.to_string());
+        }
+        // 3. PATH 兜底（已安装 daemon）。
+        if let Ok(path) = std::env::var("PATH") {
+            for dir in path.split(':') {
+                if !dir.is_empty() {
+                    dirs.push(dir.to_string());
+                }
+            }
+        }
+        dirs
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// workspace target 目录必须排在 PATH 之前——TSI-2471 核心契约。
+        /// 比较时跳过调用方自身所在目录（exe_dir，合法的绝对路径且
+        /// 优先级更高），仅验证 PATH 兜底段在 target 之后。
+        #[test]
+        fn target_dirs_precede_path_entries() {
+            let dirs = candidate_dirs(&["target/debug", "target/release"]);
+            assert!(!dirs.is_empty(), "candidate_dirs must not be empty");
+            let exe_dir = std::env::current_exe()
+                .ok()
+                .and_then(|e| e.parent().map(|p| p.to_string_lossy().into_owned()));
+            let first_target_debug = dirs
+                .iter()
+                .position(|d| d == "target/debug")
+                .expect("target/debug is a candidate");
+            let first_path_entry = dirs
+                .iter()
+                .position(|d| {
+                    std::path::Path::new(d).is_absolute() && Some(d.as_str()) != exe_dir.as_deref()
+                })
+                .unwrap_or(usize::MAX);
+            assert!(
+                first_target_debug < first_path_entry,
+                "target/debug must precede any PATH-sourced absolute entry — \
+                 got dirs={dirs:?}"
+            );
+        }
+
+        /// target/debug 先于 target/release——debug 构建在开发周期中更新更频繁，
+        /// 应优先命中以反映最新改动。
+        #[test]
+        fn debug_precedes_release() {
+            let dirs = candidate_dirs(&["target/debug", "target/release"]);
+            assert!(!dirs.is_empty());
+            let dbg = dirs.iter().position(|d| d == "target/debug").unwrap();
+            let rel = dirs.iter().position(|d| d == "target/release").unwrap();
+            assert!(dbg < rel);
+        }
+
+        /// 同目录（调用方自身目录）优先级最高——adjacent binary 规则。
+        #[test]
+        fn exe_dir_is_first_if_available() {
+            let dirs = candidate_dirs(&[]);
+            assert!(!dirs.is_empty(), "candidate_dirs must not be empty");
+            if let Ok(exe) = std::env::current_exe() {
+                if let Some(parent) = exe.parent() {
+                    assert_eq!(dirs[0], parent.to_string_lossy());
+                }
+            }
+        }
+
+        /// extra_target_dirs 注入的目录出现在 exe_dir 之后、PATH 之前。
+        #[test]
+        fn extra_dirs_between_exe_and_path() {
+            let extra = "custom/target/path";
+            let dirs = candidate_dirs(&[extra]);
+            assert!(!dirs.is_empty());
+            let extra_idx = dirs
+                .iter()
+                .position(|d| d == extra)
+                .expect("extra dir must be present");
+            let path_idx = dirs
+                .iter()
+                .position(|d| {
+                    std::path::Path::new(d).is_absolute()
+                        && d != extra
+                        && std::env::var("PATH")
+                            .map(|p| p.split(':').any(|entry| entry == d))
+                            .unwrap_or(false)
+                })
+                .unwrap_or(usize::MAX);
+            assert!(extra_idx < path_idx, "extra dir must precede PATH entries");
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -477,32 +477,21 @@ fn resolve_target(args: &Value, windows: &[Value]) -> Option<String> {
     None
 }
 
-/// 定位 daemon 二进制。
+/// 定位 daemon 二进制（委托 agent-shell-rpc::daemon_bin）。
+///
+/// workspace target 目录用 `CARGO_MANIFEST_DIR` 拼绝对路径，不依赖 CWD
+/// （TSI-2471 审查 #2）。MCP server 在 mcp/ 子 crate，向上一级是
+/// workspace 根，target/ 在根下。
 fn find_daemon_binary() -> Result<String, String> {
-    // 1. 同目录下找
-    if let Ok(exe) = std::env::current_exe() {
-        let daemon = exe.with_file_name("agent-shell-daemon");
-        if daemon.exists() {
-            return Ok(daemon.to_string_lossy().into());
-        }
-    }
-    // 2. PATH 中找
-    if let Ok(path) = std::env::var("PATH") {
-        for dir in path.split(':') {
-            let candidate = std::path::Path::new(dir).join("agent-shell-daemon");
-            if candidate.exists() {
-                return Ok(candidate.to_string_lossy().into());
-            }
-        }
-    }
-    // 3. cargo target 目录
-    for target in &["./target/debug", "../target/debug", "../../target/debug"] {
-        let p = std::path::Path::new(target).join("agent-shell-daemon");
-        if p.exists() {
-            return Ok(p.to_string_lossy().into());
-        }
-    }
-    Err("agent-shell-daemon binary not found".into())
+    let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("CARGO_MANIFEST_DIR has no parent");
+    let target_debug = workspace_root.join("target/debug");
+    let target_release = workspace_root.join("target/release");
+    agent_shell_rpc::daemon_bin::find_daemon_binary(&[
+        &target_debug.to_string_lossy(),
+        &target_release.to_string_lossy(),
+    ])
 }
 
 /// 启动 MCP server（stdio 传输）。
@@ -637,5 +626,29 @@ mod tests {
     #[test]
     fn test_map_tool_unknown() {
         assert!(AgentShellMcpServer::map_tool("unknown", &Value::Null).is_none());
+    }
+    /// MCP 注入的 target 目录用 CARGO_MANIFEST_DIR 拼绝对路径——CWD 无关
+    /// （TSI-2471 审查 #2）。验证候选目录列表中包含基于
+    /// CARGO_MANIFEST_DIR 的 target/debug 与 target/release 绝对路径。
+    #[test]
+    fn test_target_dirs_are_absolute_via_cargo_manifest_dir() {
+        let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("CARGO_MANIFEST_DIR has no parent");
+        let dbg = workspace_root.join("target/debug");
+        let rel = workspace_root.join("target/release");
+        let dirs = agent_shell_rpc::daemon_bin::candidate_dirs(&[
+            &dbg.to_string_lossy(),
+            &rel.to_string_lossy(),
+        ]);
+        assert!(!dirs.is_empty(), "candidate_dirs must not be empty");
+        assert!(
+            dirs.iter().any(|d| d == &*dbg.to_string_lossy()),
+            "target/debug (absolute) must be a candidate: {dirs:?}"
+        );
+        assert!(
+            dirs.iter().any(|d| d == &*rel.to_string_lossy()),
+            "target/release (absolute) must be a candidate: {dirs:?}"
+        );
     }
 }
