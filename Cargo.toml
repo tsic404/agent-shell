@@ -33,6 +33,8 @@ members = [
     "daemon",
     "rootd",
     "modules/capture",
+    "mcp",
+    "event",
 ]
 
 [workspace.package]
@@ -73,7 +75,9 @@ agent-shell-launcher = { path = "components/launcher" }
 agent-shell-clipboard = { path = "components/clipboard" }
 agent-shell-input = { path = "components/input" }
 agent-shell-a11y = { path = "components/a11y" }
+agent-shell-mcp = { path = "mcp" }
 agent-shell-capture = { path = "modules/capture" }
+agent-shell-event = { path = "event" }
 which = "7"
 libc = "0.2"
 ordered-stream = "0.2"

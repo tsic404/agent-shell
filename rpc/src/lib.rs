@@ -93,8 +93,88 @@ pub mod method {
     pub const SCREENSHOT_CAPTURE: &str = "screenshot.capture";
     /// AT-SPI Registry 可达性探测。
     pub const A11Y_STATUS: &str = "a11y.status";
+    // ── 事件（§22.5 D4）──
+    /// 订阅事件流（返回 subscriber_id；事件经 notification 推送）。
+    pub const EVENTS_SUBSCRIBE: &str = "events.subscribe";
+    /// 取消订阅。
+    pub const EVENTS_UNSUBSCRIBE: &str = "events.unsubscribe";
+    /// 回放环形缓冲历史事件。
+    pub const EVENTS_REPLAY: &str = "events.replay";
+    // ── daemon 管理（§22.2）──
+    /// daemon 状态查询。
+    pub const DAEMON_STATUS: &str = "daemon.status";
+    /// 查看 portal 会话。
+    pub const DAEMON_SESSIONS: &str = "daemon.sessions";
+    // ── IME（§22.8 D7）──
+    /// 列出可用输入法引擎。
+    pub const IME_ENGINE_LIST: &str = "ime.engine.list";
+    /// 设置当前引擎。
+    pub const IME_ENGINE_SET: &str = "ime.engine.set";
+    /// 查询当前引擎。
+    pub const IME_ENGINE_CURRENT: &str = "ime.engine.current";
+    /// 通过 IME 输入文本（非 ASCII）。
+    pub const IME_TYPE: &str = "ime.type";
+    // ── 扩展系统服务（§21.35）──
+    /// 安全状态。
+    pub const SECURITY_STATUS: &str = "security.status";
+    /// 授权操作。
+    pub const SECURITY_GRANT: &str = "security.grant";
+    /// 撤销授权。
+    pub const SECURITY_REVOKE: &str = "security.revoke";
+    /// 审计日志。
+    pub const SECURITY_AUDIT: &str = "security.audit";
+    /// 获取亮度。
+    pub const BRIGHTNESS_GET: &str = "brightness.get";
+    /// 设置亮度。
+    pub const BRIGHTNESS_SET: &str = "brightness.set";
+    /// 文件选择器。
+    pub const FILE_PICK: &str = "file.pick";
+    /// 文件删除到回收站。
+    pub const FILE_TRASH: &str = "file.trash";
+    /// 打开目录。
+    pub const FILE_OPEN_DIR: &str = "file.open_directory";
+    /// 查询默认应用。
+    pub const MIME_GET: &str = "mime.get";
+    /// 设置默认应用。
+    pub const MIME_SET: &str = "mime.set";
+    /// 默认浏览器。
+    pub const MIME_DEFAULT_BROWSER: &str = "mime.default_browser";
+    /// 蓝牙扫描。
+    pub const BLUETOOTH_SCAN: &str = "bluetooth.scan";
+    /// 蓝牙连接。
+    pub const BLUETOOTH_CONNECT: &str = "bluetooth.connect";
+    /// 蓝牙断开。
+    pub const BLUETOOTH_DISCONNECT: &str = "bluetooth.disconnect";
+    /// 蓝牙列表。
+    pub const BLUETOOTH_LIST: &str = "bluetooth.list";
+    /// Flatpak 列表。
+    pub const FLATPAK_LIST: &str = "flatpak.list";
+    /// Flatpak 安装。
+    pub const FLATPAK_INSTALL: &str = "flatpak.install";
+    /// 软件更新检查。
+    pub const SOFTWARE_UPDATES: &str = "software.updates";
+    /// 触控板状态。
+    pub const TOUCHPAD_STATUS: &str = "touchpad.status";
+    /// 触控板设置。
+    pub const TOUCHPAD_SET: &str = "touchpad.set";
+    /// 键盘布局列表。
+    pub const KBD_LAYOUT_LIST: &str = "kbd.layout.list";
+    /// 键盘布局设置。
+    pub const KBD_LAYOUT_SET: &str = "kbd.layout.set";
+    /// 密钥存储。
+    pub const SECRET_SET: &str = "secret.set";
+    /// 密钥读取。
+    pub const SECRET_GET: &str = "secret.get";
+    /// 快捷键绑定。
+    pub const SHORTCUT_BIND: &str = "shortcut.bind";
+    /// 快捷键触发。
+    pub const SHORTCUT_TRIGGER: &str = "shortcut.trigger";
+    /// Timer 列表。
+    pub const TIMER_LIST: &str = "timer.list";
+    /// Timer 下次触发。
+    pub const TIMER_NEXT: &str = "timer.next";
 }
-/// JSON-RPC 2.0 请求（CLI → daemon）。
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Request {
     pub jsonrpc: String,
@@ -229,6 +309,18 @@ pub struct WindowEntry {
     pub title: String,
     pub app_id: String,
     pub pid: u32,
+    /// 窗口几何信息（§17.2 要求 windows.list 含 geometry）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub x: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub y: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub width: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub height: Option<i32>,
+    /// 工作区标识（§17.2 要求 windows.list 含 workspace）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<String>,
 }
 
 /// windows.op 参数。
@@ -307,6 +399,40 @@ pub struct InfoResult {
 pub struct A11yStatusResult {
     pub available: bool,
     pub detail: String,
+}
+
+// ───────────────────────── 事件 / daemon / IME 载荷 ─────────────────────────
+
+/// IME type 结果（§22.8 D7）。
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct ImeTypeResult {
+    pub committed: String,
+    pub verified: bool,
+}
+
+/// daemon.status 结果（§22.2）。
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct DaemonStatusResult {
+    pub running: bool,
+    pub windows_cached: usize,
+    pub subscribers: usize,
+    pub ime_engine: Option<String>,
+}
+
+/// portal 会话条目（daemon.sessions 结果）。
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct SessionEntry {
+    pub kind: String,
+    pub restore_token: String,
+    pub created_at: String,
+    pub persist_mode: u32,
+}
+
+/// events.replay 结果。
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct EventsReplayResult {
+    pub count: usize,
+    pub events: Vec<Value>,
 }
 
 #[cfg(test)]

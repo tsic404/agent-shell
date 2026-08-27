@@ -15,7 +15,7 @@ pub struct Cli {
     pub output_format: OutputFormat,
 
     #[command(subcommand)]
-    pub command: Command,
+    pub command: Option<Command>,
 }
 
 /// 输出格式。
@@ -43,9 +43,46 @@ pub enum Command {
     /// 输入注入（XTest；XWayland 下不可用并明确报错，§6.3）
     #[command(subcommand)]
     Input(InputCommand),
-
     /// 截图捕获（X11 GetImage 路径；Wayland 会话待 capture 组件 T2b）
     Screenshot(ScreenshotCommand),
+    /// 事件订阅/回放（§22.5 D4）
+    #[command(subcommand)]
+    Events(EventsCommand),
+    /// daemon 管理（§22.2）
+    #[command(subcommand)]
+    Daemon(DaemonCommand),
+    /// 输入法（§22.8 D7）
+    #[command(subcommand)]
+    Ime(ImeCommand),
+    /// 亮度
+    Brightness(BrightnessCommand),
+    /// 文件操作
+    #[command(subcommand)]
+    File(FileCommand),
+    /// MIME 默认应用
+    #[command(subcommand)]
+    Mime(MimeCommand),
+    /// 蓝牙
+    #[command(subcommand)]
+    Bluetooth(BluetoothCommand),
+    /// 软件管理
+    #[command(subcommand)]
+    Software(SoftwareCommand),
+    /// 触控板
+    #[command(subcommand)]
+    Touchpad(TouchpadCommand),
+    /// 键盘布局
+    #[command(subcommand)]
+    Kbd(KbdCommand),
+    /// 密钥存储
+    #[command(subcommand)]
+    Secret(SecretCommand),
+    /// 快捷键
+    #[command(subcommand)]
+    Shortcut(ShortcutCommand),
+    /// 定时器
+    #[command(subcommand)]
+    Timer(TimerCommand),
     /// AT-SPI 无障碍（a11y bus 探测 + 语义查询）
     #[command(subcommand)]
     A11y(A11yCommand),
@@ -141,6 +178,186 @@ pub enum A11yCommand {
         #[arg(long)]
         name: Option<String>,
     },
+}
+
+// ───────────────────────── events ─────────────────────────
+
+/// 事件订阅/回放命令。
+#[derive(Subcommand, Debug)]
+pub enum EventsCommand {
+    /// 订阅事件流（按类型过滤）
+    Subscribe {
+        #[arg(long)]
+        filter: Option<String>,
+    },
+    /// 取消订阅
+    Unsubscribe {
+        #[arg(long)]
+        id: String,
+    },
+    /// 回放历史事件
+    Replay {
+        #[arg(long)]
+        filter: Option<String>,
+    },
+}
+
+// ───────────────────────── daemon ─────────────────────────
+
+#[derive(Subcommand, Debug)]
+pub enum DaemonCommand {
+    /// daemon 状态
+    Status,
+    /// portal 会话
+    Sessions,
+}
+
+// ───────────────────────── ime ─────────────────────────
+
+#[derive(Subcommand, Debug)]
+pub enum ImeCommand {
+    /// 输入法引擎子命令
+    #[command(subcommand)]
+    Engine(ImeEngineCommand),
+    /// 通过 IME 输入文本
+    Type { text: String },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ImeEngineCommand {
+    /// 列出可用引擎
+    List,
+    /// 设置当前引擎
+    Set { engine: String },
+    /// 查询当前引擎
+    Current,
+}
+
+// ───────────────────────── brightness ─────────────────────────
+
+/// 亮度命令：无值则查询，有值则设置。
+#[derive(ClapArgs, Debug)]
+pub struct BrightnessCommand {
+    /// 亮度百分比（0-100）；省略则查询当前亮度
+    pub value: Option<u32>,
+}
+
+// ───────────────────────── file ─────────────────────────
+
+#[derive(Subcommand, Debug)]
+pub enum FileCommand {
+    /// 文件选择器
+    Pick,
+    /// 删除到回收站
+    Trash { path: String },
+    /// 打开目录
+    OpenDirectory { path: String },
+}
+
+// ───────────────────────── mime ─────────────────────────
+
+#[derive(Subcommand, Debug)]
+pub enum MimeCommand {
+    /// 查询默认应用
+    Get { mime: String },
+    /// 设置默认应用
+    Set { mime: String, app: String },
+    /// 默认浏览器
+    DefaultBrowser,
+}
+
+// ───────────────────────── bluetooth ─────────────────────────
+
+#[derive(Subcommand, Debug)]
+pub enum BluetoothCommand {
+    /// 扫描
+    Scan,
+    /// 连接
+    Connect { address: String },
+    /// 断开
+    Disconnect { address: String },
+    /// 列出已配对设备
+    List,
+}
+
+// ───────────────────────── software ─────────────────────────
+
+#[derive(Subcommand, Debug)]
+pub enum SoftwareCommand {
+    /// Flatpak 管理
+    #[command(subcommand)]
+    Flatpak(FlatpakCommand),
+    /// 软件更新检查
+    Updates,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum FlatpakCommand {
+    /// 列出已安装 Flatpak
+    List,
+    /// 安装 Flatpak
+    Install { app_id: String },
+}
+
+// ───────────────────────── touchpad ─────────────────────────
+
+#[derive(Subcommand, Debug)]
+pub enum TouchpadCommand {
+    /// 触控板状态
+    Status,
+    /// 开启触控板
+    On,
+    /// 关闭触控板
+    Off,
+    /// 自然滚动开关（on/off）
+    NaturalScroll { state: String },
+}
+
+// ───────────────────────── kbd ─────────────────────────
+
+#[derive(Subcommand, Debug)]
+pub enum KbdCommand {
+    /// 键盘布局子命令
+    #[command(subcommand)]
+    Layout(KbdLayoutCommand),
+}
+
+#[derive(Subcommand, Debug)]
+pub enum KbdLayoutCommand {
+    /// 列出布局
+    List,
+    /// 设置布局
+    Set { layout: String },
+}
+
+// ───────────────────────── secret ─────────────────────────
+
+#[derive(Subcommand, Debug)]
+pub enum SecretCommand {
+    /// 存储密钥
+    Set { key: String, value: String },
+    /// 读取密钥
+    Get { key: String },
+}
+
+// ───────────────────────── shortcut ─────────────────────────
+
+#[derive(Subcommand, Debug)]
+pub enum ShortcutCommand {
+    /// 绑定快捷键到动作
+    Bind { combo: String, action: String },
+    /// 触发已绑定快捷键
+    Trigger { combo: String },
+}
+
+// ───────────────────────── timer ─────────────────────────
+
+#[derive(Subcommand, Debug)]
+pub enum TimerCommand {
+    /// 列出定时器
+    List,
+    /// 查询下次触发
+    Next { name: String },
 }
 
 // ───────────────────────── 解析辅助 ─────────────────────────
@@ -365,6 +582,11 @@ mod tests {
             title: title.into(),
             app_id: "kate".into(),
             pid: 1000,
+            x: None,
+            y: None,
+            width: None,
+            height: None,
+            workspace: None,
         }
     }
 }

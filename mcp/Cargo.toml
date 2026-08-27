@@ -1,0 +1,25 @@
+[package]
+name = "mcp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "agent-shell MCP server (rmcp-based, §17.3)"
+
+[lib]
+name = "agent_shell_mcp"
+path = "src/lib.rs"
+
+[[bin]]
+name = "agent-shell-mcp"
+path = "src/main.rs"
+
+[dependencies]
+agent-shell-rpc.workspace = true
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+rmcp = { version = "3", features = ["server", "transport-io"] }
+schemars = "0.8"

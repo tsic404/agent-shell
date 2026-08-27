@@ -29,6 +29,11 @@ pub fn windows_entries_json(wins: &[WindowEntry]) -> String {
                 "title": w.title,
                 "app_id": w.app_id,
                 "pid": w.pid,
+                "x": w.x,
+                "y": w.y,
+                "width": w.width,
+                "height": w.height,
+                "workspace": w.workspace,
             })
         })
         .collect();
@@ -54,6 +59,11 @@ mod tests {
             title: title.into(),
             app_id: "org.kde.kate".into(),
             pid: 4242,
+            x: None,
+            y: None,
+            width: None,
+            height: None,
+            workspace: None,
         }
     }
 

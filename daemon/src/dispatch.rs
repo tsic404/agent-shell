@@ -4,6 +4,7 @@
 //! 异步收集（合成器 doctor_lines + a11y 探测），CLI 只做渲染。
 
 use crate::state::Daemon;
+use agent_shell_core::types::WindowInfo;
 use agent_shell_rpc::{
     method, A11yStatusResult, CaptureParams, DoctorResult, InfoResult, InputParams, Request,
     Response, RpcErrorCode, WindowOpKind,
@@ -15,7 +16,7 @@ pub async fn dispatch(daemon: &mut Daemon, req: &Request) -> Response {
     let result = match req.method.as_str() {
         method::DOCTOR => doctor(daemon).await,
         method::INFO => info(daemon).await,
-        method::WINDOWS_LIST => windows_list(daemon).await,
+        method::WINDOWS_LIST => windows_list(daemon, req).await,
         method::WINDOW_INFO => window_info(daemon, req).await,
         method::WINDOW_OP => window_op(daemon, req).await,
         method::WORKSPACES_LIST => workspaces_list(daemon).await,
@@ -23,6 +24,48 @@ pub async fn dispatch(daemon: &mut Daemon, req: &Request) -> Response {
         method::INPUT_SEND => blocking_input_send(req).await,
         method::SCREENSHOT_CAPTURE => screenshot_capture(daemon, req).await,
         method::A11Y_STATUS => a11y_status().await,
+        // ── 事件（§22.5 D4）──
+        method::EVENTS_SUBSCRIBE => events_subscribe(daemon, req).await,
+        method::EVENTS_UNSUBSCRIBE => events_unsubscribe(daemon, req).await,
+        method::EVENTS_REPLAY => events_replay(daemon).await,
+        // ── daemon 管理（§22.2）──
+        method::DAEMON_STATUS => daemon_status(daemon).await,
+        method::DAEMON_SESSIONS => daemon_sessions(daemon).await,
+        // ── IME（§22.8 D7）──
+        method::IME_ENGINE_LIST => ime_engine_list(daemon).await,
+        method::IME_ENGINE_SET => ime_engine_set(daemon, req).await,
+        method::IME_ENGINE_CURRENT => ime_engine_current(daemon).await,
+        method::IME_TYPE => ime_type(daemon, req).await,
+        // ── 扩展系统服务（§21.35 stub）──
+        method::SECURITY_STATUS => stub_ok("security.status"),
+        method::SECURITY_GRANT => stub_ok("security.grant"),
+        method::SECURITY_REVOKE => stub_ok("security.revoke"),
+        method::SECURITY_AUDIT => stub_ok("security.audit"),
+        method::BRIGHTNESS_GET => stub_ok("brightness.get"),
+        method::BRIGHTNESS_SET => stub_ok("brightness.set"),
+        method::FILE_PICK => stub_ok("file.pick"),
+        method::FILE_TRASH => stub_ok("file.trash"),
+        method::FILE_OPEN_DIR => stub_ok("file.open_directory"),
+        method::MIME_GET => stub_ok("mime.get"),
+        method::MIME_SET => stub_ok("mime.set"),
+        method::MIME_DEFAULT_BROWSER => stub_ok("mime.default_browser"),
+        method::BLUETOOTH_SCAN => stub_ok("bluetooth.scan"),
+        method::BLUETOOTH_CONNECT => stub_ok("bluetooth.connect"),
+        method::BLUETOOTH_DISCONNECT => stub_ok("bluetooth.disconnect"),
+        method::BLUETOOTH_LIST => stub_ok("bluetooth.list"),
+        method::FLATPAK_LIST => stub_ok("flatpak.list"),
+        method::FLATPAK_INSTALL => stub_ok("flatpak.install"),
+        method::SOFTWARE_UPDATES => stub_ok("software.updates"),
+        method::TOUCHPAD_STATUS => stub_ok("touchpad.status"),
+        method::TOUCHPAD_SET => stub_ok("touchpad.set"),
+        method::KBD_LAYOUT_LIST => stub_ok("kbd.layout.list"),
+        method::KBD_LAYOUT_SET => stub_ok("kbd.layout.set"),
+        method::SECRET_SET => stub_ok("secret.set"),
+        method::SECRET_GET => stub_ok("secret.get"),
+        method::SHORTCUT_BIND => stub_ok("shortcut.bind"),
+        method::SHORTCUT_TRIGGER => stub_ok("shortcut.trigger"),
+        method::TIMER_LIST => stub_ok("timer.list"),
+        method::TIMER_NEXT => stub_ok("timer.next"),
         other => {
             return Response::err(
                 req.id,
@@ -107,9 +150,21 @@ async fn info(d: &Daemon) -> RpcResult {
 
 // ───────────────────────── windows ─────────────────────────
 
-async fn windows_list(d: &mut Daemon) -> RpcResult {
+async fn windows_list(d: &mut Daemon, req: &Request) -> RpcResult {
+    let filter = req
+        .params
+        .as_ref()
+        .and_then(|p| p.get("filter"))
+        .and_then(|v| v.as_str());
     let (wins, from_cache) = d.list_windows().await?;
-    let items: Vec<Value> = wins
+    let filtered: Vec<&WindowInfo> = match filter {
+        Some(f) => wins
+            .iter()
+            .filter(|w| w.app_id == f || w.title.contains(f))
+            .collect(),
+        None => wins.iter().collect(),
+    };
+    let items: Vec<Value> = filtered
         .iter()
         .map(|w| {
             json!({
@@ -117,6 +172,11 @@ async fn windows_list(d: &mut Daemon) -> RpcResult {
                 "title": w.title,
                 "app_id": w.app_id,
                 "pid": w.pid,
+                "x": w.geometry.x,
+                "y": w.geometry.y,
+                "width": w.geometry.width,
+                "height": w.geometry.height,
+                "workspace": w.workspace_id.as_ref().map(|ws| &ws.native_id),
             })
         })
         .collect();
@@ -217,6 +277,79 @@ async fn a11y_status() -> RpcResult {
     Ok(serde_json::to_value(r).expect("A11yStatusResult serializable"))
 }
 
+// ───────────────────────── 事件 / daemon / IME ─────────────────────────
+
+/// stub_ok — 扩展系统服务的占位响应（§21.35，待 Phase 3 接线）。
+fn stub_ok(name: &str) -> RpcResult {
+    Ok(json!({"status": "not_implemented", "service": name}))
+}
+
+/// 事件订阅——v1 不实现推送，显式返回 not_implemented（§22.5 D4 待 Phase 2 接线）。
+async fn events_subscribe(_d: &mut Daemon, _req: &Request) -> RpcResult {
+    Err((
+        RpcErrorCode::Denied,
+        "events.subscribe not implemented in v1 (event push pending Phase 2 wiring)".into(),
+    ))
+}
+
+/// 事件取消订阅——v1 不实现推送，显式返回 not_implemented。
+async fn events_unsubscribe(_d: &mut Daemon, _req: &Request) -> RpcResult {
+    Err((
+        RpcErrorCode::Denied,
+        "events.unsubscribe not implemented in v1 (event push pending Phase 2 wiring)".into(),
+    ))
+}
+
+async fn events_replay(d: &mut Daemon) -> RpcResult {
+    let events = d.ring_buffer.replay();
+    let count = events.len();
+    Ok(json!({"events": events, "count": count}))
+}
+
+async fn daemon_status(d: &mut Daemon) -> RpcResult {
+    use agent_shell_rpc::DaemonStatusResult;
+    let r = DaemonStatusResult {
+        running: true,
+        windows_cached: d.cache_len(),
+        subscribers: d.subscriber_count(),
+        ime_engine: d.ime_session.current_engine(),
+    };
+    Ok(serde_json::to_value(r).expect("DaemonStatusResult serializable"))
+}
+
+async fn daemon_sessions(d: &mut Daemon) -> RpcResult {
+    let sessions = d.portal_sessions.list_sessions();
+    Ok(json!({"sessions": sessions}))
+}
+
+async fn ime_engine_list(d: &mut Daemon) -> RpcResult {
+    Ok(json!({"engines": d.ime_session.list_engines()}))
+}
+
+async fn ime_engine_set(d: &mut Daemon, req: &Request) -> RpcResult {
+    let params = params_of(req)?;
+    let engine = params
+        .get("engine")
+        .and_then(|v| v.as_str())
+        .ok_or((RpcErrorCode::InvalidParams, "missing engine".into()))?;
+    d.ime_session.set_engine(engine);
+    Ok(json!({"set": engine}))
+}
+
+async fn ime_engine_current(d: &mut Daemon) -> RpcResult {
+    Ok(json!({"engine": d.ime_session.current_engine()}))
+}
+
+async fn ime_type(d: &mut Daemon, req: &Request) -> RpcResult {
+    let params = params_of(req)?;
+    let text = params
+        .get("text")
+        .and_then(|v| v.as_str())
+        .ok_or((RpcErrorCode::InvalidParams, "missing text".into()))?;
+    let result = d.ime_session.type_text(text);
+    Ok(serde_json::to_value(result).expect("ImeTypeResult serializable"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -291,5 +424,42 @@ mod tests {
         });
         let resp = dispatch(&mut d, &req(method::SCREENSHOT_CAPTURE, Some(params))).await;
         assert!(resp.error.is_some(), "must not succeed or panic without X");
+    }
+
+    #[tokio::test]
+    async fn events_subscribe_returns_not_implemented() {
+        // v1 不实现事件推送——subscribe 返回 Denied（not_implemented）。
+        let mut d = Daemon::connect(Duration::from_secs(1)).await;
+        let resp = dispatch(&mut d, &req(method::EVENTS_SUBSCRIBE, None)).await;
+        assert!(resp.error.is_some(), "subscribe must return error");
+        assert_eq!(resp.error.unwrap().code, RpcErrorCode::Denied as i32);
+    }
+
+    #[tokio::test]
+    async fn events_unsubscribe_returns_not_implemented() {
+        // v1 不实现事件推送——unsubscribe 返回 Denied（not_implemented）。
+        let mut d = Daemon::connect(Duration::from_secs(1)).await;
+        let resp = dispatch(
+            &mut d,
+            &req(
+                method::EVENTS_UNSUBSCRIBE,
+                Some(json!({"subscriber_id": "x"})),
+            ),
+        )
+        .await;
+        assert!(resp.error.is_some(), "unsubscribe must return error");
+        assert_eq!(resp.error.unwrap().code, RpcErrorCode::Denied as i32);
+    }
+
+    #[tokio::test]
+    async fn events_replay_returns_ring_buffer_contents() {
+        // 审查项 #2：ring_buffer 非空时 events_replay 返回事件。
+        let mut d = Daemon::connect(Duration::from_secs(1)).await;
+        d.ring_buffer
+            .push(json!({"type": "window_list", "native_id": "x"}));
+        let resp = dispatch(&mut d, &req(method::EVENTS_REPLAY, None)).await;
+        let v = resp.result.expect("replay ok");
+        let count = v.get("count").and_then(|v| v.as_u64()).expect("count");
+        assert_eq!(count, 1);
     }
 }

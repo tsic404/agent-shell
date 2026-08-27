@@ -24,6 +24,12 @@ pub struct Daemon {
     pub idle_timeout: Duration,
     /// capture 组件（三级降级链；None = 全后端探测失败，TTY 场景）。
     pub capture: Option<CaptureDispatcher>,
+    /// Portal 会话管理器（§22.6 D5）。
+    pub portal_sessions: crate::portal_sessions::PortalSessionManager,
+    /// IME 会话（§22.8 D7）。
+    pub ime_session: crate::ime_session::ImeSession,
+    /// 事件环形缓冲（§22.5 D4，CLI `events --replay`）。
+    pub ring_buffer: crate::ring_buffer::RingBuffer<serde_json::Value>,
 }
 
 impl Daemon {
@@ -50,6 +56,11 @@ impl Daemon {
             cache: Vec::new(),
             cached_at: None,
             idle_timeout,
+            portal_sessions: crate::portal_sessions::PortalSessionManager::new(
+                crate::single_instance::state_dir(),
+            ),
+            ime_session: crate::ime_session::ImeSession::new(),
+            ring_buffer: crate::ring_buffer::RingBuffer::new(),
         }
     }
 
@@ -81,6 +92,16 @@ impl Daemon {
             .await
             .map_err(|e| (agent_shell_rpc::RpcErrorCode::BackendError, e.to_string()))?;
         self.cache = wins;
+        // 每个窗口变化推入环形缓冲（§22.5 D4——events --replay 数据源）。
+        for w in &self.cache {
+            self.ring_buffer.push(serde_json::json!({
+                "type": "window_list",
+                "native_id": w.id.native_id,
+                "title": w.title,
+                "app_id": w.app_id,
+                "pid": w.pid,
+            }));
+        }
         self.cached_at = Some(Instant::now());
         Ok((self.cache.clone(), false))
     }
@@ -197,6 +218,16 @@ impl Daemon {
     pub fn has_compositor(&self) -> bool {
         self.compositor.is_some()
     }
+
+    /// 当前窗口缓存条目数（daemon_status 报告用）。
+    pub fn cache_len(&self) -> usize {
+        self.cache.len()
+    }
+
+    /// 当前事件订阅者数量（v1 事件推送未实现，返回 0）。
+    pub fn subscriber_count(&self) -> usize {
+        0
+    }
 }
 
 /// 当前会话的 DE 归类（与 core 检测同口径）。
@@ -234,5 +265,18 @@ mod tests {
             assert_eq!(code, agent_shell_rpc::RpcErrorCode::BackendUnavailable);
             assert!(msg.contains("unavailable"));
         }
+    }
+
+    #[tokio::test]
+    async fn ring_buffer_replay_after_push() {
+        // 审查项 #2：list_windows 刷新路径将窗口事件推入 ring_buffer，
+        // events --replay 必须返回非空。无合成器时直接验证 push/replay 通路。
+        let mut d = Daemon::connect(Duration::from_secs(1)).await;
+        assert!(d.ring_buffer.replay().is_empty());
+        d.ring_buffer
+            .push(serde_json::json!({"type": "window_list", "native_id": "test"}));
+        let events = d.ring_buffer.replay();
+        assert!(!events.is_empty());
+        assert_eq!(events.len(), 1);
     }
 }

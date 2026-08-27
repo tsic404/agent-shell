@@ -10,7 +10,11 @@
 mod a11y;
 mod capture;
 mod dispatch;
+mod ime_session;
 mod input;
+mod portal_sessions;
+mod ring_buffer;
+mod single_instance;
 mod state;
 
 use agent_shell_rpc::{Request, Response};
@@ -45,14 +49,23 @@ fn main() {
     let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
     runtime.block_on(run(Duration::from_secs(idle_secs), foreground));
 }
-
 async fn run(idle_timeout: Duration, _foreground: bool) {
+    // 单实例锁（§22.2 D1）——失败说明已有 daemon 运行。
+    let lock = match single_instance::SingleInstanceLock::acquire() {
+        Ok(l) => l,
+        Err(msg) => {
+            eprintln!("error: {msg}");
+            std::process::exit(1);
+        }
+    };
     // 连接来源说明（§22.2 激活策略）：
     // - systemd --user 常驻形态：CLI 经 fork/exec `--foreground` 子进程建立
     //   stdio 管道连接；unit 常驻实例的 stdin=null，不承载协议。
     // - 手动管道/测试：stdin/stdout 即协议通道。
-    // LISTEN_FDs socket-activation 留待 daemon D-Bus 服务注册任务接线；
-    // 当前统一从 inherited stdio 读取，检测到 LISTEN_FDs 时如实记录。
+    // LISTEN_FDs (systemd socket activation) — Phase 3 待接线：当前仅记录检测
+    // 到 LISTEN_FDs 的存在，但不使用 fd 接受连接，统一从 inherited stdio 读取。
+    // 这是有意限制：socket-activated 监听需先完成 daemon D-Bus 服务注册
+    // （见 §22.2 激活策略），否则单连接 stdio 服务无法与多连接 socket 模型共存。
     if std::env::var("LISTEN_FDS")
         .map(|v| v != "0")
         .unwrap_or(false)
@@ -63,6 +76,9 @@ async fn run(idle_timeout: Duration, _foreground: bool) {
     let daemon = Daemon::connect(idle_timeout).await;
     let idle = daemon.idle_timeout;
     serve_connection(daemon, idle).await;
+
+    // 释放单实例锁
+    lock.release();
 }
 
 /// 单连接服务循环：逐行读请求 → dispatch → 写响应。EOF 或空闲超时退出。
