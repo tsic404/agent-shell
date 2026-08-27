@@ -43,7 +43,7 @@ pub enum Command {
     /// 输入注入（XTest；XWayland 下不可用并明确报错，§6.3）
     #[command(subcommand)]
     Input(InputCommand),
-    /// 截图捕获（X11 GetImage 路径；Wayland 会话待 capture 组件 T2b）
+    /// 截图捕获（portal ScreenCast / Screenshot / X11 三级降级链）
     Screenshot(ScreenshotCommand),
     /// 事件订阅/回放（§22.5 D4）
     #[command(subcommand)]

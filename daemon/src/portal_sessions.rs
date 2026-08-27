@@ -126,6 +126,34 @@ impl PortalSessionManager {
     }
 }
 
+/// ScreenCast restore_token 持久化桥接——供 `CaptureDispatcher` 注入。
+///
+/// session kind 固定为 `"screencast"`（设计文档 §22.7）；persist_mode=2
+/// （persist_until_revoked）。
+impl agent_shell_capture::TokenStore for PortalSessionManager {
+    fn get_restore_token(&self) -> Option<String> {
+        self.get_token(SCREENCAST_SESSION_KIND)
+    }
+
+    fn save_restore_token(&self, token: Option<String>) {
+        match token {
+            Some(t) => {
+                if let Err(e) = self.set_token(SCREENCAST_SESSION_KIND, t, 2) {
+                    tracing::warn!("failed to persist screencast restore_token: {e}");
+                }
+            }
+            None => {
+                if let Err(e) = self.remove_token(SCREENCAST_SESSION_KIND) {
+                    tracing::warn!("failed to remove screencast restore_token: {e}");
+                }
+            }
+        }
+    }
+}
+
+/// ScreenCast 会话在 sessions.json 中的 kind 键。
+const SCREENCAST_SESSION_KIND: &str = "screencast";
+
 fn now_iso() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let secs = SystemTime::now()

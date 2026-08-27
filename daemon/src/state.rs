@@ -25,7 +25,7 @@ pub struct Daemon {
     /// capture 组件（三级降级链；None = 全后端探测失败，TTY 场景）。
     pub capture: Option<CaptureDispatcher>,
     /// Portal 会话管理器（§22.6 D5）。
-    pub portal_sessions: crate::portal_sessions::PortalSessionManager,
+    pub portal_sessions: std::sync::Arc<crate::portal_sessions::PortalSessionManager>,
     /// IME 会话（§22.8 D7）。
     pub ime_session: crate::ime_session::ImeSession,
     /// 事件环形缓冲（§22.5 D4，CLI `events --replay`）。
@@ -50,15 +50,20 @@ impl Daemon {
                 None
             }
         };
+        // PortalSessionManager 先建——注入 CaptureDispatcher 作 TokenStore，
+        // 使 ScreenCast 能 restore_token 静默恢复（§22.7 D5）。
+        let portal_sessions = std::sync::Arc::new(
+            crate::portal_sessions::PortalSessionManager::new(crate::single_instance::state_dir()),
+        );
+        let token_store: std::sync::Arc<dyn agent_shell_capture::TokenStore> =
+            std::sync::Arc::clone(&portal_sessions) as _;
         Self {
             compositor,
-            capture: CaptureDispatcher::assemble().await,
+            capture: CaptureDispatcher::with_token_store(Some(token_store)).await,
             cache: Vec::new(),
             cached_at: None,
             idle_timeout,
-            portal_sessions: crate::portal_sessions::PortalSessionManager::new(
-                crate::single_instance::state_dir(),
-            ),
+            portal_sessions,
             ime_session: crate::ime_session::ImeSession::new(),
             ring_buffer: crate::ring_buffer::RingBuffer::new(),
         }
@@ -92,16 +97,17 @@ impl Daemon {
             .await
             .map_err(|e| (agent_shell_rpc::RpcErrorCode::BackendError, e.to_string()))?;
         self.cache = wins;
-        // 每个窗口变化推入环形缓冲（§22.5 D4——events --replay 数据源）。
-        for w in &self.cache {
-            self.ring_buffer.push(serde_json::json!({
-                "type": "window_list",
+        // 单条聚合事件推入环形缓冲（§22.5 D4——events --replay 数据源）。
+        // 逐窗口推送会快速淘汰历史且 replay 只见部分快照。
+        self.ring_buffer.push(serde_json::json!({
+            "type": "window_list",
+            "windows": self.cache.iter().map(|w| serde_json::json!({
                 "native_id": w.id.native_id,
                 "title": w.title,
                 "app_id": w.app_id,
                 "pid": w.pid,
-            }));
-        }
+            })).collect::<Vec<_>>(),
+        }));
         self.cached_at = Some(Instant::now());
         Ok((self.cache.clone(), false))
     }

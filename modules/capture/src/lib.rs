@@ -24,9 +24,23 @@ use agent_shell_core::error::{AgentShellError, Result};
 use async_trait::async_trait;
 
 pub use cache::CaptureCache;
-pub use portal_screencast::{CaptureTarget, Frame, PixelFormat, ScreenCastCapture};
+pub use portal_screencast::{
+    CaptureTarget, Frame, PersistMode, PixelFormat, ScreenCastCapture, ScreenCastOptions,
+    ScreenCastSession,
+};
 pub use portal_screenshot::{ScreenshotPortal, SCREENSHOT_MAX_ATTEMPTS, SCREENSHOT_TIMEOUT};
 pub use x11::X11Capture;
+
+/// portal restore_token 持久化抽象——daemon 侧 `PortalSessionManager` 实现。
+///
+/// capture 组件不直接依赖 daemon 的 `PortalSessionManager` 类型，经此 trait
+/// 解耦：daemon 装配时注入实现，capture 负责存/取 token。
+pub trait TokenStore: Send + Sync {
+    /// 取上次持久化的 restore_token（无则 None）。
+    fn get_restore_token(&self) -> Option<String>;
+    /// 保存新 restore_token（覆盖旧值；None 清除）。
+    fn save_restore_token(&self, token: Option<String>);
+}
 
 /// 组件名（doctor 报告用）。
 pub const COMPONENT_NAME: &str = "capture";
@@ -74,6 +88,9 @@ impl ActiveBackend {
 /// Screenshot → X11`。ScreenCast 会话建立需用户弹窗确认，构造期只做
 /// 无副作用探测（bus 上 portal 是否可达、DISPLAY 是否存在）；实际
 /// 后端在首次 `capture` 时惰性建立并记录到 `active`。
+///
+/// `token_store` 注入后，ScreenCast 优先尝试用持久化的 `restore_token`
+/// 静默恢复会话——恢复成功则无弹窗（无交互授权路径）。
 pub struct CaptureDispatcher {
     conn: zbus::Connection,
     screencast_ok: bool,
@@ -81,6 +98,8 @@ pub struct CaptureDispatcher {
     screenshot: ScreenshotPortal,
     x11_present: bool,
     active: std::sync::Mutex<Option<ActiveBackend>>,
+    /// restore_token 持久化（daemon 的 PortalSessionManager；无则 None）。
+    token_store: Option<std::sync::Arc<dyn TokenStore>>,
     /// 已建立的 ScreenCast 流会话（daemon 复用，避免反复弹窗 §21.22）。
     session: tokio::sync::Mutex<Option<std::sync::Arc<ScreenCastCapture>>>,
     /// X11 捕获器（惰性建连，daemon 复用连接——审查项 #5）。
@@ -88,8 +107,18 @@ pub struct CaptureDispatcher {
 }
 
 impl CaptureDispatcher {
-    /// 按探测链装配。全部后端不可用返回 `None`（TTY 场景）。
+    /// 按探测链装配（无 token 持久化）。全部后端不可用返回 `None`（TTY 场景）。
     pub async fn assemble() -> Option<Self> {
+        Self::with_token_store(None).await
+    }
+
+    /// 按探测链装配，注入 `restore_token` 持久化后端。
+    ///
+    /// `token_store` 为 daemon 的 `PortalSessionManager`；注入后 ScreenCast
+    /// 优先尝试 `restore_token` 静默恢复，避免交互弹窗（§22.7 D5）。
+    pub async fn with_token_store(
+        token_store: Option<std::sync::Arc<dyn TokenStore>>,
+    ) -> Option<Self> {
         let conn = zbus::Connection::session().await.ok()?;
         let screencast_ok = ScreenCastCapture::available(&conn).await;
         let screenshot = ScreenshotPortal::with_connection(conn.clone());
@@ -105,6 +134,7 @@ impl CaptureDispatcher {
             screenshot,
             x11_present,
             active: std::sync::Mutex::new(None),
+            token_store,
             session: tokio::sync::Mutex::new(None),
             x11: tokio::sync::OnceCell::new(),
         })
@@ -147,29 +177,61 @@ impl CaptureDispatcher {
 
     /// 单帧捕获：ScreenCast 流式取最新帧 → 失败/不可用降级 Screenshot → 再降级 X11。
     ///
-    /// ScreenCast 需用户弹窗授权且会话由本组件持有复用；`interactive=false`
-    /// 时跳过需要弹窗的后端（无持久化会话时直接走 Screenshot/X11）。
+    /// ScreenCast 会话优先尝试 `restore_token` 静默恢复（无弹窗）；
+    /// `interactive=true` 时允许弹窗授权（无 token 或恢复失败时）；
+    /// `interactive=false` 时仅当 `token_store` 含 `restore_token` 才尝试
+    /// ScreenCast——无 token 则直接降级到 Screenshot/X11（避免弹窗）。
     pub async fn capture(&self, target: CaptureTarget, interactive: bool) -> Result<CapturedFrame> {
         // L1: portal ScreenCast（流式，daemon 复用会话）。
-        if interactive && self.screencast_ok {
-            let mut guard = self.session.lock().await;
-            if guard.is_none() {
-                match ScreenCastCapture::start(self.conn.clone(), target).await {
-                    Ok(s) => *guard = Some(std::sync::Arc::new(s)),
-                    Err(e) => tracing::warn!("screencast start failed, degrade: {e}"),
-                }
-            }
-            if let Some(s) = guard.as_ref() {
-                match s.capture_frame().await {
-                    Ok(frame) => {
-                        self.set_active(Some(ActiveBackend::ScreenCast));
-                        return Ok(CapturedFrame::Pixels(frame));
+        if self.screencast_ok {
+            // interactive=false 且无 restore_token 时跳过——portal 无免弹窗选项。
+            let has_token = self
+                .token_store
+                .as_ref()
+                .and_then(|s| s.get_restore_token())
+                .is_some();
+            if interactive || has_token {
+                let mut guard = self.session.lock().await;
+                if guard.is_none() {
+                    let opts = self.build_screencast_options();
+                    match ScreenCastCapture::start_with_options(self.conn.clone(), target, &opts)
+                        .await
+                    {
+                        Ok(session) => {
+                            // Start 返回新 restore_token 时持久化（覆盖旧值，
+                            // token 单次有效）。persist_mode 未授权则无 token。
+                            if let Some(store) = &self.token_store {
+                                if let Some(new_token) = &session.restore_token {
+                                    store.save_restore_token(Some(new_token.clone()));
+                                }
+                            }
+                            *guard = Some(std::sync::Arc::new(session.capture));
+                        }
+                        Err(e) => {
+                            // 静默恢复失败（token 过期/会话不可用）且非交互
+                            // 时静默降级；交互时也继续尝试其它后端。
+                            if interactive {
+                                tracing::warn!("screencast start failed, degrade: {e}");
+                            } else {
+                                tracing::debug!(
+                                    "screencast restore/start failed (non-interactive): {e}"
+                                );
+                            }
+                        }
                     }
-                    Err(e) => {
-                        tracing::warn!("screencast frame failed, degrade: {e}");
-                        // 会话失效即丢弃，下次重新走五步流程。
-                        *guard = None;
-                        self.set_active(None);
+                }
+                if let Some(s) = guard.as_ref() {
+                    match s.capture_frame().await {
+                        Ok(frame) => {
+                            self.set_active(Some(ActiveBackend::ScreenCast));
+                            return Ok(CapturedFrame::Pixels(frame));
+                        }
+                        Err(e) => {
+                            tracing::warn!("screencast frame failed, degrade: {e}");
+                            // 会话失效即丢弃，下次重新走五步流程。
+                            *guard = None;
+                            self.set_active(None);
+                        }
                     }
                 }
             }
@@ -203,12 +265,33 @@ impl CaptureDispatcher {
         ))
     }
 
+    /// 构造 ScreenCast 建会话选项：尝试 restore_token 恢复 + persist_mode 持久化。
+    ///
+    /// 委托 [`screencast_options_for`]——纯函数，可单测。
+    fn build_screencast_options(&self) -> ScreenCastOptions {
+        screencast_options_for(self.token_store.as_deref())
+    }
+
     /// 关闭持有的 ScreenCast 会话（daemon 退出前调用）。
     pub async fn shutdown(&self) {
         if let Some(s) = self.session.lock().await.take() {
             let _ = s.close_session().await;
         }
     }
+}
+
+/// 从 `TokenStore` 构造 ScreenCast 建会话选项（纯函数，可单测）。
+///
+/// - 有 `token_store` 且存有 `restore_token`：传入以尝试静默恢复。
+/// - 有 `token_store`：设 `persist_mode = UntilRevoked` 使 Start 返回新 token。
+/// - 无 `token_store`：不设 persist_mode（portal 默认 0），每次弹窗。
+pub fn screencast_options_for(token_store: Option<&dyn TokenStore>) -> ScreenCastOptions {
+    let mut opts = ScreenCastOptions::default();
+    if let Some(store) = token_store {
+        opts.restore_token = store.get_restore_token();
+        opts.persist_mode = Some(PersistMode::UntilRevoked);
+    }
+    opts
 }
 
 #[async_trait]
@@ -262,5 +345,71 @@ pub async fn doctor_line(dispatcher: Option<&CaptureDispatcher>) -> String {
                 None => format!("⚠ {LABEL:<12}: 候选 {backends}（尚未实际建立会话）"),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use parking_lot::Mutex;
+
+    /// 内存 TokenStore——验证 CaptureDispatcher 的 token 注入/读取逻辑。
+    struct InMemoryTokenStore {
+        token: Mutex<Option<String>>,
+    }
+
+    impl TokenStore for InMemoryTokenStore {
+        fn get_restore_token(&self) -> Option<String> {
+            self.token.lock().clone()
+        }
+
+        fn save_restore_token(&self, token: Option<String>) {
+            *self.token.lock() = token;
+        }
+    }
+
+    #[test]
+    fn token_store_save_and_get() {
+        let store = InMemoryTokenStore {
+            token: Mutex::new(None),
+        };
+        assert!(store.get_restore_token().is_none());
+        store.save_restore_token(Some("tok1".into()));
+        assert_eq!(store.get_restore_token().as_deref(), Some("tok1"));
+        store.save_restore_token(None);
+        assert!(store.get_restore_token().is_none());
+    }
+
+    #[test]
+    fn screencast_options_with_token_and_stored_restore_token() {
+        // 有 token_store + 已存 token → options 应携带 restore_token
+        // 和 persist_mode=UntilRevoked。
+        let store = InMemoryTokenStore {
+            token: Mutex::new(Some("saved_token".into())),
+        };
+        let opts = screencast_options_for(Some(&store));
+        assert_eq!(opts.restore_token.as_deref(), Some("saved_token"));
+        assert_eq!(opts.persist_mode, Some(PersistMode::UntilRevoked));
+    }
+
+    #[test]
+    fn screencast_options_with_token_store_but_no_token() {
+        // 有 token_store 但无已存 token → persist_mode 设但 restore_token=None。
+        // portal 收到 persist_mode 无 restore_token → 首次授权弹窗，返回新 token。
+        let store = InMemoryTokenStore {
+            token: Mutex::new(None),
+        };
+        let opts = screencast_options_for(Some(&store));
+        assert!(opts.restore_token.is_none());
+        assert_eq!(opts.persist_mode, Some(PersistMode::UntilRevoked));
+    }
+
+    #[test]
+    fn screencast_options_without_token_store() {
+        // 无 token_store → options 应为默认（无 restore_token、无 persist_mode）。
+        // 这锚定无持久化时回退到弹窗路径的行为。
+        let opts = screencast_options_for(None);
+        assert!(opts.restore_token.is_none());
+        assert!(opts.persist_mode.is_none());
     }
 }

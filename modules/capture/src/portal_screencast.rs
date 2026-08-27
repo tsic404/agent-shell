@@ -1,10 +1,14 @@
 //! portal ScreenCast → PipeWire 流式捕获（设计文档 §13.2）。
 //!
-//! 流程固定五步：CreateSession → SelectSources → Start（用户确认弹窗）→
+//! 流程固定五步：CreateSession → SelectSources → Start →
 //! OpenPipeWireRemote 拿 (node_id, fd) → PipeWireNode 订阅节点取帧。
 //!
 //! 会话由常驻 daemon 持有复用（§21.22/21.24）：CLI 瞬态建会话会反复弹窗。
 //! ScreenCast 超时 10s / 重试 1 次（§19.3）。
+//!
+//! **无交互授权路径**（§22.7 D5）：`SelectSources` 携带 `persist_mode` +
+//! `restore_token`——portal 静默恢复先前会话，Start 不弹窗；
+//! Start 响应返回新 `restore_token` 由调用方持久化（token 单次有效）。
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -13,6 +17,42 @@ use agent_shell_core::error::{AgentShellError, Result};
 use zbus::zvariant::{self, ObjectPath};
 
 use crate::portal_common::{portal_proxy, wait_for_response, PORTAL_SERVICE};
+
+/// portal 会话持久化模式（xdg-desktop-portal ScreenCast §SelectSources persist_mode）。
+///
+/// 0 = 不持久化；1 = 应用运行期间持久；2 = 持久至显式撤销。
+/// 设计文档 §22.7 用 3 表示 persist_until_revoked，实际 portal 规范值为 2。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PersistMode {
+    /// 不持久化（默认）。
+    None,
+    /// 应用运行期间持久。
+    WhileRunning,
+    /// 持久至显式撤销——daemon 重启后可静默恢复。
+    UntilRevoked,
+}
+
+impl PersistMode {
+    fn as_u32(self) -> u32 {
+        match self {
+            PersistMode::None => 0,
+            PersistMode::WhileRunning => 1,
+            PersistMode::UntilRevoked => 2,
+        }
+    }
+}
+
+/// 建立 ScreenCast 会话的可选参数。
+///
+/// `restore_token` 用于尝试恢复先前持久化的会话（避免弹窗）；
+/// `persist_mode` 控制本次会话是否持久化、返回新 token。
+#[derive(Clone, Debug, Default)]
+pub struct ScreenCastOptions {
+    /// 尝试恢复的 restore_token（上次 Start 返回的新 token）。
+    pub restore_token: Option<String>,
+    /// 本次会话的持久化模式。None = 不设 persist_mode（portal 默认 0）。
+    pub persist_mode: Option<PersistMode>,
+}
 
 /// ScreenCast 通道默认超时（§19.3）。
 pub const SCREENCAST_TIMEOUT: Duration = Duration::from_secs(10);
@@ -89,22 +129,48 @@ pub struct ScreenCastCapture {
     worker: Option<std::thread::JoinHandle<()>>,
 }
 
+/// `start_with_options` 产出：捕获器 + Start 返回的新 `restore_token`。
+///
+/// 调用方应在持久化存储中用此新 token 覆盖旧值（token 单次有效）。
+pub struct ScreenCastSession {
+    /// 捕获器（`capture_frame` / `close_session` 委托给它）。
+    pub capture: ScreenCastCapture,
+    /// Start 响应返回的新 restore_token（persist_mode 授权后才有）。
+    pub restore_token: Option<String>,
+}
+
 impl ScreenCastCapture {
-    /// 走完整 portal 五步流程建立流。
+    /// 走完整 portal 五步流程建立流（无持久化/恢复）。
     ///
     /// 阻塞直至用户在 portal 弹窗确认（或超时 `SCREENCAST_TIMEOUT`）。
     pub async fn start(conn: zbus::Connection, target: CaptureTarget) -> Result<Self> {
+        let session = Self::start_with_options(conn, target, &ScreenCastOptions::default()).await?;
+        Ok(session.capture)
+    }
+
+    /// 走完整 portal 五步流程，携带 `persist_mode` / `restore_token`。
+    ///
+    /// 传 `restore_token` 时 portal 尝试静默恢复先前会话——恢复成功则
+    /// Start 不弹窗；失败则正常弹窗（portal 忽略无效 token）。
+    /// 设 `persist_mode` 后 Start 响应携带新 `restore_token`，经返回值
+    /// [`ScreenCastSession::restore_token`] 交调用方持久化。
+    pub async fn start_with_options(
+        conn: zbus::Connection,
+        target: CaptureTarget,
+        opts: &ScreenCastOptions,
+    ) -> Result<ScreenCastSession> {
         let proxy = portal_proxy(&conn, "org.freedesktop.portal.ScreenCast")
             .await
             .map_err(|e| AgentShellError::DBus(format!("ScreenCast proxy: {e}")))?;
-        Self::start_via_proxy(&conn, &proxy, target).await
+        Self::start_via_proxy(&conn, &proxy, target, opts).await
     }
 
     async fn start_via_proxy(
         conn: &zbus::Connection,
         proxy: &zbus::Proxy<'_>,
         target: CaptureTarget,
-    ) -> Result<Self> {
+        opts: &ScreenCastOptions,
+    ) -> Result<ScreenCastSession> {
         let pid = std::process::id();
         let token = format!("agent_shell_screencast_{}", std::process::id());
 
@@ -134,11 +200,18 @@ impl ScreenCastCapture {
                 .map_err(|e| AgentShellError::Capture(format!("bad session_handle: {e}")))?
                 .into_owned();
 
-        // 2. SelectSources：返回其 Request handle，须等 Response 才算完成。
+        // 2. SelectSources：persist_mode + restore_token 在此传入
+        //    （xdg-desktop-portal ScreenCast §SelectSources）。
         let mut o = std::collections::HashMap::<&str, zvariant::Value>::new();
         o.insert("handle_token", zvariant::Value::from(token.as_str()));
         o.insert("types", zvariant::Value::from(target.source_type_u32()));
         o.insert("multiple", zvariant::Value::from(false));
+        if let Some(pm) = opts.persist_mode {
+            o.insert("persist_mode", zvariant::Value::from(pm.as_u32()));
+        }
+        if let Some(rt) = &opts.restore_token {
+            o.insert("restore_token", zvariant::Value::from(rt.as_str()));
+        }
         let select_request: zvariant::OwnedObjectPath = proxy
             .call::<_, (
                 &ObjectPath<'_>,
@@ -148,8 +221,8 @@ impl ScreenCastCapture {
             .map_err(|e| AgentShellError::DBus(format!("SelectSources: {e}")))?;
         wait_for_response(conn, &select_request, SCREENCAST_TIMEOUT).await?;
 
-        // 3. Start：触发用户确认弹窗；Response（在其 Request handle 上）
-        //    携带 streams 数组。
+        // 3. Start：触发用户确认弹窗（或静默恢复）；Response 携带 streams
+        //    数组与可选的新 restore_token。
         let mut o = std::collections::HashMap::<&str, zvariant::Value>::new();
         o.insert("handle_token", zvariant::Value::from(token.as_str()));
         let start_request: zvariant::OwnedObjectPath = proxy
@@ -164,6 +237,9 @@ impl ScreenCastCapture {
         let node_id = extract_node_id(&results).ok_or_else(|| {
             AgentShellError::Capture("ScreenCast: no stream node in response".into())
         })?;
+        // Start 响应可能携带新 restore_token（persist_mode 授权后）。
+        let new_restore_token =
+            crate::portal_common::string_field(&results, "restore_token").map(str::to_owned);
 
         // 4. OpenPipeWireRemote → fd
         let fd: zbus::zvariant::OwnedFd = proxy
@@ -194,12 +270,15 @@ impl ScreenCastCapture {
             })
             .map_err(|e| AgentShellError::Other(Box::new(e)))?;
 
-        Ok(Self {
-            conn: conn.clone(),
-            session_path,
-            shutdown: shutdown_tx,
-            latest,
-            worker: Some(worker),
+        Ok(ScreenCastSession {
+            capture: Self {
+                conn: conn.clone(),
+                session_path,
+                shutdown: shutdown_tx,
+                latest,
+                worker: Some(worker),
+            },
+            restore_token: new_restore_token,
         })
     }
 
@@ -453,5 +532,38 @@ fn run_pipewire_node(
         mainloop
             .loop_()
             .iterate(pw::loop_::Timeout::Finite(Duration::from_millis(50)));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn persist_mode_as_u32_matches_portal_spec() {
+        // xdg-desktop-portal ScreenCast §SelectSources persist_mode：
+        // 0=none, 1=while_running, 2=until_revoked。
+        assert_eq!(PersistMode::None.as_u32(), 0);
+        assert_eq!(PersistMode::WhileRunning.as_u32(), 1);
+        assert_eq!(PersistMode::UntilRevoked.as_u32(), 2);
+    }
+
+    #[test]
+    fn options_default_has_no_persistence() {
+        // 默认选项不设 persist_mode、不传 restore_token——弹窗路径。
+        let opts = ScreenCastOptions::default();
+        assert!(opts.restore_token.is_none());
+        assert!(opts.persist_mode.is_none());
+    }
+
+    #[test]
+    fn options_with_token_and_persist_mode() {
+        // 完整无交互路径：restore_token + persist_mode=UntilRevoked。
+        let opts = ScreenCastOptions {
+            restore_token: Some("abc123".into()),
+            persist_mode: Some(PersistMode::UntilRevoked),
+        };
+        assert_eq!(opts.restore_token.as_deref(), Some("abc123"));
+        assert_eq!(opts.persist_mode, Some(PersistMode::UntilRevoked));
     }
 }
