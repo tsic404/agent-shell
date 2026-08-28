@@ -133,8 +133,10 @@ impl DdeCompositor {
         }
     }
 
-    /// doctor 输出（对照 §10.4 验证输出示例）。
-    pub fn doctor_lines(&self) -> Vec<String> {
+    /// doctor 输出的异步版本：deepin-kwin 分支先补齐 `/Scripting` 探测
+    /// 证据再渲染（TSI-2486 同款假阴性修复；TSI-2501 将 DDE 后端与
+    /// daemon doctor 的 async 契约对齐）。
+    pub async fn doctor_lines_async(&self) -> Vec<String> {
         let mut lines = Vec::new();
         lines.push(format!(
             "{} DDE 版本     : {} ({}/{} service families resolved)",
@@ -150,7 +152,8 @@ impl DdeCompositor {
         match &self.compositor {
             Compositor::DeepinKwin(kwin) => {
                 lines.extend(
-                    kwin.doctor_lines()
+                    kwin.doctor_lines_async()
+                        .await
                         .into_iter()
                         .map(|l| l.replace("KWin 服务", "deepin-kwin")),
                 );
@@ -476,7 +479,7 @@ mod tests {
     #[test]
     fn name_follows_design_contract() {
         // 组件名保持小写 kebab（registry 日志过滤用）；doctor 面向用户的
-        // 「DDE (Wayland, deepin-kwin)」行由 doctor_lines() 渲染。
+        // 「DDE (Wayland, deepin-kwin)」行由 doctor_lines_async() 渲染。
         let c = DdeCompositor::with_parts(Compositor::X11, DdeVersion::default());
         assert_eq!(c.name(), "dde-compositor");
     }
@@ -491,20 +494,20 @@ mod tests {
         }
     }
 
-    #[test]
-    fn doctor_lines_render_without_panicking_for_x11_branch() {
+    #[tokio::test]
+    async fn doctor_lines_async_render_without_panicking_for_x11_branch() {
         let c = DdeCompositor::with_parts(Compositor::X11, DdeVersion::default());
-        let lines = c.doctor_lines();
+        let lines = c.doctor_lines_async().await;
         assert_eq!(lines.len(), 3);
         assert!(lines[0].contains("unknown"));
         assert!(lines[2].contains("DDE 服务"));
     }
 
-    #[test]
-    fn major_label_used_in_doctor() {
+    #[tokio::test]
+    async fn major_label_used_in_doctor() {
         let v = DdeVersion::from_probes([("display".into(), "org.deepin.dde.Display1".into())]);
         assert_eq!(v.major(), DdeMajor::V25);
         let c = DdeCompositor::with_parts(Compositor::X11, v);
-        assert!(c.doctor_lines()[0].contains("DDE 25"));
+        assert!(c.doctor_lines_async().await[0].contains("DDE 25"));
     }
 }
