@@ -6,12 +6,14 @@
 #![forbid(unsafe_code)]
 #![allow(missing_docs)]
 
+pub mod audit;
 pub mod component;
 pub mod de_detection;
 pub mod error;
 pub mod event;
 pub mod fallback;
 pub mod registry;
+pub mod security;
 pub mod services;
 pub mod types;
 

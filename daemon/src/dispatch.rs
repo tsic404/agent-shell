@@ -4,6 +4,7 @@
 //! 异步收集（合成器 doctor_lines + a11y 探测），CLI 只做渲染。
 
 use crate::state::Daemon;
+use agent_shell_core::security::{Operation, PermissionDecision, PermissionLevel};
 use agent_shell_core::types::WindowInfo;
 use agent_shell_rpc::{
     method, A11yStatusResult, CaptureParams, DoctorResult, InfoResult, InputParams, Request,
@@ -13,6 +14,35 @@ use serde_json::{json, Value};
 
 /// 单请求处理入口。返回完整 Response（永不 panic——所有错误走 RPC error）。
 pub async fn dispatch(daemon: &mut Daemon, req: &Request) -> Response {
+    // 统一权限 gate（审查项 #4）：在真实命令入口 match 之前判定。
+    // `security.*` 是策略管理面（bootstrap 可达性）豁免普通级别 gate。
+    // 威胁模型（审查项 F2）：daemon stdin/控制 socket 属用户会话（同 UID），
+    // caller_id 由同 UID 进程经 env 注入、可伪造——按 caller_id 门禁不构成
+    // 额外权限边界。故 grant/revoke 提权原语以 `"*"` 为管理面边界：仅本地
+    // 调用方（未注入 agent id 的 CLI/MCP）可授权/撤销；具名 agent 必须经
+    // `"*"`。未知方法返回 None 交下方 match 报 MethodNotFound。
+    let management = security_operation_for(&req.method);
+    if management {
+        if let Some(reason) = check_management_permission(&daemon.caller_id) {
+            return Response::err(req.id, RpcErrorCode::Denied, reason);
+        }
+    }
+    if let Some(op) = operation_for(&req.method, &req.params) {
+        let caller = daemon.caller_id.clone();
+        match daemon.security.check_permission(&caller, &op) {
+            PermissionDecision::Allow => {}
+            PermissionDecision::Deny(reason) => {
+                return Response::err(req.id, RpcErrorCode::Denied, reason);
+            }
+            PermissionDecision::Confirm(mode) => {
+                return Response::err(
+                    req.id,
+                    RpcErrorCode::ConfirmationRequired,
+                    format!("{op} ({mode})"),
+                );
+            }
+        }
+    }
     let result = match req.method.as_str() {
         method::DOCTOR => doctor(daemon).await,
         method::INFO => info(daemon).await,
@@ -36,11 +66,11 @@ pub async fn dispatch(daemon: &mut Daemon, req: &Request) -> Response {
         method::IME_ENGINE_SET => ime_engine_set(daemon, req).await,
         method::IME_ENGINE_CURRENT => ime_engine_current(daemon).await,
         method::IME_TYPE => ime_type(daemon, req).await,
-        // ── 扩展系统服务（§21.35 stub）──
-        method::SECURITY_STATUS => stub_ok("security.status"),
-        method::SECURITY_GRANT => stub_ok("security.grant"),
-        method::SECURITY_REVOKE => stub_ok("security.revoke"),
-        method::SECURITY_AUDIT => stub_ok("security.audit"),
+        // ── 安全边界（§22.7 D6）──
+        method::SECURITY_STATUS => security_status(daemon).await,
+        method::SECURITY_GRANT => security_grant(daemon, req).await,
+        method::SECURITY_REVOKE => security_revoke(daemon, req).await,
+        method::SECURITY_AUDIT => security_audit(daemon, req).await,
         method::BRIGHTNESS_GET => stub_ok("brightness.get"),
         method::BRIGHTNESS_SET => stub_ok("brightness.set"),
         method::FILE_PICK => stub_ok("file.pick"),
@@ -80,6 +110,103 @@ pub async fn dispatch(daemon: &mut Daemon, req: &Request) -> Response {
     match result {
         Ok(v) => Response::ok(req.id, v),
         Err((code, msg)) => Response::err(req.id, code, msg),
+    }
+}
+
+/// 方法名 → 权限操作映射（统一 gate 用）。`security.*` 与未知方法返回 `None`。
+fn operation_for(method_name: &str, params: &Option<Value>) -> Option<Operation> {
+    use PermissionLevel::*;
+
+    if method_name == method::WINDOW_OP {
+        // windows.op 按 params.op 细分级别（close=L2，其余写操作=L1）。
+        let kind = params
+            .as_ref()
+            .and_then(|p| p.get("op"))
+            .and_then(|v| v.as_str());
+        return Some(match kind {
+            Some("close") => Operation::new("windows.close", L2),
+            Some("focus") => Operation::new("windows.focus", L1),
+            Some("move") => Operation::new("windows.move", L1),
+            Some("resize") => Operation::new("windows.resize", L1),
+            Some("minimize") => Operation::new("windows.minimize", L1),
+            _ => return None, // 非法/缺省 op 交 handler 报 InvalidParams。
+        });
+    }
+
+    const OPS: &[(&str, PermissionLevel)] = &[
+        (method::DOCTOR, L0),
+        (method::INFO, L0),
+        (method::WINDOWS_LIST, L0),
+        (method::WINDOW_INFO, L0),
+        (method::WORKSPACES_LIST, L0),
+        (method::WORKSPACE_SWITCH, L1),
+        (method::INPUT_SEND, L1),
+        (method::SCREENSHOT_CAPTURE, L2),
+        (method::A11Y_STATUS, L0),
+        (method::EVENTS_SUBSCRIBE, L0),
+        (method::EVENTS_UNSUBSCRIBE, L0),
+        (method::EVENTS_REPLAY, L0),
+        (method::DAEMON_STATUS, L0),
+        (method::DAEMON_SESSIONS, L0),
+        (method::IME_ENGINE_LIST, L0),
+        (method::IME_ENGINE_SET, L1),
+        (method::IME_ENGINE_CURRENT, L0),
+        (method::IME_TYPE, L1),
+        (method::BRIGHTNESS_GET, L0),
+        (method::BRIGHTNESS_SET, L1),
+        (method::FILE_PICK, L0),
+        (method::FILE_TRASH, L2),
+        (method::FILE_OPEN_DIR, L0),
+        (method::MIME_GET, L0),
+        (method::MIME_SET, L1),
+        (method::MIME_DEFAULT_BROWSER, L1),
+        (method::BLUETOOTH_SCAN, L0),
+        (method::BLUETOOTH_CONNECT, L1),
+        (method::BLUETOOTH_DISCONNECT, L1),
+        (method::BLUETOOTH_LIST, L0),
+        (method::FLATPAK_LIST, L0),
+        (method::FLATPAK_INSTALL, L2),
+        (method::SOFTWARE_UPDATES, L0),
+        (method::TOUCHPAD_STATUS, L0),
+        (method::TOUCHPAD_SET, L1),
+        (method::KBD_LAYOUT_LIST, L0),
+        (method::KBD_LAYOUT_SET, L1),
+        (method::SECRET_SET, L3),
+        (method::SECRET_GET, L3),
+        (method::SHORTCUT_BIND, L1),
+        (method::SHORTCUT_TRIGGER, L1),
+        (method::TIMER_LIST, L0),
+        (method::TIMER_NEXT, L0),
+        (method::SERVICE_CONTROL, L3),
+        (method::SYSTEM_LOG_VIEW, L0),
+        (method::ROOTD_HELLO, L0),
+    ];
+    OPS.iter()
+        .find(|(m, _)| *m == method_name)
+        .map(|(m, l)| Operation::new(m, *l))
+}
+
+/// `grant` / `revoke` 为提权原语，门禁策略与普通操作不同：两者按
+/// §22.7「所有命令必经」落 caller 校验（F2）。`"*"` 是本地调用方
+/// （未注入 `AGENT_SHELL_AGENT_ID` 的 CLI/MCP 子进程），放行；具名 agent
+/// 不可自行授予白名单，必须经 `"*"`（本地用户/编排层）完成。其余
+/// `security.*` 管理面（status/audit）只读，免 caller 校验。
+fn security_operation_for(method_name: &str) -> bool {
+    matches!(
+        method_name,
+        method::SECURITY_GRANT | method::SECURITY_REVOKE
+    )
+}
+
+/// 管理面 caller 门禁：`"*"` 放行，其余拒绝。
+fn check_management_permission(caller_id: &str) -> Option<String> {
+    if caller_id == "*" {
+        None
+    } else {
+        Some(format!(
+            "security grant/revoke requires local caller (got {caller_id:?}); \
+             set AGENT_SHELL_AGENT_ID=* for the local orchestrator"
+        ))
     }
 }
 
@@ -283,6 +410,85 @@ async fn a11y_status() -> RpcResult {
 
 // ───────────────────────── 事件 / daemon / IME ─────────────────────────
 
+// ───────────────────────── 安全边界（§22.7 D6）─────────────────────────
+
+/// 返回当前安全配置真值：默认确认级别、白名单、黑名单、审计路径。
+async fn security_status(d: &mut Daemon) -> RpcResult {
+    let cfg = &d.security.config;
+    let allow: serde_json::Map<_, _> = cfg
+        .permissions
+        .allow
+        .iter()
+        .map(|(agent, levels)| {
+            (
+                agent.clone(),
+                serde_json::Value::Array(
+                    levels
+                        .iter()
+                        .map(|l| serde_json::Value::from(l.as_str()))
+                        .collect(),
+                ),
+            )
+        })
+        .collect();
+    Ok(json!({
+        "default_confirm_level": cfg.security.default_confirm_level.as_str(),
+        "allow": allow,
+        "deny": cfg.permissions.deny,
+        "audit_path": d.security.audit.path(),
+    }))
+}
+
+/// `security.grant {agent_id, level}` —— 授权 agent 到指定级别并持久化。
+async fn security_grant(d: &mut Daemon, req: &Request) -> RpcResult {
+    let params = params_of(req)?;
+    let agent_id = params
+        .get("agent_id")
+        .and_then(|v| v.as_str())
+        .ok_or((RpcErrorCode::InvalidParams, "missing agent_id".into()))?;
+    let level = params
+        .get("level")
+        .and_then(|v| v.as_str())
+        .ok_or((RpcErrorCode::InvalidParams, "missing level".into()))?
+        .parse::<agent_shell_core::security::PermissionLevel>()
+        .map_err(|e| (RpcErrorCode::InvalidParams, e))?;
+    d.security.grant(agent_id, level).map_err(|e| {
+        tracing::warn!("security.grant failed: {e}");
+        (RpcErrorCode::InternalError, e)
+    })?;
+    Ok(json!({"granted": agent_id, "level": level.as_str()}))
+}
+
+/// `security.revoke {agent_id}` —— 撤销 agent 白名单并持久化。
+async fn security_revoke(d: &mut Daemon, req: &Request) -> RpcResult {
+    let params = params_of(req)?;
+    let agent_id = params
+        .get("agent_id")
+        .and_then(|v| v.as_str())
+        .ok_or((RpcErrorCode::InvalidParams, "missing agent_id".into()))?;
+    d.security.revoke(agent_id).map_err(|e| {
+        tracing::warn!("security.revoke failed: {e}");
+        (RpcErrorCode::InternalError, e)
+    })?;
+    Ok(json!({"revoked": agent_id}))
+}
+
+/// `security.audit [{agent_id}, {op}, {decision}]` —— 过滤读回审计日志。
+async fn security_audit(d: &mut Daemon, req: &Request) -> RpcResult {
+    let params = req.params.as_ref().cloned().unwrap_or_default();
+    let agent_id = params
+        .get("agent_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let op = params.get("op").and_then(|v| v.as_str()).unwrap_or("");
+    let decision = params
+        .get("decision")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let entries = d.security.audit.query(agent_id, op, decision);
+    Ok(json!({"entries": entries}))
+}
+
 /// stub_ok — 扩展系统服务的占位响应（§21.35，待 Phase 3 接线）。
 fn stub_ok(name: &str) -> RpcResult {
     Ok(json!({"status": "not_implemented", "service": name}))
@@ -468,6 +674,7 @@ async fn system_log_view(_d: &mut Daemon, req: &Request) -> RpcResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agent_shell_core::security::{AgentShellConfig, SecurityManager};
     use agent_shell_rpc::method;
     use std::time::Duration;
 
@@ -576,5 +783,108 @@ mod tests {
         let v = resp.result.expect("replay ok");
         let count = v.get("count").and_then(|v| v.as_u64()).expect("count");
         assert_eq!(count, 1);
+    }
+
+    #[tokio::test]
+    async fn deny_short_circuits_before_handler() {
+        let mut d = Daemon::connect(Duration::from_secs(1)).await;
+        d.security
+            .config
+            .permissions
+            .deny
+            .insert("input.send".into(), true);
+        let resp = dispatch(&mut d, &req(method::INPUT_SEND, Some(json!({})))).await;
+        assert_eq!(resp.error.expect("error").code, RpcErrorCode::Denied as i32);
+    }
+
+    #[tokio::test]
+    async fn above_level_without_whitelist_returns_confirmation_required() {
+        // 默认配置：`"*"` 无白名单 → service.control（L3）需确认。
+        let mut d = Daemon::connect(Duration::from_secs(1)).await;
+        let resp = dispatch(&mut d, &req(method::SERVICE_CONTROL, Some(json!({})))).await;
+        assert_eq!(
+            resp.error.expect("error").code,
+            RpcErrorCode::ConfirmationRequired as i32
+        );
+    }
+
+    #[tokio::test]
+    async fn allow_passes_gate_and_reaches_handler() {
+        let mut d = Daemon::connect(Duration::from_secs(1)).await;
+        d.caller_id = "trusted".into();
+        d.security
+            .config
+            .permissions
+            .allow
+            .insert("trusted".into(), vec![PermissionLevel::L4]);
+        // gate 已过、handler 已执行：bad payload 返回 InvalidParams（而非 Denied）。
+        let resp = dispatch(
+            &mut d,
+            &req(
+                method::INPUT_SEND,
+                Some(json!({ "kind": "key", "payload": {} })),
+            ),
+        )
+        .await;
+        assert_eq!(
+            resp.error.expect("error").code,
+            RpcErrorCode::InvalidParams as i32
+        );
+    }
+
+    #[tokio::test]
+    async fn screenshot_capture_requires_confirmation_when_whitelist_below_l2() {
+        // F1：截图含屏幕内容，L2；`"*"` 白名单只有 L1 时必须确认（L0 只读
+        // 不会触发确认，故该断言同时证明截图不再是 L0 只读映射）。
+        let mut d = Daemon::connect(Duration::from_secs(1)).await;
+        d.security
+            .config
+            .permissions
+            .allow
+            .insert("*".into(), vec![PermissionLevel::L1]);
+        let resp = dispatch(&mut d, &req(method::SCREENSHOT_CAPTURE, Some(json!({})))).await;
+        assert_eq!(
+            resp.error.expect("error").code,
+            RpcErrorCode::ConfirmationRequired as i32
+        );
+    }
+
+    #[tokio::test]
+    async fn grant_revoked_for_named_agent() {
+        // F2：具名 caller 不可自我提权——grant/revoke 必须经 `"*"`。
+        let mut d = Daemon::connect(Duration::from_secs(1)).await;
+        d.caller_id = "agent-x".into();
+        d.security = SecurityManager::with_config(AgentShellConfig::default());
+        let resp = dispatch(
+            &mut d,
+            &req(
+                method::SECURITY_GRANT,
+                Some(json!({"agent_id": "agent-x", "level": "L4"})),
+            ),
+        )
+        .await;
+        let err = resp.error.expect("error");
+        assert_eq!(err.code, RpcErrorCode::Denied as i32);
+        assert!(!d.security.config.permissions.allow.contains_key("agent-x"));
+    }
+
+    #[tokio::test]
+    async fn grant_allowed_for_local_caller() {
+        // F2 反例：`"*"`（本地 CLI/MCP，未注入 agent id）通过门禁、可达 handler。
+        // 非法 level 由 handler 报 InvalidParams——合法 grant 会写盘污染真实配置，
+        // 故用 InvalidParams 断言门禁放行；成功 grant 路径由 core security 测试覆盖。
+        let mut d = Daemon::connect(Duration::from_secs(1)).await;
+        let resp = dispatch(
+            &mut d,
+            &req(
+                method::SECURITY_GRANT,
+                Some(json!({"agent_id": "agent-x", "level": "INVALID"})),
+            ),
+        )
+        .await;
+        assert_eq!(
+            resp.error.expect("error").code,
+            RpcErrorCode::InvalidParams as i32
+        );
     }
 }

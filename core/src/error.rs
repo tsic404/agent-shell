@@ -38,6 +38,11 @@ pub enum AgentShellError {
     #[error("Permission denied: {0}")]
     Permission(String),
 
+    /// 操作需要用户交互确认（L3/L4 或确认覆盖命中）；纯后端阶段由
+    /// router 短路返回，真正弹窗在 `daemon/safety.rs`。
+    #[error("Confirmation required: {0}")]
+    ConfirmationRequired(String),
+
     /// 操作超时（等待窗口出现/portal 应答超时）。
     #[error("Timeout: {0}")]
     Timeout(String),

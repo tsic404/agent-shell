@@ -30,6 +30,11 @@ pub struct Daemon {
     pub ime_session: crate::ime_session::ImeSession,
     /// 事件环形缓冲（§22.5 D4，CLI `events --replay`）。
     pub ring_buffer: crate::ring_buffer::RingBuffer<serde_json::Value>,
+    /// 安全判定（§22.7 D6）：daemon 层唯一权限入口。
+    pub security: agent_shell_core::security::SecurityManager,
+    /// 发起调用的 agent 身份。由宿主编排层在启动 CLI/MCP 前经
+    /// `AGENT_SHELL_AGENT_ID` 注入，子进程经 fork/exec 继承；未设置回落 `"*"`。
+    pub caller_id: String,
 }
 
 impl Daemon {
@@ -57,6 +62,14 @@ impl Daemon {
         );
         let token_store: std::sync::Arc<dyn agent_shell_capture::TokenStore> =
             std::sync::Arc::clone(&portal_sessions) as _;
+        let caller_id = std::env::var("AGENT_SHELL_AGENT_ID").unwrap_or_else(|_| "*".to_string());
+        let security =
+            agent_shell_core::security::SecurityManager::load_default().unwrap_or_else(|e| {
+                tracing::warn!("security config load failed, falling back to defaults: {e}");
+                agent_shell_core::security::SecurityManager::with_config(
+                    agent_shell_core::security::AgentShellConfig::default(),
+                )
+            });
         Self {
             compositor,
             capture: CaptureDispatcher::with_token_store(Some(token_store)).await,
@@ -66,6 +79,8 @@ impl Daemon {
             portal_sessions,
             ime_session: crate::ime_session::ImeSession::new(),
             ring_buffer: crate::ring_buffer::RingBuffer::new(),
+            security,
+            caller_id,
         }
     }
 

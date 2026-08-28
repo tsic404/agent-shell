@@ -15,9 +15,10 @@ use agent_shell_core::component::{
     BackendCapabilities, ComponentHealth, ComponentType, CompositorComponent, DesktopComponent,
 };
 use agent_shell_core::error::{AgentShellError, Result};
+use agent_shell_core::security::{AgentShellConfig, ConfirmMode, SecurityManager};
 use agent_shell_core::types::{
-    CaptureTarget, DesktopEnvironment, Key, MonitorInfo, MouseButton, Rect, SemanticTarget,
-    TitleMatchMode, WindowId, WindowInfo, WorkspaceId, WorkspaceInfo,
+    CaptureTarget, DesktopEnvironment, Key, KeyCombo, MonitorInfo, MouseButton, Rect,
+    SemanticTarget, TitleMatchMode, WindowId, WindowInfo, WorkspaceId, WorkspaceInfo,
 };
 use async_trait::async_trait;
 
@@ -158,6 +159,7 @@ impl CompositorComponent for MockCompositor {
 #[derive(Default)]
 struct MockInput {
     typed: Mutex<Vec<String>>,
+    sent: Mutex<usize>,
 }
 
 #[async_trait]
@@ -167,6 +169,7 @@ impl InputDispatcher for MockInput {
         Ok(())
     }
     async fn send_key_combo(&self, _keys: &[Key]) -> Result<()> {
+        *self.sent.lock() += 1;
         Ok(())
     }
     async fn mouse_move(&self, _x: i32, _y: i32) -> Result<()> {
@@ -222,6 +225,10 @@ impl ElementActions for FailingSetTextA11y {
 
 // ───────────────────────── 构造辅助 ─────────────────────────
 
+fn default_security() -> Arc<SecurityManager> {
+    Arc::new(SecurityManager::with_config(AgentShellConfig::default()))
+}
+
 fn make_executor(
     compositor: MockCompositor,
 ) -> (Executor, Arc<Mutex<Vec<String>>>, Arc<MockInput>) {
@@ -232,6 +239,7 @@ fn make_executor(
         input.clone(),
         Arc::new(MockCapture),
         Arc::new(FailingSetTextA11y),
+        default_security(),
     );
     (ex, focused, input)
 }
@@ -496,6 +504,7 @@ async fn wait_for_window_succeeds_once_window_appears() {
         input.clone(),
         Arc::new(MockCapture),
         Arc::new(FailingSetTextA11y),
+        default_security(),
     );
 
     let res = ex
@@ -520,6 +529,7 @@ async fn type_text_falls_back_to_input_when_a11y_set_text_fails() {
         input.clone(),
         Arc::new(MockCapture),
         Arc::new(FailingSetTextA11y),
+        default_security(),
     );
 
     let res = ex
@@ -532,6 +542,67 @@ async fn type_text_falls_back_to_input_when_a11y_set_text_fails() {
 
     assert!(matches!(res, CommandResult::Success));
     assert_eq!(input.typed.lock().as_slice(), ["hello fallback"]);
+}
+
+#[tokio::test]
+async fn denied_command_short_circuits_before_execution() {
+    // 黑名单命中 → execute 入口返回 Permission，不触达 backend。
+    let mut config = AgentShellConfig::default();
+    config.permissions.deny.insert("input.send".into(), true);
+    let security = Arc::new(SecurityManager::with_config(config));
+
+    let comp = MockCompositor::new(vec![win("w", "t", "app")]);
+    let input = Arc::new(MockInput::default());
+    let ex = Executor::new(
+        Box::new(comp),
+        input.clone(),
+        Arc::new(MockCapture),
+        Arc::new(FailingSetTextA11y),
+        security,
+    );
+
+    let err = ex
+        .execute(Command::SendKey {
+            combo: KeyCombo {
+                keys: vec![Key::Char('a')],
+                modifiers: Default::default(),
+            },
+        })
+        .await
+        .expect_err("denied command must fail");
+    assert!(matches!(err, AgentShellError::Permission(_)));
+    assert_eq!(*input.sent.lock(), 0, "no key must be injected");
+}
+
+#[tokio::test]
+async fn confirm_override_returns_confirmation_required() {
+    // 操作确认覆盖命中 → 纯后端阶段返回 ConfirmationRequired 占位。
+    let mut config = AgentShellConfig::default();
+    config
+        .operations
+        .confirm
+        .insert("input.send".into(), ConfirmMode::Always);
+    let security = Arc::new(SecurityManager::with_config(config));
+
+    let comp = MockCompositor::new(vec![win("w", "t", "app")]);
+    let ex = Executor::new(
+        Box::new(comp),
+        Arc::new(MockInput::default()),
+        Arc::new(MockCapture),
+        Arc::new(FailingSetTextA11y),
+        security,
+    );
+
+    let err = ex
+        .execute(Command::SendKey {
+            combo: KeyCombo {
+                keys: vec![Key::Char('b')],
+                modifiers: Default::default(),
+            },
+        })
+        .await
+        .expect_err("confirm override must gate");
+    assert!(matches!(err, AgentShellError::ConfirmationRequired(_)));
 }
 
 #[tokio::test]

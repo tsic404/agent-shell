@@ -6,6 +6,7 @@
 
 use std::time::Duration;
 
+use agent_shell_core::security::{Operation, PermissionLevel};
 use agent_shell_core::types::{
     CaptureTarget, KeyCombo, MouseButton, Rect, SemanticTarget, WindowFilter, WorkspaceId,
 };
@@ -92,6 +93,44 @@ pub enum Command {
     GetDesktopInfo,
     /// 获取后端组件状态。
     GetBackendStatus,
+}
+
+impl Command {
+    /// 本命令对应的权限操作（§22.7 D6：全部命令必经 SecurityManager）。
+    ///
+    /// 分级按 §21.21.1：L0 只读 / L1 低风险 / L2 中风险 / L3 高风险 /
+    /// L4 系统级。窗口类写操作聚焦/移动/缩放/最小化/切换均为可逆小影响
+    /// → L1；CloseWindow 关窗口数据丢失不可逆 → L2；截图内容敏感非只读
+    /// → L2（与 daemon 权威 gate 一致）；无障碍读/等待轮询只读 → L0；
+    /// 输入注入影响其它应用 → L1。
+    pub fn operation(&self) -> Operation {
+        use PermissionLevel::*;
+        match self {
+            Self::ListWindows { .. } => Operation::new("windows.list", L0),
+            Self::GetActiveWindow => Operation::new("windows.info", L0),
+            Self::FocusWindow { .. } => Operation::new("windows.focus", L1),
+            Self::MoveWindow { .. } => Operation::new("windows.move", L1),
+            Self::ResizeWindow { .. } => Operation::new("windows.resize", L1),
+            Self::MinimizeWindow { .. } => Operation::new("windows.minimize", L1),
+            Self::CloseWindow { .. } => Operation::new("windows.close", L2),
+            Self::SetWindowGeometry { .. } => Operation::new("windows.geometry", L1),
+            Self::ListWorkspaces => Operation::new("workspaces.list", L0),
+            Self::SwitchWorkspace { .. } => Operation::new("workspaces.switch", L1),
+            Self::MoveWindowToWorkspace { .. } => Operation::new("workspaces.move_window", L1),
+            Self::SendKey { .. } => Operation::new("input.send", L1),
+            Self::TypeText { .. } => Operation::new("input.type", L1),
+            Self::MouseClick { .. } => Operation::new("input.click", L1),
+            Self::MouseMove { .. } => Operation::new("input.move", L1),
+            Self::Scroll { .. } => Operation::new("input.scroll", L1),
+            Self::Screenshot { .. } => Operation::new("screenshot.capture", L2),
+            Self::GetElementText { .. } => Operation::new("a11y.element_text", L0),
+            Self::GetA11yTree { .. } => Operation::new("a11y.tree", L0),
+            Self::WaitForWindow { .. } => Operation::new("wait.window", L0),
+            Self::WaitForText { .. } => Operation::new("wait.text", L0),
+            Self::GetDesktopInfo => Operation::new("system.desktop_info", L0),
+            Self::GetBackendStatus => Operation::new("system.backend_status", L0),
+        }
+    }
 }
 
 /// 命令执行结果。

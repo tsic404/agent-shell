@@ -9,6 +9,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use agent_shell_core::component::CompositorComponent;
 use agent_shell_core::error::{AgentShellError, Result};
+use agent_shell_core::security::{PermissionDecision, SecurityManager};
 use agent_shell_core::types::{SemanticTarget, TitleMatchMode, WindowInfo};
 
 use crate::command::{Command, CommandResult};
@@ -16,12 +17,13 @@ use crate::dispatcher::{not_implemented, CaptureDispatcher, ElementActions, Inpu
 
 /// 等待类命令的轮询步进（design/11 §19.3 默认值配套）。
 const POLL_STEP: Duration = Duration::from_millis(100);
-
 pub struct Executor {
     backend: Box<dyn CompositorComponent>,
     input: Arc<dyn InputDispatcher>,
     capture: Arc<dyn CaptureDispatcher>,
     a11y: Arc<dyn ElementActions>,
+    /// 安全判定入口（§22.7 D6）：`execute()` 在分派前统一调用。
+    security: Arc<SecurityManager>,
 }
 
 impl Executor {
@@ -30,16 +32,30 @@ impl Executor {
         input: Arc<dyn InputDispatcher>,
         capture: Arc<dyn CaptureDispatcher>,
         a11y: Arc<dyn ElementActions>,
+        security: Arc<SecurityManager>,
     ) -> Self {
         Self {
             backend,
             input,
             capture,
             a11y,
+            security,
         }
     }
-
     pub async fn execute(&self, cmd: Command) -> Result<CommandResult> {
+        // §22.7 D6：SecurityManager 是唯一入口，全部命令必经。agent_id
+        // 本层不可知（无 caller 上下文），以 `"*"` 走默认策略——daemon
+        // 层持有真实 agent 身份时在调用前以显式 id 复核。
+        let op = cmd.operation();
+        match self.security.check_permission("*", &op) {
+            PermissionDecision::Allow => {}
+            PermissionDecision::Deny(reason) => return Err(AgentShellError::Permission(reason)),
+            PermissionDecision::Confirm(mode) => {
+                return Err(AgentShellError::ConfirmationRequired(format!(
+                    "{op} ({mode})"
+                )))
+            }
+        }
         match cmd {
             // ── 窗口 ──
             Command::ListWindows { filter } => {

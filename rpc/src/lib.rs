@@ -302,6 +302,8 @@ pub enum RpcErrorCode {
     Denied = 1004,
     /// 底层系统调用失败。
     BackendError = 1005,
+    /// 需要用户确认（安全判定为 Confirm，纯后端无 UI 时短路返回）。
+    ConfirmationRequired = 1006,
 }
 
 // ───────────────────────── 载荷定义 ─────────────────────────
