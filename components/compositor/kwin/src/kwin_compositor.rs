@@ -132,6 +132,28 @@ impl KWinCompositor {
         })
     }
 
+    /// 测试注入点（TSI-2502）：仅测试可用，直接给定桥接连接与
+    /// `scripting_probe` 初值，绕过真实显示服务器/版本探测路径。
+    ///
+    /// 生产构造路径（`new_wayland` / `new_x11`）不受影响；本构造函数
+    /// 不触碰 `ensure_scripting_probe` 的真实探测逻辑。
+    #[cfg(test)]
+    pub(crate) fn for_test(bridge: KWinBridge, probe: u8) -> Self {
+        use std::sync::atomic::AtomicU8;
+        Self {
+            wayland_core: None,
+            protocols: None,
+            bridge,
+            x11: None,
+            version: KWinVersion {
+                full: "6.1.4".into(),
+                major: crate::version::KWinMajor::V6,
+            },
+            event_handle: AsyncMutex::new(None),
+            scripting_probe: AtomicU8::new(probe),
+        }
+    }
+
     /// 会话类型。
     pub fn session_kind(&self) -> SessionKind {
         if self.wayland_core.is_some() {
@@ -748,10 +770,120 @@ impl CompositorComponent for KWinCompositor {
     }
 }
 
-/// 测试与诊断：通道组合摘要。
+/// 测试与诊断：通道组合摘要 + `/Scripting` 探测三态迁移（TSI-2502）。
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Stdio;
+
+    /// 独立私有 session bus（避免 `Connection::session()` 环境变量在并行
+    /// 测试间竞争）。daemon 与桥接/被测对象共享同一地址。
+    struct TestBus {
+        addr: String,
+        _child: std::process::Child,
+    }
+
+    impl TestBus {
+        async fn start() -> Self {
+            let mut child = std::process::Command::new("dbus-daemon")
+                .args(["--session", "--nofork", "--print-address=1"])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("dbus-daemon must be installed for kwin probe tests");
+            let stdout = child.stdout.take().expect("piped stdout");
+            let addr = read_address_line(stdout);
+            assert!(
+                addr.starts_with("unix:"),
+                "dbus-daemon printed unexpected address: {addr:?}"
+            );
+            Self {
+                addr,
+                _child: child,
+            }
+        }
+
+        async fn connect(&self) -> zbus::Connection {
+            zbus::connection::Builder::address(self.addr.as_str())
+                .expect("dbus-daemon address must parse")
+                .build()
+                .await
+                .expect("connect to private session bus")
+        }
+    }
+
+    impl Drop for TestBus {
+        fn drop(&mut self) {
+            let _ = self._child.kill();
+            let _ = self._child.wait();
+        }
+    }
+
+    /// 逐字节读地址行：`dbus-daemon --print-address=1` 恰好一行，
+    /// 不依赖 `read_line` 缓冲是否越界吞掉后续（daemon 无后续输出）。
+    fn read_address_line(stdout: std::process::ChildStdout) -> String {
+        use std::io::Read as _;
+        let mut reader = std::io::BufReader::new(stdout);
+        let mut bytes = Vec::new();
+        loop {
+            let mut buf = [0u8; 1];
+            match reader.read_exact(&mut buf) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                Err(e) => panic!("read dbus-daemon address: {e}"),
+            }
+            bytes.push(buf[0]);
+            if buf[0] == b'\n' {
+                break;
+            }
+        }
+        let line = String::from_utf8(bytes).expect("dbus-daemon address must be UTF-8");
+        assert!(!line.is_empty(), "dbus-daemon printed no address line");
+        line.trim_end_matches('\n').to_string()
+    }
+    /// 注册 org.kde.KWin 的 /Scripting 单例（仅声明接口，供 introspect 判定）。
+    #[derive(Clone, Copy)]
+    struct KWinScripting;
+
+    #[zbus::interface(name = "org.kde.kwin.Scripting")]
+    impl KWinScripting {
+        fn load_script(&self, _file_path: String, _plugin_name: String) -> i32 {
+            0
+        }
+    }
+
+    impl KWinScripting {
+        fn new() -> Self {
+            Self
+        }
+    }
+
+    async fn spawn_fake_kwin(bus: &TestBus) -> zbus::Connection {
+        let conn = bus.connect().await;
+        conn.object_server()
+            .at("/Scripting", KWinScripting::new())
+            .await
+            .expect("register /Scripting");
+        use zbus::names::WellKnownName;
+        let name = WellKnownName::try_from("org.kde.KWin".to_string()).expect("valid bus name");
+        conn.request_name(name).await.expect("claim org.kde.KWin");
+        conn
+    }
+
+    async fn bridge(bus: &TestBus) -> KWinBridge {
+        let conn = bus.connect().await;
+        KWinBridge::with_connection(conn)
+            .await
+            .expect("build KWinBridge on private bus")
+    }
+
+    fn has_ready_bridge(lines: &[String]) -> bool {
+        lines.iter().any(|l| l.contains("✓ D-Bus 桥接"))
+    }
+
+    fn has_not_ready_bridge(lines: &[String]) -> bool {
+        lines.iter().any(|l| l.contains("未就绪"))
+    }
 
     #[test]
     fn session_kind_names() {
@@ -760,5 +892,65 @@ mod tests {
             format!("{:?}", SessionKind::Wayland),
             format!("{:?}", SessionKind::X11)
         );
+    }
+
+    /// 三态迁移：`None`（PROBE_UNSET）触发探测 → 成功升级为 Some(true)。
+    #[tokio::test]
+    async fn unset_probe_triggers_probe_and_becomes_ok() {
+        let bus = TestBus::start().await;
+        let _kwin = spawn_fake_kwin(&bus).await;
+        let comp = KWinCompositor::for_test(bridge(&bus).await, PROBE_UNSET);
+
+        assert_eq!(comp.scripting_probe_ok(), None);
+        let lines = comp.doctor_lines_async().await;
+
+        assert_eq!(comp.scripting_probe_ok(), Some(true));
+        assert!(has_ready_bridge(&lines));
+    }
+
+    /// TSI-2486 回归守卫：`Some(false)`（PROBE_FAIL）必须重试，不能把
+    /// 一次性失败固化为永不重试的假阴性。
+    #[tokio::test]
+    async fn failed_probe_is_retried_and_becomes_ok() {
+        let bus = TestBus::start().await;
+        // 先建桥（无 org.kde.KWin 服务），在桥接上探测一次失败。
+        let comp = KWinCompositor::for_test(bridge(&bus).await, PROBE_UNSET);
+        let _ = comp.ensure_scripting_probe().await;
+        assert_eq!(comp.scripting_probe_ok(), Some(false));
+
+        // 服务事后可达——旧失败必须被重试，升级为确认态。
+        let _kwin = spawn_fake_kwin(&bus).await;
+        let lines = comp.doctor_lines_async().await;
+
+        assert_eq!(comp.scripting_probe_ok(), Some(true));
+        assert!(has_ready_bridge(&lines));
+    }
+
+    /// 三态迁移：`Some(true)`（PROBE_OK）短路，不再发探测。
+    #[tokio::test]
+    async fn ok_probe_short_circuits_without_probing() {
+        let bus = TestBus::start().await;
+        // 不注册 org.kde.KWin：若短路失败，doctor_lines_async 会重测并
+        // 把 PROBE_OK 覆写为 PROBE_FAIL。
+        let comp = KWinCompositor::for_test(bridge(&bus).await, PROBE_OK);
+
+        let lines = comp.doctor_lines_async().await;
+
+        assert_eq!(comp.scripting_probe_ok(), Some(true));
+        assert!(has_ready_bridge(&lines));
+    }
+
+    /// 三态迁移：`Some(false)` 服务仍不可达 → 保持 PROBE_FAIL，桥接行
+    /// 报「未就绪」而非「未探测」。
+    #[tokio::test]
+    async fn failed_probe_remains_failed_when_still_unreachable() {
+        let bus = TestBus::start().await;
+        let comp = KWinCompositor::for_test(bridge(&bus).await, PROBE_FAIL);
+
+        let lines = comp.doctor_lines_async().await;
+
+        assert_eq!(comp.scripting_probe_ok(), Some(false));
+        assert!(has_not_ready_bridge(&lines));
+        assert!(!has_ready_bridge(&lines));
     }
 }
