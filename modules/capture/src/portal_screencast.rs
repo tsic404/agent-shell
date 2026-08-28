@@ -16,7 +16,10 @@ use std::time::Duration;
 use agent_shell_core::error::{AgentShellError, Result};
 use zbus::zvariant::{self, ObjectPath};
 
-use crate::portal_common::{portal_proxy, wait_for_response, PORTAL_SERVICE};
+use crate::portal_common::{
+    drain_response, portal_proxy, prepare_response_stream, sender_part, wait_for_response,
+    PORTAL_SERVICE,
+};
 
 /// portal 会话持久化模式（xdg-desktop-portal ScreenCast §SelectSources persist_mode）。
 ///
@@ -172,13 +175,24 @@ impl ScreenCastCapture {
         opts: &ScreenCastOptions,
     ) -> Result<ScreenCastSession> {
         let pid = std::process::id();
-        let token = format!("agent_shell_screencast_{}", std::process::id());
+        // 每步使用不同的 handle_token——portal Request 路径由
+        // `/org/freedesktop/portal/desktop/request/<sender>/<token>` 计算，
+        // 重用同一 token 会导致路径冲突，后端仅响应首个请求。
+        let sender = sender_part(conn)
+            .ok_or_else(|| AgentShellError::DBus("no unique name on session bus".into()))?;
+        let create_token = format!("agent_shell_sc_create_{pid}");
+        let select_token = format!("agent_shell_sc_select_{pid}");
+        let start_token = format!("agent_shell_sc_start_{pid}");
+        let req_prefix = "/org/freedesktop/portal/desktop/request/";
 
         // 1. CreateSession：方法返回值是 **Request 对象路径**；
         //    真正的 session_handle 在其 Response 信号的
         //    results["session_handle"] 里（xdg-desktop-portal 规范）。
+        let create_path = ObjectPath::try_from(format!("{req_prefix}{sender}/{create_token}"))
+            .map_err(|e| AgentShellError::DBus(format!("create path: {e}")))?;
+        let mut create_stream = prepare_response_stream(conn, &create_path).await?;
         let mut o = std::collections::HashMap::<&str, zvariant::Value>::new();
-        o.insert("handle_token", zvariant::Value::from(token.as_str()));
+        o.insert("handle_token", zvariant::Value::from(create_token.as_str()));
         o.insert(
             "session_handle_token",
             zvariant::Value::from(format!("agent_shell_{pid}")),
@@ -187,8 +201,19 @@ impl ScreenCastCapture {
             .call("CreateSession", &(o,))
             .await
             .map_err(|e| AgentShellError::DBus(format!("CreateSession: {e}")))?;
-        let (_, create_results) =
-            wait_for_response(conn, &create_request, SCREENCAST_TIMEOUT).await?;
+        // 返回的路径应与预算一致；不一致则用返回值重订阅（后端自定路径）。
+        // 注意：wait_for_response 在方法返回后才订阅 Response 信号，
+        // 重新引入竞态——但此路径仅在后端不按规范返回路径时触发（非默认路径）。
+        let (_, create_results) = if create_request.as_str() == create_path.as_str() {
+            drain_response(&mut create_stream, SCREENCAST_TIMEOUT).await?
+        } else {
+            tracing::warn!(
+                "CreateSession path mismatch: expected {}, got {}",
+                create_path,
+                create_request
+            );
+            wait_for_response(conn, &create_request, SCREENCAST_TIMEOUT).await?
+        };
         let session_handle = crate::portal_common::string_field(&create_results, "session_handle")
             .ok_or_else(|| {
                 AgentShellError::Capture(
@@ -202,8 +227,11 @@ impl ScreenCastCapture {
 
         // 2. SelectSources：persist_mode + restore_token 在此传入
         //    （xdg-desktop-portal ScreenCast §SelectSources）。
+        let select_path = ObjectPath::try_from(format!("{req_prefix}{sender}/{select_token}"))
+            .map_err(|e| AgentShellError::DBus(format!("select path: {e}")))?;
+        let mut select_stream = prepare_response_stream(conn, &select_path).await?;
         let mut o = std::collections::HashMap::<&str, zvariant::Value>::new();
-        o.insert("handle_token", zvariant::Value::from(token.as_str()));
+        o.insert("handle_token", zvariant::Value::from(select_token.as_str()));
         o.insert("types", zvariant::Value::from(target.source_type_u32()));
         o.insert("multiple", zvariant::Value::from(false));
         if let Some(pm) = opts.persist_mode {
@@ -219,12 +247,27 @@ impl ScreenCastCapture {
             ), zvariant::OwnedObjectPath>("SelectSources", &(&session_path, o))
             .await
             .map_err(|e| AgentShellError::DBus(format!("SelectSources: {e}")))?;
-        wait_for_response(conn, &select_request, SCREENCAST_TIMEOUT).await?;
+        if select_request.as_str() == select_path.as_str() {
+            drain_response(&mut select_stream, SCREENCAST_TIMEOUT).await?;
+        } else {
+            // 同 CreateSession 路径失配回退：wait_for_response 在方法返回后
+            // 才订阅 Response 信号，重新引入竞态——但此路径仅在后端不按规范
+            // 返回路径时触发（非默认路径）。
+            tracing::warn!(
+                "SelectSources path mismatch: expected {}, got {}",
+                select_path,
+                select_request
+            );
+            wait_for_response(conn, &select_request, SCREENCAST_TIMEOUT).await?;
+        }
 
         // 3. Start：触发用户确认弹窗（或静默恢复）；Response 携带 streams
         //    数组与可选的新 restore_token。
+        let start_path = ObjectPath::try_from(format!("{req_prefix}{sender}/{start_token}"))
+            .map_err(|e| AgentShellError::DBus(format!("start path: {e}")))?;
+        let mut start_stream = prepare_response_stream(conn, &start_path).await?;
         let mut o = std::collections::HashMap::<&str, zvariant::Value>::new();
-        o.insert("handle_token", zvariant::Value::from(token.as_str()));
+        o.insert("handle_token", zvariant::Value::from(start_token.as_str()));
         let start_request: zvariant::OwnedObjectPath = proxy
             .call::<_, (
                 &ObjectPath<'_>,
@@ -233,7 +276,19 @@ impl ScreenCastCapture {
             ), zvariant::OwnedObjectPath>("Start", &(&session_path, "", o))
             .await
             .map_err(|e| AgentShellError::DBus(format!("Start: {e}")))?;
-        let (_, results) = wait_for_response(conn, &start_request, SCREENCAST_TIMEOUT).await?;
+        let (_, results) = if start_request.as_str() == start_path.as_str() {
+            drain_response(&mut start_stream, SCREENCAST_TIMEOUT).await?
+        } else {
+            // 同 CreateSession 路径失配回退：wait_for_response 在方法返回后
+            // 才订阅 Response 信号，重新引入竞态——但此路径仅在后端不按规范
+            // 返回路径时触发（非默认路径）。
+            tracing::warn!(
+                "Start path mismatch: expected {}, got {}",
+                start_path,
+                start_request
+            );
+            wait_for_response(conn, &start_request, SCREENCAST_TIMEOUT).await?
+        };
         let node_id = extract_node_id(&results).ok_or_else(|| {
             AgentShellError::Capture("ScreenCast: no stream node in response".into())
         })?;
@@ -565,5 +620,19 @@ mod tests {
         };
         assert_eq!(opts.restore_token.as_deref(), Some("abc123"));
         assert_eq!(opts.persist_mode, Some(PersistMode::UntilRevoked));
+    }
+
+    #[test]
+    fn handle_tokens_are_unique_per_step() {
+        // 三步 portal 调用各需不同 handle_token——重复 token 导致
+        // Request 路径冲突，后端仅响应首步（10s 挂起根因）。
+        let pid = std::process::id();
+        let create = format!("agent_shell_sc_create_{pid}");
+        let select = format!("agent_shell_sc_select_{pid}");
+        let start = format!("agent_shell_sc_start_{pid}");
+        let mut tokens = vec![create.as_str(), select.as_str(), start.as_str()];
+        tokens.sort();
+        tokens.dedup();
+        assert_eq!(tokens.len(), 3, "handle_token must be unique per step");
     }
 }

@@ -3,9 +3,9 @@
 //! portal 调用的响应通过 `org.freedesktop.portal.Request` 对象的
 //! `Response` 信号返回；调用方在 options 里传 `handle_token`，
 //! Request 路径即 `/<sender>/<token>`。本模块提供：
-//!
 //! - [`portal_proxy`]：构造指向 `org.freedesktop.portal.Desktop` 的通用代理；
-//! - [`wait_for_response`]：等待指定 Request 路径上的 Response 信号并解析结果字典。
+//! - [`prepare_response_stream`] / [`drain_response`]：先订阅 `Response` 信号再发请求（避免竞态）；
+//! - [`wait_for_response`]：调用后订阅的旧路径（仅适用于 `Screenshot` 等单步调用）。
 
 use std::time::Duration;
 
@@ -22,6 +22,79 @@ pub async fn portal_proxy<'a>(
     interface: &'a str,
 ) -> zbus::Result<zbus::Proxy<'a>> {
     zbus::Proxy::new(conn, PORTAL_SERVICE, PORTAL_PATH, interface).await
+}
+
+/// 将 D-Bus unique name 编码为 portal Request 路径的 sender 段。
+///
+/// `":1.42"` → `"1_42"`——xdg-desktop-portal handle_token 路径编码规则：
+/// 去掉前导 `':'`，将 `'.'` 替换为 `'_'`。
+fn encode_sender_part(unique_name: &str) -> String {
+    unique_name.trim_start_matches(':').replace('.', "_")
+}
+
+/// 从连接的 unique name 计算 portal Request 路径的 sender 段。
+///
+/// 返回 `None` 当连接尚未获得 unique name（理论上 session bus 总有）。
+pub fn sender_part(conn: &zbus::Connection) -> Option<String> {
+    conn.unique_name().map(|n| encode_sender_part(n.as_str()))
+}
+
+/// 在发送 portal 方法调用 **之前** 订阅指定 Request 路径上的 `Response` 信号。
+///
+/// `request_path` 由调用方按 `handle_token` 规则预算：
+/// `/org/freedesktop/portal/desktop/request/<sender>/<token>`。
+/// 先订阅再发请求，避免后端在订阅前就回复导致信号丢失（竞态）。
+/// 流交给 [`drain_response`] 消费。
+pub async fn prepare_response_stream(
+    conn: &zbus::Connection,
+    request_path: &ObjectPath<'_>,
+) -> Result<zbus::MessageStream, AgentShellError> {
+    let rule = zbus::MatchRule::builder()
+        .msg_type(zbus::message::Type::Signal)
+        .interface("org.freedesktop.portal.Request")
+        .map_err(|e| AgentShellError::DBus(format!("match rule interface: {e}")))?
+        .member("Response")
+        .map_err(|e| AgentShellError::DBus(format!("match rule member: {e}")))?
+        .path(request_path.clone())
+        .map_err(|e| AgentShellError::DBus(format!("match rule path: {e}")))?
+        .build();
+    zbus::MessageStream::for_match_rule(rule, conn, Some(4))
+        .await
+        .map_err(|e| AgentShellError::DBus(format!("signal stream: {e}")))
+}
+
+/// 消费 [`prepare_response_stream`] 预订阅的流，等待 `Response` 信号。
+///
+/// 返回 `(response_code, results)`；超时按 §19.3 各通道配置由调用方控制。
+/// response_code：0 = 成功，1 = 用户取消，2 = 其它错误。
+pub async fn drain_response(
+    stream: &mut zbus::MessageStream,
+    timeout: Duration,
+) -> Result<(u32, std::collections::HashMap<String, zvariant::OwnedValue>), AgentShellError> {
+    let wait = async {
+        let Some(msg) = stream.next().await else {
+            return Err(AgentShellError::DBus(
+                "Request signal stream ended before Response".into(),
+            ));
+        };
+        let msg = msg.map_err(|e| AgentShellError::DBus(format!("signal read: {e}")))?;
+        let body = msg.body();
+        let (code, results): (u32, std::collections::HashMap<String, zvariant::OwnedValue>) = body
+            .deserialize()
+            .map_err(|e| AgentShellError::DBus(format!("Response body: {e}")))?;
+        if code != 0 {
+            return Err(AgentShellError::Permission(format!(
+                "portal request denied (response code {code})"
+            )));
+        }
+        Ok((code, results))
+    };
+    tokio::time::timeout(timeout, wait).await.map_err(|_| {
+        AgentShellError::Timeout(format!(
+            "portal Response timed out after {}s",
+            timeout.as_secs()
+        ))
+    })?
 }
 
 /// 等待 portal Request 的 Response 信号，返回 `(response_code, results)`。
@@ -148,5 +221,13 @@ mod tests {
     fn percent_decode_plain() {
         assert_eq!(percent_decode("/a/b%20c"), "/a/b c");
         assert_eq!(percent_decode("/plain"), "/plain");
+    }
+
+    #[test]
+    fn encode_sender_part_strips_colon_and_dots() {
+        // ":1.42" → "1_42"——portal handle_token 路径编码规则。
+        assert_eq!(encode_sender_part(":1.42"), "1_42");
+        assert_eq!(encode_sender_part(":1.99"), "1_99");
+        assert_eq!(encode_sender_part(":1.0"), "1_0");
     }
 }
