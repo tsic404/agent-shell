@@ -217,6 +217,20 @@ impl KWinCompositor {
         lines
     }
 
+    /// doctor 输出的异步版本：在渲染桥接行前触发一次 `/Scripting` 探测
+    /// （懒探测缓存，成功后升级为确认态）。
+    ///
+    /// TSI-2486：doctor 路径从不调用 [`Self::ensure_scripting_probe`]，
+    /// 导致 D-Bus 桥接行恒为「未探测」——尽管 `org.kde.KWin` 的
+    /// `/Scripting` 实际可达。同步版本 [`Self::doctor_lines`] 保留给
+    /// 内部状态渲染；daemon doctor 走本方法补齐证据后渲染。
+    pub async fn doctor_lines_async(&self) -> Vec<String> {
+        if self.scripting_probe_ok() != Some(true) {
+            let _ = self.ensure_scripting_probe().await;
+        }
+        self.doctor_lines()
+    }
+
     /// 探测并缓存 `/Scripting` 可用性（TSI-2374）。
     ///
     /// doctor 与降级链的证据来源：成功后 `doctor_lines` 的桥接行升级为

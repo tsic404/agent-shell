@@ -20,13 +20,19 @@ pub fn atspi_line() -> String {
     "⚠ AT-SPI         : unavailable (org.a11y.atspi.Registry not reachable)".into()
 }
 
-/// a11y bus 地址候选：环境变量 → `$XDG_RUNTIME_DIR/at-spi/bus`。
+/// a11y bus 地址候选：环境变量 → `$XDG_RUNTIME_DIR/at-spi/bus_0`（现代
+/// at-spi2 标准 socket 名）→ `$XDG_RUNTIME_DIR/at-spi/bus`（旧版兜底）。
+///
+/// TSI-2486：旧实现只探测 `at-spi/bus`，而实际运行环境（及组件桥接
+/// `atspi_bridge.rs` 文档）使用 `at-spi/bus_0`，导致 doctor 恒报
+/// 「unavailable (Registry not reachable)」假阴性。
 fn a11y_bus_addresses() -> Vec<String> {
     let mut addrs = Vec::new();
     if let Ok(a) = std::env::var("AT_SPI_BUS_ADDRESS") {
         addrs.push(a);
     }
     if let Ok(runtime) = std::env::var("XDG_RUNTIME_DIR") {
+        addrs.push(format!("unix:path={runtime}/at-spi/bus_0"));
         addrs.push(format!("unix:path={runtime}/at-spi/bus"));
     }
     addrs
@@ -42,6 +48,7 @@ mod tests {
         unsafe { std::env::set_var("XDG_RUNTIME_DIR", "/run/user/1000") };
         let addrs = a11y_bus_addresses();
         assert_eq!(addrs[0], "unix:path=/tmp/custom-bus");
+        assert!(addrs.contains(&"unix:path=/run/user/1000/at-spi/bus_0".to_string()));
         assert!(addrs.contains(&"unix:path=/run/user/1000/at-spi/bus".to_string()));
         unsafe { std::env::remove_var("AT_SPI_BUS_ADDRESS") };
         unsafe { std::env::remove_var("XDG_RUNTIME_DIR") };

@@ -165,10 +165,11 @@ impl Daemon {
         r.map_err(|e| (agent_shell_rpc::RpcErrorCode::BackendError, e.to_string()))
     }
 
-    /// KWin 合成器 doctor 输出行（dispatch 层异步收集用）。
-    pub fn doctor_lines(&self) -> Vec<String> {
+    /// doctor 输出行的异步版本：先补齐 `/Scripting` 探测证据再渲染
+    /// （TSI-2486：doctor 路径此前从不触发懒探测，桥接行恒为「未探测」）。
+    pub async fn doctor_lines_async(&self) -> Vec<String> {
         match self.compositor.as_ref() {
-            Some(c) => c.doctor_lines(),
+            Some(c) => c.doctor_lines_async().await,
             None => Vec::new(),
         }
     }

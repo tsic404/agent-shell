@@ -120,8 +120,9 @@ async fn doctor(d: &mut Daemon) -> RpcResult {
 
 async fn compositor_doctor_lines(d: &Daemon) -> Vec<String> {
     if d.has_compositor() {
-        // KWinCompositor::doctor_lines 需要实例引用；经 state 层暴露。
-        d.doctor_lines()
+        // KWinCompositor::doctor_lines_async 需要实例引用；经 state 层暴露。
+        // 异步版本先补齐 /Scripting 懒探测，再渲染桥接行（TSI-2486）。
+        d.doctor_lines_async().await
     } else {
         Vec::new()
     }
