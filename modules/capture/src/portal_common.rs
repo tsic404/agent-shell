@@ -4,7 +4,7 @@
 //! `Response` 信号返回；调用方在 options 里传 `handle_token`，
 //! Request 路径即 `/<sender>/<token>`。本模块提供：
 //! - [`portal_proxy`]：构造指向 `org.freedesktop.portal.Desktop` 的通用代理；
-//! - [`prepare_response_stream`] / [`drain_response`]：先订阅 `Response` 信号再发请求（避免竞态）；
+//! - [`prepare_response_stream`] / [`drain_response_with_timeout`]：先订阅 `Response` 信号再发请求（避免竞态）；
 //! - [`wait_for_response`]：调用后订阅的旧路径（仅适用于 `Screenshot` 等单步调用）。
 
 use std::time::Duration;
@@ -44,7 +44,7 @@ pub fn sender_part(conn: &zbus::Connection) -> Option<String> {
 /// `request_path` 由调用方按 `handle_token` 规则预算：
 /// `/org/freedesktop/portal/desktop/request/<sender>/<token>`。
 /// 先订阅再发请求，避免后端在订阅前就回复导致信号丢失（竞态）。
-/// 流交给 [`drain_response`] 消费。
+/// 流交给 [`drain_response_with_timeout`] 消费。
 pub async fn prepare_response_stream(
     conn: &zbus::Connection,
     request_path: &ObjectPath<'_>,
@@ -67,9 +67,13 @@ pub async fn prepare_response_stream(
 ///
 /// 返回 `(response_code, results)`；超时按 §19.3 各通道配置由调用方控制。
 /// response_code：0 = 成功，1 = 用户取消，2 = 其它错误。
-pub async fn drain_response(
+///
+/// `format_step` 为调用方提供的步骤标签（如 `Start`），超时时拼进错误
+/// 信息——ScreenCast 多步流程里便于直接定位卡在哪一步。
+pub async fn drain_response_with_timeout(
     stream: &mut zbus::MessageStream,
     timeout: Duration,
+    format_step: &str,
 ) -> Result<(u32, std::collections::HashMap<String, zvariant::OwnedValue>), AgentShellError> {
     let wait = async {
         let Some(msg) = stream.next().await else {
@@ -91,7 +95,7 @@ pub async fn drain_response(
     };
     tokio::time::timeout(timeout, wait).await.map_err(|_| {
         AgentShellError::Timeout(format!(
-            "portal Response timed out after {}s",
+            "portal {format_step} Response timed out after {}s (no Response signal on the request path)",
             timeout.as_secs()
         ))
     })?

@@ -17,8 +17,8 @@ use agent_shell_core::error::{AgentShellError, Result};
 use zbus::zvariant::{self, ObjectPath};
 
 use crate::portal_common::{
-    drain_response, portal_proxy, prepare_response_stream, sender_part, wait_for_response,
-    PORTAL_SERVICE,
+    drain_response_with_timeout, portal_proxy, prepare_response_stream, sender_part,
+    wait_for_response, PORTAL_SERVICE,
 };
 
 /// portal 会话持久化模式（xdg-desktop-portal ScreenCast §SelectSources persist_mode）。
@@ -205,7 +205,8 @@ impl ScreenCastCapture {
         // 注意：wait_for_response 在方法返回后才订阅 Response 信号，
         // 重新引入竞态——但此路径仅在后端不按规范返回路径时触发（非默认路径）。
         let (_, create_results) = if create_request.as_str() == create_path.as_str() {
-            drain_response(&mut create_stream, SCREENCAST_TIMEOUT).await?
+            drain_response_with_timeout(&mut create_stream, SCREENCAST_TIMEOUT, "CreateSession")
+                .await?
         } else {
             tracing::warn!(
                 "CreateSession path mismatch: expected {}, got {}",
@@ -248,7 +249,8 @@ impl ScreenCastCapture {
             .await
             .map_err(|e| AgentShellError::DBus(format!("SelectSources: {e}")))?;
         if select_request.as_str() == select_path.as_str() {
-            drain_response(&mut select_stream, SCREENCAST_TIMEOUT).await?;
+            drain_response_with_timeout(&mut select_stream, SCREENCAST_TIMEOUT, "SelectSources")
+                .await?;
         } else {
             // 同 CreateSession 路径失配回退：wait_for_response 在方法返回后
             // 才订阅 Response 信号，重新引入竞态——但此路径仅在后端不按规范
@@ -277,7 +279,21 @@ impl ScreenCastCapture {
             .await
             .map_err(|e| AgentShellError::DBus(format!("Start: {e}")))?;
         let (_, results) = if start_request.as_str() == start_path.as_str() {
-            drain_response(&mut start_stream, SCREENCAST_TIMEOUT).await?
+            match drain_response_with_timeout(&mut start_stream, SCREENCAST_TIMEOUT, "Start").await
+            {
+                Ok(v) => v,
+                Err(e @ AgentShellError::Timeout(_)) => {
+                    // KDE 后端在 PipeWire 目标解析失败时不会发送 Response
+                    // （见 TSI-2481：`Stream error: target not found`），
+                    // 超时是 agent-shell 的预期兜底——提示操作者查 portal 日志。
+                    tracing::warn!(
+                        "ScreenCast Start: portal Response never arrived (check PipeWire state and \
+                         `journalctl --user -u plasma-xdg-desktop-portal-kde.service`): {e}"
+                    );
+                    return Err(e);
+                }
+                Err(e) => return Err(e),
+            }
         } else {
             // 同 CreateSession 路径失配回退：wait_for_response 在方法返回后
             // 才订阅 Response 信号，重新引入竞态——但此路径仅在后端不按规范
