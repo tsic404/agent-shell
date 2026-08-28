@@ -1,0 +1,14 @@
+#!/bin/sh
+# rootd-pkexec — pkexec 入口（§23.4.1 通道 3：未在 rootd 白名单的一次性命令）
+#
+# polkit action: com.agentshell.pkexec.install-package
+# org.freedesktop.policykit.exec.path 指向此脚本。
+#
+# 用途：pkexec 瞬态提权兜底——当 rootd 未安装或某操作不在 rootd 白名单
+# 时，CLI 经 pkexec 调用此脚本执行一次性特权命令。每次弹窗（§23.4.1）。
+#
+# 安全：此脚本只转发参数给 rootd 二进制的 pkexec 子命令模式；
+# 不做任何业务逻辑（§23.2 薄代理原则）。实际命令白名单由 polkit
+# action 定义控制（com.agentshell.pkexec.install-package）。
+
+exec /usr/bin/agent-shell-rootd pkexec "$@"

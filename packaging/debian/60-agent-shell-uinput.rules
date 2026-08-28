@@ -1,0 +1,6 @@
+# udev rules for agent-shell — ydotool /dev/uinput access (§20.3 权限模型)
+#
+# /dev/uinput 走 udev 规则 `uinput` 组：ydotool 输入注入后端依赖此设备。
+# daemon 不直接持 root——输入注入经 libei(portal) → ydotool(/dev/uinput) → XTest 降级链。
+
+KERNEL=="uinput", SUBSYSTEM=="misc", GROUP="uinput", MODE="0660", OPTIONS+="static_node=uinput"

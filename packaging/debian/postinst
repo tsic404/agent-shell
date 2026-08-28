@@ -1,0 +1,34 @@
+#!/bin/sh
+# postinst — agent-shell / agent-shell-rootd
+#
+# 安装后：重载 systemd + polkit + udev 规则（§20.2 打包）
+set -e
+
+case "$1" in
+    configure)
+        # systemd unit 重载（system + user）
+        if command -v systemctl >/dev/null 2>&1; then
+            systemctl daemon-reload || true
+        fi
+        # polkit policy 重载
+        if command -v pkaction >/dev/null 2>&1; then
+            # polkitd 自动监视 actions 目录，无需显式 reload
+            true
+        fi
+        # udev 规则重载（ydotool /dev/uinput, §20.3）
+        if command -v udevadm >/dev/null 2>&1; then
+            udevadm control --reload-rules || true
+            udevadm trigger --subsystem-match=input || true
+        fi
+        # rootd 系统单元启用——仅在 agent-shell-rootd 包安装时执行
+        #（$DPKG_MAINTSCRIPT_PACKAGE 区分当前包，避免 agent-shell 包安装时
+        #  尝试 enable 未安装的 rootd unit）
+        if [ -d /run/systemd/system ] && [ "${DPKG_MAINTSCRIPT_PACKAGE:-}" = "agent-shell-rootd" ]; then
+            systemctl enable agent-shell-rootd.service || true
+            # 不自动 start——由管理员按需启动（polkit 首次授权触发）
+        fi
+        ;;
+esac
+
+# dh_installdeb 会自动调用此脚本
+exit 0

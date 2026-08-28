@@ -86,6 +86,10 @@ pub enum Command {
     /// AT-SPI 无障碍（a11y bus 探测 + 语义查询）
     #[command(subcommand)]
     A11y(A11yCommand),
+    /// 系统服务控制（rootd 特权链路，§23.4）
+    #[command(subcommand)]
+    Service(ServiceCommand),
+    Log(LogCommand),
 }
 
 // ───────────────────────── windows ─────────────────────────
@@ -358,6 +362,29 @@ pub enum TimerCommand {
     List,
     /// 查询下次触发
     Next { name: String },
+}
+
+// ───────────────────────── service（rootd 特权链路） ─────────────────────────
+
+/// 系统服务控制命令（rootd ServiceStart/Stop/Restart，§23.4）。
+#[derive(Subcommand, Debug)]
+pub enum ServiceCommand {
+    /// 启动系统服务
+    Start { unit: String },
+    /// 停止系统服务
+    Stop { unit: String },
+    /// 重启系统服务
+    Restart { unit: String },
+}
+
+// ───────────────────────── log（rootd 特权链路） ─────────────────────────
+
+/// 系统日志查看命令（rootd JournalQuery，§23.4）。
+#[derive(ClapArgs, Debug)]
+pub struct LogCommand {
+    /// 过滤表达式 JSON（如 '{"unit":"nginx","priority":"err"}'）
+    #[arg(long = "filter", default_value = "{}")]
+    pub filter: String,
 }
 
 // ───────────────────────── 解析辅助 ─────────────────────────

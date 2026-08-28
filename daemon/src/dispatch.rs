@@ -65,7 +65,10 @@ pub async fn dispatch(daemon: &mut Daemon, req: &Request) -> Response {
         method::SHORTCUT_BIND => stub_ok("shortcut.bind"),
         method::SHORTCUT_TRIGGER => stub_ok("shortcut.trigger"),
         method::TIMER_LIST => stub_ok("timer.list"),
-        method::TIMER_NEXT => stub_ok("timer.next"),
+        // ── rootd 特权代理（§23.4）──
+        method::SERVICE_CONTROL => service_control(daemon, req).await,
+        method::SYSTEM_LOG_VIEW => system_log_view(daemon, req).await,
+        method::ROOTD_HELLO => rootd_hello(daemon).await,
         other => {
             return Response::err(
                 req.id,
@@ -348,6 +351,117 @@ async fn ime_type(d: &mut Daemon, req: &Request) -> RpcResult {
         .ok_or((RpcErrorCode::InvalidParams, "missing text".into()))?;
     let result = d.ime_session.type_text(text);
     Ok(serde_json::to_value(result).expect("ImeTypeResult serializable"))
+}
+
+// ───────────────────────── rootd 特权代理（§23.4） ─────────────────────────
+
+/// rootd 版本对账（§23.4.3：daemon 与 rootd 需匹配安全模型版本）。
+///
+/// rootd 未安装时返回 "rootd not installed" 并降级（§23.2）。
+/// rootd 已安装但版本不匹配时拒绝服务。
+async fn rootd_hello(_d: &mut Daemon) -> RpcResult {
+    match crate::rootd_client::connect().await {
+        Some(proxy) => {
+            let version = proxy
+                .hello()
+                .await
+                .map_err(|e| (RpcErrorCode::BackendError, format!("rootd Hello: {e}")))?;
+            // 解析 rootd 返回的 security_model 版本并与 daemon 自身比较
+            let parsed: Value = serde_json::from_str(&version).map_err(|e| {
+                (
+                    RpcErrorCode::BackendError,
+                    format!("rootd Hello parse: {e}"),
+                )
+            })?;
+            let rootd_sm = parsed
+                .get("security_model")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            // daemon 自身安全模型版本（与 rootd lib.rs SECURITY_MODEL_VERSION 一致）
+            const DAEMON_SECURITY_MODEL: u64 = 1;
+            if rootd_sm != DAEMON_SECURITY_MODEL {
+                return Ok(json!({
+                    "rootd_installed": true,
+                    "version_mismatch": true,
+                    "daemon_security_model": DAEMON_SECURITY_MODEL,
+                    "rootd_security_model": rootd_sm,
+                    "error": "security model version mismatch — refusing service"
+                }));
+            }
+            Ok(json!({
+                "rootd_installed": true,
+                "version_mismatch": false,
+                "version": version
+            }))
+        }
+        None => Ok(json!({ "rootd_installed": false, "error": "rootd not installed" })),
+    }
+}
+
+/// 启停系统服务（rootd ServiceStart/Stop/Restart）。
+///
+/// 参数：{ "action": "start|stop|restart", "unit": "nginx.service" }
+/// rootd 未安装时返回降级错误。
+async fn service_control(_d: &mut Daemon, req: &Request) -> RpcResult {
+    let params = params_of(req)?;
+    let action = params
+        .get("action")
+        .and_then(|v| v.as_str())
+        .ok_or((RpcErrorCode::InvalidParams, "missing action".into()))?;
+    let unit = params
+        .get("unit")
+        .and_then(|v| v.as_str())
+        .ok_or((RpcErrorCode::InvalidParams, "missing unit".into()))?;
+
+    let proxy = crate::rootd_client::connect().await.ok_or((
+        RpcErrorCode::BackendUnavailable,
+        "rootd not installed — privileged operation unavailable".into(),
+    ))?;
+
+    match action {
+        "start" => proxy
+            .service_start(unit)
+            .await
+            .map_err(|e| (RpcErrorCode::BackendError, format!("rootd: {e}")))?,
+        "stop" => proxy
+            .service_stop(unit)
+            .await
+            .map_err(|e| (RpcErrorCode::BackendError, format!("rootd: {e}")))?,
+        "restart" => proxy
+            .service_restart(unit)
+            .await
+            .map_err(|e| (RpcErrorCode::BackendError, format!("rootd: {e}")))?,
+        other => {
+            return Err((
+                RpcErrorCode::InvalidParams,
+                format!("unknown action: {other} (expected start/stop/restart)"),
+            ))
+        }
+    }
+    Ok(json!({ "accepted": true, "action": action, "unit": unit }))
+}
+
+/// 查看系统日志（rootd JournalQuery）。
+///
+/// 参数：{ "filter": { "unit": "nginx", "priority": "err" } }
+/// rootd 未安装时返回降级错误。
+async fn system_log_view(_d: &mut Daemon, req: &Request) -> RpcResult {
+    let params = params_of(req)?;
+    let filter = params
+        .get("filter")
+        .map(|v| serde_json::to_string(v).unwrap_or_default())
+        .unwrap_or_else(|| "{}".to_string());
+
+    let proxy = crate::rootd_client::connect().await.ok_or((
+        RpcErrorCode::BackendUnavailable,
+        "rootd not installed — system journal unavailable".into(),
+    ))?;
+
+    let result = proxy
+        .journal_query(&filter)
+        .await
+        .map_err(|e| (RpcErrorCode::BackendError, format!("rootd: {e}")))?;
+    Ok(json!({ "result": result }))
 }
 
 #[cfg(test)]

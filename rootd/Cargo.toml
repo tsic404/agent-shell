@@ -14,8 +14,13 @@ path = "src/main.rs"
 agent-shell-rpc.workspace = true
 agent-shell-core.workspace = true
 serde_json.workspace = true
+zbus.workspace = true
+zbus_macros.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+libc.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
+parking_lot.workspace = true

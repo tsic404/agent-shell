@@ -1,0 +1,14 @@
+#!/bin/sh
+# prerm — agent-shell-rootd 移除前停止服务
+set -e
+
+case "$1" in
+    remove|deconfigure)
+        if [ -d /run/systemd/system ]; then
+            systemctl stop agent-shell-rootd.service || true
+            systemctl disable agent-shell-rootd.service || true
+        fi
+        ;;
+esac
+
+exit 0

@@ -14,9 +14,9 @@ mod ime_session;
 mod input;
 mod portal_sessions;
 mod ring_buffer;
+mod rootd_client;
 mod single_instance;
 mod state;
-
 use agent_shell_rpc::{Request, Response};
 use state::Daemon;
 use std::time::Duration;

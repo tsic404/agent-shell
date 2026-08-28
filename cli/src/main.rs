@@ -67,6 +67,8 @@ async fn dispatch_command(command: Command, out: OutputFormat) -> CmdResult {
         Command::Secret(cmd) => secret(&mut c, cmd).await,
         Command::Shortcut(cmd) => shortcut(&mut c, cmd).await,
         Command::Timer(cmd) => timer(&mut c, cmd).await,
+        Command::Service(cmd) => service_cmd(&mut c, cmd).await,
+        Command::Log(cmd) => log_cmd(&mut c, cmd).await,
     }
 }
 
@@ -482,4 +484,64 @@ async fn timer(c: &mut DaemonClient, cmd: cli::TimerCommand) -> CmdResult {
         }
     }
     Ok(0)
+}
+
+// ───────────────────────── service / log（rootd 特权链路，§23.4） ─────────────────────────
+
+async fn service_cmd(c: &mut DaemonClient, cmd: cli::ServiceCommand) -> CmdResult {
+    let (action, unit) = match cmd {
+        cli::ServiceCommand::Start { unit } => ("start", unit),
+        cli::ServiceCommand::Stop { unit } => ("stop", unit),
+        cli::ServiceCommand::Restart { unit } => ("restart", unit),
+    };
+    let _ = c
+        .call(
+            method::SERVICE_CONTROL,
+            json!({ "action": action, "unit": unit }),
+        )
+        .await?;
+    // service_control 的错误由 RPC error 层处理（call() 已返回 Err）。
+    // 成功到达此处的 result 不含 error 字段——只检查 accepted。
+    println!("service {action} {unit}: accepted");
+    Ok(0)
+}
+
+async fn log_cmd(c: &mut DaemonClient, cmd: cli::LogCommand) -> CmdResult {
+    // --filter 是 clap 捕获的字符串，必须解析为 JSON 对象后再嵌入 RPC 参数。
+    // 若直接传字符串，daemon 会二次序列化——rootd journal_query 收到
+    // `"{\"unit\":\"sshd\"}"` 字符串字面量而非对象，`is_object()` 拒绝。
+    let filter = parse_log_filter(&cmd.filter)?;
+    let r = c
+        .call(method::SYSTEM_LOG_VIEW, json!({ "filter": filter }))
+        .await?;
+    // system_log_view 的错误由 RPC error 层处理（call() 已返回 Err）。
+    println!("{}", serde_json::to_string_pretty(&r).unwrap_or_default());
+    Ok(0)
+}
+
+/// 把 `--filter` 原始字符串解析为 JSON 对象（§23.4 JournalQuery 参数契约）。
+fn parse_log_filter(raw: &str) -> Result<Value, String> {
+    let v: Value =
+        serde_json::from_str(raw).map_err(|e| format!("--filter must be a JSON object: {e}"))?;
+    if !v.is_object() {
+        return Err("--filter must be a JSON object".into());
+    }
+    Ok(v)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_log_filter;
+
+    #[test]
+    fn filter_object_parses() {
+        let v = parse_log_filter(r#"{"unit":"sshd"}"#).expect("object filter");
+        assert_eq!(v.get("unit").and_then(|u| u.as_str()), Some("sshd"));
+    }
+
+    #[test]
+    fn filter_non_object_rejected() {
+        assert!(parse_log_filter(r#""free text""#).is_err());
+        assert!(parse_log_filter("not json").is_err());
+    }
 }

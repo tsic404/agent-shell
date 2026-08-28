@@ -1,0 +1,38 @@
+Source: agent-shell
+Section: utils
+Priority: optional
+Maintainer: Agent Shell <agent-shell@example.com>
+Build-Depends: cargo, libpipewire-0.3-dev | libpipewire-dev, pkg-config, libsystemd-dev
+Standards-Version: 4.6.0
+
+Package: agent-shell
+Architecture: amd64 arm64
+Depends: systemd, xdg-desktop-portal, pipewire
+Description: Agent Shell — Linux desktop agent shell
+ Agent Shell is a desktop automation framework providing window management,
+ input injection, screenshot capture, and accessibility integration across
+ KDE, GNOME, DDE, Hyprland, Sway, and X11.
+ .
+ This package contains the user-session daemon (agent-shell-daemon), CLI
+ (agent-shell), and MCP server (agent-shell-mcp).
+ .
+ systemd user service: agent-shell-daemon.service (graphical-session.target).
+ .
+ udev rules: 60-agent-shell-uinput.rules grants /dev/uinput to the `uinput`
+ group for ydotool input injection fallback (§20.3 权限模型).
+
+Package: agent-shell-rootd
+Architecture: amd64 arm64
+Depends: policykit-1, systemd
+Description: Agent Shell rootd — privileged proxy (systemd system unit)
+ Agent Shell rootd is the privileged proxy daemon (§23.2/§23.4): a thin
+ stateless agent exposing a whitelisted D-Bus interface on the system bus,
+ with per-method polkit authorization (auth_admin_keep).
+ .
+ This package contains:
+   * agent-shell-rootd binary (systemd system unit, system-level singleton)
+   * /usr/share/polkit-1/actions/com.agentshell.policy
+   * /usr/lib/agent-shell/rootd-pkexec (pkexec fallback, §23.4.1 channel 3)
+ .
+ rootd is independently installable — when absent, privileged operations
+ return "rootd not installed" and degrade to user-only operations (§23.2).

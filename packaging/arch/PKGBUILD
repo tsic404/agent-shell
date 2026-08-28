@@ -1,0 +1,57 @@
+# Maintainer: Agent Shell <agent-shell@example.com>
+# Agent Shell — Linux desktop agent shell (§20.2 打包)
+# 两个包：agent-shell (daemon+cli+mcp) + agent-shell-rootd (特权代理)
+
+pkgname=('agent-shell' 'agent-shell-rootd')
+pkgver=0.1.0
+pkgrel=1
+arch=('x86_64' 'aarch64')
+url="https://github.com/tsip404/agent-shell"
+license=('MIT')
+makedepends=('cargo' 'pipewire' 'systemd' 'polkit')
+source=("agent-shell::git+$url")
+sha256sums=('SKIP')
+
+build() {
+    cd "$srcdir/agent-shell"
+    # D2 编译策略：release profile lto + strip（Cargo.toml [profile.release]）
+    cargo build --release
+}
+
+package_agent-shell() {
+    pkgdesc="Agent Shell — Linux desktop agent shell (daemon + CLI + MCP)"
+    depends=('systemd' 'xdg-desktop-portal' 'pipewire' 'hicolor-icon-theme')
+    optdepends=('ydotool: input injection fallback (/dev/uinput)')
+
+    cd "$srcdir/agent-shell"
+    # 二进制
+    install -Dm755 target/release/agent-shell-daemon "$pkgdir/usr/bin/agent-shell-daemon"
+    install -Dm755 target/release/agent-shell "$pkgdir/usr/bin/agent-shell"
+    install -Dm755 target/release/agent-shell-mcp "$pkgdir/usr/bin/agent-shell-mcp"
+    # systemd user service（§22.2 D1）
+    install -Dm644 daemon/agent-shell-daemon.service \
+        "$pkgdir/usr/lib/systemd/user/agent-shell-daemon.service"
+    # udev rules for ydotool /dev/uinput（§20.3 权限模型）
+    install -Dm644 packaging/debian/60-agent-shell-uinput.rules \
+        "$pkgdir/usr/lib/udev/rules.d/60-agent-shell-uinput.rules"
+}
+
+package_agent-shell-rootd() {
+    pkgdesc="Agent Shell rootd — privileged proxy (systemd system unit, polkit whitelist)"
+    depends=('polkit' 'systemd')
+
+    cd "$srcdir/agent-shell"
+    # rootd 二进制
+    install -Dm755 target/release/agent-shell-rootd "$pkgdir/usr/bin/agent-shell-rootd"
+    # pkexec 兜底入口（§23.4.1 通道 3）
+    install -Dm755 packaging/rootd-pkexec \
+        "$pkgdir/usr/lib/agent-shell/rootd-pkexec"
+    # systemd system unit（§23.2 系统级单例）
+    install -Dm644 rootd/agent-shell-rootd.service \
+        "$pkgdir/usr/lib/systemd/system/agent-shell-rootd.service"
+    # polkit policy（§23.4.2）
+    install -Dm644 packaging/com.agentshell.policy \
+        "$pkgdir/usr/share/polkit-1/actions/com.agentshell.policy"
+    # D-Bus system policy（允许 rootd 注册 org.agentshell.Rootd）
+    install -Dm644 packaging/org.agentshell.Rootd.conf \
+        "$pkgdir/usr/share/dbus-1/system.d/org.agentshell.Rootd.conf"

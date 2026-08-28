@@ -1,0 +1,137 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC
+  "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+  "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+<policyconfig>
+  <vendor>Agent Shell</vendor>
+  <!-- §23.4.2 polkit action 定义：rootd 白名单方法，每方法独立 action。
+       auth_admin_keep：管理员认证一次后本会话内记住授权。 -->
+
+  <!-- 软件包 -->
+  <action id="com.agentshell.pkexec.install-package">
+    <description>Install a software package</description>
+    <message>Authentication is required to install packages</message>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/lib/agent-shell/rootd-pkexec</annotate>
+    <annotate key="org.freedesktop.policykit.exec.allow_gui">true</annotate>
+  </action>
+
+  <action id="com.agentshell.package.remove">
+    <description>Remove a software package</description>
+    <message>Authentication is required to remove packages</message>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+  </action>
+
+  <action id="com.agentshell.package.update">
+    <description>Update software packages</description>
+    <message>Authentication is required to update packages</message>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+  </action>
+
+  <action id="com.agentshell.package.refresh">
+    <description>Refresh package metadata cache</description>
+    <message>Authentication is required to refresh package cache</message>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+  </action>
+
+  <!-- systemd system 单元 -->
+  <action id="com.agentshell.service.control">
+    <description>Start/stop/restart a system service</description>
+    <message>Authentication is required to control a system service</message>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+  </action>
+
+  <action id="com.agentshell.systemd.manage">
+    <description>Manage systemd system units (enable/disable/daemon-reload)</description>
+    <message>Authentication is required to manage system units</message>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+  </action>
+
+  <!-- 系统日志 -->
+  <action id="com.agentshell.system-log.view">
+    <description>View full system journal</description>
+    <message>Authentication is required to view system logs</message>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+  </action>
+
+  <!-- 系统配置 -->
+  <action id="com.agentshell.sysctl.get">
+    <description>Read kernel parameters</description>
+    <message>Authentication is required to read kernel parameters</message>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+  </action>
+
+  <action id="com.agentshell.sysctl.set">
+    <description>Modify kernel parameters</description>
+    <message>Authentication is required to modify kernel parameters</message>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+  </action>
+
+  <action id="com.agentshell.hostname.set">
+    <description>Set system hostname</description>
+    <message>Authentication is required to change the system hostname</message>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+  </action>
+
+  <!-- 进程管理 -->
+  <action id="com.agentshell.process.kill">
+    <description>Kill a process (cross-user)</description>
+    <message>Authentication is required to kill processes</message>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+  </action>
+
+  <!-- 挂载 -->
+  <action id="com.agentshell.mount">
+    <description>Mount or unmount filesystems</description>
+    <message>Authentication is required to mount or unmount filesystems</message>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+  </action>
+</policyconfig>

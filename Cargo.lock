@@ -393,6 +393,7 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
  "x11rb",
+ "zbus",
 ]
 
 [[package]]
@@ -510,10 +511,15 @@ version = "0.1.0"
 dependencies = [
  "agent-shell-core",
  "agent-shell-rpc",
+ "libc",
+ "parking_lot",
  "serde_json",
  "tempfile",
  "tokio",
  "tracing",
+ "tracing-subscriber",
+ "zbus",
+ "zbus_macros",
 ]
 
 [[package]]

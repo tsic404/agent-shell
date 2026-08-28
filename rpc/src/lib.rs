@@ -173,6 +173,13 @@ pub mod method {
     pub const TIMER_LIST: &str = "timer.list";
     /// Timer 下次触发。
     pub const TIMER_NEXT: &str = "timer.next";
+    // ── rootd 特权代理（§23.4）──
+    /// 启停系统服务（rootd ServiceStart/Stop/Restart）。
+    pub const SERVICE_CONTROL: &str = "service.control";
+    /// 查看系统日志（rootd JournalQuery）。
+    pub const SYSTEM_LOG_VIEW: &str = "system-log.view";
+    /// rootd 版本对账（rootd Hello）。
+    pub const ROOTD_HELLO: &str = "rootd.hello";
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
