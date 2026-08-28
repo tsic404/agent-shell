@@ -3,6 +3,12 @@
 //! X11Generic 会话（或 portal 全部不可用时的 X11 兜底）直用
 //! SHM GetImage：server 端把像素写进共享内存段，客户端免大块
 //! socket 拷贝。SHM 扩展不可用时回退普通 GetImage。
+//!
+//! **原生 X11 门控**（§6.4；与 §6.3 XTest 同规则）：X11 根窗口直捕仅
+//! 在原生 X11 会话（`XDG_SESSION_TYPE=x11`）下可用。纯 Wayland 会话里
+//! XWayland 也提供 `DISPLAY`，但其 root 窗口无合成器内容——直捕只会得到
+//! 全黑帧；此路径应显式标记不可用（`BackendUnavailable`），而非返回全黑帧。
+//!
 
 use agent_shell_core::error::{AgentShellError, Result};
 use agent_shell_displayserver_x11::X11DisplayServer;
@@ -20,15 +26,29 @@ pub struct X11Capture {
 
 impl X11Capture {
     /// 连接 `$DISPLAY` 并探测 MIT-SHM 版本。
+    ///
+    /// 纯 Wayland 会话（XWayland `DISPLAY` 存在但 root 无内容）返回
+    /// [`AgentShellError::BackendUnavailable`]，而非建立一条只会产出
+    /// 全黑帧的连接。
     pub fn connect() -> Result<Self> {
+        if !native_x11_session() {
+            return Err(AgentShellError::BackendUnavailable(
+                "x11 capture unavailable: not a native X11 session (XWayland root has no \
+                 compositor content; use portal ScreenCast/Screenshot)"
+                    .into(),
+            ));
+        }
         Ok(Self {
             x: std::sync::Arc::new(std::sync::Mutex::new(X11DisplayServer::connect()?)),
         })
     }
 
-    /// `$DISPLAY` 是否存在（装配探测；不建立连接）。
+    /// 原生 X11 捕获是否可用（装配探测；不建立连接）。
+    ///
+    /// 要求原生 X11 会话且 `DISPLAY` 存在——纯 Wayland 会话下的
+    /// XWayland `DISPLAY` 不满足前者。
     pub fn display_present() -> bool {
-        std::env::var_os("DISPLAY").is_some()
+        native_x11_session() && std::env::var_os("DISPLAY").is_some()
     }
 
     /// 抓取整个屏幕（根窗口），返回原始像素帧。
@@ -229,4 +249,57 @@ fn shm_capture(
 
 fn capture_err(e: impl std::fmt::Display) -> AgentShellError {
     AgentShellError::Capture(format!("x11 capture: {e}"))
+}
+
+/// 原生 X11 会话判定：既无 Wayland compositor 环境（`WAYLAND_DISPLAY` /
+/// `WAYLAND_SOCKET`），又有 X server 可连（`DISPLAY`）。
+///
+/// 纯 Wayland 会话下的 XWayland 同样导出 `DISPLAY`，但其 root 窗口由
+/// XWayland 独占、无合成器内容——X11 根窗口直捕只会产出全黑帧，故此处
+/// 一律视为“非原生 X11”拒绝。门户（portal ScreenCast/Screenshot）才是
+/// 纯 Wayland 会话的可用后端。
+fn native_x11_session() -> bool {
+    native_x11_with(
+        std::env::var_os("WAYLAND_DISPLAY"),
+        std::env::var_os("WAYLAND_SOCKET"),
+        std::env::var_os("DISPLAY"),
+    )
+}
+
+/// 纯函数版判定（可单测，不触碰进程环境变量）。
+fn native_x11_with(
+    wayland_display: Option<std::ffi::OsString>,
+    wayland_socket: Option<std::ffi::OsString>,
+    display: Option<std::ffi::OsString>,
+) -> bool {
+    wayland_display.is_none() && wayland_socket.is_none() && display.is_some()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::native_x11_with;
+
+    fn os(s: &str) -> Option<std::ffi::OsString> {
+        Some(std::ffi::OsString::from(s))
+    }
+
+    #[test]
+    fn native_x11_when_only_display() {
+        assert!(native_x11_with(None, None, os(":0")));
+    }
+
+    #[test]
+    fn xwayland_wayland_display_rejected() {
+        assert!(!native_x11_with(os("wayland-0"), None, os(":0")));
+    }
+
+    #[test]
+    fn xwayland_wayland_socket_rejected() {
+        assert!(!native_x11_with(None, os("wayland-0"), os(":0")));
+    }
+
+    #[test]
+    fn no_display_rejected() {
+        assert!(!native_x11_with(None, None, None));
+    }
 }

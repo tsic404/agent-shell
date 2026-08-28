@@ -1195,6 +1195,8 @@ impl X11DisplayServer {
 }
 ```
 
+**注意事项**：X11 根窗口直捕仅在**原生 X11 会话**（XDG_SESSION_TYPE=X11）下可用。XWayland 下禁用——纯 Wayland 会话的 XWayland root 无合成器内容，直捕只会得到全黑帧；此时截图应走 portal ScreenCast/Screenshot。
+
 ### 6.5 子类额外接口
 
 | 后端 | 额外 D-Bus 接口 |

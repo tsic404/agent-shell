@@ -86,7 +86,7 @@ impl ActiveBackend {
 ///
 /// 装配探测链（design/02 §4.2）：`capture: portal ScreenCast →
 /// Screenshot → X11`。ScreenCast 会话建立需用户弹窗确认，构造期只做
-/// 无副作用探测（bus 上 portal 是否可达、DISPLAY 是否存在）；实际
+/// 无副作用探测（bus 上 portal 是否可达、原生 X11 会话是否存在）；实际
 /// 后端在首次 `capture` 时惰性建立并记录到 `active`。
 ///
 /// `token_store` 注入后，ScreenCast 优先尝试用持久化的 `restore_token`
@@ -142,7 +142,15 @@ impl CaptureDispatcher {
 
     /// 窗口直捕（X11-only；portal 无法定位 native window id）。
     /// 连接经 `OnceCell` 惰性建立并复用。
+    ///
+    /// 纯 Wayland 会话（`x11_present == false`）无原生 X11 可捕——返回
+    /// `BackendUnavailable`，不建立只会产出全黑帧的 XWayland 连接。
     pub async fn capture_window(&self, window: u32) -> Result<Frame> {
+        if !self.x11_present {
+            return Err(AgentShellError::BackendUnavailable(
+                "x11 capture unavailable: not a native X11 session".into(),
+            ));
+        }
         let x = self
             .x11
             .get_or_try_init(|| async { X11Capture::connect() })
@@ -260,7 +268,8 @@ impl CaptureDispatcher {
         }
 
         Err(AgentShellError::BackendUnavailable(
-            "no capture backend available (portal ScreenCast/Screenshot unreachable, no DISPLAY)"
+            "no capture backend available (portal ScreenCast/Screenshot unreachable, no native \
+             X11 session)"
                 .into(),
         ))
     }
@@ -337,7 +346,7 @@ impl CaptureComponent for CaptureDispatcher {
 pub async fn doctor_line(dispatcher: Option<&CaptureDispatcher>) -> String {
     const LABEL: &str = "截图捕获";
     match dispatcher {
-        None => format!("✗ {LABEL:<12}: 不可用（无 portal 且无 DISPLAY，TTY？）"),
+        None => format!("✗ {LABEL:<12}: 不可用（无 portal 且无原生 X11 会话，TTY？）"),
         Some(d) => {
             let backends = d.available_backends().join(" → ");
             match d.selected_backend() {
