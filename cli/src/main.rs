@@ -506,14 +506,29 @@ async fn service_cmd(c: &mut DaemonClient, cmd: cli::ServiceCommand) -> CmdResul
     Ok(0)
 }
 
+/// `log` 查询的 CLI 侧超时（秒）：大于 daemon→rootd 链路最长 90s 的容错余量，
+/// 到点主动失败并给明确提示（TSI-2493），而非静默挂起。
+const LOG_QUERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
+
+/// `log` 查询超时后的用户可读错误信息。
+fn log_query_timeout_error() -> String {
+    format!(
+        "journal query timed out after {}s (rootd may be scanning an oversized journal)",
+        LOG_QUERY_TIMEOUT.as_secs()
+    )
+}
+
 async fn log_cmd(c: &mut DaemonClient, cmd: cli::LogCommand) -> CmdResult {
     // --filter 是 clap 捕获的字符串，必须解析为 JSON 对象后再嵌入 RPC 参数。
     // 若直接传字符串，daemon 会二次序列化——rootd journal_query 收到
     // `"{\"unit\":\"sshd\"}"` 字符串字面量而非对象，`is_object()` 拒绝。
     let filter = parse_log_filter(&cmd.filter)?;
-    let r = c
-        .call(method::SYSTEM_LOG_VIEW, json!({ "filter": filter }))
-        .await?;
+    let r = tokio::time::timeout(
+        LOG_QUERY_TIMEOUT,
+        c.call(method::SYSTEM_LOG_VIEW, json!({ "filter": filter })),
+    )
+    .await
+    .map_err(|_| log_query_timeout_error())??;
     // system_log_view 的错误由 RPC error 层处理（call() 已返回 Err）。
     println!("{}", serde_json::to_string_pretty(&r).unwrap_or_default());
     Ok(0)
@@ -531,7 +546,15 @@ fn parse_log_filter(raw: &str) -> Result<Value, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_log_filter;
+    use super::{log_query_timeout_error, parse_log_filter, LOG_QUERY_TIMEOUT};
+
+    #[test]
+    fn log_timeout_is_positive_and_explicit() {
+        assert_eq!(LOG_QUERY_TIMEOUT.as_secs(), 90);
+        let msg = log_query_timeout_error();
+        assert!(msg.contains("timed out"), "{msg}");
+        assert!(msg.contains("90"), "{msg}");
+    }
 
     #[test]
     fn filter_object_parses() {

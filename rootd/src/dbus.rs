@@ -5,7 +5,10 @@
 //!   中的调用者 unique name（非 rootd 自己的总线名）
 //! - 非白名单方法由 lib `dispatch` 拒绝（默认拒绝）
 //! - `JobProgress`/`JobDone` 信号经 `job_snapshot`/`job_drain_done` 驱动
-use crate::{dispatch, job_drain_done, job_snapshot, polkit_action_for, JobState};
+use crate::{
+    dispatch, job_drain_done, job_snapshot, polkit_action_for, JobState, COMMAND_TIMEOUT,
+    JOURNAL_QUERY_TIMEOUT,
+};
 use serde_json::Value;
 use zbus::fdo;
 use zbus::message::Header;
@@ -154,7 +157,50 @@ impl RootdInterface {
         if let Some(action_id) = polkit_action_for(method) {
             check_polkit(connection, caller, action_id).await?;
         }
-        dispatch(method, &args).map_err(fdo::Error::Failed)
+        // polkit 通过后，分派与超时/事件循环隔离全部委托给
+        // `dispatch_with_timeout`——同步 dispatch 可能执行阻塞性系统命令
+        // （journalctl/systemctl/sysctl/hostnamectl/mount/umount），必须从
+        // tokio worker 移出，否则单次长查询会占住 rootd 事件循环，后续调用
+        // 全部排队超时（TSI-2493：全量 journalctl 200s，本应 0.4s 的
+        // --lines=50 排队）。
+        dispatch_with_timeout(method, args)
+            .await
+            .map_err(fdo::Error::Failed)
+    }
+}
+
+/// 带超时与事件循环隔离地执行一次 dispatch（§23.4.3 白名单方法）。
+///
+/// 同步 `dispatch` 可能执行阻塞性系统命令；`spawn_blocking` 将阻塞工作移出
+/// tokio worker，`tokio::time::timeout` 在超时后放弃等待（底层阻塞线程与
+/// 子进程继续运行至自然结束——超时不 kill，见 §开放问题）。
+/// 独立成 async 纯函数，使「超时 + spawn_blocking 包装」可被 `#[tokio::test]`
+/// 直接断言：把包装改回同步 `dispatch` 会使超时测试失败。
+async fn dispatch_with_timeout(method: &str, args: Vec<Value>) -> Result<Value, String> {
+    let timeout = command_timeout_for(method);
+    let method_name = method.to_string();
+    let result = tokio::time::timeout(
+        timeout,
+        tokio::task::spawn_blocking(move || dispatch(&method_name, &args)),
+    )
+    .await
+    .map_err(|_| format!("{method} timed out after {timeout:?}"))?
+    .map_err(|e| format!("{method} task join failed: {e}"))?;
+    result
+}
+
+/// 方法对应的命令超时：`JournalQuery` 走专项超时（60s），其余走默认（30s）。
+///
+/// 纯函数便于单测分支；阻塞性命令实际执行仍经 `dispatch_with_timeout` 的
+/// `spawn_blocking` + `timeout` 包装。`TestSlowMethod` 为测试专用慢方法，
+/// 映射亚秒超时保证回归测试在 CI 快速完成，而非真等 30s。
+fn command_timeout_for(method: &str) -> std::time::Duration {
+    if method == "JournalQuery" {
+        JOURNAL_QUERY_TIMEOUT
+    } else if method == "TestSlowMethod" {
+        std::time::Duration::from_millis(100)
+    } else {
+        COMMAND_TIMEOUT
     }
 }
 
@@ -542,10 +588,42 @@ pub async fn drive_signals(
         }
     }
 }
-
 #[cfg(test)]
 mod tests {
-    use super::process_start_time;
+    use super::{command_timeout_for, dispatch_with_timeout, process_start_time};
+    use crate::{COMMAND_TIMEOUT, JOURNAL_QUERY_TIMEOUT};
+
+    #[test]
+    fn journal_query_uses_dedicated_timeout() {
+        assert_eq!(command_timeout_for("JournalQuery"), JOURNAL_QUERY_TIMEOUT);
+    }
+
+    #[test]
+    fn other_methods_use_default_timeout() {
+        assert_eq!(command_timeout_for("ServiceStart"), COMMAND_TIMEOUT);
+        assert_eq!(command_timeout_for("PackageInstall"), COMMAND_TIMEOUT);
+    }
+
+    #[test]
+    fn slow_test_method_uses_short_timeout() {
+        // 测试专用慢方法映射到亚秒超时，保证超时测试在 CI 快速完成。
+        assert!(command_timeout_for("TestSlowMethod") < std::time::Duration::from_secs(1));
+    }
+
+    #[tokio::test]
+    async fn slow_dispatch_times_out_in_wrapper() {
+        // 核心回归保护：移除 spawn_blocking+timeout 包装后，本测试会因
+        // 阻塞线程占用测试线程而死锁或 panic，不再绿。
+        let r = dispatch_with_timeout("TestSlowMethod", vec![]).await;
+        let err = r.expect_err("slow command must be timed out");
+        assert!(err.contains("timed out"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn fast_dispatch_returns_through_wrapper() {
+        let r = dispatch_with_timeout("Hello", vec![]).await;
+        assert!(r.is_ok(), "fast command must succeed: {r:?}");
+    }
 
     #[test]
     fn start_time_of_current_process_is_positive() {

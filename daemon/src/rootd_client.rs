@@ -43,8 +43,15 @@ pub trait Rootd {
 /// zbus Proxy::builder 不校验 name ownership，即使 rootd 缺席
 /// 也能 build 成功，导致降级分支不可达。
 pub async fn connect() -> Option<RootdProxy<'static>> {
-    let conn = zbus::Connection::system().await.ok()?;
-    // 探测 rootd 是否在 system bus 上注册
+    // 方法超时必须大于 rootd 内部 JournalQuery 超时（60s），让 rootd 的
+    // 超时错误（而非 daemon 侧 D-Bus 超时）传播回 CLI——daemon 侧先行
+    // 超时会掩盖真实失败原因（TSI-2493）。
+    let conn = zbus::connection::Builder::system()
+        .ok()?
+        .method_timeout(std::time::Duration::from_secs(90))
+        .build()
+        .await
+        .ok()?;
     let dbus_proxy = zbus::proxy::Proxy::new(
         &conn,
         "org.freedesktop.DBus",

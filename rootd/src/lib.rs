@@ -14,9 +14,38 @@ pub mod dbus;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
+use std::time::Duration;
+
+/// 阻塞性系统命令的默认超时（秒）。
+///
+/// `journalctl` 全量查询在超大 journal（数百万条）上可运行数分钟——
+/// 超时使命令失败而非无限占用线程。`JournalQuery` 有更长的专项超时
+/// [`JOURNAL_QUERY_TIMEOUT`]。本常量是实际执行阻塞命令的方法
+/// （systemctl/sysctl/hostnamectl/mount/umount）的上界；Package* 方法
+/// 只返回 job id 不阻塞执行，30s 对其是无实际约束的兜底。
+pub const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// `JournalQuery` 专项超时（秒）。
+///
+/// 有界查询（默认 `--lines` 上界）通常在 1s 内返回；给足 60s 覆盖
+/// 冷缓存与慢磁盘场景，同时保证绝不无限阻塞 rootd 事件循环。
+pub const JOURNAL_QUERY_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// `JournalQuery` 默认行数上界（无显式 `limit` 时强制）。
+pub const DEFAULT_JOURNAL_LINES: u64 = 1000;
+
+/// `JournalQuery` 显式 `limit` 的最大值（防 `{"limit": <极大值>}` 绕过上界）。
+pub const MAX_JOURNAL_LINES: u64 = 10000;
+
+/// `JournalQuery` 默认时间上界（无 `since`/`until`/`boot` 时强制）。
+pub const DEFAULT_JOURNAL_SINCE: &str = "-24h";
 
 /// 执行系统命令（rootd 以 root 运行）。失败时返回错误描述。
 /// 薄代理职责：校验后的参数直接转发给系统工具，不做额外业务逻辑。
+///
+/// 同步阻塞实现——调用方（D-Bus 服务层）负责经 `spawn_blocking` +
+/// `tokio::time::timeout` 包装，本函数自身不含超时，便于单测。
 fn run_command(cmd: &str, args: &[&str]) -> Result<String, String> {
     let output = std::process::Command::new(cmd)
         .args(args)
@@ -28,7 +57,6 @@ fn run_command(cmd: &str, args: &[&str]) -> Result<String, String> {
     }
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
-use std::sync::Mutex;
 
 /// 当前安全模型版本（§23.4.3 版本对账字段）。
 pub const SECURITY_MODEL_VERSION: u32 = 1;
@@ -198,6 +226,13 @@ pub fn dispatch(method: &str, args: &[Value]) -> RootResult {
         "Unmount" => unmount(args),
         // 会话 Token 管理（可选，无系统副作用）
         "SetToken" => set_token(args),
+        // 测试专用慢方法（仅 cfg(test)）：为 dbus 层超时回归测试提供真实
+        // 阻塞源，验证 spawn_blocking+timeout 包装确实隔离事件循环。
+        #[cfg(test)]
+        "TestSlowMethod" => {
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            Ok(json!({"slow": true}))
+        }
         _ => Err(format!("method not in whitelist: {method}")),
     }
 }
@@ -542,31 +577,10 @@ fn daemon_reload() -> RootResult {
 // journal 解析注意多行消息和二进制字段（_MESSAGE 可能跨多行，§开放问题 #7）。
 // 过滤表达式为结构化 JSON 对象，非自由文本拼接——防注入。
 
-fn journal_query(args: &[Value]) -> RootResult {
-    let filter = str_arg(args, 0)?;
-    // 过滤表达式必须是合法 JSON 对象（结构化查询，非自由文本拼接）。
-    let parsed: Value = serde_json::from_str(filter)
-        .map_err(|e| format!("journal filter must be JSON object: {e}"))?;
-    if !parsed.is_object() {
-        return Err("journal filter must be a JSON object".into());
-    }
-    // 支持的过滤键（白名单，防注入）：
-    //   unit, priority, since, until, boot, dmesg, grep
-    let filter_obj = parsed.as_object().unwrap();
-    let allowed_keys = [
-        "unit", "priority", "since", "until", "boot", "dmesg", "grep", "limit",
-    ];
-    for key in filter_obj.keys() {
-        if !allowed_keys.contains(&key.as_str()) {
-            return Err(format!("unknown journal filter key: {key}"));
-        }
-    }
-    tracing::info!(
-        filter_keys = ?filter_obj.keys().collect::<Vec<_>>(),
-        "journal query requested (polkit action: com.agentshell.system-log.view)",
-    );
-    // 实际执行：journalctl --output=json + 过滤参数
-    let mut cmd_args: Vec<String> = vec!["--output=json".into()];
+/// 构造 `journalctl` 参数（不含 `--output=json` 前缀），供 `journal_query`
+/// 与测试复用。参数校验（JSON 对象 / 白名单键）由 `journal_query` 前置完成。
+fn build_journal_args(filter_obj: &serde_json::Map<String, Value>) -> Vec<String> {
+    let mut cmd_args: Vec<String> = Vec::new();
     if let Some(unit) = filter_obj.get("unit").and_then(|v| v.as_str()) {
         cmd_args.push(format!("--unit={unit}"));
     }
@@ -597,9 +611,49 @@ fn journal_query(args: &[Value]) -> RootResult {
         cmd_args.push("--grep".into());
         cmd_args.push(grep.to_string());
     }
+    let mut has_limit = false;
     if let Some(limit) = filter_obj.get("limit").and_then(|v| v.as_u64()) {
-        cmd_args.push(format!("--lines={limit}"));
+        cmd_args.push(format!("--lines={}", limit.min(MAX_JOURNAL_LINES)));
+        has_limit = true;
     }
+    if !has_limit {
+        cmd_args.push(format!("--lines={}", DEFAULT_JOURNAL_LINES));
+    }
+    let has_time_bound = filter_obj.contains_key("since")
+        || filter_obj.contains_key("until")
+        || filter_obj.contains_key("boot");
+    if !has_time_bound {
+        cmd_args.push(format!("--since={}", DEFAULT_JOURNAL_SINCE));
+    }
+    cmd_args
+}
+
+fn journal_query(args: &[Value]) -> RootResult {
+    let filter = str_arg(args, 0)?;
+    // 过滤表达式必须是合法 JSON 对象（结构化查询，非自由文本拼接）。
+    let parsed: Value = serde_json::from_str(filter)
+        .map_err(|e| format!("journal filter must be JSON object: {e}"))?;
+    if !parsed.is_object() {
+        return Err("journal filter must be a JSON object".into());
+    }
+    // 支持的过滤键（白名单，防注入）：
+    //   unit, priority, since, until, boot, dmesg, grep, limit
+    let filter_obj = parsed.as_object().unwrap();
+    let allowed_keys = [
+        "unit", "priority", "since", "until", "boot", "dmesg", "grep", "limit",
+    ];
+    for key in filter_obj.keys() {
+        if !allowed_keys.contains(&key.as_str()) {
+            return Err(format!("unknown journal filter key: {key}"));
+        }
+    }
+    tracing::info!(
+        filter_keys = ?filter_obj.keys().collect::<Vec<_>>(),
+        "journal query requested (polkit action: com.agentshell.system-log.view)",
+    );
+    // 实际执行：journalctl --output=json + 过滤参数（含默认上界与 clamp）。
+    let mut cmd_args: Vec<String> = vec!["--output=json".into()];
+    cmd_args.extend(build_journal_args(filter_obj));
     let refs: Vec<&str> = cmd_args.iter().map(|s| s.as_str()).collect();
     let output = run_command("journalctl", &refs)?;
     Ok(json!({
@@ -1182,7 +1236,60 @@ mod tests {
         }
     }
 
-    // ── 系统配置 ──
+    fn parse_filter(s: &str) -> serde_json::Map<String, Value> {
+        serde_json::from_str::<Value>(s)
+            .expect("valid filter JSON")
+            .as_object()
+            .expect("filter is an object")
+            .clone()
+    }
+
+    #[test]
+    fn journal_args_defaults_line_and_time_bounds() {
+        let args = build_journal_args(&parse_filter(r#"{}"#));
+        assert!(args
+            .iter()
+            .any(|a| a == &format!("--lines={}", DEFAULT_JOURNAL_LINES)));
+        assert!(args
+            .iter()
+            .any(|a| a == &format!("--since={}", DEFAULT_JOURNAL_SINCE)));
+    }
+
+    #[test]
+    fn journal_args_explicit_limit_omits_default_and_clamps() {
+        // 显式 limit：不带默认 --lines，且钳到 MAX_JOURNAL_LINES
+        let args = build_journal_args(&parse_filter(r#"{"limit":100}"#));
+        assert!(args.iter().any(|a| a == "--lines=100"));
+        assert!(!args
+            .iter()
+            .any(|a| a == &format!("--lines={}", DEFAULT_JOURNAL_LINES)));
+        assert!(args
+            .iter()
+            .any(|a| a == &format!("--since={}", DEFAULT_JOURNAL_SINCE)));
+
+        let args = build_journal_args(&parse_filter(r#"{"limit":999999999}"#));
+        assert!(args
+            .iter()
+            .any(|a| a == &format!("--lines={}", MAX_JOURNAL_LINES)));
+    }
+
+    #[test]
+    fn journal_args_explicit_time_bound_omits_default_since() {
+        let args = build_journal_args(&parse_filter(r#"{"since":"-48h"}"#));
+        assert!(args.iter().any(|a| a == "--since=-48h"));
+        assert!(!args
+            .iter()
+            .any(|a| a == &format!("--since={}", DEFAULT_JOURNAL_SINCE)));
+        // 无显式 limit 时仍带默认行数上界
+        assert!(args
+            .iter()
+            .any(|a| a == &format!("--lines={}", DEFAULT_JOURNAL_LINES)));
+
+        let args = build_journal_args(&parse_filter(r#"{"boot":true}"#));
+        assert!(!args
+            .iter()
+            .any(|a| a == &format!("--since={}", DEFAULT_JOURNAL_SINCE)));
+    }
 
     #[test]
     fn sysctl_key_validation_blocks_traversal() {
