@@ -39,6 +39,10 @@ pub enum MutterError {
     #[error("shell extension not available ({EXTENSION_ID}): {0}")]
     Extension(String),
 
+    /// Wayland 协议通道连接失败（wl_display connect / registry 初始化）。
+    #[error("wayland connect failed: {0}")]
+    Wayland(String),
+
     /// DisplayConfig 调用失败（不可达 / 序列号过期 InvalidArgs）。
     #[error("display config error: {0}")]
     DisplayConfig(String),
@@ -57,6 +61,9 @@ impl From<MutterError> for AgentShellError {
             )),
             MutterError::DisplayConfig(msg) => {
                 AgentShellError::DBus(format!("mutter display config: {msg}"))
+            }
+            MutterError::Wayland(msg) => {
+                AgentShellError::BackendUnavailable(format!("mutter wayland: {msg}"))
             }
             MutterError::Version(msg) => {
                 AgentShellError::BackendUnavailable(format!("gnome version: {msg}"))
@@ -99,5 +106,12 @@ mod tests {
     fn version_error_maps_to_backend_unavailable() {
         let e = AgentShellError::from(MutterError::Version("no ShellVersion".into()));
         assert!(matches!(e, AgentShellError::BackendUnavailable(_)));
+    }
+
+    #[test]
+    fn wayland_error_maps_to_backend_unavailable() {
+        let e = AgentShellError::from(MutterError::Wayland("NoCompositor".into()));
+        assert!(matches!(e, AgentShellError::BackendUnavailable(_)));
+        assert!(e.to_string().contains("mutter wayland"));
     }
 }

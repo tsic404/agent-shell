@@ -48,7 +48,8 @@ impl GnomeBackend {
     }
 
     /// 装配清单（§3.3 GNOME 行）：
-    /// - 合成器：MutterCompositor（D-Bus Eval/Extension，两会话均用）
+    /// - 合成器：MutterCompositor（D-Bus Eval/Extension，两会话均用；
+    ///   Wayland 会话额外组合 WaylandDisplayServer 基类通道）
     /// - 音频：公共探测链（GNOME 无 DE 层音量 D-Bus，§3.5）
     /// - 网络：NetworkManager
     /// - 输入 / 截图 / 无障碍 / 剪贴板：公共探测链
@@ -58,13 +59,24 @@ impl GnomeBackend {
     /// - 启动器：GnomeLauncher（.desktop + gio）
     /// - 系统服务：Systemd + Logind
     pub async fn assemble(&self) -> Result<ComponentRegistry> {
-        // 1. 合成器：MutterCompositor（Eval/Extension 双路径，会话无关）
-        let compositor: Option<Box<dyn CompositorComponent>> = match MutterCompositor::new().await {
-            Ok(c) => Some(Box::new(c)),
-            Err(e) => {
-                tracing::warn!(error = %e, "Mutter assembly failed; compositor slot None");
-                None
-            }
+        // 1. 合成器：MutterCompositor（Eval/Extension 双路径；Wayland 会话
+        //    额外组合 WaylandDisplayServer 基类通道，落地 WaylandCompositor
+        //    继承层次）。
+        let compositor: Option<Box<dyn CompositorComponent>> = match self.session {
+            SessionType::Wayland => match MutterCompositor::new_wayland().await {
+                Ok(c) => Some(Box::new(c)),
+                Err(e) => {
+                    tracing::warn!(error = %e, "Mutter Wayland assembly failed; compositor slot None");
+                    None
+                }
+            },
+            SessionType::X11 => match MutterCompositor::new_x11().await {
+                Ok(c) => Some(Box::new(c)),
+                Err(e) => {
+                    tracing::warn!(error = %e, "Mutter X11 assembly failed; compositor slot None");
+                    None
+                }
+            },
         };
 
         // 2. DE 专有组件优先，失败回退公共组件

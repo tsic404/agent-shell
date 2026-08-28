@@ -33,5 +33,5 @@ pub use display_config::{
 pub use error::{MutterError, Result, EXTENSION_ID};
 pub use eval::GnomeEvalBridge;
 pub use extension::{ExtensionRunner, EXTENSION_JS};
-pub use mutter_compositor::{GnomePath, MutterCompositor};
+pub use mutter_compositor::{GnomePath, MutterCompositor, SessionKind};
 pub use version::{detect_version, parse_shell_version, GnomeMajor, GnomeVersion};

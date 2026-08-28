@@ -8,6 +8,8 @@ description = "agent-shell Mutter compositor component (org.gnome.Shell Eval/Ext
 
 [dependencies]
 agent-shell-core.workspace = true
+agent-shell-compositor-wayland-core.workspace = true
+agent-shell-displayserver-wayland.workspace = true
 async-trait.workspace = true
 serde.workspace = true
 serde_json.workspace = true
