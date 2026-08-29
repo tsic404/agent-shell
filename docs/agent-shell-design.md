@@ -6248,40 +6248,44 @@ agent-shell doctor
   Input:     LibeiInput (portal 通道)
 ```
 
-### 22.11 实施路线图与里程碑
+### 22.11 实施里程碑与当前状态
 
-**Phase 0：骨架 + KWin/DDE 桥接（2-3 周）**
+> 本节是历史里程碑记录，不是待办路线图。Phase 0–2 的交付物已实现并合入主分支，
+> Phase 3–4 为「部分实现/部分接线」状态：组件 crate 与后端装配器已合入，但 daemon
+> 侧接线与端到端验收尚未完成。读者不应把未标注完成状态的条目误读为「工作尚未开始」。
+
+**Phase 0：骨架 + KWin/DDE 桥接（2-3 周）— ✅ 已完成**
 - core 类型 + trait + error + config
 - KwinBridge (callDBus 回传) + 预置脚本
 - DE 检测 + AgentShell
 - CLI: windows / window focus|move|close / info
 - 验收：DDE 环境 `agent-shell windows` 输出正确 JSON
 
-**Phase 1：输入 + 截图 + 无障碍（2-3 周）**
+**Phase 1：输入 + 截图 + 无障碍（2-3 周）— ✅ 已完成**
 - InputDispatcher：libei/EIS via portal（含会话管理基础）
 - CaptureDispatcher：ScreenCast → PipeWire 单帧
 - AT-SPI 桥接 + SemanticLocator
 - CLI: input / screenshot / a11y
 - 验收：能语义化点击按钮（zenity 测试窗口）
 
-**Phase 2：Daemon + 安全 + 事件（2-3 周）**
+**Phase 2：Daemon + 安全 + 事件（2-3 周）— ✅ 已完成**
 - daemon 主循环 + JSON-RPC
 - PortalSessionManager + 持久化
 - SecurityManager + AuditLogger
 - EventHub + 归一化 + CLI `-f`
 - 验收：`agent-shell daemon` 起后，事件流可订阅
 
-**Phase 3：系统服务（2-3 周）**
-- services 全模块：display/audio/network/apps/notify/power/clipboard/appearance
-- 基础设施：systemd/journal/dbus/hostname/process
-- 补充：brightness/files/brightness/IME
-- 验收：全部 CLI 命令在 DDE 实测通过
+**Phase 3：系统服务（2-3 周）— 🟡 部分实现/部分接线**
+- services 组件 crate 已合入：`components/audio|network|power|notification|appearance|clipboard|launcher`（PR #6/#8/#9）
+- 基础设施 crate 已合入：`components/systemd|logind`（PR #6）
+- daemon 侧大量方法仍为 `stub_ok`（`daemon/src/dispatch.rs:78-101`：brightness/file/mime/bluetooth/flatpak/software/touchpad/kbd/secret/shortcut/timer）
+- 验收「全部 CLI 命令在 DDE 实测通过」未达成
 
-**Phase 4：跨 DE + MCP 打磨（2 周）**
-- GNOME/Hyprland/X11 backends
-- MCP server 完整工具集
-- `agent-shell doctor` 全绿
-- 验收：GNOME 容器 + Hyprland 容器冒烟测试
+**Phase 4：跨 DE + MCP 打磨（2 周）— 🟡 部分实现/部分接线**
+- GNOME/Hyprland/Sway backends + 8 后端装配器已合入（PR #37）；X11 兜底 backend 位于 `backends/generic`，尚未验证
+- MCP server 18 tools 已实现（PR #39，`mcp/src/server.rs`）
+- 「`agent-shell doctor` 全绿」未验证
+- 验收：GNOME 容器 + Hyprland 容器冒烟测试 未完成
 
 ---
 
