@@ -2622,6 +2622,22 @@ impl ElementActions {
         self.input.mouse_click(MouseButton::Left).await
     }
 
+    /// 聚焦元素：AT-SPI Component.GrabFocus 优先，失败降级 Action.DoAction(0)
+    pub async fn focus(&self, element: &ElementNode) -> Result<()> {
+        let component = element.get_component_interface().await?;
+        if component.grab_focus().await? {
+            return Ok(());
+        }
+        // 降级：有 Action 接口的元素触发主动作通常等效聚焦
+        if element.has_action_interface().await {
+            element.get_action_interface().await?.do_action(0).await?;
+            return Ok(());
+        }
+        Err(AgentShellError::DBus(format!(
+            "GrabFocus unsupported for {}", element.path
+        )))
+    }
+
     /// 获取元素文本
     pub async fn get_text(&self, element: &ElementNode) -> Result<String> {
         let text = element.get_text_interface().await?;
