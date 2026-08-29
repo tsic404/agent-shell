@@ -2640,15 +2640,52 @@ impl ElementActions {
 
     /// 获取元素文本
     pub async fn get_text(&self, element: &ElementNode) -> Result<String> {
-        let text = element.get_text_interface().await?;
-        text.get_text(0, -1).await.map_err(Into::into)
+        let text = self
+            .bridge
+            .proxy_for(
+                element.bus_name.as_str(),
+                element.path.as_str(),
+                "org.a11y.atspi.Text",
+            )
+            .await?;
+        // 终点偏移用 CharacterCount 而非 -1：Qt atspi 按字面区间处理负值会出错
+        let count: i32 = text
+            .get_property("CharacterCount")
+            .await
+            .map_err(|e| AgentShellError::DBus(format!("Text.CharacterCount: {e}")))?;
+        let content: String =
+            AtspiBridge::call_checked(&text, "GetText", &(0, count), "Text.GetText").await?;
+        Ok(content)
     }
 
-    /// 输入文本（AT-SPI EditableText 接口）
-    pub async fn set_text(&self, element: &ElementNode, text: &str) -> Result<()> {
-        let editable = element.get_editable_text_interface().await?;
-        editable.set_text_contents(text).await?;
-        Ok(())
+    /// 输入文本：EditableText.SetTextContents 整体覆写。
+    pub async fn set_text(&self, element: &ElementNode, contents: &str) -> Result<()> {
+        if !self.is_editable(element).await {
+            return Err(AgentShellError::BackendUnavailable(format!(
+                "element {} is not editable (missing EditableText or EDITABLE state)",
+                element.path
+            )));
+        }
+        let editable = self
+            .bridge
+            .proxy_for(
+                element.bus_name.as_str(),
+                element.path.as_str(),
+                "org.a11y.atspi.EditableText",
+            )
+            .await?;
+        let ok: bool = AtspiBridge::call_checked(
+            &editable,
+            "SetTextContents",
+            &(contents,),
+            "EditableText.SetTextContents",
+        )
+        .await?;
+        if ok {
+            Ok(())
+        } else {
+            Err(AgentShellError::DBus("SetTextContents returned false".into()))
+        }
     }
 }
 ```
