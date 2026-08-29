@@ -455,6 +455,9 @@ mod tests {
     use super::*;
     use crate::compositor::classify;
     use crate::version::DdeMajor;
+    use std::process::Stdio;
+
+    use agent_shell_compositor_kwin::dbus_bridge::KWinBridge;
 
     #[test]
     fn detection_order_matches_design() {
@@ -492,6 +495,139 @@ mod tests {
             assert!(names[0].starts_with("org.deepin.dde."));
             assert!(names[1].starts_with("com.deepin.daemon."));
         }
+    }
+
+    /// 独立私有 session bus（避免 `Connection::session()` 环境变量在并行
+    /// 测试间竞争）。与 kwin 组件测试同款最小设施。
+    struct TestBus {
+        addr: String,
+        _child: std::process::Child,
+    }
+
+    impl TestBus {
+        async fn start() -> Self {
+            let mut child = std::process::Command::new("dbus-daemon")
+                .args(["--session", "--nofork", "--print-address=1"])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("dbus-daemon must be installed for DDE doctor tests");
+            let stdout = child.stdout.take().expect("piped stdout");
+            let addr = read_address_line(stdout);
+            assert!(
+                addr.starts_with("unix:"),
+                "dbus-daemon printed unexpected address: {addr:?}"
+            );
+            Self {
+                addr,
+                _child: child,
+            }
+        }
+
+        async fn connect(&self) -> zbus::Connection {
+            zbus::connection::Builder::address(self.addr.as_str())
+                .expect("dbus-daemon address must parse")
+                .build()
+                .await
+                .expect("connect to private session bus")
+        }
+    }
+
+    impl Drop for TestBus {
+        fn drop(&mut self) {
+            let _ = self._child.kill();
+            let _ = self._child.wait();
+        }
+    }
+
+    /// 逐字节读地址行（与 kwin 测试设施一致：`--print-address=1` 恰好一行）。
+    fn read_address_line(stdout: std::process::ChildStdout) -> String {
+        use std::io::Read as _;
+        let mut reader = std::io::BufReader::new(stdout);
+        let mut bytes = Vec::new();
+        loop {
+            let mut buf = [0u8; 1];
+            match reader.read_exact(&mut buf) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                Err(e) => panic!("read dbus-daemon address: {e}"),
+            }
+            bytes.push(buf[0]);
+            if buf[0] == b'\n' {
+                break;
+            }
+        }
+        let line = String::from_utf8(bytes).expect("dbus-daemon address must be UTF-8");
+        assert!(!line.is_empty(), "dbus-daemon printed no address line");
+        line.trim_end_matches('\n').to_string()
+    }
+
+    /// 注册 org.kde.KWin 的 /Scripting 单例（仅声明接口，供 introspect 判定）。
+    struct KWinScripting;
+
+    #[zbus::interface(name = "org.kde.kwin.Scripting")]
+    impl KWinScripting {
+        fn load_script(&self, _file_path: String, _plugin_name: String) -> i32 {
+            0
+        }
+    }
+
+    async fn spawn_fake_kwin(bus: &TestBus) -> zbus::Connection {
+        let conn = bus.connect().await;
+        conn.object_server()
+            .at("/Scripting", KWinScripting)
+            .await
+            .expect("register /Scripting");
+        use zbus::names::WellKnownName;
+        let name = WellKnownName::try_from("org.kde.KWin".to_string()).expect("valid bus name");
+        conn.request_name(name).await.expect("claim org.kde.KWin");
+        conn
+    }
+
+    async fn bridge_on(bus: &TestBus) -> KWinBridge {
+        KWinBridge::with_connection(bus.connect().await)
+            .await
+            .expect("build KWinBridge on private bus")
+    }
+
+    #[tokio::test]
+    async fn doctor_lines_async_deepin_kwin_branch_renames_and_probes() {
+        let bus = TestBus::start().await;
+        let _kwin = spawn_fake_kwin(&bus).await;
+
+        // 最小 KWin 实例：/Scripting 探测初值 None——只有走
+        // doctor_lines_async 才会触发懒探测并把桥接行升级为「就绪」。
+        let kwin = KWinCompositor::for_test(bridge_on(&bus).await, None);
+        let v = DdeVersion::from_probes([("display".into(), "org.deepin.dde.Display1".into())]);
+        let c = DdeCompositor::with_parts(Compositor::DeepinKwin(Box::new(kwin)), v);
+
+        let lines = c.doctor_lines_async().await;
+
+        // (c) 行数与版本标签一致：1 版本行 + 3 KWin 行 + 1 DDE 服务行。
+        assert_eq!(lines.len(), 5, "unexpected doctor line count: {lines:#?}");
+        assert!(
+            lines[0].contains("DDE 25"),
+            "version label missing: {}",
+            lines[0]
+        );
+
+        // (a) 调用链走 doctor_lines_async：未探测初值经异步探测升级为就绪。
+        assert!(
+            lines.iter().any(|l| l.contains("✓ D-Bus 桥接")),
+            "async probe must run via doctor_lines_async: {lines:#?}"
+        );
+
+        // (b) "KWin 服务" 被替换为 "deepin-kwin"。
+        assert!(
+            !lines.iter().any(|l| l.contains("KWin 服务")),
+            "raw KWin 服务 label must be renamed: {lines:#?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("deepin-kwin") && l.contains("org.kde.KWin")),
+            "renamed version line missing: {lines:#?}"
+        );
     }
 
     #[tokio::test]

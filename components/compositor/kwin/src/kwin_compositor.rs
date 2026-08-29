@@ -132,14 +132,27 @@ impl KWinCompositor {
         })
     }
 
-    /// 测试注入点（TSI-2502）：仅测试可用，直接给定桥接连接与
-    /// `scripting_probe` 初值，绕过真实显示服务器/版本探测路径。
+    /// 测试注入点（TSI-2502/TSI-2505）：跨 crate 测试需绕过真实显示
+    /// 服务器/版本探测路径构造最小实例。给定桥接连接与 `/Scripting`
+    /// 探测初值：`None`=未探测，`Some(false)`=最近失败，`Some(true)`=
+    /// 已确认可用。
     ///
     /// 生产构造路径（`new_wayland` / `new_x11`）不受影响；本构造函数
     /// 不触碰 `ensure_scripting_probe` 的真实探测逻辑。
-    #[cfg(test)]
-    pub(crate) fn for_test(bridge: KWinBridge, probe: u8) -> Self {
+    ///
+    /// 权衡：`#[doc(hidden)]` 只隐藏文档、不隐藏符号，release 构建中下游
+    /// crate 仍可调用本测试构造器。采纳该模式是因为 DDE 组件的集成测试
+    /// 需要从 crate 外注入最小 KWin 实例（`Option<bool>` 表达三态探测），
+    /// 而 `#[cfg(test)]` 注入点对下游 crate 不可见；风险仅限误用构造器，
+    /// 不触及真实探测/构造路径。
+    #[doc(hidden)]
+    pub fn for_test(bridge: KWinBridge, probe: Option<bool>) -> Self {
         use std::sync::atomic::AtomicU8;
+        let probe = match probe {
+            Some(true) => PROBE_OK,
+            Some(false) => PROBE_FAIL,
+            None => PROBE_UNSET,
+        };
         Self {
             wayland_core: None,
             protocols: None,
@@ -899,7 +912,7 @@ mod tests {
     async fn unset_probe_triggers_probe_and_becomes_ok() {
         let bus = TestBus::start().await;
         let _kwin = spawn_fake_kwin(&bus).await;
-        let comp = KWinCompositor::for_test(bridge(&bus).await, PROBE_UNSET);
+        let comp = KWinCompositor::for_test(bridge(&bus).await, None);
 
         assert_eq!(comp.scripting_probe_ok(), None);
         let lines = comp.doctor_lines_async().await;
@@ -914,7 +927,7 @@ mod tests {
     async fn failed_probe_is_retried_and_becomes_ok() {
         let bus = TestBus::start().await;
         // 先建桥（无 org.kde.KWin 服务），在桥接上探测一次失败。
-        let comp = KWinCompositor::for_test(bridge(&bus).await, PROBE_UNSET);
+        let comp = KWinCompositor::for_test(bridge(&bus).await, None);
         let _ = comp.ensure_scripting_probe().await;
         assert_eq!(comp.scripting_probe_ok(), Some(false));
 
@@ -932,7 +945,7 @@ mod tests {
         let bus = TestBus::start().await;
         // 不注册 org.kde.KWin：若短路失败，doctor_lines_async 会重测并
         // 把 PROBE_OK 覆写为 PROBE_FAIL。
-        let comp = KWinCompositor::for_test(bridge(&bus).await, PROBE_OK);
+        let comp = KWinCompositor::for_test(bridge(&bus).await, Some(true));
 
         let lines = comp.doctor_lines_async().await;
 
@@ -945,7 +958,7 @@ mod tests {
     #[tokio::test]
     async fn failed_probe_remains_failed_when_still_unreachable() {
         let bus = TestBus::start().await;
-        let comp = KWinCompositor::for_test(bridge(&bus).await, PROBE_FAIL);
+        let comp = KWinCompositor::for_test(bridge(&bus).await, Some(false));
 
         let lines = comp.doctor_lines_async().await;
 
