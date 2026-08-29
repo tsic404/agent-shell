@@ -479,10 +479,11 @@ pub enum AgentShellError {
     #[error("DE not supported: {0}")] UnsupportedDE(String),
     #[error("Backend not available: {0}")] BackendUnavailable(String),
     #[error("Window not found: {0}")] WindowNotFound(String),
-    #[error("D-Bus error: {0}")] DBus(#[from] zbus::Error),
+    #[error("D-Bus error: {0}")] DBus(String),
     #[error("Input backend error: {0}")] Input(String),
     #[error("Capture error: {0}")] Capture(String),
     #[error("Permission denied: {0}")] Permission(String),
+    #[error("Confirmation required: {0}")] ConfirmationRequired(String),
     #[error("Timeout: {0}")] Timeout(String),
     #[error("Not implemented: {0}")] NotImplemented(String),
     #[error(transparent)] Other(#[from] Box<dyn std::error::Error + Send + Sync>),
@@ -671,7 +672,7 @@ use async_trait::async_trait;
 pub enum ComponentType {
     Compositor, AudioServer, Network, Input, Capture,
     A11y, Clipboard, Power, Notification, Appearance, Launcher,
-    InitSystem, SessionManager, SystemdService,
+    InitSystem, SessionManager,
 }
 
 /// 组件健康状态
@@ -776,6 +777,8 @@ pub struct ComponentRegistry {
     pub notification: Option<Box<dyn NotificationComponent>>,
     // 外观
     pub appearance: Option<Box<dyn AppearanceComponent>>,
+    // 显示布局（显示器排列 / 输出配置）
+    pub display_layout: Option<Box<dyn DisplayLayoutComponent>>,
     // 启动器
     pub launcher: Option<Box<dyn LauncherComponent>>,
     // 初始化系统（systemd，任何 Linux 环境都有）
@@ -851,15 +854,14 @@ pub enum BackendKind {
 
 ```rust
 pub struct AgentShell {
-    // 核心基础设施
-    dbus: DBusManager,               // D-Bus 连接管理（session + system）
-    event_hub: EventHub,             // 事件枢纽（所有组件事件归一化）
+    // 事件枢纽（所有组件事件归一化）
+    pub event_hub: EventHub,
 
     // 当前 backend（桌面环境）
-    backend: BackendKind,            // Kde / Dde / Gnome / Hyprland / Sway / X11Generic / WLRWayland / Tty
+    pub backend: BackendKind,        // Kde / Dde / Gnome / Hyprland / Sway / X11Generic / WLRWayland / Tty
 
     // 公共组件装配结果
-    components: ComponentRegistry,
+    pub components: ComponentRegistry,
 }
 ```
 
@@ -908,96 +910,57 @@ AgentShell::detect_and_assemble()
 ```rust
 impl AgentShell {
     pub async fn detect_and_assemble() -> Result<Self> {
-        let de = detect_backend().await?;   // DesktopEnvironment (Kde/Dde/Gnome/...)
-        let session_type = detect_session_type();
-
-        // 公共基础设施（跨 DE 共享）
-        let dbus = DBusManager::new().await?;
+        let de = detect_desktop_environment();   // → DesktopEnvironment (KDE/DDE/GNOME/...)
         let event_hub = EventHub::new();
-
-        // 按 DE 调用对应 backend 的 assemble()，由 backend 决定：
-        //   1. 选哪个合成器（KWinCompositor / TreelandCompositor / MutterCompositor…）
-        //   2. 选哪些 DE 专有组件（KdePowerDevil / DdePower / GnomePower…）
-        //   3. 未覆盖的公共组件（audio / input / capture / a11y）由公共组件层探测
-        let components = match de {
-            DesktopEnvironment::Kde => {
-                let backend = KdeBackend::new(dbus.clone(), session_type);
-                backend.assemble(event_hub.clone()).await?
-            }
-            DesktopEnvironment::Dde => {
-                let backend = DdeBackend::new(dbus.clone(), session_type);
-                backend.assemble(event_hub.clone()).await?
-            }
-            DesktopEnvironment::Gnome => {
-                let backend = GnomeBackend::new(dbus.clone(), session_type);
-                backend.assemble(event_hub.clone()).await?
-            }
-            DesktopEnvironment::Hyprland => {
-                let backend = HyprlandBackend::new(dbus.clone());
-                backend.assemble(event_hub.clone()).await?
-            }
-            DesktopEnvironment::Sway => {
-                let backend = SwayBackend::new(dbus.clone());
-                backend.assemble(event_hub.clone()).await?
-            }
-            DesktopEnvironment::X11Generic => {
-                let backend = X11Backend::new();
-                backend.assemble(event_hub.clone()).await?
-            }
-            DesktopEnvironment::WLRWayland => {
-                let backend = WlrWaylandBackend::new(dbus.clone());
-                backend.assemble(event_hub.clone()).await?
-            }
-            DesktopEnvironment::Tty => {
-                let backend = TtyBackend::new();
-                backend.assemble(event_hub.clone()).await?
-            }
-        };
-
-        Ok(Self { dbus, event_hub, backend: de, components })
+        let components = assemble_for(de).await?;
+        let backend = BackendKind::from(de);
+        Ok(Self { event_hub, backend, components })
     }
 }
 
-// 每个 DE 的 assemble() 内部实现示例（KDE）：
+// 按检测到的桌面环境分发到对应 backend 的 assemble()（feature 门控）
+async fn assemble_for(de: DesktopEnvironment) -> Result<ComponentRegistry> {
+    match de {
+        #[cfg(feature = "kde")]
+        DesktopEnvironment::KDE => {
+            let backend = KdeBackend::new(SessionType::from_env());
+            backend.assemble().await
+        }
+        #[cfg(not(feature = "kde"))]
+        DesktopEnvironment::KDE => Err(unsupported("kde")),
+        // DDE / GNOME / Hyprland / Sway 同构：new(SessionType::from_env()) 或 new() → assemble().await
+        DesktopEnvironment::Tty => {
+            let backend = TtyBackend::new();
+            backend.assemble().await
+        }
+        _ => Err(AgentShellError::UnsupportedDE(format!("{de:?}"))),
+    }
+}
+
+// KDE backend 装配清单（§3.3 KDE 行）：
 impl KdeBackend {
-    pub async fn assemble(&self, event_hub: EventHub) -> Result<ComponentRegistry> {
+    pub fn new(session: SessionType) -> Self { ... }
+
+    pub async fn assemble(&self) -> Result<ComponentRegistry> {
         // 1. 合成器：KWin（Wayland 优先，回退 X11）
-        let compositor: Option<Box<dyn CompositorComponent>> = Some(match self.session_type {
-            SessionType::Wayland => Box::new(KWinCompositor::new_wayland(self.dbus.clone()).await?),
-            SessionType::X11 => Box::new(KWinCompositor::new_x11(self.dbus.clone()).await?),
-        });  // TTY backend 用 None
+        let compositor: Option<Box<dyn CompositorComponent>> = match self.session {
+            SessionType::Wayland => Some(Box::new(KWinCompositor::new_wayland().await?)),
+            SessionType::X11 => Some(Box::new(KWinCompositor::new_x11().await?)),
+        };  // TTY backend 用 None
 
-        // 2. DE 专有组件优先（org.kde.* 接口）
-        let power: Box<dyn PowerComponent> = KdePowerDevil::try_new(self.dbus.clone()).await?
-            .unwrap_or_else(|| Box::new(UPowerComponent::new().await?));  // 回退公共组件
-        let notification = KdeNotification::try_new(self.dbus.clone()).await?
-            .unwrap_or_else(|| Box::new(PortalNotification::new().await?));
-        let appearance = KdeAppearance::try_new(self.dbus.clone()).await?
-            .unwrap_or_else(|| Box::new(PortalAppearance::new().await?));
-        let launcher = KdeLauncher::try_new(self.dbus.clone()).await?
-            .unwrap_or_else(|| Box::new(PortalAppLauncher::new().await?));
+        // 2. DE 专有组件优先（org.kde.* 接口），失败回退公共组件
+        let power: Option<Box<dyn PowerComponent>> = KdePowerDevil::try_new().await?
+            .map(|p| Box::new(p) as Box<dyn PowerComponent>)
+            .or(Some(Box::new(UPowerComponent::new().await?)));
+        let notification = ...;  // freedesktop Notifications（KDE 即其实现）
+        let appearance = ...;    // KdeAppearance（plasma-apply-* CLI）
+        let launcher = ...;      // KdeLauncher（.desktop + gio）
 
-        // 3. 公共组件探测（跨 DE 一致）
-        let audio: Option<Box<dyn AudioServerComponent>> = if pipewire_available() {
-            Box::new(PipeWireAudioServer::new()?)
-        } else if pulseaudio_available() {
-            Some(Box::new(PulseAudioAudioServer::new()?))
-        } else {
-            None  // 无音频服务器
-        };
-        let network = NetworkManagerComponent::new(self.dbus.clone()).await?;
-        let input = InputComponent::detect(self.session_type).await?;
-        let capture = CaptureComponent::detect(self.session_type).await?;
-        let a11y = AccessibilityComponent::detect().await?;
-        let clipboard = ClipboardComponent::detect(self.session_type).await?;
-        let init_system = SystemdComponent::new().await?;
-        let session_manager = LogindComponent::new().await?;
-
-        Ok(ComponentRegistry {
-            compositor, audio, network, power, notification,
-            appearance, launcher, input, capture, a11y, clipboard,
-            init_system, session_manager,
-        })
+        // 3. 公共组件探测（跨 DE 一致）：audio / network / input / capture / a11y / clipboard
+        // 4. 系统服务：Systemd + Logind
+        Ok(ComponentRegistry { compositor, audio, network, power, notification,
+            appearance, display_layout, launcher, input, capture, a11y, clipboard,
+            init_system, session_manager })
     }
 }
 ```
@@ -1159,10 +1122,14 @@ impl X11DisplayServer {
         // 检查 DISPLAY → x11rb::connect(None)
         // root window → intern_atom 批量获取原子
     }
-    pub fn get_client_list(&self) -> Result<Vec<u32>> { /* _NET_CLIENT_LIST */ }
+    pub fn get_client_list(&self) -> Result<Vec<x11rb::protocol::xproto::Window>> { /* _NET_CLIENT_LIST */ }
     pub fn activate_window(&self, window: u32) -> Result<()> { /* _NET_ACTIVE_WINDOW */ }
     pub fn close_window(&self, window: u32) -> Result<()> { /* _NET_CLOSE_WINDOW */ }
-    pub fn move_resize_window(&self, w: u32, x: i32, y: i32, w2: i32, h: i32) -> Result<()> {
+    pub fn move_resize_window(
+        &self,
+        window: x11rb::protocol::xproto::Window,
+        x: Option<i32>, y: Option<i32>, w: Option<i32>, h: Option<i32>,
+    ) -> Result<()> {
         // _NET_MOVERESIZE_WINDOW ClientMessage
     }
     pub fn get_current_desktop(&self) -> Result<u32> { /* _NET_CURRENT_DESKTOP */ }
@@ -1203,7 +1170,7 @@ impl X11DisplayServer {
         Ok(())
     }
 
-    pub fn fake_motion_event(&self, x: i32, y: i32) -> Result<()> {
+    pub fn fake_motion_event(&self, x: i16, y: i16) -> Result<()> {
         self.conn.xtest_fake_input(
             xtest::FakeInput::MOTION_NOTIFY,
             0,
@@ -1225,7 +1192,7 @@ X11 截图通过 `XGetImage` 或 MIT-SHM 扩展实现，不依赖 ImageMagick `i
 
 ```rust
 impl X11DisplayServer {
-    pub fn capture_window(&self, window: u32) -> Result<Vec<u8>> {
+    pub fn capture_window(&self, window: x11rb::protocol::xproto::Window) -> Result<Vec<u8>> {
         // 首选 MIT-SHM（共享内存，零拷贝）
         if let Ok(img) = self.conn.xshm_get_image(...) {
             return Ok(img.data);
@@ -1457,28 +1424,20 @@ workspace.activeWindowChanged.connect(function() {
 // components/compositor/kwin/src/dbus_bridge.rs
 
 pub struct KWinBridge {
-    connection: zbus::Connection,
-    response_tx: tokio::sync::oneshot::Sender<String>,
-    script_counter: Arc<AtomicU64>,
+    conn: Connection,                    // session bus 连接（Scripting 调用与响应服务共用）
+    router: SharedRouter,                // 按请求 id 的回传路由表
+    event_rx: Mutex<Option<mpsc::UnboundedReceiver<Value>>>, // 事件推送接收端（subscribe 时取走）
 }
 
 impl KWinBridge {
-    async fn run_script(&self, js: &str) -> Result<String> {
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        self.response_tx = tx;
+    pub async fn connect() -> Result<Self> { ... }
+    pub async fn with_connection(conn: Connection) -> Result<Self> { ... }
 
+    pub async fn run_script(&self, script_name: &str, v6: bool, js: &str) -> Result<Value> {
         // 注册临时 D-Bus 响应服务（com.agent_shell.Response）
         // 构造内联脚本：执行 js → callDBus sendResult
-        // loadScript → run
-        let script_path = scripting.load_script(&inline).await?;
-        let script_obj = ScriptProxy::new(&self.connection, &script_path).await?;
-        script_obj.run().await?;
-
-        // 等待响应（5s 超时）
-        let result = tokio::time::timeout(Duration::from_secs(5), rx).await??;
-
-        script_obj.stop().await.ok();
-        Ok(result)
+        // loadScript → run → 等待响应（5s 超时）→ stop
+        ...
     }
 }
 ```
@@ -1529,17 +1488,25 @@ Scripting（补充通道）。实现时确认 KWin 6.7 上任务栏与第三方�
 
 ```rust
 pub struct KWinCompositor {
-    wayland: Option<KWinProtocols>,        // Wayland 协议通道（基础，首选）
-    bridge: KWinBridge,                    // D-Bus / Scripting 通道（补充）
+    wayland_core: Option<WaylandDisplayServer>,  // 基类协议通道（仅 Wayland 会话为 Some）
+    protocols: Option<KWinProtocols>,            // org_kde_* 私有协议通道（叠加在基类之上）
+    bridge: KWinBridge,                          // D-Bus / Scripting 补充通道（会话无关，共享）
+    x11: Option<X11DisplayServer>,               // X11 基础通道（仅 X11 会话为 Some）
     version: KWinVersion,
-    event_handle: Option<EventScriptHandle>,
+    event_handle: AsyncMutex<Option<EventScriptHandle>>,  // 长驻事件脚本句柄（懒启动）
+    scripting_probe: AtomicU8,                   // /Scripting 探测状态：0=未探测 1=失败 2=成功
 }
 
 pub struct KWinProtocols {
-    wl: Arc<WaylandDisplayServer>,                  // 共享 wl_display
-    window_mgmt: Option<WindowManagement>,    // 短绑，仅一个客户端
-    fake_input: Option<FakeInput>,            // 输入注入
-    vd_mgmt: Option<VirtualDesktopManagement>,// 虚拟桌面
+    queue: Mutex<EventQueue<KWinWaylandState>>,  // 私有协议派发队列
+    window_mgmt: Option<WindowManagement>,       // 短绑，仅一个客户端
+    fake_input: Option<FakeInput>,               // 输入注入
+    vd_mgmt: Option<VirtualDesktopManagement>,   // 虚拟桌面
+    bind_failures: Vec<(&'static str, String)>,  // 绑定失败明细（doctor 报告）
+}
+
+impl KWinProtocols {
+    pub fn probe(wl: &WaylandDisplayServer) -> Result<Self> { ... }
 }
 ```
 
@@ -1659,15 +1626,19 @@ const DBusInterface = `
 ### 8.2 Rust 实现
 
 ```rust
-// components/compositor/mutter/src/eval_bridge.rs
+// components/compositor/mutter/src/eval.rs
 
-pub struct GnomeEvalBridge { shell_proxy: ShellProxy }
+pub struct GnomeEvalBridge { conn: Connection }
 
 impl GnomeEvalBridge {
-    /// 执行 JS 表达式并解析返回值
-    async fn eval_js(&self, js: &str) -> Result<serde_json::Value> {
-        let (success, result_json) = self.shell_proxy.eval(js).await?;
-        if !success { return Err(AgentShellError::Other(...)); }
+    /// 建桥：复用既有 session bus 连接（与 DisplayConfig 共享）
+    pub fn new(conn: Connection) -> Self { ... }
+
+    /// 执行 JS 表达式并解析返回值：(true, '"JSON"') → Value
+    pub async fn eval_js(&self, js: &str) -> Result<serde_json::Value> {
+        let shell = ShellProxy::new(&self.conn).await?;
+        let (success, result_json) = shell.eval(js).await?;
+        if !success { return Err(MutterError::Eval(...)); }
         serde_json::from_str(&result_json).map_err(Into::into)
     }
 
@@ -1707,16 +1678,18 @@ GNOME/Mutter 明确不实现 `wlr-foreign-toplevel-management` / `ext-foreign-to
 | `display_config.rs` | Mutter.DisplayConfig 显示器配置 |
 | `version.rs` | GNOME 版本探测 |
 | `error.rs` | Mutter 特有错误类型 |
-
-**核心接口**：
-
 ```rust
-pub enum GnomePath { Eval(EvalRunner), Extension(ExtensionRunner) }
+pub enum GnomePath { Eval(GnomeEvalBridge), Extension(ExtensionRunner) }
 
 pub struct MutterCompositor {
-    path: GnomePath,
-    version: GnomeVersion,
+    wayland_core: Option<WaylandDisplayServer>,  // 基类协议通道（仅 Wayland 会话为 Some）
+    session: SessionKind,                        // 构造期确定的会话类型
+    wayland_display_name: Option<String>,        // Wayland 会话捕获的 display 名
+    path: GnomePath,                             // 窗口语义通道（探测后确定）
     display_config: DisplayConfig,
+    version: GnomeVersion,
+    conn: Connection,                            // session bus 连接（保活句柄）
+    screensaver_probe: AtomicU8,                 // org.gnome.ScreenSaver 探测缓存
 }
 ```
 
@@ -1795,18 +1768,29 @@ $XDG_RUNTIME_DIR/hypr/<HIS>/.socket2.sock  → 事件推送（EVENT>>DATA\n）
 ```rust
 // components/compositor/hyprland/src/hyprctl.rs
 
-pub struct Hyprctl { socket_path: PathBuf }
+pub struct Hyprctl {
+    socket_path: PathBuf,        // hyprctl 请求 socket（.socket.sock）
+    event_socket_path: PathBuf,  // 事件流 socket（.socket2.sock）
+    his: String,                 // HYPRLAND_INSTANCE_SIGNATURE
+}
 
 impl Hyprctl {
+    /// 从会话环境构造（HYPRLAND_INSTANCE_SIGNATURE + XDG_RUNTIME_DIR）
     pub fn new() -> Result<Self> {
         let his = env::var("HYPRLAND_INSTANCE_SIGNATURE")
             .map_err(|_| AgentShellError::BackendUnavailable("NOT in Hyprland session".into()))?;
         let runtime = env::var("XDG_RUNTIME_DIR")?;
-        Ok(Self { socket_path: Path::new(&runtime).join("hypr").join(his).join(".socket.sock") })
+        let base = Path::new(&runtime).join("hypr").join(&his);
+        Ok(Self {
+            socket_path: base.join(".socket.sock"),
+            event_socket_path: base.join(".socket2.sock"),
+            his,
+        })
     }
 
     /// 发送请求。注意：Hyprland 同步求值，连接必须即开即关，否则会阻塞 compositor。
-    async fn request(&self, cmd: &str) -> Result<serde_json::Value> {
+    pub async fn request(&self, cmd: &str) -> Result<serde_json::Value> {
+        // 短间隔重试（IPC 内 2 次），跨调用退避由上层降级链负责
         let mut stream = UnixStream::connect(&self.socket_path).await?;
         stream.write_all(cmd.as_bytes()).await?;
         stream.shutdown(Write).unwrap();
@@ -1815,32 +1799,15 @@ impl Hyprctl {
         serde_json::from_str(&buf).map_err(Into::into)
     }
 
-    async fn dispatch(&self, cmd: &str) -> Result<()> {
-        self.request(&format!("dispatch {}", cmd)).await?;
+    pub async fn dispatch(&self, action: &str) -> Result<()> {
+        self.request(&format!("dispatch {}", action)).await?;
         Ok(())
     }
 
-    async fn list_windows(&self) -> Result<Vec<WindowInfo>> {
-        // clients -j 返回完整 JSON
-        Self::parse_clients(self.request("clients -j").await?)
-    }
-
-    async fn focus_window(&self, address: &str) -> Result<()> {
-        self.dispatch(&format!("focuswindow address:0x{}", address)).await
-    }
-
-    async fn move_window(&self, address: &str, x: i32, y: i32) -> Result<()> {
-        self.dispatch(&format!("setfloating address:0x{}", address)).await?;
-        self.dispatch(&format!("movewindowpixel exact {} {},address:0x{}", x, y, address)).await
-    }
-
-    async fn close_window(&self, address: &str) -> Result<()> {
-        self.dispatch(&format!("closewindow address:0x{}", address)).await
-    }
-
-    async fn activate_workspace(&self, id: i32) -> Result<()> {
-        self.dispatch(&format!("workspace {}", id)).await
-    }
+    pub async fn clients(&self) -> Result<serde_json::Value> { /* clients -j */ }
+    pub async fn monitors(&self) -> Result<serde_json::Value> { /* monitors -j */ }
+    pub async fn workspaces(&self) -> Result<serde_json::Value> { /* workspaces -j */ }
+    pub async fn version(&self) -> Result<serde_json::Value> { /* version */ }
 }
 ```
 
@@ -1912,19 +1879,13 @@ Hyprland 是 wlroots 系 compositor，支持全部 wlr 标准扩展 + Hyprland �
 
 ```rust
 pub struct HyprlandCompositor {
-    wayland: Option<HyprlandWayland>,  // 首选
-    hyprctl: Hyprctl,                   // 降级 + 扩展
-    window_cache: Arc<RwLock<Vec<WindowInfo>>>,
-    event_handle: Option<JoinHandle<()>>,
+    base: WlrWaylandCompositor,        // 基类：wlr 标准协议完整实现
+    bindings: Option<HyprlandBindings>, // hyprland_* 私有协议绑定（叠加在同一 wl_display）
+    hyprctl: Hyprctl,                   // socket IPC（降级 + 扩展）
+    window_cache: WindowCache,          // 窗口缓存（事件流持续更新）
+    focused_address: Arc<AsyncMutex<String>>, // 当前焦点窗口地址
+    event: RwLock<Option<EventTaskHandle>>,   // 事件任务句柄（懒启动）
 }
-```
-
-**Hyprctl 封装**：
-```rust
-pub async fn clients(&self) -> Result<Vec<Value>> { /* clients -j */ }
-pub async fn monitors(&self) -> Result<Vec<Value>> { /* monitors -j */ }
-pub async fn workspaces(&self) -> Result<Vec<Value>> { /* workspaces -j */ }
-pub async fn dispatch(&self, action: &str) -> Result<()> { /* dispatch ... */ }
 ```
 
 **操作选择矩阵**：
@@ -1995,25 +1956,31 @@ DDE 在 Wayland 下使用 `deepin-kwin`（KWin fork），因此 DDE backend = �
 ### 10.2 实现
 
 ```rust
-// backends/dde/src/dde_api.rs
+// backends/dde/src/dde_compositor.rs
 
 pub struct DdeCompositor {
-    kwin: KWinCompositor,   // 复用 KWin 合成器组件
-    dde: DdeApi,         // 补充 DDE 专有接口
+    compositor: Compositor,   // 窗口管理分支后端（deepin-kwin / Treeland / X11）
+    version: DdeVersion,      // DDE 20 vs 25 服务名路由
+}
+
+impl DdeCompositor {
+    /// 全自动装配：检测合成器形态 → 构造分支后端 → 探测 dde-api 服务族
+    pub async fn connect() -> Result<Self> { ... }
+}
+
+#[async_trait]
+impl DesktopComponent for DdeCompositor {
+    fn name(&self) -> &'static str { "dde-compositor" }
+    fn component_type(&self) -> ComponentType { ComponentType::Compositor }
+    fn is_available(&self) -> bool { true }
+    async fn health(&self) -> ComponentHealth { ... }
 }
 
 #[async_trait]
 impl CompositorComponent for DdeCompositor {
-    fn name(&self) -> &'static str { "DDE (Wayland, deepin-kwin)" }
-    fn de_type(&self) -> DesktopEnvironment { DesktopEnvironment::DDE }
-
-    // 窗口管理：委托 KWin
-    async fn list_windows(&self) -> Result<Vec<WindowInfo>> { self.kwin.list_windows().await }
-
-    // 补充 DDE 专有能力（如窗口缩略图 / 拆分区域）
-    pub async fn split_window(&self, id: &WindowId, region: SplitRegion) -> Result<()> {
-        self.kwin.set_window_geometry(id, region_to_rect(region)).await
-    }
+    // 窗口管理全部委托 self.compositor 分支后端（deepin-kwin / Treeland / X11）
+    async fn list_windows(&self) -> Result<Vec<WindowInfo>> { ... }
+    // focus_window / move_window / close_window / workspace_* 同构委托
 }
 ```
 
@@ -2054,25 +2021,40 @@ deepin 新一代 compositor **Treeland**（基于 wlroots，deepin 25+ 过渡）
 **核心接口**：
 
 ```rust
-pub enum Compositor { DeepinKwin(KWinCompositor), Treeland(Treeland), X11(X11DisplayServer) }
+pub enum CompositorKind {
+    Treeland,
+    DeepinKwin,
+    X11,
+    #[default]
+    Unknown,
+}
+
+pub enum Compositor {
+    DeepinKwin(Box<KWinCompositor>),
+    Treeland { display_server: Arc<WaylandDisplayServer>, bindings: TreelandBindings },
+    X11(Box<KWinCompositor>),
+}
 
 pub struct DdeCompositor {
     pub compositor: Compositor,
-    pub dde: DdeApi,
     pub version: DdeVersion,
 }
 ```
 
 窗口管理全部委托给 compositor 后端。系统服务（音量/显示/电源/通知/壁纸）走 `DdeApi`。
 
-**Compositor 检测**：
+**Compositor 检测**（`backends/dde/src/compositor.rs`）：
 ```rust
-pub async fn detect_compositor() -> CompositorType {
-    // 1. XDG_SESSION_TYPE == "wayland"
-    // 2. 检查 registry globals:
-    //    a. org_kde_plasma_window_management → deepin-kwin
-    //    b. wlr-foreign-toplevel-management → Treeland
-    // 3. X11: 检查 DISPLAY
+pub fn classify(wl_connected: bool, interfaces: &[&str]) -> CompositorKind {
+    // treeland_foreign_toplevel_manager_v1 或 treeland_window_management_v1 → Treeland
+    // org_kde_plasma_window_management → DeepinKwin
+    // 否则 Unknown
+}
+
+pub async fn detect_compositor() -> CompositorKind {
+    // 1. 连接 $WAYLAND_DISPLAY，读 registry globals → classify(true, interfaces)
+    // 2. Wayland 不可用且 DISPLAY 存在 → X11
+    // 3. 两者皆缺 → Unknown
 }
 ```
 
@@ -2157,9 +2139,10 @@ pub trait WaylandCompositor: CompositorComponent {
 
 // components/compositor/wlr-wayland/src/compositor.rs
 pub struct WlrWaylandCompositor {
-    display: WaylandDisplayServer,   // wl_display 连接
-    bindings: WlrBindings,           // wlr-* 协议绑定（7 项）
-    windows: WindowCache,            // foreign-toplevel 事件驱动缓存
+    display_server: WaylandDisplayServer,   // wl_display 连接（私有协议叠加复用）
+    bindings: WlrBindings,                  // wlr 标准 + 扩展协议绑定
+    state: WlrState,                        // foreign-toplevel / ext-workspace 共享缓存
+    queue: SyncMutex<EventQueue<WlrState>>, // 事件派发队列（roundtrip 用）
 }
 
 #[async_trait]
@@ -2200,15 +2183,15 @@ pub struct HyprlandCompositor {
 > 不在此合成器 crate 内；本 crate 无 `event.rs`（X11 无合成器级原生事件流，XDamage/XRecord 可选）。
 
 **核心接口**：
-
 ```rust
 pub struct X11DisplayServer {
-    conn: x11rb::Connection,
-    ewmh: Ewmh,
-    xtest: Option<XTestState>,  // XTest 扩展（原生）
-    cmd: Option<X11Commands>,   // CLI 工具（仅保底）
-    root_window: Window,
-    screen_num: usize,
+    conn: RustConnection,
+    screen_index: usize,
+    root: x11rb::protocol::xproto::Window,
+    atoms: EwmhAtoms,
+    wm_atoms: WmProtocolAtoms,   // ICCCM 原子（WM_PROTOCOLS/DELETE_WINDOW 等）
+    xtest_available: bool,       // XTest 扩展可用性（连接时探测）
+    shm_available: bool,         // MIT-SHM 扩展可用性（连接时探测）
 }
 ```
 
@@ -2247,11 +2230,12 @@ pub struct X11DisplayServer {
 它不是合成器，而是**无 DE 的操作系统 Agent**——仅提供系统服务（init、session、进程、文件、日志、网络）。
 
 ```rust
-// backends/tty/src/mod.rs
+// backends/tty/src/lib.rs
 pub struct TtyBackend;
 
 impl TtyBackend {
-    pub async fn assemble(&self, event_hub: EventHub) -> Result<ComponentRegistry> {
+    pub fn new() -> Self { ... }
+    pub async fn assemble(&self) -> Result<ComponentRegistry> {
         Ok(ComponentRegistry {
             compositor: None,              // 无合成器
             audio: None,                   // 无音频
@@ -2416,28 +2400,33 @@ impl InputService for YdotoolInput {
 ### 13.2 ScreenCast (PipeWire 流式)
 
 ```rust
-// capture/src/portal_screencast.rs
+// modules/capture/src/portal_screencast.rs
 
 pub struct ScreenCastCapture {
-    session: PortalSession,
-    pw_node: PipeWireNode,
+    conn: zbus::Connection,
+    session_path: ObjectPath<'static>,
+    shutdown: std::sync::mpsc::Sender<()>,   // 关闭信号：Drop 时释放 worker
+    latest: Arc<(Mutex<Option<Frame>>, Condvar)>,  // 最新帧共享槽位
+    worker: Option<std::thread::JoinHandle<()>>,
 }
 
 impl ScreenCastCapture {
-    /// 通过 ScreenCast portal 获取 PipeWire 流
-    pub async fn start(target: CaptureTarget) -> Result<Self> {
-        let portal = ScreenCastPortalProxy::new(&session_bus).await?;
-        let session = portal.create_session(options).await?;
-        portal.select_sources(&session, source_type_from(target)).await?;
-        portal.start(&session, "").await?;
-        let (node_id, fd) = portal.open_pipewire_remote(&session).await?;
-        let pw = PipeWireNode::new(fd, node_id)?;
-        Ok(Self { session, pw_node: pw })
+    /// 走完整 portal 五步流程建立流（无持久化/恢复）
+    pub async fn start(conn: zbus::Connection, target: CaptureTarget) -> Result<Self> {
+        let session = Self::start_with_options(conn, target, &ScreenCastOptions::default()).await?;
+        Ok(session.capture)
     }
 
+    /// 走完整 portal 五步流程，携带 persist_mode / restore_token
+    pub async fn start_with_options(
+        conn: zbus::Connection,
+        target: CaptureTarget,
+        opts: &ScreenCastOptions,
+    ) -> Result<ScreenCastSession> { ... }
+
     /// 捕获单帧
-    pub async fn capture_frame(&self) -> Result<Vec<u8>> {
-        self.pw_node.capture_frame().await
+    pub async fn capture_frame(&self) -> Result<Frame> {
+        self.latest.lock().unwrap().clone().ok_or_else(|| ...)
     }
 }
 ```
@@ -2445,18 +2434,26 @@ impl ScreenCastCapture {
 ### 13.3 Screenshot Portal
 
 ```rust
-// capture/src/portal_screenshot.rs
 
-pub struct ScreenshotPortal { portal: ScreenshotProxy }
+pub struct ScreenshotPortal { conn: zbus::Connection }
 
 impl ScreenshotPortal {
-    pub async fn capture(target: ScreenshotTarget) -> Result<PathBuf> {
-        let portal = ScreenshotProxy::new(&session_bus).await?;
-        let request = portal.screenshot("", dict! { "target" => target as u32 }).await?;
-        // 等待 Request::Response 信号获取 uri → 转为本地路径
-        let (result, _) = wait_for_response(&request).await?;
-        let uri = result["uri"].as_str().ok_or(...)?;
-        Ok(parse_uri_to_path(uri))
+    /// 连接 session bus（不探测 portal 存在性——available() 懒探测）
+    pub async fn new() -> Result<Self> { ... }
+
+    /// session bus 连接（供装配层复用同一连接）
+    pub fn with_connection(conn: zbus::Connection) -> Self { ... }
+
+    /// portal 服务是否在 bus 上（NameHasOwner 探测）
+    pub async fn available(&self) -> bool { ... }
+
+    /// 截取屏幕，返回 PNG 本地路径
+    pub async fn capture(&self, interactive: bool) -> Result<std::path::PathBuf> {
+        let proxy = portal_proxy(&self.conn, "org.freedesktop.portal.Screenshot").await?;
+        let request_path = proxy.call("Screenshot", &("", options)).await?;
+        let (_, results) = wait_for_response(&self.conn, &request_path, SCREENSHOT_TIMEOUT).await?;
+        let uri = string_field(&results, "uri").ok_or(...)?;
+        uri_to_path(uri).ok_or_else(|| ...)
     }
 }
 ```
@@ -2464,7 +2461,7 @@ impl ScreenshotPortal {
 ### 13.4 变化检测缓存
 
 ```rust
-// capture/src/cache.rs
+// modules/capture/src/cache.rs
 
 pub struct CaptureCache {
     last_frame: Option<Vec<u8>>,
@@ -2472,17 +2469,23 @@ pub struct CaptureCache {
 }
 
 impl CaptureCache {
-    /// 快速像素级差分检测
-    pub fn has_changed(&self, new_frame: &[u8]) -> bool {
-        let Some(last) = &self.last_frame else { return true };
-        if last.len() != new_frame.len() { return true; }
-        // 逐像素 RGBA 比较，忽略 alpha
-        let changed = last.chunks_exact(4).zip(new_frame.chunks_exact(4))
-            .filter(|(a, b)| a[0].abs_diff(b[0]) > 10 ||
-                              a[1].abs_diff(b[1]) > 10 ||
-                              a[2].abs_diff(b[2]) > 10)
-            .count();
-        (changed as f64 / (last.len() / 4) as f64) > self.threshold
+    /// 快速像素级差分检测；首帧返回 true 并记录，判定变化后更新历史帧
+    pub fn has_changed(&mut self, new_frame: &[u8]) -> bool {
+        let changed = match &self.last_frame {
+            None => true,
+            Some(last) if last.len() != new_frame.len() => true,
+            Some(last) => {
+                // 逐像素 RGBA 比较，忽略 alpha
+                let changed = last.chunks_exact(4).zip(new_frame.chunks_exact(4))
+                    .filter(|(a, b)| a[0].abs_diff(b[0]) > 10 ||
+                                      a[1].abs_diff(b[1]) > 10 ||
+                                      a[2].abs_diff(b[2]) > 10)
+                    .count();
+                changed as f64 / (last.len() / 4).max(1) as f64 > self.threshold
+            }
+        };
+        if changed { self.last_frame = Some(new_frame.to_vec()); }
+        changed
     }
 }
 ```
@@ -2507,80 +2510,103 @@ Agent Shell
 ### 14.2 核心桥接
 
 ```rust
-// a11y/src/atspi_bridge.rs
+// components/a11y/src/atspi_bridge.rs
 
-pub struct AtspiBridge { connection: zbus::Connection }
+pub struct AtspiBridge { conn: zbus::Connection }
 
 impl AtspiBridge {
-    /// 获取桌面根节点（所有应用）
-    pub async fn get_desktop(&self) -> Result<ApplicationNode> {
-        let registry = RegistryProxy::new(&self.connection).await?;
-        registry.get_desktop(0).await.map(Into::into)
-    }
+    /// 连接 a11y bus（session bus → org.a11y.Bus.GetAddress → a11y bus）
+    pub async fn connect() -> Result<Self> { ... }
 
-    /// 获取指定 PID 的无障碍树
-    pub async fn get_app_tree(&self, pid: u32) -> Result<ApplicationNode> {
-        let desktop = self.get_desktop().await?;
-        desktop.children().into_iter()
-            .find(|c| c.pid() == pid)
-            .ok_or(AgentShellError::WindowNotFound(format!("PID {}", pid)))
-    }
+    /// 共享连接的克隆构造（component.rs 的 Arc 包装用）
+    pub fn clone_bridge(&self) -> Self { ... }
 
-    /// 获取当前活动窗口
-    pub async fn get_active_window(&self) -> Result<WindowNode> {
-        let desktop = self.get_desktop().await?;
-        for app in desktop.children() {
-            for window in app.children() {
-                let states = window.get_state().await?;
-                if states.contains(AtspiState::ACTIVE) || states.contains(AtspiState::FOCUSED) {
-                    return Ok(window);
-                }
-            }
-        }
-        Err(AgentShellError::WindowNotFound("no active window".into()))
-    }
+    /// 枚举所有应用窗口（无障碍树遍历入口）
+    pub async fn all_windows(&self) -> Result<Vec<WindowNode>> { ... }
 }
 ```
 
 ### 14.3 语义定位引擎
 
 ```rust
-// a11y/src/semantic_locator.rs
+// components/a11y/src/semantic_locator.rs
 
 pub struct SemanticLocator { bridge: AtspiBridge }
 
 impl SemanticLocator {
+    pub fn new(bridge: AtspiBridge) -> Self { ... }
+    pub fn bridge(&self) -> &AtspiBridge { ... }
+
     /// 按语义描述定位元素
     pub async fn locate(&self, target: &SemanticTarget) -> Result<Vec<ElementNode>> {
         match target {
             SemanticTarget::ByAccessibility { role, name, parent_role, parent_name } => {
-                let desktop = self.bridge.get_desktop().await?;
                 let mut results = Vec::new();
-                for window in self.find_all_windows(&desktop).await {
-                    if let Some(parent) = parent_role.zip(parent_name) {
-                        if let Ok(p) = self.find_element(&window, &parent.0, &parent.1).await {
-                            results.extend(self.find_elements_in_parent(&p, role, name).await);
+                for window in self.bridge.all_windows().await? {
+                    let window_el = self.bridge.window_as_element(&window).await?;
+                    match (parent_role, parent_name) {
+                        // 有父约束：先找父，再在父子树内搜目标
+                        (Some(prole), Some(pname)) => {
+                            let parents =
+                                self.find_elements(&window_el, Some(prole), Some(pname.clone()));
+                            for parent in parents.await {
+                                results.extend(
+                                    self.find_elements(&parent, role.as_deref(), name.clone())
+                                        .await,
+                                );
+                            }
                         }
-                    } else {
-                        results.extend(self.find_elements_in_parent(&window, role, name).await);
+                        // 无父约束：全窗口搜索
+                        _ => {
+                            results.extend(
+                                self.find_elements(&window_el, role.as_deref(), name.clone())
+                                    .await,
+                            );
+                        }
                     }
                 }
                 Ok(results)
             }
-            _ => Err(AgentShellError::NotImplemented("locator strategy".into()))
+            other => Err(AgentShellError::NotImplemented(format!(
+                "locator strategy: {other:?}"
+            ))),
         }
     }
+
+    /// 在子树内按 (role, name) 过滤搜索（DFS + 深度保护）；两者均空返回空
+    pub fn find_elements(
+        &self,
+        root: &ElementNode,
+        role: Option<&str>,
+        name: Option<String>,
+    ) -> impl Future<Output = Vec<ElementNode>> + Send + '_ { ... }
+
+    /// 递归 DFS，命中即收集；深度超限截断
+    async fn search(
+        &self,
+        node: &ElementNode,
+        role: Option<String>,
+        name: Option<String>,
+        out: &mut Vec<ElementNode>,
+        depth: u8,
+    ) { ... }
 }
 ```
 
 ### 14.4 元素操作
 
 ```rust
-// a11y/src/action.rs
+// components/a11y/src/action.rs
 
-pub struct ElementActions { bridge: AtspiBridge, input: InputDispatcher }
+pub struct ElementActions {
+    bridge: AtspiBridge,
+    input: Arc<dyn PointerInput>,
+}
 
 impl ElementActions {
+    pub fn new(bridge: AtspiBridge) -> Self { ... }
+    pub fn with_input(mut self, input: Arc<dyn PointerInput>) -> Self { ... }
+    pub fn bridge(&self) -> &AtspiBridge { ... }
     /// 点击元素：优先 AT-SPI Action 接口，降级坐标点击
     pub async fn click(&self, element: &ElementNode) -> Result<()> {
         let action = element.get_action_interface().await?;
@@ -2666,10 +2692,10 @@ pub enum Command {
 
 pub struct Executor {
     backend: Box<dyn CompositorComponent>,
-    input: InputDispatcher,
-    capture: CaptureDispatcher,
-    a11y: ElementActions,
-    locator: SemanticLocator,
+    input: Arc<dyn InputDispatcher>,
+    capture: Arc<dyn CaptureDispatcher>,
+    a11y: Arc<dyn ElementActions>,
+    security: Arc<SecurityManager>,   // §22.7 D6：execute() 分派前统一调用
 }
 
 impl Executor {
@@ -2683,9 +2709,9 @@ impl Executor {
             Command::TypeText { text, target } => {
                 if let Some(target) = &target {
                     // 优先 AT-SPI 语义输入
-                    if let Ok(elements) = self.locator.locate(target).await {
+                    if let Ok(elements) = self.a11y.locate(target).await {
                         if let Some(el) = elements.first() {
-                            if self.a11y.set_text(el, &text).await.is_ok() {
+                            if el.set_text(&text).await.is_ok() {
                                 return Ok(CommandResult::Success);
                             }
                         }
@@ -2696,7 +2722,7 @@ impl Executor {
                 Ok(CommandResult::Success)
             }
             Command::Screenshot { target, output } => {
-                let image = self.capture.capture(target).await?;
+                let image = self.capture.capture_png(&target).await?;
                 let path = output.unwrap_or(format!("screenshot_{}.png", timestamp()));
                 tokio::fs::write(&path, &image).await?;
                 Ok(CommandResult::File(path))
@@ -2718,8 +2744,7 @@ impl Executor {
         }
     }
 
-    /// 解析语义目标为具体的 WindowInfo
-    async fn resolve_target(&self, target: &SemanticTarget) -> Result<WindowInfo> {
+    pub async fn resolve_target(&self, target: &SemanticTarget) -> Result<WindowInfo> {
         match target {
             SemanticTarget::Active =>
                 self.backend.get_active_window().await?
@@ -2843,18 +2868,28 @@ pub fn detect_desktop_environment() -> DesktopEnvironment {
 ### 16.2 后端装配
 
 ```rust
+// core/src/de_detection.rs —— 特性门控占位骨架（T3c 阶段）
+// 未启用 assemble：对全部 DE 返回 UnsupportedDE
+#[cfg(not(feature = "assemble"))]
+pub fn assemble_wm(de: DesktopEnvironment) -> Result<Box<dyn CompositorComponent>> {
+    Err(AgentShellError::UnsupportedDE(format!("{de:?}")))
+}
+
+// 启用 assemble：7 个装配 DE 分发到具体后端（T1 就绪前 NotImplemented 占位）
+#[cfg(feature = "assemble")]
 pub fn assemble_wm(de: DesktopEnvironment) -> Result<Box<dyn CompositorComponent>> {
     match de {
-        DesktopEnvironment::DDE => Ok(Box::new(DdeCompositor::new()?)),
-        DesktopEnvironment::KDE => Ok(Box::new(KWinCompositor::new()?)),
-        DesktopEnvironment::GNOME => Ok(Box::new(MutterCompositor::new()?)),
-        DesktopEnvironment::Hyprland => Ok(Box::new(HyprlandCompositor::new()?)),
-        DesktopEnvironment::Sway => Ok(Box::new(SwayCompositor::new()?)),
-        DesktopEnvironment::WLRWayland => Ok(Box::new(WlrWaylandCompositor::new()?)),
-        DesktopEnvironment::X11Generic => Ok(Box::new(X11Compositor::new()?)),
-        _ => Err(AgentShellError::UnsupportedDE(format!("{:?}", de))),
+        DesktopEnvironment::DDE | DesktopEnvironment::KDE | DesktopEnvironment::GNOME
+        | DesktopEnvironment::Hyprland | DesktopEnvironment::Sway
+        | DesktopEnvironment::WLRWayland | DesktopEnvironment::X11Generic =>
+            Err(AgentShellError::NotImplemented(format!(
+                "compositor backend for {de:?} lands with T1"))),
+        _ => Err(AgentShellError::UnsupportedDE(format!("{de:?}"))),
     }
 }
+
+// 实际后端装配在 shell/src/lib.rs assemble_for(de)：按 DE 分发到
+// KdeBackend/DdeBackend/GnomeBackend/… 各自的 assemble().await
 ```
 
 ### 16.3 doctor 诊断
@@ -3250,21 +3285,21 @@ pub struct EventFilter {
 }
 
 pub struct EventHub {
-    subscribers: HashMap<Uuid, mpsc::Sender<DesktopEvent>>,  // 有界通道
+    inner: Arc<EventHubInner>,
     capacity: usize,  // 默认 1024
 }
 
+struct EventHubInner {
+    subscribers: Mutex<HashMap<Uuid, (mpsc::Sender<DesktopEvent>, EventFilter)>>,
+}
+
 impl EventHub {
-    pub fn publish(&self, event: DesktopEvent) {
-        for tx in self.subscribers.values() {
-            // 有界通道：高优先级阻塞，低优先级 try_send
-            match event.priority() {
-                EventPriority::High => { let _ = tx.try_send(event.clone()); },
-                EventPriority::Medium | EventPriority::Low => { let _ = tx.try_send(event.clone()); },
-            }
-        }
+    pub fn new() -> Self { ... }
+    pub fn with_capacity(capacity: usize) -> Self { ... }
+    pub async fn publish(&self, event: DesktopEvent) {
+        // 向订阅者广播；filter 由订阅端 recv() 内部匹配（未匹配静默跳过）
     }
-    pub fn subscribe(&mut self, filter: EventFilter) -> EventSubscription { ... }
+    pub fn subscribe(&self, filter: EventFilter) -> EventSubscription { ... }
 }
 
 /// 事件优先级推导
@@ -3273,12 +3308,12 @@ impl DesktopEvent {
         match self {
             DesktopEvent::WindowOpened { .. } | DesktopEvent::WindowClosed { .. }
             | DesktopEvent::WindowFocused { .. } => EventPriority::High,
-            DesktopEvent::WindowMoved { .. } | DesktopEvent::WorkspaceChanged { .. }
+            DesktopEvent::WindowStateChanged { .. }
+            | DesktopEvent::WindowMoved { .. } | DesktopEvent::WorkspaceChanged { .. }
             | DesktopEvent::MonitorHotplug { .. } | DesktopEvent::MonitorChanged { .. }
-            | DesktopEvent::PointerButton { .. } => EventPriority::Medium,
+            | DesktopEvent::PointerButton { .. }
+            | DesktopEvent::KeyComboPressed { .. } => EventPriority::Medium,
             _ => EventPriority::Low,
-        }
-    }
 }
 ```
 
@@ -3324,25 +3359,33 @@ impl EventNormalizer {
 ```rust
 // event/src/normalize.rs
 
-pub async fn normalize(raw: RawEvent) -> DesktopEvent {
+/// 归一化一个原始事件；返回 None 表示事件降级丢弃
+pub fn normalize(
+    source_name: &'static str,
+    source: EventSource,
+    raw: RawEvent,
+    merger: &mut MoveMerger,
+) -> Option<DesktopEvent> {
+    let now = std::time::Instant::now();
     match raw {
-        // KWin/Hyprland/DDE 的 windowOpened 语义不同，统一为 WindowOpened
-        RawEvent::KWinWindowAdded { id } |
-        RawEvent::HyprlandOpenWindow { address } |
-        RawEvent::DdeWindowOpened { id } => {
-            DesktopEvent::WindowOpened {
-                window: resolve_window_info_by_id(id).await?,
-                occurred_at: now(),
-            }
+        // 窗口打开/聚焦需要完整 WindowInfo → 走 normalize_with_resolver；
+        // 同步路径（无 resolver）直接丢弃
+        RawEvent::KWinWindowAdded { .. } |
+        RawEvent::HyprlandOpenWindow { .. } |
+        RawEvent::DdeWindowOpened { .. } => return None,
+        // 关闭语义一致，直接归一化
+        RawEvent::KWinWindowRemoved { id }
+        | RawEvent::HyprlandCloseWindow { address: id }
+        | RawEvent::SwayWindowClose { id } => DesktopEvent::WindowClosed {
+            id: win_id(&id), source, occurred_at: now,
+        },
+        // 同窗口 100ms 内连续移动经 merger 合并，仅最终位置发布
+        RawEvent::HyprlandMoveWindow { address } => {
+            let _expired = merger.observe(&address, Rect::default());
+            return None;
         }
-        // 输入事件 → 窗口事件（点击某窗口 = 聚焦该窗口）
-        RawEvent::PointerButtonPressed { x, y, button } => {
-            if let Some(w) = window_at(x, y).await? {
-                DesktopEvent::WindowFocused { window: w, occurred_at: now() }
-            } else { DesktopEvent::Noop }
-        }
-        _ => DesktopEvent::Noop,
-    }
+        _ => return None,
+    }.into()
 }
 ```
 
@@ -3899,8 +3942,6 @@ pub struct ComponentCapabilities {
     pub wallpaper: bool,
     pub color_scheme: bool,
 }
-rust
-// components/各模块（见 §21.1 表） (新增类型)
 
 /// 监视器配置
 #[derive(Clone, Debug, Serialize, Deserialize)]
