@@ -184,6 +184,8 @@ pub mod method {
     pub const SYSTEM_LOG_VIEW: &str = "system-log.view";
     /// rootd 版本对账（rootd Hello）。
     pub const ROOTD_HELLO: &str = "rootd.hello";
+    /// 设置系统主机名（rootd HostnameSet）。
+    pub const HOSTNAME_SET: &str = "hostname.set";
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]

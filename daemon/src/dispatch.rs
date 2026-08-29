@@ -103,6 +103,7 @@ pub async fn dispatch(daemon: &mut Daemon, req: &Request) -> Response {
         method::SERVICE_CONTROL => service_control(daemon, req).await,
         method::SYSTEM_LOG_VIEW => system_log_view(daemon, req).await,
         method::ROOTD_HELLO => rootd_hello(daemon).await,
+        method::HOSTNAME_SET => hostname_set(daemon, req).await,
         other => {
             return Response::err(
                 req.id,
@@ -184,6 +185,7 @@ fn operation_for(method_name: &str, params: &Option<Value>) -> Option<Operation>
         (method::SERVICE_CONTROL, L3),
         (method::SYSTEM_LOG_VIEW, L0),
         (method::ROOTD_HELLO, L0),
+        (method::HOSTNAME_SET, L3),
     ];
     OPS.iter()
         .find(|(m, _)| *m == method_name)
@@ -805,6 +807,30 @@ async fn system_log_view(_d: &mut Daemon, req: &Request) -> RpcResult {
     Ok(json!({ "result": result }))
 }
 
+/// 设置系统主机名（rootd HostnameSet，§23.4）。
+///
+/// 参数：{ "hostname": "workstation-01" }
+/// 主机名校验在 rootd `validate_hostname` 完成——daemon 纯路由，
+/// 不重复校验（rootd 是唯一的权威边界）。rootd 未安装时返回降级错误。
+async fn hostname_set(_d: &mut Daemon, req: &Request) -> RpcResult {
+    let params = params_of(req)?;
+    let hostname = params
+        .get("hostname")
+        .and_then(|v| v.as_str())
+        .ok_or((RpcErrorCode::InvalidParams, "missing hostname".into()))?;
+
+    let proxy = crate::rootd_client::connect().await.ok_or((
+        RpcErrorCode::BackendUnavailable,
+        "rootd not installed — privileged operation unavailable".into(),
+    ))?;
+
+    proxy
+        .hostname_set(hostname)
+        .await
+        .map_err(|e| (RpcErrorCode::BackendError, format!("rootd: {e}")))?;
+    Ok(json!({ "accepted": true, "hostname": hostname }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1139,6 +1165,74 @@ mod tests {
         assert_eq!(
             resp.error.expect("error").code,
             RpcErrorCode::InvalidParams as i32
+        );
+    }
+    #[tokio::test]
+    async fn hostname_set_default_config_returns_confirmation_required() {
+        // hostname.set（L3）与 service.control/process.kill 同级：
+        // 默认配置需确认，在 handler 之前短路——不触碰 rootd。
+        let mut d = Daemon::connect(Duration::from_secs(1)).await;
+        let resp = dispatch(
+            &mut d,
+            &req(
+                method::HOSTNAME_SET,
+                Some(json!({ "hostname": "workstation-01" })),
+            ),
+        )
+        .await;
+        assert_eq!(
+            resp.error.expect("error").code,
+            RpcErrorCode::ConfirmationRequired as i32
+        );
+    }
+
+    #[tokio::test]
+    async fn hostname_set_gate_pass_reaches_handler() {
+        // L4 白名单放行后进入 handler：缺失/非字符串 hostname 必须报
+        // InvalidParams（证明门禁放行且 handler 已执行，而非 Denied 短路）。
+        let mut d = Daemon::connect(Duration::from_secs(1)).await;
+        d.caller_id = "trusted".into();
+        d.security
+            .config
+            .permissions
+            .allow
+            .insert("trusted".into(), vec![PermissionLevel::L4]);
+        for params in [
+            json!({}),
+            json!({ "hostname": 123 }),
+            json!({ "name": "workstation-01" }),
+        ] {
+            let resp = dispatch(&mut d, &req(method::HOSTNAME_SET, Some(params))).await;
+            assert_eq!(
+                resp.error.expect("error").code,
+                RpcErrorCode::InvalidParams as i32
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn hostname_set_valid_params_reaches_rootd_degrade() {
+        // L4 放行后进入 handler：合法 hostname 通过参数提取，到达 rootd
+        // 连接。本环境无 rootd → BackendUnavailable 降级，证明成功路径的
+        // 前置链路（参数解析 + 门禁放行）完整；rootd Ok 分支需实机。
+        let mut d = Daemon::connect(Duration::from_secs(1)).await;
+        d.caller_id = "trusted".into();
+        d.security
+            .config
+            .permissions
+            .allow
+            .insert("trusted".into(), vec![PermissionLevel::L4]);
+        let resp = dispatch(
+            &mut d,
+            &req(
+                method::HOSTNAME_SET,
+                Some(json!({ "hostname": "workstation-01" })),
+            ),
+        )
+        .await;
+        assert_eq!(
+            resp.error.expect("error").code,
+            RpcErrorCode::BackendUnavailable as i32
         );
     }
 }

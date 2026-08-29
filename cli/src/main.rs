@@ -69,6 +69,7 @@ async fn dispatch_command(command: Command, out: OutputFormat) -> CmdResult {
         Command::Timer(cmd) => timer(&mut c, cmd).await,
         Command::Service(cmd) => service_cmd(&mut c, cmd).await,
         Command::Log(cmd) => log_cmd(&mut c, cmd).await,
+        Command::Hostname(cmd) => hostname_cmd(&mut c, cmd).await,
     }
 }
 
@@ -559,9 +560,117 @@ fn parse_log_filter(raw: &str) -> Result<Value, String> {
     Ok(v)
 }
 
+/// `hostname set` 命令（rootd HostnameSet，§23.4）。
+///
+/// 错误分两类处理：
+/// - rootd 直传的校验/系统调用错误（BackendError 1005）与 rootd 未安装
+///   （BackendUnavailable 1002）——映射为 issue 错误表要求的干净信息；
+/// - 其余错误（权限 gate ConfirmationRequired、daemon 连接失败等）保留
+///   `rpc error N: …` 原始形态，由 `run` 统一 `error: {e}` 打印。
+async fn hostname_cmd(c: &mut DaemonClient, cmd: cli::HostnameCommand) -> CmdResult {
+    let name = match cmd {
+        cli::HostnameCommand::Set { name } => name,
+    };
+    match c
+        .call(method::HOSTNAME_SET, json!({ "hostname": name }))
+        .await
+    {
+        Ok(_) => {
+            println!("hostname set {name}: accepted");
+            Ok(0)
+        }
+        Err(e) => match process_rootd_error(&e) {
+            Some((code, msg)) => {
+                eprintln!("error: {msg}");
+                Ok(code)
+            }
+            None => Err(e),
+        },
+    }
+}
+
+/// 把 rootd 链路的 daemon 层错误映射为 issue 错误表规定的 (退出码, stderr 信息)。
+///
+/// 传输形态（daemon → CLI）：
+/// - `rpc error 1002: rootd not installed — privileged operation unavailable`
+/// - `rpc error 1005: rootd: org.freedesktop.DBus.Error.Failed: <rootd detail>`
+/// - `rpc error 1005: rootd: org.freedesktop.DBus.Error.AuthFailed: polkit denied action: com.agentshell.hostname.set`
+///
+/// 返回 `None` 表示非本链路错误，交通用 RPC 错误路径。
+fn process_rootd_error(e: &str) -> Option<(i32, String)> {
+    // 剥通用 RPC 错误前缀 `rpc error <code>: `；传输层错误无此前缀，原样保留。
+    let body = e.split_once(": ").map(|(_, rest)| rest).unwrap_or(e);
+    if body.contains("rootd not installed") {
+        return Some((
+            1,
+            "rootd not installed — privileged operation unavailable".into(),
+        ));
+    }
+    let zbus = body.strip_prefix("rootd: ")?;
+    // 剥 zbus 方法错误名（`org.freedesktop.DBus.Error.*: `），只留 rootd 原文。
+    let detail = zbus.split_once(": ").map(|(_, d)| d).unwrap_or(zbus);
+    if let Some(action) = detail.strip_prefix("polkit denied action: ") {
+        return Some((2, format!("authentication required: {action}")));
+    }
+    // hostnamectl 失败保留 `rootd: ` 前缀与 zbus 错误名（issue 错误表
+    // `error: rootd: <zbus error>`）；校验类错误剥前缀后干净输出。
+    if detail.starts_with("hostnamectl failed") {
+        return Some((1, body.to_string()));
+    }
+    Some((1, detail.to_string()))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{log_query_timeout_error, parse_log_filter, LOG_QUERY_TIMEOUT};
+    use super::{
+        log_query_timeout_error, parse_log_filter, process_rootd_error, LOG_QUERY_TIMEOUT,
+    };
+
+    #[test]
+    fn process_rootd_error_maps_all_five_branches() {
+        // rootd 未安装 → exit 1（降级）。
+        assert_eq!(
+            process_rootd_error(
+                "rpc error 1002: rootd not installed — privileged operation unavailable"
+            ),
+            Some((
+                1,
+                "rootd not installed — privileged operation unavailable".into()
+            ))
+        );
+        // polkit 拒绝 → exit 2 + 前缀改写为 authentication required。
+        assert_eq!(
+            process_rootd_error(
+                "rpc error 1005: rootd: org.freedesktop.DBus.Error.AuthFailed: polkit denied action: com.agentshell.hostname.set"
+            ),
+            Some((
+                2,
+                "authentication required: com.agentshell.hostname.set".into()
+            ))
+        );
+        // 校验失败 → exit 1，剥 zbus 错误名，保留 rootd 原文。
+        assert_eq!(
+            process_rootd_error(
+                "rpc error 1005: rootd: org.freedesktop.DBus.Error.Failed: illegal character in hostname: \"work_station\""
+            ),
+            Some((1, "illegal character in hostname: \"work_station\"".into()))
+        );
+        // hostnamectl 失败 → exit 1，保留 `rootd: ` 前缀与 zbus 错误名。
+        assert_eq!(
+            process_rootd_error(
+                "rpc error 1005: rootd: org.freedesktop.DBus.Error.Failed: hostnamectl failed: some stderr"
+            ),
+            Some((
+                1,
+                "rootd: org.freedesktop.DBus.Error.Failed: hostnamectl failed: some stderr".into()
+            ))
+        );
+        // 非本链路错误（权限 gate 等）→ None，保留 RPC 原始形态。
+        assert_eq!(
+            process_rootd_error("rpc error 1006: hostname.set (always)"),
+            None
+        );
+    }
 
     #[test]
     fn log_timeout_is_positive_and_explicit() {

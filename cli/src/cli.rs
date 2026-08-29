@@ -90,6 +90,9 @@ pub enum Command {
     #[command(subcommand)]
     Service(ServiceCommand),
     Log(LogCommand),
+    /// 主机名管理（rootd 特权链路，§23.4）
+    #[command(subcommand)]
+    Hostname(HostnameCommand),
 }
 
 // ───────────────────────── windows ─────────────────────────
@@ -393,6 +396,15 @@ pub struct LogCommand {
     /// 过滤表达式 JSON（如 '{"unit":"nginx","priority":"err"}'）
     #[arg(long = "filter", default_value = "{}")]
     pub filter: String,
+}
+
+// ───────────────────────── hostname（rootd 特权链路） ─────────────────────────
+
+/// 主机名管理命令（rootd HostnameSet，§23.4）。
+#[derive(Subcommand, Debug)]
+pub enum HostnameCommand {
+    /// 设置系统主机名
+    Set { name: String },
 }
 
 // ───────────────────────── 解析辅助 ─────────────────────────
