@@ -626,6 +626,240 @@ impl CompositorComponent for MutterCompositor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::net::UnixStream;
+    use std::process::Stdio;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    /// 独立私有 session bus（避免 `Connection::session()` 环境变量在并行
+    /// 测试间竞争）。daemon 与 mock shell 服务共享同一地址。
+    struct TestBus {
+        addr: String,
+        _child: std::process::Child,
+    }
+
+    impl TestBus {
+        async fn start() -> Self {
+            let mut child = std::process::Command::new("dbus-daemon")
+                .args(["--session", "--nofork", "--print-address=1"])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("dbus-daemon must be installed for mutter doctor tests");
+            let stdout = child.stdout.take().expect("piped stdout");
+            let addr = read_address_line(stdout);
+            assert!(
+                addr.starts_with("unix:"),
+                "dbus-daemon printed unexpected address: {addr:?}"
+            );
+            Self {
+                addr,
+                _child: child,
+            }
+        }
+
+        async fn connect(&self) -> zbus::Connection {
+            zbus::connection::Builder::address(self.addr.as_str())
+                .expect("dbus-daemon address must parse")
+                .build()
+                .await
+                .expect("connect to private session bus")
+        }
+    }
+
+    impl Drop for TestBus {
+        fn drop(&mut self) {
+            let _ = self._child.kill();
+            let _ = self._child.wait();
+        }
+    }
+
+    /// 逐字节读地址行：`dbus-daemon --print-address=1` 恰好一行。
+    fn read_address_line(stdout: std::process::ChildStdout) -> String {
+        use std::io::Read as _;
+        let mut reader = std::io::BufReader::new(stdout);
+        let mut bytes = Vec::new();
+        loop {
+            let mut buf = [0u8; 1];
+            match reader.read_exact(&mut buf) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                Err(e) => panic!("read dbus-daemon address: {e}"),
+            }
+            bytes.push(buf[0]);
+            if buf[0] == b'\n' {
+                break;
+            }
+        }
+        let line = String::from_utf8(bytes).expect("dbus-daemon address must be UTF-8");
+        assert!(!line.is_empty(), "dbus-daemon printed no address line");
+        line.trim_end_matches('\n').to_string()
+    }
+
+    /// mock `org.gnome.Shell.Eval`：任何脚本都返回 `(true, "null")`——
+    /// `null` 是合法 JSON，`eval_js` 解析通过即 `probe()` 成功。
+    #[derive(Clone, Copy)]
+    struct FakeShell;
+
+    #[zbus::interface(name = "org.gnome.Shell")]
+    impl FakeShell {
+        fn eval(&self, _script: String) -> (bool, String) {
+            (true, "null".to_string())
+        }
+
+        #[zbus(property)]
+        fn shell_version(&self) -> String {
+            "45.2".to_string()
+        }
+    }
+
+    async fn spawn_fake_shell(bus: &TestBus) -> zbus::Connection {
+        let conn = bus.connect().await;
+        conn.object_server()
+            .at("/org/gnome/Shell", FakeShell)
+            .await
+            .expect("register org.gnome.Shell");
+        use zbus::names::WellKnownName;
+        let name = WellKnownName::try_from("org.gnome.Shell".to_string()).expect("valid bus name");
+        conn.request_name(name)
+            .await
+            .expect("claim org.gnome.Shell");
+        conn
+    }
+
+    /// 原始 Wayland 服务端线程：`UnixStream::pair()` 一侧交给 `Backend`，
+    /// 空转 dispatch/flush 直至客户端 `roundtrip` 完成。`wl_display` 不注册
+    /// 任何 global，因此 `global_count()` 为 0。
+    struct WaylandTestServer {
+        done: Arc<AtomicBool>,
+        join: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl WaylandTestServer {
+        fn start() -> (Self, wayland_client::Connection) {
+            let (server_stream, client_stream) = UnixStream::pair().expect("socketpair");
+            let done = Arc::new(AtomicBool::new(false));
+            let done_t = Arc::clone(&done);
+            let join = std::thread::spawn(move || {
+                let mut backend =
+                    wayland_backend::rs::server::Backend::<()>::new().expect("wayland backend");
+                let mut handle = backend.handle();
+                handle
+                    .insert_client(server_stream, Arc::new(()))
+                    .expect("insert client");
+                for _ in 0..100_000 {
+                    if done_t.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let _ = backend.dispatch_all_clients(&mut ());
+                    let _ = backend.flush(None);
+                    std::thread::sleep(Duration::from_micros(100));
+                }
+            });
+            let conn =
+                wayland_client::Connection::from_socket(client_stream).expect("client connection");
+            (
+                Self {
+                    done,
+                    join: Some(join),
+                },
+                conn,
+            )
+        }
+    }
+
+    impl Drop for WaylandTestServer {
+        fn drop(&mut self) {
+            self.done.store(true, Ordering::Relaxed);
+            if let Some(join) = self.join.take() {
+                let _ = join.join();
+            }
+        }
+    }
+
+    async fn build(bus: &TestBus, wayland_core: Option<WaylandDisplayServer>) -> MutterCompositor {
+        let conn = bus.connect().await;
+        MutterCompositor::with_session(
+            conn,
+            if wayland_core.is_some() {
+                SessionKind::Wayland
+            } else {
+                SessionKind::X11
+            },
+            wayland_core,
+            Some("wayland-9".to_string()),
+        )
+        .await
+        .expect("assemble mutter compositor on private bus")
+    }
+
+    /// X11 会话：协议通道只有 D-Bus，无 Wayland 绑定。
+    #[tokio::test]
+    async fn x11_session_doctor_line_is_dbus_only() {
+        let bus = TestBus::start().await;
+        let _shell = spawn_fake_shell(&bus).await;
+        let comp = build(&bus, None).await;
+
+        let lines = comp.doctor_lines();
+
+        assert_eq!(lines[0], x11_protocol_line());
+        assert!(lines[1].contains("GNOME 45.2 (Eval 可用)"), "{}", lines[1]);
+        assert!(
+            lines[2].contains("Eval (agent-shell-bridge@multica.dev)"),
+            "{}",
+            lines[2]
+        );
+    }
+
+    /// Wayland 会话但 wl_display 连接失败降级：D-Bus 仍是唯一通道。
+    #[tokio::test]
+    async fn wayland_degraded_doctor_line_reports_fallback() {
+        let bus = TestBus::start().await;
+        let _shell = spawn_fake_shell(&bus).await;
+        let conn = bus.connect().await;
+        let comp = MutterCompositor::with_session(
+            conn,
+            SessionKind::Wayland,
+            None,
+            Some("wayland-9".to_string()),
+        )
+        .await
+        .expect("assemble degraded mutter compositor");
+
+        let lines = comp.doctor_lines();
+
+        assert!(lines[0].starts_with("⚠ 协议通道"));
+        assert!(lines[0].contains("Wayland 会话 wayland-9 连接失败"));
+        assert!(lines[0].contains("仅 D-Bus 可用"));
+    }
+
+    /// Wayland 会话且 wl_display 在位：协议通道行报告 display 名与
+    /// global 数。裸服务端无任何 global，计数为 0。
+    #[tokio::test]
+    async fn wayland_connected_doctor_line_reports_globals() {
+        let bus = TestBus::start().await;
+        let _shell = spawn_fake_shell(&bus).await;
+        let (_server, client_conn) = WaylandTestServer::start();
+        let wls = WaylandDisplayServer::connect_with(client_conn)
+            .expect("connect to socketpair wayland server");
+        let conn = bus.connect().await;
+        let comp = MutterCompositor::with_session(
+            conn,
+            SessionKind::Wayland,
+            Some(wls),
+            Some("wayland-9".to_string()),
+        )
+        .await
+        .expect("assemble connected mutter compositor");
+
+        let lines = comp.doctor_lines();
+
+        assert_eq!(
+            lines[0],
+            "✓ Wayland 显示  : wayland-9 (wl_display connected, 0 globals)"
+        );
+    }
 
     #[test]
     fn session_kind_is_debug_visible() {

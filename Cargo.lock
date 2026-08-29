@@ -305,6 +305,8 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "tracing",
+ "wayland-backend",
+ "wayland-client",
  "zbus",
 ]
 
