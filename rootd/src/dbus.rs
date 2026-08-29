@@ -751,18 +751,33 @@ mod tests {
     }
 
     /// 从匹配流里读下一条属于 `member` 的信号；超时或流结束返回 None。
-    async fn next_signal(
-        stream: &mut zbus::MessageStream,
+    ///
+    /// 传输错误（`Ok(Some(Err(_)))`）不再静默丢弃：计数累加并 `tracing::warn!`
+    /// 记录，便于日后诊断信号丢失；行为不变——跳过该项继续读。
+    async fn next_signal<S>(
+        stream: &mut S,
         member: &str,
         deadline: Instant,
-    ) -> Option<zbus::Message> {
+        transport_errors: &mut u64,
+    ) -> Option<zbus::Message>
+    where
+        S: futures_util::Stream<Item = zbus::Result<zbus::Message>> + Unpin,
+    {
         while Instant::now() < deadline {
             let next =
                 tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), stream.next())
                     .await;
             let msg = match next {
                 Ok(Some(Ok(msg))) => msg,
-                Ok(Some(Err(_))) | Ok(None) => continue,
+                Ok(Some(Err(e))) => {
+                    *transport_errors += 1;
+                    tracing::warn!(
+                        error = %e,
+                        "D-Bus transport error while reading signal stream; skipping"
+                    );
+                    continue;
+                }
+                Ok(None) => continue,
                 Err(_) => return None,
             };
             let header = msg.header();
@@ -814,9 +829,19 @@ mod tests {
         job_progress(&id, 0.7);
 
         let progress_deadline = Instant::now() + Duration::from_secs(5);
-        let progress_msg = next_signal(&mut stream, "JobProgress", progress_deadline)
-            .await
-            .expect("JobProgress signal must be received");
+        let mut progress_transport_errors = 0;
+        let progress_msg = next_signal(
+            &mut stream,
+            "JobProgress",
+            progress_deadline,
+            &mut progress_transport_errors,
+        )
+        .await
+        .expect("JobProgress signal must be received");
+        assert_eq!(
+            progress_transport_errors, 0,
+            "no transport errors expected on a live bus"
+        );
         let (job_id, progress): (String, f64) = progress_msg
             .body()
             .deserialize()
@@ -829,9 +854,19 @@ mod tests {
 
         job_done_with(&id, true, Some(0), String::new());
         let done_deadline = Instant::now() + Duration::from_secs(5);
-        let done_msg = next_signal(&mut stream, "JobDone", done_deadline)
-            .await
-            .expect("JobDone signal must be received");
+        let mut done_transport_errors = 0;
+        let done_msg = next_signal(
+            &mut stream,
+            "JobDone",
+            done_deadline,
+            &mut done_transport_errors,
+        )
+        .await
+        .expect("JobDone signal must be received");
+        assert_eq!(
+            done_transport_errors, 0,
+            "no transport errors expected on a live bus"
+        );
         let (job_id, success): (String, bool) = done_msg
             .body()
             .deserialize()
@@ -846,6 +881,32 @@ mod tests {
         );
         handle.abort();
         let _ = crate::job_drain_done();
+    }
+
+    /// 传输错误不再静默：坏消息先于目标信号入队时，`next_signal` 跳过它、
+    /// 计数 +1，并在同一次 deadline 内继续读到随后的有效信号。
+    #[tokio::test]
+    async fn next_signal_counts_transport_error_and_continues() {
+        let err: zbus::Result<zbus::Message> =
+            Err(zbus::Error::Failure("simulated transport error".into()));
+        let valid = zbus::Message::signal(
+            "/org/agentshell/Rootd",
+            "org.agentshell.Rootd",
+            "JobProgress",
+        )
+        .expect("signal builder")
+        .build(&("job-1".to_string(), 0.5f64))
+        .expect("signal build");
+        let items: Vec<zbus::Result<zbus::Message>> = vec![err, Ok(valid)];
+        let mut stream = futures_util::stream::iter(items);
+        let mut transport_errors = 0;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let msg = next_signal(&mut stream, "JobProgress", deadline, &mut transport_errors)
+            .await
+            .expect("valid JobProgress must follow the transport error");
+        assert_eq!(transport_errors, 1, "transport error must be counted");
+        let (job_id, _): (String, f64) = msg.body().deserialize().expect("body deserialize");
+        assert_eq!(job_id, "job-1");
     }
 
     #[test]
