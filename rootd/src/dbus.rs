@@ -677,6 +677,177 @@ mod tests {
     use crate::{COMMAND_TIMEOUT, JOURNAL_QUERY_TIMEOUT};
     use std::os::fd::AsRawFd;
 
+    // ── drive_signals 信号循环 ──
+
+    use super::{drive_signals, RootdInterface};
+    use crate::{job_create, job_done_with, job_progress, job_status, JOB_TEST_MUTEX};
+    use futures_util::StreamExt;
+    use std::io::Read as _;
+    use std::process::{ChildStdout, Stdio};
+    use std::time::{Duration, Instant};
+
+    /// 独立私有 session bus（避免 `Connection::session()` 环境变量在并行
+    /// 测试间竞争）。对象服务与信号订阅方共享同一地址。
+    struct TestBus {
+        addr: String,
+        _child: std::process::Child,
+    }
+
+    impl TestBus {
+        async fn start() -> Self {
+            let mut child = std::process::Command::new("dbus-daemon")
+                .args(["--session", "--nofork", "--print-address=1"])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("dbus-daemon must be installed for rootd dbus tests");
+            let stdout = child.stdout.take().expect("piped stdout");
+            let addr = read_address_line(stdout);
+            assert!(
+                addr.starts_with("unix:"),
+                "dbus-daemon printed unexpected address: {addr:?}"
+            );
+            Self {
+                addr,
+                _child: child,
+            }
+        }
+
+        async fn connect(&self) -> zbus::Connection {
+            zbus::connection::Builder::address(self.addr.as_str())
+                .expect("dbus-daemon address must parse")
+                .build()
+                .await
+                .expect("connect to private session bus")
+        }
+    }
+
+    impl Drop for TestBus {
+        fn drop(&mut self) {
+            let _ = self._child.kill();
+            let _ = self._child.wait();
+        }
+    }
+
+    /// 逐字节读地址行：`dbus-daemon --print-address=1` 恰好一行。
+    fn read_address_line(stdout: ChildStdout) -> String {
+        let mut reader = std::io::BufReader::new(stdout);
+        let mut bytes = Vec::new();
+        loop {
+            let mut buf = [0u8; 1];
+            match reader.read_exact(&mut buf) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                Err(e) => panic!("read dbus-daemon address: {e}"),
+            }
+            bytes.push(buf[0]);
+            if buf[0] == b'\n' {
+                break;
+            }
+        }
+        let line = String::from_utf8(bytes).expect("dbus-daemon address must be UTF-8");
+        assert!(!line.is_empty(), "dbus-daemon printed no address line");
+        line.trim_end_matches('\n').to_string()
+    }
+
+    /// 从匹配流里读下一条属于 `member` 的信号；超时或流结束返回 None。
+    async fn next_signal(
+        stream: &mut zbus::MessageStream,
+        member: &str,
+        deadline: Instant,
+    ) -> Option<zbus::Message> {
+        while Instant::now() < deadline {
+            let next =
+                tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), stream.next())
+                    .await;
+            let msg = match next {
+                Ok(Some(Ok(msg))) => msg,
+                Ok(Some(Err(_))) | Ok(None) => continue,
+                Err(_) => return None,
+            };
+            let header = msg.header();
+            if header.member().map(|m| m.as_str()) == Some(member) {
+                return Some(msg);
+            }
+        }
+        None
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn drive_signals_emits_progress_and_done_and_drains_registry() {
+        // 全程持有进程级测试闸：drive_signals 每 200ms `job_drain_done`，
+        // 会抽走其他 job 测试尚未断言完成的 job——必须串行。parking_lot
+        // 守护跨 `.await` 持有（await_holding_lock 由此豁免）。
+        let _guard = JOB_TEST_MUTEX.lock();
+        let _ = crate::job_drain_done();
+
+        let bus = TestBus::start().await;
+        let server = bus.connect().await;
+        let _ = server
+            .object_server()
+            .at("/org/agentshell/Rootd", RootdInterface::new())
+            .await
+            .expect("register RootdInterface");
+        let iface_ref = server
+            .object_server()
+            .interface::<_, RootdInterface>("/org/agentshell/Rootd")
+            .await
+            .expect("fetch InterfaceRef");
+
+        let subscriber = bus.connect().await;
+        let rule = zbus::MatchRule::builder()
+            .msg_type(zbus::message::Type::Signal)
+            .interface("org.agentshell.Rootd")
+            .expect("interface name must parse")
+            .build();
+        let mut stream = zbus::MessageStream::for_match_rule(rule, &subscriber, Some(16))
+            .await
+            .expect("subscribe to Rootd signals");
+
+        let server_conn = server.clone();
+        let handle = tokio::spawn(async move { drive_signals(&server_conn, iface_ref).await });
+
+        let id = job_create("PackageInstall");
+        job_progress(&id, 0.5);
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        job_progress(&id, 0.7);
+
+        let progress_deadline = Instant::now() + Duration::from_secs(5);
+        let progress_msg = next_signal(&mut stream, "JobProgress", progress_deadline)
+            .await
+            .expect("JobProgress signal must be received");
+        let (job_id, progress): (String, f64) = progress_msg
+            .body()
+            .deserialize()
+            .expect("JobProgress body must deserialize");
+        assert_eq!(job_id, id);
+        assert!(
+            (progress - 0.7).abs() < f64::EPSILON,
+            "progress was {progress}"
+        );
+
+        job_done_with(&id, true, Some(0), String::new());
+        let done_deadline = Instant::now() + Duration::from_secs(5);
+        let done_msg = next_signal(&mut stream, "JobDone", done_deadline)
+            .await
+            .expect("JobDone signal must be received");
+        let (job_id, success): (String, bool) = done_msg
+            .body()
+            .deserialize()
+            .expect("JobDone body must deserialize");
+        assert_eq!(job_id, id);
+        assert!(success, "job must report success");
+
+        // drain 在 JobDone 发射后同步发生——该 job 必须已从注册表淘汰。
+        assert!(
+            job_status(&id).is_none(),
+            "done job must be drained from registry"
+        );
+        handle.abort();
+        let _ = crate::job_drain_done();
+    }
+
     #[test]
     fn journal_query_uses_dedicated_timeout() {
         assert_eq!(command_timeout_for("JournalQuery"), JOURNAL_QUERY_TIMEOUT);

@@ -193,6 +193,12 @@ pub struct JobState {
     pub stderr: String,
 }
 
+/// 测试串行闸：`JOBS` 是进程级全局静态，lib 内 job 测试与 dbus 内
+/// `drive_signals` 循环测试（后者每 200ms `job_drain_done`，会抽走前者
+/// 尚未断言完成的 job）必须互斥。parking_lot 守护可跨 `.await` 持有。
+#[cfg(test)]
+pub(crate) static JOB_TEST_MUTEX: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
 /// 进程内 job 注册表（D-Bus 服务层轮询/订阅以发射信号）。
 static JOBS: Mutex<Option<HashMap<String, JobState>>> = Mutex::new(None);
 
@@ -1412,8 +1418,6 @@ mod tests {
     fn clear_job_runner() {
         *JOB_RUNNER.lock().expect("JOB_RUNNER mutex poisoned") = None;
     }
-
-    static JOB_TEST_MUTEX: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
     #[test]
     fn job_create_and_progress() {
