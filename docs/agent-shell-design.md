@@ -5312,6 +5312,12 @@ impl MimeService {
 
 Wayland 下启动应用后聚焦的**核心机制**。没有 token，启动的应用可能聚焦失败（focus stealing prevention）。
 
+**v1 范围**：只透传进程环境已有的 `XDG_ACTIVATION_TOKEN`（`components/launcher/src/lib.rs` 经 `gio launch --activation-token` 透传，GLib ≥ 2.76）；DE 专有路径（KWin `activate` / GNOME Eval）直接激活窗口，绕过 token。**v1 不主动获取 token**。
+
+**v2 候选**：主动获取 `xdg_activation_v1.get_activation_token`（见 §22.9 D8），属直连协议绑定，待 portal 路径无法满足聚焦需求时引入。
+
+目标形态（v2）：
+
 ```
 ┌──────────┐                     ┌────────────────┐
 │  agent    │  xdg_activation.v1 │  Wayland        │
@@ -5325,19 +5331,17 @@ Wayland 下启动应用后聚焦的**核心机制**。没有 token，启动的�
 └──────────┘                     └────────────────┘
 ```
 
-**实现要点**：
+**v2 实现草图**（`components/compositor/activation.rs`，非 v1 交付物）：
 
 ```rust
 // 未实现（pending）：无 xdg_activation_v1 客户端
-
 pub struct ActivationTokenManager {
     wl: WaylandConnection,   // agent-shell 自身的 wayland 客户端连接
 }
 
 impl ActivationTokenManager {
-    /// 获取激活 token 并设置到环境变量
+    /// 获取激活 token（v2 候选：xdg_activation_v1.get_activation_token）
     pub async fn request_token(&mut self) -> Result<String> {
-        // 通过 xdg_activation_v1.get_activation_token
         let token = self.wl.get_activation_token().await?;
         Ok(token)
     }
@@ -5345,17 +5349,21 @@ impl ActivationTokenManager {
     /// 带 token 启动应用
     pub async fn launch_with_activation(&mut self, desktop_file: &str) -> Result<()> {
         let token = self.request_token().await?;
-        // 传给启动命令: gio launch 支持 --activation-token? 
-        // 或设置 XDG_ACTIVATION_TOKEN 环境变量
         run_cmd(&format!("XDG_ACTIVATION_TOKEN={} gio launch {}", token, desktop_file)).await?;
         Ok(())
     }
+}
+```
 
-    /// 通知 portal（部分 portal 支持 activation token 参数）
-    pub async fn activate_via_portal(&mut self, app_id: &str) -> Result<()> {
-        // org.freedesktop.portal.Background 等支持 activation
-        unimplemented!("根据 portal 版本")
-    }
+**v1 已落地**（`components/launcher/src/lib.rs`）：
+
+```rust
+// Wayland 下若设置了 XDG_ACTIVATION_TOKEN 则透传给 gio launch（GLib ≥2.76）
+let activation_token = std::env::var("XDG_ACTIVATION_TOKEN").ok();
+if let Some(token) = &activation_token {
+    cmd.arg("launch").arg("--activation-token").arg(token);
+} else {
+    cmd.arg("launch");
 }
 ```
 
@@ -6144,21 +6152,24 @@ CLI 结果 {"committed": "你好世界", "verified": true}
 
 ---
 
-### 22.9 D8 Wayland 协议：portal 优先，直连可选
+### 22.9 D8 Wayland 协议：portal 优先，直连按需
 
-**决策**：agent-shell v1 **不实现直连 Wayland 协议客户端**，全部走 portal + DE 专有。
+**决策**：agent-shell v1 **不新增通用直连 Wayland 协议客户端**；具备 portal 覆盖的能力（ScreenCast/RemoteDesktop/Screenshot/Clipboard、OpenURI）一律走 portal，portal 未覆盖的能力（窗口列表/管理、输入注入等）走 DE 专有接口（KWin Scripting、GNOME Eval、hyprctl）或已落地的合成器私有协议绑定。
+
+**代码库现状**（2026-08）：`wayland-client` 已非「可选 feature」，而是合成器 crates 的实际运行时依赖——`components/displayserver/wayland` 提供 `wl_display` 连接与 registry 探测，`components/compositor/wlr-wayland`、`kwin`、`hyprland` 各自叠加 wlr-* / org_kde_* / hyprland_* 私有协议绑定（`mutter` 的 `wayland-client` 仅 dev-dependencies，用于测试）。「直连」的真实语义是**按需的合成器私有协议绑定**，而非零 Wayland 客户端。
 
 理由：
 - portal 已是所有现代 DE 的标准路径，API 稳定
-- 直连协议需维护 `wayland-client` + 动态协议 XML（wlr-* 不稳定、ext-* 在 staging）
-- ScreenCast/RemoteDesktop/Screenshot/Clipboard 都有 portal 覆盖
-- 仅 window 列表/管理这些 portal 没有的能力，由 DE 专有接口（KWin Scripting、GNOME Eval、hyprctl）提供
+- 动态协议 XML 需逐协议维护（wlr-* 不稳定、ext-* 在 staging），只为 portal 未覆盖且 DE 专有接口缺失的能力引入
+- 窗口列表/管理等 portal 没有的能力，优先 DE 专有接口；仅当 DE 专有接口不可用时，才以对应合成器私有协议绑定保底
 
-**预留扩展点**（v2 候选）：
-- `wayland-rs` / `wayland-client` 作为可选 feature
-- 需要时实现：`xdg_activation_v1`（activation token）、`ext_foreign_toplevel_list_v1`（窗口列表保底）
+**已落地/待落地的直连绑定**：
+- v1 已落地（代表性列举，完整清单见 `components/compositor/wlr-wayland/src/wlr_protocols.rs`、`components/compositor/hyprland/src/wayland.rs`、`components/compositor/kwin/src/wayland.rs`）：wlr-*（`zwlr_foreign_toplevel_manager_v1`、`zwlr_output_manager_v1`、`zwlr_screencopy_manager_v1`、`zwlr_virtual_pointer_manager_v1`、`ext_workspace_manager_v1`、`zwp_virtual_keyboard_manager_v1`、`ext_data_control_manager_v1`）、org_kde_*（window_management/fake_input/virtual_desktop）、hyprland_*（toplevel_export/toplevel_mapping/focus_grab/global_shortcuts）
+- v2 候选：`ext_foreign_toplevel_list_v1`（跨 DE 窗口列表保底）、`xdg_activation_v1`（activation token 主动获取）
 
-**Activation token 实现就放在 v1**：因为它是启动应用聚焦的关键，且实现轻量（`wayland-client` 最小子集 + `xdg_activation_v1`）。
+**绑定 ≠ 消费**：`zwlr_screencopy_manager_v1` 等绑定当前仅能力/兜底登记（`inert_dispatch!`，无原生捕获消费方）；实际捕获走 portal 链（`modules/capture/src/lib.rs`：ScreenCast → Screenshot → X11），与「一律走 portal」不矛盾。
+
+**XDG activation token 不在 v1**：launcher 目前仅透传进程环境已有的 `XDG_ACTIVATION_TOKEN` 给 `gio launch --activation-token`（GLib ≥ 2.76），**不实现** token 的主动获取（`xdg_activation_v1.get_activation_token`）。主动获取放入 v2 候选；DE 聚焦需求在 v1 由 DE 专有路径（KWin activate / GNOME Eval）覆盖（§21.28）。
 
 ---
 
@@ -6306,7 +6317,7 @@ anyhow = "1"
 zbus = "5"                    # 异步 D-Bus（核心，几乎所有模块用）
 zbus_macros = "5"
 
-# Wayland (可选 feature)
+# Wayland (运行时依赖：合成器 crates 直连协议绑定)
 wayland-client = "0.31"
 wayland-protocols = "0.32"
 
