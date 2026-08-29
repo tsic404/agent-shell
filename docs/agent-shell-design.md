@@ -5768,6 +5768,16 @@ DE 源                     daemon                    订阅者
 - **缓冲**：环形队列保留最近 N=1000 条，CLI `agent-shell events --replay` 可查历史
 - **断线**：订阅者断开自动移除，重连恢复时补发最近事件
 
+**当前实现偏差（Phase 2/TSI-2317，PR #46）**：
+- `EventNormalizer` 尚未装配：`daemon/` 无 `RawSource` 注册，`KWinCompositor::
+  subscribe()` 未被 daemon 消费，KWin 原始事件流未持续推送。
+- 事件仅在 `windows_list` 触发窗口缓存刷新时经「窗口差分」产生（`WindowOpened`
+  / `WindowClosed`），`hub.publish` 挂在该轮询差分路径上。
+- `events subscribe` 因此只交付 `subscriber_id` 协议与 replay 数据源，不含
+  持续的真实事件源推送；`events --replay` 数据同样只反映查询触发的差分历史。
+- 后续接线：把 `KWinCompositor::subscribe()` 的原始流包装为 `RawSource`，
+  `add_source` 进 `EventNormalizer` 并 `run()`，以恢复本节描述的持续推送语义。
+
 **事件去重/节流**：
 - 100ms 窗口内的连续 WindowMoved 合并
 - 同一 window state 变化 500ms 内只发一次（防抖）

@@ -93,6 +93,8 @@ pub mod method {
     pub const SCREENSHOT_CAPTURE: &str = "screenshot.capture";
     /// AT-SPI Registry 可达性探测。
     pub const A11Y_STATUS: &str = "a11y.status";
+    /// 语义查询（role/name 过滤，§14.3）。
+    pub const A11Y_QUERY: &str = "a11y.query";
     // ── 事件（§22.5 D4）──
     /// 订阅事件流（返回 subscriber_id；事件经 notification 推送）。
     pub const EVENTS_SUBSCRIBE: &str = "events.subscribe";
@@ -100,6 +102,8 @@ pub mod method {
     pub const EVENTS_UNSUBSCRIBE: &str = "events.unsubscribe";
     /// 回放环形缓冲历史事件。
     pub const EVENTS_REPLAY: &str = "events.replay";
+    /// 事件推送通知（daemon → 订阅者，无 id）。
+    pub const EVENTS_NOTIFY: &str = "events.notify";
     // ── daemon 管理（§22.2）──
     /// daemon 状态查询。
     pub const DAEMON_STATUS: &str = "daemon.status";
@@ -274,6 +278,35 @@ impl Response {
     }
 }
 
+/// JSON-RPC 2.0 通知（daemon → 订阅者，无 id 字段，§22.5 D4）。
+///
+/// 事件订阅（`events.subscribe`）生效后，daemon 在每一条匹配事件上以
+/// `events.notify` 方法推送一行通知；同一 stdio 连接上的普通请求响应
+/// 与通知共享行流，接收端按 `id` 有无区分。
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct Notification {
+    pub jsonrpc: String,
+    pub method: String,
+    pub params: Value,
+}
+
+impl Notification {
+    /// 构造事件推送通知。
+    pub fn event(params: Value) -> Self {
+        Self {
+            jsonrpc: "2.0".into(),
+            method: method::EVENTS_NOTIFY.into(),
+            params,
+        }
+    }
+
+    pub fn to_line(&self) -> String {
+        let mut s = serde_json::to_string(self).expect("Notification is JSON-serializable");
+        s.push('\n');
+        s
+    }
+}
+
 /// 错误对象。code 采用 JSON-RPC 2.0 规范保留区间 + 应用自定义区间。
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct RpcError {
@@ -408,6 +441,27 @@ pub struct InfoResult {
 pub struct A11yStatusResult {
     pub available: bool,
     pub detail: String,
+}
+
+/// a11y.query 结果条目（daemon 侧 `ElementNode` 的协议投影，§14.3）。
+///
+/// rpc crate 保持与重依赖（zbus/a11y crate）解耦——daemon 把
+/// `components/a11y` 的节点投影为纯数据字段，CLI/MCP 只消费本结构。
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct A11yElementResult {
+    pub bus_name: String,
+    pub path: String,
+    pub name: String,
+    pub role: String,
+    pub role_code: u32,
+    pub states: u64,
+}
+
+/// a11y.query 结果。
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct A11yQueryResult {
+    pub count: usize,
+    pub elements: Vec<A11yElementResult>,
 }
 
 // ───────────────────────── 事件 / daemon / IME 载荷 ─────────────────────────

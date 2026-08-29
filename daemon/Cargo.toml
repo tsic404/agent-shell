@@ -16,6 +16,8 @@ agent-shell-rpc.workspace = true
 agent-shell-compositor-kwin.workspace = true
 agent-shell-capture.workspace = true
 agent-shell-displayserver-x11.workspace = true
+agent-shell-event.workspace = true
+agent-shell-a11y.workspace = true
 x11rb = { version = "0.14", features = ["xtest"] }
 serde.workspace = true
 serde_json.workspace = true

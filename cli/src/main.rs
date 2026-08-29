@@ -128,6 +128,23 @@ async fn windows(out: OutputFormat, c: &mut DaemonClient, cmd: cli::WindowsComma
         } => window_op(c, out, target, WindowOpKind::Resize, [0, 0, width, height]).await,
         W::Minimize { target } => window_op(c, out, target, WindowOpKind::Minimize, [0; 4]).await,
         W::Close { target } => window_op(c, out, target, WindowOpKind::Close, [0; 4]).await,
+        W::Wait { app_id, timeout_ms } => {
+            let timeout_ms = timeout_ms.unwrap_or(15_000);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+            loop {
+                let (wins, _) = c.windows_list(Some(app_id.clone())).await?;
+                if let Some(w) = wins.first() {
+                    emit_windows_json_or_table(out, std::slice::from_ref(w));
+                    return Ok(0);
+                }
+                if std::time::Instant::now() >= deadline {
+                    return Err(format!(
+                        "window '{app_id}' did not appear within {timeout_ms}ms"
+                    ));
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+        }
     }
 }
 
@@ -208,9 +225,11 @@ async fn a11y(c: &mut DaemonClient, cmd: cli::A11yCommand) -> CmdResult {
             println!("{}", r.detail);
             Ok(if r.available { 0 } else { 2 })
         }
-        cli::A11yCommand::Query { .. } => Err(
-            "a11y query requires components/a11y (AT-SPI tree, TSI-2317); only bus status is available".into(),
-        ),
+        cli::A11yCommand::Query { role, name } => {
+            let r = c.a11y_query(role, name).await?;
+            println!("{}", serde_json::to_string_pretty(&r).expect("json"));
+            Ok(if r.count > 0 { 0 } else { 2 })
+        }
     }
 }
 
@@ -220,11 +239,7 @@ async fn events(c: &mut DaemonClient, cmd: cli::EventsCommand) -> CmdResult {
     use cli::EventsCommand as E;
     match cmd {
         E::Subscribe { filter } => {
-            let params = filter
-                .map(|f| json!({ "filter": f }))
-                .unwrap_or(Value::Null);
-            let r = c.call(method::EVENTS_SUBSCRIBE, params).await?;
-            println!("{}", serde_json::to_string_pretty(&r).unwrap_or_default());
+            c.subscribe(filter).await?;
         }
         E::Unsubscribe { id } => {
             c.call(method::EVENTS_UNSUBSCRIBE, json!({ "subscriber_id": id }))

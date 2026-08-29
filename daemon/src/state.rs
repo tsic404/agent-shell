@@ -6,10 +6,12 @@
 //! - WindowStateCache（查询走缓存；T3b 事件归一化落地后改为事件驱动刷新，
 //!   当前以 TTL 短缓存近似——如实标注 `from_cache` 语义）
 
+use agent_shell_a11y::AtSpiComponent;
 use agent_shell_capture::CaptureDispatcher;
 use agent_shell_compositor_kwin::KWinCompositor;
 use agent_shell_core::component::CompositorComponent;
 use agent_shell_core::types::WindowInfo;
+use event::{EventHub, EventRing};
 use std::time::{Duration, Instant};
 
 /// 缓存条目有效期。T3b（EventHub 归一化）落地后由事件失效替代。
@@ -28,13 +30,19 @@ pub struct Daemon {
     pub portal_sessions: std::sync::Arc<crate::portal_sessions::PortalSessionManager>,
     /// IME 会话（§22.8 D7）。
     pub ime_session: crate::ime_session::ImeSession,
-    /// 事件环形缓冲（§22.5 D4，CLI `events --replay`）。
-    pub ring_buffer: crate::ring_buffer::RingBuffer<serde_json::Value>,
     /// 安全判定（§22.7 D6）：daemon 层唯一权限入口。
     pub security: agent_shell_core::security::SecurityManager,
     /// 发起调用的 agent 身份。由宿主编排层在启动 CLI/MCP 前经
     /// `AGENT_SHELL_AGENT_ID` 注入，子进程经 fork/exec 继承；未设置回落 `"*"`。
     pub caller_id: String,
+    /// AT-SPI 组件（None = a11y bus 不可达，a11y.query 返回 BackendUnavailable）。
+    pub a11y: Option<AtSpiComponent>,
+    /// 事件枢纽（§22.5 D4：订阅者 fan-out 中心）。
+    pub hub: EventHub,
+    /// 事件环形缓冲（§22.5 D4：CLI `events --replay`）。
+    pub ring: EventRing,
+    /// 待 serve_connection 取走的订阅句柄（转发任务消费）。
+    pub subscriptions: Vec<event::EventSubscription>,
 }
 
 impl Daemon {
@@ -78,9 +86,12 @@ impl Daemon {
             idle_timeout,
             portal_sessions,
             ime_session: crate::ime_session::ImeSession::new(),
-            ring_buffer: crate::ring_buffer::RingBuffer::new(),
             security,
             caller_id,
+            a11y: AtSpiComponent::probe().await,
+            hub: EventHub::new(),
+            ring: EventRing::default(),
+            subscriptions: Vec::new(),
         }
     }
 
@@ -95,7 +106,15 @@ impl Daemon {
         })
     }
 
-    /// 窗口列表：命中未过期缓存直接返回（零系统调用），否则经 KWin 刷新。
+    /// 当前 KWin 会话对应的 [`event::EventSource`]（审查建议 4：X11 会话
+    /// 不得错标为 KWinWayland）。
+    fn event_source_kind(&self) -> event::EventSource {
+        match self.compositor.as_ref().map(|c| c.session_kind()) {
+            Some(agent_shell_compositor_kwin::SessionKind::X11) => event::EventSource::KWinX11,
+            _ => event::EventSource::KWinWayland,
+        }
+    }
+
     ///
     /// 返回 `(列表, 是否来自缓存)`。
     pub async fn list_windows(
@@ -111,19 +130,42 @@ impl Daemon {
             .list_windows()
             .await
             .map_err(|e| (agent_shell_rpc::RpcErrorCode::BackendError, e.to_string()))?;
+        // 窗口差异事件：把 list_windows 的刷新接回 `ring` 与 `hub.publish`，
+        // 使订阅者能收到事件、replay 有真实数据。首个快照（空缓存）会把
+        // 全部当前窗口计为 WindowOpened——符合事件语义（订阅/回放前窗口
+        // 即已存在）。后续刷新按 id 差分。事件源按会话类型标注（审查建议 4）。
+        // 注意：这是「查询驱动的轮询差分」，不是 §22.5 D4 的持续真实推送
+        // （EventNormalizer 装配留待 Phase 2/TSI-2317，见 docs 偏差记录）。
+        let source_kind = self.event_source_kind();
+        let now = Instant::now();
+        let opened = wins
+            .iter()
+            .filter(|w| {
+                !self
+                    .cache
+                    .iter()
+                    .any(|old| old.id.native_id == w.id.native_id)
+            })
+            .map(|w| event::DesktopEvent::WindowOpened {
+                info: w.clone(),
+                source: source_kind.clone(),
+                occurred_at: now,
+            });
+        let closed = self
+            .cache
+            .iter()
+            .filter(|old| !wins.iter().any(|w| w.id.native_id == old.id.native_id))
+            .map(|old| event::DesktopEvent::WindowClosed {
+                id: old.id.clone(),
+                source: source_kind.clone(),
+                occurred_at: now,
+            });
+        for evt in opened.chain(closed) {
+            self.ring.push(evt.clone());
+            self.hub.publish(evt).await;
+        }
         self.cache = wins;
-        // 单条聚合事件推入环形缓冲（§22.5 D4——events --replay 数据源）。
-        // 逐窗口推送会快速淘汰历史且 replay 只见部分快照。
-        self.ring_buffer.push(serde_json::json!({
-            "type": "window_list",
-            "windows": self.cache.iter().map(|w| serde_json::json!({
-                "native_id": w.id.native_id,
-                "title": w.title,
-                "app_id": w.app_id,
-                "pid": w.pid,
-            })).collect::<Vec<_>>(),
-        }));
-        self.cached_at = Some(Instant::now());
+        self.cached_at = Some(now);
         Ok((self.cache.clone(), false))
     }
 
@@ -246,9 +288,9 @@ impl Daemon {
         self.cache.len()
     }
 
-    /// 当前事件订阅者数量（v1 事件推送未实现，返回 0）。
+    /// 当前事件订阅者数量。
     pub fn subscriber_count(&self) -> usize {
-        0
+        self.hub.subscriber_count()
     }
 }
 
@@ -290,14 +332,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ring_buffer_replay_after_push() {
-        // 审查项 #2：list_windows 刷新路径将窗口事件推入 ring_buffer，
-        // events --replay 必须返回非空。无合成器时直接验证 push/replay 通路。
-        let mut d = Daemon::connect(Duration::from_secs(1)).await;
-        assert!(d.ring_buffer.replay().is_empty());
-        d.ring_buffer
-            .push(serde_json::json!({"type": "window_list", "native_id": "test"}));
-        let events = d.ring_buffer.replay();
+    async fn event_ring_replay_after_push() {
+        // events --replay 数据源：push 一个真实 DesktopEvent 后 snapshot 非空。
+        let d = Daemon::connect(Duration::from_secs(1)).await;
+        assert!(d.ring.snapshot().is_empty());
+        d.ring.push(event::DesktopEvent::Noop);
+        let events = d.ring.snapshot();
         assert!(!events.is_empty());
         assert_eq!(events.len(), 1);
     }

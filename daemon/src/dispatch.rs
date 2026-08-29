@@ -4,13 +4,16 @@
 //! 异步收集（合成器 doctor_lines + a11y 探测），CLI 只做渲染。
 
 use crate::state::Daemon;
+use agent_shell_core::error::AgentShellError;
 use agent_shell_core::security::{Operation, PermissionDecision, PermissionLevel};
-use agent_shell_core::types::WindowInfo;
+use agent_shell_core::types::{SemanticTarget, WindowInfo};
 use agent_shell_rpc::{
-    method, A11yStatusResult, CaptureParams, DoctorResult, InfoResult, InputParams, Request,
-    Response, RpcErrorCode, WindowOpKind,
+    method, A11yElementResult, A11yQueryResult, A11yStatusResult, CaptureParams, DoctorResult,
+    InfoResult, InputParams, Request, Response, RpcErrorCode, WindowOpKind,
 };
+use event::EventFilter;
 use serde_json::{json, Value};
+use uuid::Uuid;
 
 /// 单请求处理入口。返回完整 Response（永不 panic——所有错误走 RPC error）。
 pub async fn dispatch(daemon: &mut Daemon, req: &Request) -> Response {
@@ -54,10 +57,11 @@ pub async fn dispatch(daemon: &mut Daemon, req: &Request) -> Response {
         method::INPUT_SEND => blocking_input_send(req).await,
         method::SCREENSHOT_CAPTURE => screenshot_capture(daemon, req).await,
         method::A11Y_STATUS => a11y_status().await,
+        method::A11Y_QUERY => a11y_query(daemon, req).await,
         // ── 事件（§22.5 D4）──
         method::EVENTS_SUBSCRIBE => events_subscribe(daemon, req).await,
         method::EVENTS_UNSUBSCRIBE => events_unsubscribe(daemon, req).await,
-        method::EVENTS_REPLAY => events_replay(daemon).await,
+        method::EVENTS_REPLAY => events_replay(daemon, req).await,
         // ── daemon 管理（§22.2）──
         method::DAEMON_STATUS => daemon_status(daemon).await,
         method::DAEMON_SESSIONS => daemon_sessions(daemon).await,
@@ -408,6 +412,74 @@ async fn a11y_status() -> RpcResult {
     Ok(serde_json::to_value(r).expect("A11yStatusResult serializable"))
 }
 
+/// 语义查询（§14.3）：AT-SPI 树按 (role, name) 定位元素，投影为协议载荷。
+async fn a11y_query(d: &Daemon, req: &Request) -> RpcResult {
+    // 参数校验先于后端可用性判定：无效请求恒返回 InvalidParams，
+    // 与 AT-SPI 是否可达无关（不信任客户端输入）。`role`/`name` 键
+    // 缺省或值为 `null` 均视为未提供；存在且非字符串 → InvalidParams。
+    let params = params_of(req)?;
+    let role = match params.get("role") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(s)) => Some(s.clone()),
+        Some(_) => {
+            return Err((
+                RpcErrorCode::InvalidParams,
+                "a11y.query role must be a string".to_string(),
+            ))
+        }
+    };
+    let name = match params.get("name") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(s)) => Some(s.clone()),
+        Some(_) => {
+            return Err((
+                RpcErrorCode::InvalidParams,
+                "a11y.query name must be a string".to_string(),
+            ))
+        }
+    };
+    if role.is_none() && name.is_none() {
+        return Err((
+            RpcErrorCode::InvalidParams,
+            "a11y.query requires `role` and/or `name`".to_string(),
+        ));
+    }
+    let component = d.a11y.as_ref().ok_or((
+        RpcErrorCode::BackendUnavailable,
+        "AT-SPI unavailable".to_string(),
+    ))?;
+    let target = SemanticTarget::ByAccessibility {
+        role,
+        name,
+        parent_role: None,
+        parent_name: None,
+    };
+    let nodes = component
+        .locator()
+        .locate(&target)
+        .await
+        .map_err(|e| match e {
+            AgentShellError::BackendUnavailable(msg) => (RpcErrorCode::BackendUnavailable, msg),
+            other => (RpcErrorCode::BackendError, other.to_string()),
+        })?;
+    let elements = nodes
+        .into_iter()
+        .map(|n| A11yElementResult {
+            bus_name: n.bus_name,
+            path: n.path,
+            name: n.name,
+            role: n.role.name,
+            role_code: n.role.code,
+            states: n.states.0,
+        })
+        .collect::<Vec<_>>();
+    let r = A11yQueryResult {
+        count: elements.len(),
+        elements,
+    };
+    Ok(serde_json::to_value(r).expect("A11yQueryResult serializable"))
+}
+
 // ───────────────────────── 事件 / daemon / IME ─────────────────────────
 
 // ───────────────────────── 安全边界（§22.7 D6）─────────────────────────
@@ -494,26 +566,88 @@ fn stub_ok(name: &str) -> RpcResult {
     Ok(json!({"status": "not_implemented", "service": name}))
 }
 
-/// 事件订阅——v1 不实现推送，显式返回 not_implemented（§22.5 D4 待 Phase 2 接线）。
-async fn events_subscribe(_d: &mut Daemon, _req: &Request) -> RpcResult {
-    Err((
-        RpcErrorCode::Denied,
-        "events.subscribe not implemented in v1 (event push pending Phase 2 wiring)".into(),
-    ))
+/// 事件订阅（§22.5 D4）：解析过滤器、创建订阅句柄，返回 subscriber_id。
+///
+/// 推送在 `serve_connection` 层：dispatch 返回订阅句柄后由主循环 spawn
+/// 转发任务，把匹配事件序列化为 JSON-RPC notification 写入 stdout。
+///
+/// **当前范围（Phase 2/TSI-2317）**：`EventNormalizer` 尚未装配，KWin
+/// `subscribe()` 未被 daemon 消费——事件仅在 `windows_list` 触发窗口缓存
+/// 刷新时经差分产生。因此 `events subscribe` 只交付 `subscriber_id` 协议
+/// 与 replay 数据源，不含持续的原始事件流推送。偏差详见设计文档 §22.5。
+async fn events_subscribe(d: &mut Daemon, req: &Request) -> RpcResult {
+    let filter = parse_event_filter(req)?;
+    let sub = d.hub.subscribe(filter);
+    let id = sub.id().to_string();
+    // 订阅句柄暂存于 daemon，由 serve_connection 取走并 spawn 转发任务。
+    d.subscriptions.push(sub);
+    Ok(json!({"subscriber_id": id}))
 }
 
-/// 事件取消订阅——v1 不实现推送，显式返回 not_implemented。
-async fn events_unsubscribe(_d: &mut Daemon, _req: &Request) -> RpcResult {
-    Err((
-        RpcErrorCode::Denied,
-        "events.unsubscribe not implemented in v1 (event push pending Phase 2 wiring)".into(),
-    ))
+/// 事件取消订阅（§22.5 D4）：幂等，未知 id 同样返回 unsubscribed。
+async fn events_unsubscribe(d: &mut Daemon, req: &Request) -> RpcResult {
+    let params = params_of(req)?;
+    let raw = params
+        .get("subscriber_id")
+        .and_then(|v| v.as_str())
+        .ok_or((
+            RpcErrorCode::InvalidParams,
+            "missing subscriber_id".to_string(),
+        ))?;
+    let id = Uuid::parse_str(raw).map_err(|_| {
+        (
+            RpcErrorCode::InvalidParams,
+            format!("invalid subscriber_id: {raw}"),
+        )
+    })?;
+    d.hub.unsubscribe(id);
+    Ok(json!({"unsubscribed": true}))
 }
 
-async fn events_replay(d: &mut Daemon) -> RpcResult {
-    let events = d.ring_buffer.replay();
+async fn events_replay(d: &mut Daemon, req: &Request) -> RpcResult {
+    let filter = parse_event_filter(req)?;
+    let events = d
+        .ring
+        .snapshot()
+        .into_iter()
+        .filter(|e| filter.matches(e))
+        .map(|e| serde_json::to_value(e).expect("DesktopEvent serializable"))
+        .collect::<Vec<_>>();
     let count = events.len();
     Ok(json!({"events": events, "count": count}))
+}
+
+/// 解析 events.subscribe 的可选 `filter` 字符串（逗号分隔类别）。
+fn parse_event_filter(req: &Request) -> Result<EventFilter, (RpcErrorCode, String)> {
+    let Some(params) = req.params.as_ref() else {
+        return Ok(EventFilter::all());
+    };
+    let Some(raw) = params.get("filter").and_then(|v| v.as_str()) else {
+        return Ok(EventFilter::all());
+    };
+    if raw.trim().is_empty() {
+        return Ok(EventFilter::all());
+    }
+    let mut f = EventFilter::default();
+    for token in raw.split(',').map(str::trim).filter(|t| !t.is_empty()) {
+        match token {
+            "all" => return Ok(EventFilter::all()),
+            "window" => f.window_events = true,
+            "workspace" => f.workspace_events = true,
+            "monitor" => f.monitor_events = true,
+            "input" => f.input_events = true,
+            "app" => f.app_events = true,
+            "a11y" => f.a11y_events = true,
+            "power" => f.power_events = true,
+            other => {
+                return Err((
+                    RpcErrorCode::InvalidParams,
+                    format!("unknown event filter: {other}"),
+                ))
+            }
+        }
+    }
+    Ok(f)
 }
 
 async fn daemon_status(d: &mut Daemon) -> RpcResult {
@@ -749,40 +883,160 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn events_subscribe_returns_not_implemented() {
-        // v1 不实现事件推送——subscribe 返回 Denied（not_implemented）。
+    async fn a11y_query_non_string_role_name_is_invalid_params() {
+        // TSI-2480 QA 回归锚定：类型校验先于后端可用性判定，
+        // headless（无 AT-SPI bus）环境也须返回 InvalidParams。
         let mut d = Daemon::connect(Duration::from_secs(1)).await;
-        let resp = dispatch(&mut d, &req(method::EVENTS_SUBSCRIBE, None)).await;
-        assert!(resp.error.is_some(), "subscribe must return error");
-        assert_eq!(resp.error.unwrap().code, RpcErrorCode::Denied as i32);
+        for params in [json!({"role": 123}), json!({"name": true})] {
+            let resp = dispatch(&mut d, &req(method::A11Y_QUERY, Some(params))).await;
+            assert_eq!(
+                resp.error.expect("error").code,
+                RpcErrorCode::InvalidParams as i32
+            );
+        }
     }
 
     #[tokio::test]
-    async fn events_unsubscribe_returns_not_implemented() {
-        // v1 不实现事件推送——unsubscribe 返回 Denied（not_implemented）。
+    async fn a11y_query_null_is_treated_as_absent() {
+        // `null` 与缺省等价：单条件仍有效，绝不可判 InvalidParams。
+        // 有 AT-SPI bus 时返回结果（含 count），headless 时退化
+        // BackendUnavailable——两条路径都证明 null 未触发类型/缺参误拒。
         let mut d = Daemon::connect(Duration::from_secs(1)).await;
         let resp = dispatch(
             &mut d,
             &req(
-                method::EVENTS_UNSUBSCRIBE,
-                Some(json!({"subscriber_id": "x"})),
+                method::A11Y_QUERY,
+                Some(json!({"role": "pushButton", "name": null})),
             ),
         )
         .await;
-        assert!(resp.error.is_some(), "unsubscribe must return error");
-        assert_eq!(resp.error.unwrap().code, RpcErrorCode::Denied as i32);
+        match resp.error {
+            Some(err) => {
+                assert_ne!(
+                    err.code,
+                    RpcErrorCode::InvalidParams as i32,
+                    "null must not be InvalidParams"
+                );
+                // headless → BackendUnavailable；AT-SPI 探测成功但定位阶段
+                // bus 掉线 → BackendError。两条后端路径都证明 null 未误拒。
+            }
+            None => {
+                let v = resp.result.expect("query ok");
+                assert!(v.get("count").is_some(), "result must carry count: {v}");
+            }
+        }
     }
 
     #[tokio::test]
-    async fn events_replay_returns_ring_buffer_contents() {
-        // 审查项 #2：ring_buffer 非空时 events_replay 返回事件。
+    async fn events_subscribe_returns_subscriber_id() {
         let mut d = Daemon::connect(Duration::from_secs(1)).await;
-        d.ring_buffer
-            .push(json!({"type": "window_list", "native_id": "x"}));
+        let resp = dispatch(&mut d, &req(method::EVENTS_SUBSCRIBE, None)).await;
+        let v = resp.result.expect("subscribe ok");
+        let id = v.get("subscriber_id").and_then(|v| v.as_str()).expect("id");
+        Uuid::parse_str(id).expect("valid uuid");
+        assert_eq!(d.subscriptions.len(), 1);
+        assert_eq!(d.hub.subscriber_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn events_subscribe_unknown_filter_is_invalid_params() {
+        let mut d = Daemon::connect(Duration::from_secs(1)).await;
+        let resp = dispatch(
+            &mut d,
+            &req(method::EVENTS_SUBSCRIBE, Some(json!({"filter": "bogus"}))),
+        )
+        .await;
+        assert_eq!(
+            resp.error.expect("error").code,
+            RpcErrorCode::InvalidParams as i32
+        );
+    }
+
+    #[tokio::test]
+    async fn events_unsubscribe_invalid_id_is_invalid_params() {
+        let mut d = Daemon::connect(Duration::from_secs(1)).await;
+        for params in [json!({}), json!({"subscriber_id": "not-a-uuid"})] {
+            let resp = dispatch(&mut d, &req(method::EVENTS_UNSUBSCRIBE, Some(params))).await;
+            assert_eq!(
+                resp.error.expect("error").code,
+                RpcErrorCode::InvalidParams as i32
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn events_unsubscribe_is_idempotent() {
+        let mut d = Daemon::connect(Duration::from_secs(1)).await;
+        let resp = dispatch(&mut d, &req(method::EVENTS_UNSUBSCRIBE, None)).await;
+        assert_eq!(
+            resp.error.expect("error").code,
+            RpcErrorCode::InvalidParams as i32
+        );
+        // 有效但未知的 uuid：幂等成功。
+        let uuid = Uuid::new_v4().to_string();
+        let resp = dispatch(
+            &mut d,
+            &req(
+                method::EVENTS_UNSUBSCRIBE,
+                Some(json!({"subscriber_id": uuid})),
+            ),
+        )
+        .await;
+        let v = resp.result.expect("unsubscribe ok");
+        assert_eq!(v.get("unsubscribed").and_then(|v| v.as_bool()), Some(true));
+    }
+
+    #[tokio::test]
+    async fn events_replay_returns_ring_contents() {
+        // events --replay 数据源：push 一个真实 DesktopEvent 后 count=1。
+        let mut d = Daemon::connect(Duration::from_secs(1)).await;
+        d.ring.push(event::DesktopEvent::WindowClosed {
+            id: test_window_id(),
+            source: event::EventSource::KWinWayland,
+            occurred_at: std::time::Instant::now(),
+        });
         let resp = dispatch(&mut d, &req(method::EVENTS_REPLAY, None)).await;
         let v = resp.result.expect("replay ok");
         let count = v.get("count").and_then(|v| v.as_u64()).expect("count");
         assert_eq!(count, 1);
+        let events = v.get("events").and_then(|v| v.as_array()).expect("events");
+        assert_eq!(events.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn events_replay_honors_filter() {
+        // 阻塞 3 回归锚定：`filter` 参数必须被 events_replay 应用，
+        // 未匹配类别（含 Noop）被过滤。
+        let mut d = Daemon::connect(Duration::from_secs(1)).await;
+        d.ring.push(event::DesktopEvent::WindowClosed {
+            id: test_window_id(),
+            source: event::EventSource::KWinWayland,
+            occurred_at: std::time::Instant::now(),
+        });
+        d.ring.push(event::DesktopEvent::Noop);
+
+        let resp = dispatch(
+            &mut d,
+            &req(method::EVENTS_REPLAY, Some(json!({"filter": "window"}))),
+        )
+        .await;
+        let v = resp.result.expect("replay ok");
+        assert_eq!(v.get("count").and_then(|v| v.as_u64()), Some(1));
+
+        let resp = dispatch(
+            &mut d,
+            &req(method::EVENTS_REPLAY, Some(json!({"filter": "input"}))),
+        )
+        .await;
+        let v = resp.result.expect("replay ok");
+        assert_eq!(v.get("count").and_then(|v| v.as_u64()), Some(0));
+    }
+
+    fn test_window_id() -> agent_shell_core::types::WindowId {
+        agent_shell_core::types::WindowId {
+            native_id: "test-1".into(),
+            de_type: agent_shell_core::types::DesktopEnvironment::KDE,
+        }
     }
 
     #[tokio::test]

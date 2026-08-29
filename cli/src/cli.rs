@@ -118,6 +118,14 @@ pub enum WindowsCommand {
     Minimize { target: String },
     /// 关闭窗口
     Close { target: String },
+    /// 等待 app_id 窗口出现（轮询 windows.list）
+    Wait {
+        /// 目标 app_id
+        app_id: String,
+        /// 超时毫秒（默认 15000）
+        #[arg(long)]
+        timeout_ms: Option<u64>,
+    },
 }
 
 // ───────────────────────── workspaces ─────────────────────────

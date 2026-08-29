@@ -13,12 +13,13 @@ mod dispatch;
 mod ime_session;
 mod input;
 mod portal_sessions;
-mod ring_buffer;
 mod rootd_client;
 mod single_instance;
 mod state;
-use agent_shell_rpc::{Request, Response};
+
+use agent_shell_rpc::{Notification, Request, Response};
 use state::Daemon;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
@@ -85,6 +86,9 @@ async fn run(idle_timeout: Duration, _foreground: bool) {
 async fn serve_connection(mut daemon: Daemon, idle_timeout: Duration) {
     let stdin = tokio::io::stdin();
     let mut lines = BufReader::new(stdin);
+    // 响应与通知共用同一 stdout 行流；订阅转发任务独立 spawn，必须共享
+    // 一个互斥 writer，否则并发写入会交织半行。tokio Mutex 跨 await 持有。
+    let out = Arc::new(tokio::sync::Mutex::new(tokio::io::stdout()));
     loop {
         // 空闲超时退出（§22.2 激活策略）：连接上无请求达 idle_timeout 即退，
         // systemd `Restart=on-failure` 语义下正常退出不重启。
@@ -110,12 +114,31 @@ async fn serve_connection(mut daemon: Daemon, idle_timeout: Duration) {
             Err(e) => {
                 // 解析失败：id 不可知，回 id=0 的 ParseError（规范允许）。
                 let resp = Response::err(0, agent_shell_rpc::RpcErrorCode::ParseError, e);
-                write_response(resp).await;
+                write_line(&out, resp.to_line()).await;
                 continue;
             }
         };
         let resp = dispatch::dispatch(&mut daemon, &req).await;
-        write_response(resp).await;
+        write_line(&out, resp.to_line()).await;
+
+        // events.subscribe 的返回订阅句柄被 dispatch 暂存在 daemon；此处取走
+        // 并 spawn 转发任务。订阅句柄 channel 关闭（unsubscribe）时任务退出。
+        let subs = std::mem::take(&mut daemon.subscriptions);
+        for mut sub in subs {
+            let out = Arc::clone(&out);
+            tokio::spawn(async move {
+                while let Some(evt) = sub.recv().await {
+                    let params = match serde_json::to_value(evt) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            tracing::warn!("event serialize failed: {e}");
+                            continue;
+                        }
+                    };
+                    write_line(&out, Notification::event(params).to_line()).await;
+                }
+            });
+        }
     }
 
     // 退出前关闭 portal ScreenCast 会话（D-Bus Close，审查项 #6）。
@@ -124,8 +147,8 @@ async fn serve_connection(mut daemon: Daemon, idle_timeout: Duration) {
     }
 }
 
-async fn write_response(resp: Response) {
-    let mut stdout = tokio::io::stdout();
-    let _ = stdout.write_all(resp.to_line().as_bytes()).await;
+async fn write_line(out: &Arc<tokio::sync::Mutex<tokio::io::Stdout>>, line: String) {
+    let mut stdout = out.lock().await;
+    let _ = stdout.write_all(line.as_bytes()).await;
     let _ = stdout.flush().await;
 }

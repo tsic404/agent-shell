@@ -50,6 +50,11 @@ impl DaemonConnection {
     }
 
     /// 复用连接发送一条 JSON-RPC 请求并读取对应响应。
+    ///
+    /// 事件订阅生效后，daemon 会在同一 stdio 行流上推送 `events.notify`
+    /// 通知（无 `id`）。本方法循环读取并按 `id` 有无区分：通知直接跳过，
+    /// 直到拿到匹配本请求 id 的响应——避免后续任何工具调用把通知误解析
+    /// 为响应。
     async fn call(&mut self, method: &str, params: Value) -> Result<Value, String> {
         let id = self.next_id;
         self.next_id += 1;
@@ -65,20 +70,45 @@ impl DaemonConnection {
             .await
             .map_err(|e| format!("flush: {e}"))?;
 
-        let mut buf = String::new();
-        tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            self.reader.read_line(&mut buf),
-        )
-        .await
-        .map_err(|_| "timeout".to_string())?
-        .map_err(|e| format!("read: {e}"))?;
-
-        let resp = agent_shell_rpc::Response::from_line(&buf).map_err(|e| format!("parse: {e}"))?;
-        if let Some(err) = resp.error {
-            return Err(format!("RPC error {}: {}", err.code, err.message));
+        // 仅首个读使用 10s 死线；订阅激活期间 `events.notify` 会持续流入，
+        // 每次读到通知后重入循环即重置死线，避免后续工具调用因活跃订阅
+        // 误报 timeout（审查建议 3）。
+        let mut first = true;
+        loop {
+            let mut buf = String::new();
+            let read = if first {
+                first = false;
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(10),
+                    self.reader.read_line(&mut buf),
+                )
+                .await
+                .map_err(|_| "timeout".to_string())?
+                .map_err(|e| format!("read: {e}"))?
+            } else {
+                self.reader
+                    .read_line(&mut buf)
+                    .await
+                    .map_err(|e| format!("read: {e}"))?
+            };
+            if read == 0 {
+                return Err("daemon closed connection before responding".to_string());
+            }
+            let msg: Value = serde_json::from_str(&buf).map_err(|e| format!("parse: {e}"))?;
+            if msg.get("id").is_none() {
+                // events.notify 通知：不属于本请求，继续等待响应。
+                continue;
+            }
+            let resp =
+                agent_shell_rpc::Response::from_line(&buf).map_err(|e| format!("parse: {e}"))?;
+            if resp.id != id {
+                return Err(format!("response id mismatch: got {} want {}", resp.id, id));
+            }
+            if let Some(err) = resp.error {
+                return Err(format!("RPC error {}: {}", err.code, err.message));
+            }
+            return resp.result.ok_or_else(|| "empty result".to_string());
         }
-        resp.result.ok_or_else(|| "empty result".to_string())
     }
 
     /// 清理关闭 daemon 子进程。
@@ -169,7 +199,7 @@ impl AgentShellMcpServer {
             ),
             make_tool(
                 "subscribe_events",
-                "订阅桌面事件：window_opened/focused/closed, workspace_changed",
+                "订阅桌面事件（window_opened/focused/closed, workspace_changed）。MCP 无流式通知通道，仅返回 subscriber_id 句柄，事件暂不投递到本连接",
                 json!({
                     "type": "object",
                     "properties": { "events": {"type":"array","items":{"type":"string"}} }

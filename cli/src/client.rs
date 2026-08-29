@@ -55,7 +55,22 @@ impl DaemonClient {
         })
     }
 
-    /// 单次请求往返。
+    /// 读取一行原始消息（响应与通知共享同一 stdio 行流）。
+    async fn read_line(&mut self) -> Result<String, String> {
+        let mut line = String::new();
+        let n = self
+            .reader
+            .read_line(&mut line)
+            .await
+            .map_err(|e| format!("daemon read: {e}"))?;
+        if n == 0 {
+            return Err("daemon closed connection before responding".into());
+        }
+        Ok(line)
+    }
+
+    /// 单次请求往返。响应与 `events.notify` 通知共享行流，通知无 `id`——
+    /// 读到通知即跳过，直到拿到匹配本请求 id 的响应。
     pub async fn call(&mut self, method: &str, params: Value) -> Result<Value, String> {
         let id = self.next_id;
         self.next_id += 1;
@@ -73,29 +88,97 @@ impl DaemonClient {
             .await
             .map_err(|e| format!("daemon flush: {e}"))?;
 
-        let mut line = String::new();
-        let n = self
-            .reader
-            .read_line(&mut line)
-            .await
-            .map_err(|e| format!("daemon read: {e}"))?;
-        if n == 0 {
-            return Err("daemon closed connection before responding".into());
-        }
-        let resp = Response::from_line(&line)?;
-        if resp.id != id {
-            return Err(format!("response id mismatch: got {} want {}", resp.id, id));
-        }
-        match (resp.result, resp.error) {
-            (Some(v), None) => Ok(v),
-            (None, Some(err)) => Err(format!("rpc error {}: {}", err.code, err.message)),
-            _ => Err("malformed response: neither result nor error".into()),
+        loop {
+            let line = self.read_line().await?;
+            let msg: Value =
+                serde_json::from_str(&line).map_err(|e| format!("bad message: {e}"))?;
+            if msg.get("id").is_none() {
+                // 通知（events.notify）不归属本请求。
+                continue;
+            }
+            let resp = Response::from_line(&line)?;
+            if resp.id != id {
+                return Err(format!("response id mismatch: got {} want {}", resp.id, id));
+            }
+            match (resp.result, resp.error) {
+                (Some(v), None) => return Ok(v),
+                (None, Some(err)) => {
+                    return Err(format!("rpc error {}: {}", err.code, err.message))
+                }
+                _ => return Err("malformed response: neither result nor error".into()),
+            }
         }
     }
 
     /// 无参调用。
     pub async fn call0(&mut self, method_name: &str) -> Result<Value, String> {
         self.call(method_name, Value::Null).await
+    }
+
+    /// 订阅事件流：发送 `events.subscribe` 后持续读取，直到连接关闭。
+    ///
+    /// `subscriber_id` 响应打印一次；此后每条 `events.notify` 通知以
+    /// pretty JSON 打印到 stdout，与普通查询命令的单行输出互不干扰。
+    ///
+    /// 流结束（EOF，daemon 退出或空闲超时）显式提示并 exit 0；真实 I/O
+    /// 错误返回 Err 以非零退出（审查建议 2）。
+    pub async fn subscribe(&mut self, filter: Option<String>) -> Result<(), String> {
+        let id = self.next_id;
+        self.next_id += 1;
+        let params = filter
+            .map(|f| json!({ "filter": f }))
+            .unwrap_or(Value::Null);
+        let req = if params.is_null() {
+            Request::without_params(id, method::EVENTS_SUBSCRIBE)
+        } else {
+            Request::new(id, method::EVENTS_SUBSCRIBE, params)
+        };
+        self.stdin
+            .write_all(req.to_line().as_bytes())
+            .await
+            .map_err(|e| format!("daemon write: {e}"))?;
+        self.stdin
+            .flush()
+            .await
+            .map_err(|e| format!("daemon flush: {e}"))?;
+
+        loop {
+            let line = match self.read_line().await {
+                Ok(l) => l,
+                Err(e) if e.contains("closed connection") => {
+                    eprintln!("event stream ended");
+                    return Ok(());
+                }
+                Err(e) => return Err(e),
+            };
+            let msg: Value = match serde_json::from_str(&line) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            match msg.get("id") {
+                Some(vid) => {
+                    if vid.as_u64() == Some(id) {
+                        let resp = Response::from_line(&line)?;
+                        match (resp.result, resp.error) {
+                            (Some(r), None) => {
+                                println!(
+                                    "{}",
+                                    serde_json::to_string_pretty(&r).unwrap_or_default()
+                                );
+                            }
+                            (None, Some(err)) => {
+                                return Err(format!("rpc error {}: {}", err.code, err.message))
+                            }
+                            _ => return Err("malformed response: neither result nor error".into()),
+                        }
+                    }
+                }
+                None => {
+                    // 事件通知：打印后继续等待下一条。
+                    println!("{}", serde_json::to_string_pretty(&msg).unwrap_or_default());
+                }
+            }
+        }
     }
 }
 
@@ -222,11 +305,40 @@ impl DaemonClient {
         let v = self.call0(method::A11Y_STATUS).await?;
         serde_json::from_value(v).map_err(|e| e.to_string())
     }
+
+    pub async fn a11y_query(
+        &mut self,
+        role: Option<String>,
+        name: Option<String>,
+    ) -> Result<agent_shell_rpc::A11yQueryResult, String> {
+        let v = self
+            .call(
+                method::A11Y_QUERY,
+                a11y_query_params(role.as_deref(), name.as_deref()),
+            )
+            .await?;
+        serde_json::from_value(v).map_err(|e| e.to_string())
+    }
 }
 
+/// `a11y.query` 参数构造：`None` 条件省略该键，而非序列化为 JSON `null`。
+///
+/// daemon 侧把缺省键与 `null` 值均视为「未提供」，但 CLI 省略键更忠实于
+/// 「单条件查询」语义，且不依赖双方对 null 解释的一致性。
+fn a11y_query_params(role: Option<&str>, name: Option<&str>) -> Value {
+    let mut params = serde_json::Map::new();
+    if let Some(r) = role {
+        params.insert("role".into(), json!(r));
+    }
+    if let Some(n) = name {
+        params.insert("name".into(), json!(n));
+    }
+    Value::Object(params)
+}
 #[cfg(test)]
 mod tests {
     use super::*;
+
     /// CLI 注入的 target 目录用 CARGO_MANIFEST_DIR 拼绝对路径——CWD 无关
     /// （TSI-2471 审查 #2）。验证候选目录列表中包含基于
     /// CARGO_MANIFEST_DIR 的 target/debug 与 target/release 绝对路径。
@@ -250,5 +362,20 @@ mod tests {
             dirs.iter().any(|d| d == &*rel.to_string_lossy()),
             "target/release (absolute) must be a candidate: {dirs:?}"
         );
+    }
+
+    /// `a11y.query` 单条件调用：未提供的条件必须省略键，
+    /// 而非序列化为 JSON `null`（TSI-2480 QA 回归锚定）。
+    #[test]
+    fn a11y_query_params_omits_none_keys() {
+        let v = a11y_query_params(Some("pushButton"), None);
+        let obj = v.as_object().expect("params must be object");
+        assert_eq!(obj.get("role").and_then(|v| v.as_str()), Some("pushButton"));
+        assert!(!obj.contains_key("name"), "None name must be omitted");
+
+        let v = a11y_query_params(None, Some("foo"));
+        let obj = v.as_object().expect("params must be object");
+        assert_eq!(obj.get("name").and_then(|v| v.as_str()), Some("foo"));
+        assert!(!obj.contains_key("role"), "None role must be omitted");
     }
 }
