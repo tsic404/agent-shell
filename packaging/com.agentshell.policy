@@ -134,4 +134,14 @@
       <allow_active>auth_admin_keep</allow_active>
     </defaults>
   </action>
+  <!-- Job 状态查询（只读，无系统副作用） -->
+  <action id="com.agentshell.job.status">
+    <description>Query package operation job status</description>
+    <message>Authentication is required to query job status</message>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>yes</allow_active>
+    </defaults>
+  </action>
 </policyconfig>

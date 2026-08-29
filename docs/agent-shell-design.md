@@ -6344,6 +6344,11 @@ jsonrpsee = "0.24"            # 或手动实现（协议简单）
     <method name="SetToken">
       <arg type="s" direction="in"/>  <!-- 持久化 token（可选） -->
     </method>
+    <!-- Job 状态查询 -->
+    <method name="JobStatus">
+      <arg type="s" direction="in"/>   <!-- job id -->
+      <arg type="s" direction="out"/>  <!-- JSON: {found, method, progress, done, success, exit_code, stderr} -->
+    </method>
 
     <signal name="JobProgress">
       <arg type="s"/>  <!-- job id -->

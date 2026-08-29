@@ -109,6 +109,7 @@ pub struct LogicalMonitor {
     interface = "org.gnome.Mutter.DisplayConfig"
 )]
 trait DisplayConfig {
+    #[allow(clippy::type_complexity)]
     fn get_current_state(
         &self,
     ) -> zbus::Result<(

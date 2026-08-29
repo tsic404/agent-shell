@@ -92,6 +92,7 @@ pub fn polkit_action_for(method: &str) -> Option<&'static str> {
         "HostnameSet" => Some("com.agentshell.hostname.set"),
         "ProcessKill" => Some("com.agentshell.process.kill"),
         "Mount" | "Unmount" => Some("com.agentshell.mount"),
+        "JobStatus" => Some("com.agentshell.job.status"),
         "SetToken" => None, // 内部 token 管理，无系统副作用
         "Hello" => None,    // 版本对账，无副作用
         _ => None,
@@ -114,6 +115,10 @@ pub struct JobState {
     pub progress: f64,
     pub done: bool,
     pub success: bool,
+    /// 子进程退出码（未完成/未执行时为 None）。
+    pub exit_code: Option<i32>,
+    /// stderr 摘要（前 4 KiB），完成时写入。
+    pub stderr: String,
 }
 
 /// 进程内 job 注册表（D-Bus 服务层轮询/订阅以发射信号）。
@@ -137,6 +142,8 @@ pub fn job_create(method: &str) -> String {
         progress: 0.0,
         done: false,
         success: false,
+        exit_code: None,
+        stderr: String::new(),
     };
     let mut jobs = jobs_lock();
     jobs.get_or_insert_with(HashMap::new)
@@ -160,14 +167,47 @@ pub fn job_progress(id: &str, progress: f64) {
 /// 调用 drain 读取已完成 job 后从注册表淘汰，防止无限增长
 /// （rootd 是系统级单例常驻进程）。
 pub fn job_done(id: &str, success: bool) {
+    job_done_with(id, success, None, String::new());
+}
+
+/// 标记 job 完成并记录退出码与 stderr 摘要。
+pub fn job_done_with(id: &str, success: bool, exit_code: Option<i32>, stderr: String) {
     let mut jobs = jobs_lock();
     if let Some(map) = jobs.as_mut() {
         if let Some(job) = map.get_mut(id) {
             job.done = true;
             job.success = success;
             job.progress = 1.0;
+            job.exit_code = exit_code;
+            job.stderr = stderr;
         }
     }
+}
+
+/// 查询单个 job 状态（Issue「job：status / progress 查询」）。
+pub fn job_status(id: &str) -> Option<JobState> {
+    let jobs = jobs_lock();
+    jobs.as_ref().and_then(|m| m.get(id)).cloned()
+}
+
+/// `JobStatus(job_id)` 方法分派：把 `JobState` 序列化为 JSON 出参。
+///
+/// 未知 id 返回 `{"found": false}` 而非错误——查询语义下「不存在」是
+/// 合法结果（job 可能已被 drain 淘汰），错误会误导调用方为调用失败。
+fn job_status_dispatch(args: &[Value]) -> RootResult {
+    let job_id = str_arg(args, 0)?;
+    let Some(state) = job_status(job_id) else {
+        return Ok(json!({ "found": false }));
+    };
+    Ok(json!({
+        "found": true,
+        "method": state.method,
+        "progress": state.progress,
+        "done": state.done,
+        "success": state.success,
+        "exit_code": state.exit_code,
+        "stderr": state.stderr,
+    }))
 }
 
 /// 取走并淘汰已完成 job（D-Bus 服务层发射 JobDone 后调用）。
@@ -224,6 +264,8 @@ pub fn dispatch(method: &str, args: &[Value]) -> RootResult {
         // 挂载
         "Mount" => mount(args),
         "Unmount" => unmount(args),
+        // job 状态查询（issue「job：status / progress 查询」）
+        "JobStatus" => job_status_dispatch(args),
         // 会话 Token 管理（可选，无系统副作用）
         "SetToken" => set_token(args),
         // 测试专用慢方法（仅 cfg(test)）：为 dbus 层超时回归测试提供真实
@@ -453,7 +495,6 @@ fn validate_package_name(pkg: &str) -> Result<(), String> {
     }
     Ok(())
 }
-
 fn package_op(method: &str, args: &[Value]) -> RootResult {
     let packages = array_str_arg(args, 0)?;
     for pkg in &packages {
@@ -475,9 +516,75 @@ fn package_op(method: &str, args: &[Value]) -> RootResult {
         "package operation queued (polkit action: {})",
         polkit_action_for(method).unwrap_or("none"),
     );
-    // 包操作返回 job id——实际异步执行（spawn 后台进程 + job_progress/job_done）
-    // 待 D-Bus 服务层落地。当前 lib 层只准备命令与 job 跟踪。
-    Ok(json!({ "job_id": job_id, "cmd": cmd, "pm": format!("{pm:?}") }))
+    spawn_package_job(job_id.clone(), method.to_string(), cmd);
+    Ok(json!({ "job_id": job_id, "pm": format!("{pm:?}") }))
+}
+
+/// 包管理器命令执行器（可注入 seam，供单测替换真实进程 spawn）。
+type JobRunner = fn(&str, &[String]) -> (bool, Option<i32>, String);
+
+/// 测试注入的包管理器执行器；`None` = 使用默认真实执行器。
+static JOB_RUNNER: Mutex<Option<JobRunner>> = Mutex::new(None);
+
+/// 按 UTF-8 字节边界截断 stderr 到 `max_bytes`（与 JobState「前 4 KiB」一致）。
+///
+/// 不按 `.chars().take(n)` 计数——多字节字符会突破字节上界。也不在
+/// 任意字节处硬切——那会产出非法 UTF-8。做法：找到不超过 `max_bytes`
+/// 的最大合法字符边界（`char_indices` 累加 `len_utf8`），截断于该处。
+fn truncate_utf8(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut boundary = 0;
+    for (idx, ch) in s.char_indices() {
+        if idx + ch.len_utf8() > max_bytes {
+            break;
+        }
+        boundary = idx + ch.len_utf8();
+    }
+    &s[..boundary]
+}
+
+/// 默认执行器：真实 spawn 包管理器命令并汇总结果。
+fn default_job_runner(program: &str, args: &[String]) -> (bool, Option<i32>, String) {
+    match std::process::Command::new(program).args(args).output() {
+        Ok(out) => {
+            let code = out.status.code();
+            let err = truncate_utf8(&String::from_utf8_lossy(&out.stderr), 4096).to_string();
+            (out.status.success(), code, err)
+        }
+        Err(e) => (false, None, format!("spawn failed: {e}")),
+    }
+}
+
+/// 经注入 seam 执行包管理器命令。
+fn run_job(program: &str, args: &[String]) -> (bool, Option<i32>, String) {
+    let runner = JOB_RUNNER
+        .lock()
+        .expect("JOB_RUNNER mutex poisoned")
+        .unwrap_or(default_job_runner);
+    runner(program, args)
+}
+
+/// spawn 后台包管理器进程并驱动 job 进度（JobProgress → JobDone）。
+///
+/// 使用独立线程 + std `Command` 同步执行——不阻塞调用方；
+fn spawn_package_job(job_id: String, method: String, cmd: Vec<String>) {
+    std::thread::spawn(move || {
+        job_progress(&job_id, 0.1); // queued
+        let (program, args) = match cmd.split_first() {
+            Some((p, a)) => (p.clone(), a.to_vec()),
+            None => {
+                job_done(&job_id, false);
+                return;
+            }
+        };
+        job_progress(&job_id, 0.3); // running
+        let (success, exit_code, stderr) = run_job(&program, &args);
+        job_progress(&job_id, 0.75);
+        job_done_with(&job_id, success, exit_code, stderr);
+        tracing::info!(method, job = %job_id, success, "package job finished");
+    });
 }
 
 fn package_refresh() -> RootResult {
@@ -490,7 +597,8 @@ fn package_refresh() -> RootResult {
         cmd = ?cmd,
         "package refresh queued (polkit action: com.agentshell.package.refresh)",
     );
-    Ok(json!({ "job_id": job_id, "cmd": cmd, "pm": format!("{pm:?}") }))
+    spawn_package_job(job_id.clone(), "PackageRefresh".to_string(), cmd);
+    Ok(json!({ "job_id": job_id, "pm": format!("{pm:?}") }))
 }
 
 // ───────────────────── systemd system 单元控制 ─────────────────────
@@ -524,17 +632,23 @@ fn service_control(method: &str, args: &[Value]) -> RootResult {
         systemd_method,
         "service control requested (polkit action: com.agentshell.service.control)",
     );
-    // 实际执行：systemctl 命令（rootd 以 root 运行，薄代理转发）
-    let subcmd = match method {
-        "ServiceStart" => "start",
-        "ServiceStop" => "stop",
-        "ServiceRestart" => "restart",
-        "ServiceReload" => "reload",
-        "ServiceEnable" => "enable",
-        "ServiceDisable" => "disable",
-        _ => return Err(format!("unknown service method: {method}")),
-    };
-    run_command("systemctl", &[subcmd, unit])?;
+    // Enable/Disable 走 EnableUnitFiles/DisableUnitFiles：
+    //   EnableUnitFiles(files, runtime, force) → (carries_install_info, changes)
+    //   DisableUnitFiles(files, runtime)       → changes
+    // 其余走 Start/Stop/Restart/ReloadUnit（参数 (unit, "replace")）。
+    match method {
+        "ServiceEnable" => {
+            let _: (bool, Vec<(String, String, String)>) =
+                systemd_call(systemd_method, (vec![unit.to_string()], false, true))?;
+        }
+        "ServiceDisable" => {
+            let _: Vec<(String, String, String)> =
+                systemd_call(systemd_method, (vec![unit.to_string()], false))?;
+        }
+        _ => {
+            let _: SystemdJobPath = systemd_call(systemd_method, unit_call_body(unit))?;
+        }
+    }
     // mode 只对 Start/Stop/Restart/Reload 有效（Enable/Disable 走
     // EnableUnitFiles/DisableUnitFiles，无 mode 参数，只有 runtime/persistent 语义）
     let mut result = json!({
@@ -567,10 +681,49 @@ fn validate_unit_name(unit: &str) -> Result<(), String> {
 
 fn daemon_reload() -> RootResult {
     tracing::info!("daemon-reload requested (polkit action: com.agentshell.systemd.manage)");
-    // 实际执行：systemctl daemon-reload
-    run_command("systemctl", &["daemon-reload"])?;
+    // 实际执行：org.freedesktop.systemd1.Manager.Reload()（无参）
+    systemd_call::<(), ()>("Reload", ())?;
     Ok(json!({ "accepted": true, "systemd_method": "Reload" }))
 }
+
+// ───────────────────── systemd1 D-Bus 调用（§23.4.3） ─────────────────────
+
+/// 经 org.freedesktop.systemd1.Manager D-Bus 接口执行一个方法。
+///
+/// 在独立线程内用 `zbus::blocking` 调用——`dispatch` 是同步函数，
+/// 可能运行在 tokio runtime 内（D-Bus 服务层 `call_method`），
+/// 直接 `block_on` 会触发 "Cannot start a runtime from within a runtime"。
+/// 新线程无 tokio 上下文，blocking zbus 可自建 runtime。
+fn systemd_call<B, R>(method: &'static str, body: B) -> Result<R, String>
+where
+    B: serde::ser::Serialize + zvariant::DynamicType + Send + 'static,
+    R: for<'d> zvariant::DynamicDeserialize<'d> + Send + 'static,
+{
+    std::thread::spawn(move || -> Result<R, String> {
+        let conn = zbus::blocking::Connection::system()
+            .map_err(|e| format!("systemd D-Bus connect failed: {e}"))?;
+        let proxy = zbus::blocking::Proxy::new(
+            &conn,
+            "org.freedesktop.systemd1",
+            "/org/freedesktop/systemd1",
+            "org.freedesktop.systemd1.Manager",
+        )
+        .map_err(|e| format!("systemd Manager proxy failed: {e}"))?;
+        proxy
+            .call(method, &body)
+            .map_err(|e| format!("systemd {method} failed: {e}"))
+    })
+    .join()
+    .map_err(|_| "systemd D-Bus thread panicked".to_string())?
+}
+
+/// StartUnit/StopUnit/RestartUnit/ReloadUnit 请求体。
+fn unit_call_body(unit: &str) -> (String, &'static str) {
+    (unit.to_string(), "replace")
+}
+
+/// systemd1 方法返回值：Start/Stop/Restart/Reload 返回 `o`（job object path）。
+type SystemdJobPath = zvariant::OwnedObjectPath;
 
 // ───────────────────── 系统日志 ─────────────────────
 //
@@ -763,14 +916,22 @@ fn process_kill(args: &[Value]) -> RootResult {
     if !(1..=31).contains(&signal) {
         return Err(format!("signal must be in range 1-31, got {signal}"));
     }
+    // PID 上界：kill(2) 的 pid_t 是 i32；i64 窄化截断会把
+    // pid > i32::MAX 回绕为负 → kill(-pid) 语义变为「杀进程组」。
+    // 显式 try_from 拒绝而非截断。
+    let pid_c = match i32::try_from(pid) {
+        Ok(p) => p,
+        Err(_) => return Err(format!("pid out of range for i32: {pid}")),
+    };
+    let signal_c = signal as i32;
     tracing::info!(
         pid,
         signal,
         "process kill requested (polkit action: com.agentshell.process.kill)",
     );
     // 实际执行：kill 系统调用（rootd 以 root 运行）
-    let pid_c = unsafe { libc::kill(pid as i32, signal as i32) };
-    if pid_c != 0 {
+    let rc = unsafe { libc::kill(pid_c, signal_c) };
+    if rc != 0 {
         let err = std::io::Error::last_os_error();
         return Err(format!("kill({pid}, {signal}) failed: {err}"));
     }
@@ -933,6 +1094,7 @@ pub fn whitelist_methods() -> &'static [&'static str] {
         "ProcessKill",
         "Mount",
         "Unmount",
+        "JobStatus",
         "SetToken",
     ]
 }
@@ -1052,6 +1214,10 @@ mod tests {
         );
         assert_eq!(polkit_action_for("Mount"), Some("com.agentshell.mount"));
         assert_eq!(polkit_action_for("Unmount"), Some("com.agentshell.mount"));
+        assert_eq!(
+            polkit_action_for("JobStatus"),
+            Some("com.agentshell.job.status")
+        );
     }
 
     #[test]
@@ -1063,10 +1229,48 @@ mod tests {
     // ── 软件包管理 ──
 
     #[test]
-    fn package_install_returns_job_id() {
-        let r = dispatch("PackageInstall", &[json!(["curl", "wget"])]).expect("package install");
-        assert!(r["job_id"].as_str().is_some());
-        assert!(r["cmd"].is_array());
+    fn package_job_tracks_success() {
+        let _guard = JOB_TEST_MUTEX.lock();
+        let _ = job_drain_done();
+        set_job_runner(fake_success_runner);
+        let id = job_create("PackageInstall");
+        spawn_package_job(
+            id.clone(),
+            "PackageInstall".to_string(),
+            vec![
+                "apt-get".to_string(),
+                "install".to_string(),
+                "-y".to_string(),
+            ],
+        );
+        let job = wait_job_done(&id);
+        assert!(job.success, "{job:?}");
+        assert_eq!(job.exit_code, Some(0));
+        clear_job_runner();
+        let _ = job_drain_done();
+    }
+
+    #[test]
+    fn package_job_tracks_failure() {
+        let _guard = JOB_TEST_MUTEX.lock();
+        let _ = job_drain_done();
+        set_job_runner(fake_failure_runner);
+        let id = job_create("PackageRemove");
+        spawn_package_job(
+            id.clone(),
+            "PackageRemove".to_string(),
+            vec![
+                "apt-get".to_string(),
+                "remove".to_string(),
+                "-y".to_string(),
+            ],
+        );
+        let job = wait_job_done(&id);
+        assert!(!job.success, "{job:?}");
+        assert_eq!(job.exit_code, Some(1));
+        assert_eq!(job.stderr, "permission denied");
+        clear_job_runner();
+        let _ = job_drain_done();
     }
 
     #[test]
@@ -1077,31 +1281,40 @@ mod tests {
     }
 
     #[test]
-    fn package_remove_returns_job_id() {
-        let r = dispatch("PackageRemove", &[json!(["curl"])]).expect("package remove");
-        assert!(r["job_id"].as_str().is_some());
-    }
-
-    #[test]
-    fn package_update_empty_means_all() {
-        let r = dispatch("PackageUpdate", &[json!([])]).expect("package update all");
-        assert!(r["job_id"].as_str().is_some());
-    }
-
-    #[test]
-    fn package_refresh_returns_job_id() {
-        let r = dispatch("PackageRefresh", &[]).expect("package refresh");
-        assert!(r["job_id"].as_str().is_some());
-    }
-
-    #[test]
     fn package_install_rejects_non_array() {
         assert!(dispatch("PackageInstall", &[json!("curl")]).is_err());
     }
 
-    // ── Job 跟踪 ──
+    /// 轮询等待 job 完成（后台线程异步推进），返回最终状态。超时视为失败。
+    fn wait_job_done(job_id: &str) -> JobState {
+        for _ in 0..100 {
+            if let Some(job) = job_snapshot()
+                .into_iter()
+                .find(|j| j.id == job_id && j.done)
+            {
+                return job;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        panic!("job {job_id} did not finish within 5s");
+    }
 
-    /// 串行化 job 测试——全局 JOBS static 在并行测试间竞争。
+    fn fake_success_runner(_p: &str, _a: &[String]) -> (bool, Option<i32>, String) {
+        (true, Some(0), String::new())
+    }
+
+    fn fake_failure_runner(_p: &str, _a: &[String]) -> (bool, Option<i32>, String) {
+        (false, Some(1), "permission denied".to_string())
+    }
+
+    fn set_job_runner(r: JobRunner) {
+        *JOB_RUNNER.lock().expect("JOB_RUNNER mutex poisoned") = Some(r);
+    }
+
+    fn clear_job_runner() {
+        *JOB_RUNNER.lock().expect("JOB_RUNNER mutex poisoned") = None;
+    }
+
     static JOB_TEST_MUTEX: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
     #[test]
@@ -1115,6 +1328,63 @@ mod tests {
         assert_eq!(job.method, "PackageInstall");
         assert!((job.progress - 0.5).abs() < f64::EPSILON);
         assert!(!job.done);
+    }
+
+    #[test]
+    fn job_done_records_exit_code_and_stderr() {
+        let _guard = JOB_TEST_MUTEX.lock();
+        let _ = job_drain_done();
+        let id = job_create("PackageInstall");
+        job_done_with(&id, false, Some(1), "permission denied".to_string());
+        let job = job_status(&id).expect("job found");
+        assert!(!job.success);
+        assert_eq!(job.exit_code, Some(1));
+        assert_eq!(job.stderr, "permission denied");
+        assert!((job.progress - 1.0).abs() < f64::EPSILON);
+        let _ = job_drain_done();
+    }
+    #[test]
+    fn job_status_dispatch_known_job() {
+        let _guard = JOB_TEST_MUTEX.lock();
+        let _ = job_drain_done();
+        let id = job_create("PackageInstall");
+        job_done_with(&id, false, Some(2), "boom".to_string());
+        let v = dispatch("JobStatus", &[json!(id.clone())]).expect("job status");
+        assert_eq!(v["found"], json!(true));
+        assert_eq!(v["method"], json!("PackageInstall"));
+        assert_eq!(v["progress"], json!(1.0));
+        assert_eq!(v["done"], json!(true));
+        assert_eq!(v["success"], json!(false));
+        assert_eq!(v["exit_code"], json!(2));
+        assert_eq!(v["stderr"], json!("boom"));
+        let _ = job_drain_done();
+    }
+
+    #[test]
+    fn job_status_dispatch_unknown_and_missing_arg() {
+        let _guard = JOB_TEST_MUTEX.lock();
+        let _ = job_drain_done();
+        let v = dispatch("JobStatus", &[json!("job-nonexistent")]).expect("job status");
+        assert_eq!(v["found"], json!(false));
+        assert!(dispatch("JobStatus", &[]).is_err());
+        let _ = job_drain_done();
+    }
+
+    #[test]
+    fn truncate_utf8_respects_byte_boundary() {
+        // "你" 是 3 字节；4096 不是 3 的倍数 → 最后截断在 4095 字节边界
+        let s = "你".repeat(2000);
+        assert!(s.len() > 4096);
+        let t = truncate_utf8(&s, 4096);
+        assert!(t.len() <= 4096);
+        assert!(t.is_char_boundary(t.len()));
+        assert_eq!(t, &s[..t.len()]);
+        // 输入 ≤ 上限：原样返回（不重分配）
+        let short = "abc";
+        assert_eq!(truncate_utf8(short, 4096), short);
+        // 精确 4096 字节边界：整体保留
+        let exact = "a".repeat(4096);
+        assert_eq!(truncate_utf8(&exact, 4096).len(), 4096);
     }
 
     #[test]
@@ -1181,28 +1451,28 @@ mod tests {
         assert!(dispatch("ServiceStop", &[json!("evil; rm -rf /")]).is_err());
         assert!(dispatch("ServiceRestart", &[json!("../escape")]).is_err());
         assert!(dispatch("ServiceEnable", &[json!("")]).is_err());
-        // 有效单元名通过校验——systemctl 在测试环境会失败，预期 Err
+        // 有效单元名通过校验——CI 无 systemd system bus，D-Bus 连接失败，预期 Err
         assert!(dispatch("ServiceStart", &[json!("nginx.service")]).is_err());
     }
 
     #[test]
     fn service_start_maps_to_systemd_method() {
-        // systemctl 在 CI 无 systemd → Err，但 Err 消息含 systemctl 路径
+        // CI 无 systemd system bus → D-Bus 连接失败；但 Err 消息含 systemd
         let e = dispatch("ServiceStart", &[json!("nginx.service")]).unwrap_err();
-        assert!(e.contains("systemctl"), "{e}");
+        assert!(e.contains("systemd"), "{e}");
     }
 
     #[test]
     fn service_enable_maps_to_enable_unit_files() {
         let e = dispatch("ServiceEnable", &[json!("nginx.service")]).unwrap_err();
-        assert!(e.contains("systemctl"), "{e}");
+        assert!(e.contains("systemd"), "{e}");
     }
 
     #[test]
     fn daemon_reload_maps_to_reload() {
-        // systemctl daemon-reload 在 CI 无 systemd → Err
+        // CI 无 systemd system bus → D-Bus 连接失败，预期 Err
         let e = dispatch("DaemonReload", &[]).unwrap_err();
-        assert!(e.contains("systemctl"), "{e}");
+        assert!(e.contains("systemd"), "{e}");
     }
 
     // ── 系统日志 ──
@@ -1326,6 +1596,12 @@ mod tests {
         // 有效输入通过校验——kill(1234,9) 在 CI 无 PID 1234 → Err
         assert!(dispatch("ProcessKill", &[json!(1234), json!(9)]).is_err());
     }
+    #[test]
+    fn process_kill_rejects_pid_out_of_i32_range() {
+        // pid > i32::MAX：try_from 拒绝，不窄化截断为负（kill 进程组语义）
+        let pid = i32::MAX as i64 + 1;
+        assert!(dispatch("ProcessKill", &[json!(pid), json!(9)]).is_err());
+    }
 
     // ── 挂载 ──
 
@@ -1425,6 +1701,7 @@ mod tests {
             "ProcessKill",
             "Mount",
             "Unmount",
+            "JobStatus",
             "SetToken",
         ];
         for method in expected {

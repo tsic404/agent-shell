@@ -499,6 +499,20 @@ impl RootdInterface {
             .map(|_| ())
     }
 
+    // ── Job 状态查询 ──
+
+    async fn job_status(
+        &self,
+        #[zbus(connection)] conn: &zbus::Connection,
+        #[zbus(header)] hdr: Header<'_>,
+        job_id: String,
+    ) -> fdo::Result<String> {
+        let caller = hdr.sender().map(|n| n.as_str()).unwrap_or("");
+        self.call_method(conn, caller, "JobStatus", vec![Value::from(job_id)])
+            .await
+            .map(|r| serde_json::to_string(&r).unwrap_or_else(|_| "{}".to_string()))
+    }
+
     // ── 会话 Token ──
 
     async fn set_token(&self, token: String) -> fdo::Result<()> {

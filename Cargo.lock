@@ -520,6 +520,7 @@ dependencies = [
  "agent-shell-rpc",
  "libc",
  "parking_lot",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",
@@ -527,6 +528,7 @@ dependencies = [
  "tracing-subscriber",
  "zbus",
  "zbus_macros",
+ "zvariant",
 ]
 
 [[package]]

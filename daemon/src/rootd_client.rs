@@ -10,11 +10,7 @@ use zbus::proxy;
 /// 方法经 polkit 授权（§23.4.2）；daemon 不直连系统资源——
 /// 全部经 rootd 白名单接口中转。
 ///
-/// **注意**：当前仅接线 CLI 需要的 5 个方法（hello/service_start/
-/// service_stop/service_restart/journal_query）。rootd D-Bus 接口暴露
-/// 20 个白名单方法，其余（service_enable/disable/reload/daemon_reload/
-/// sysctl_get/set/hostname_set/process_kill/mount/unmount/set_token/
-/// package_*）待 CLI 后续命令扩展时添加。
+/// 完整接线 §23.4.3 的全部 21 个白名单方法 + JobProgress/JobDone 信号。
 #[proxy(
     interface = "org.agentshell.Rootd",
     default_service = "org.agentshell.Rootd",
@@ -24,17 +20,53 @@ pub trait Rootd {
     /// 版本对账（§23.4.3）。
     fn hello(&self) -> zbus::Result<String>;
 
-    /// 启动系统服务。
+    // ── 软件包（返回 job id，进度经 JobProgress/JobDone 信号）──
+    fn package_install(&self, packages: Vec<String>) -> zbus::Result<String>;
+    fn package_remove(&self, packages: Vec<String>) -> zbus::Result<String>;
+    fn package_update(&self, packages: Vec<String>) -> zbus::Result<String>;
+    fn package_refresh(&self) -> zbus::Result<String>;
+
+    // ── systemd system 单元 ──
     fn service_start(&self, unit: &str) -> zbus::Result<()>;
-
-    /// 停止系统服务。
     fn service_stop(&self, unit: &str) -> zbus::Result<()>;
-
-    /// 重启系统服务。
     fn service_restart(&self, unit: &str) -> zbus::Result<()>;
+    fn service_reload(&self, unit: &str) -> zbus::Result<()>;
+    fn service_enable(&self, unit: &str) -> zbus::Result<()>;
+    fn service_disable(&self, unit: &str) -> zbus::Result<()>;
+    fn daemon_reload(&self) -> zbus::Result<()>;
 
-    /// 查询系统日志。
+    // ── 系统日志 ──
     fn journal_query(&self, filter: &str) -> zbus::Result<String>;
+
+    // ── 系统配置 ──
+    fn sysctl_get(&self, key: &str) -> zbus::Result<String>;
+    fn sysctl_set(&self, key: &str, value: zbus::zvariant::Value<'_>) -> zbus::Result<()>;
+    fn hostname_set(&self, hostname: &str) -> zbus::Result<()>;
+
+    // ── 进程管理（跨用户）──
+    fn process_kill(&self, pid: i32, signal: i32) -> zbus::Result<()>;
+
+    // ── 挂载 ──
+    fn mount(
+        &self,
+        device: &str,
+        target: &str,
+        fstype: &str,
+        options: Vec<String>,
+    ) -> zbus::Result<()>;
+    fn unmount(&self, target: &str) -> zbus::Result<()>;
+
+    // ── 会话 Token ──
+    fn set_token(&self, token: &str) -> zbus::Result<()>;
+
+    // ── Job 状态查询 ──
+    fn job_status(&self, job_id: &str) -> zbus::Result<String>;
+
+    // ── 信号（§23.4.3）──
+    #[zbus(signal)]
+    fn job_progress(&self, job_id: String, progress: f64) -> zbus::Result<()>;
+    #[zbus(signal)]
+    fn job_done(&self, job_id: String, success: bool) -> zbus::Result<()>;
 }
 
 /// rootd 连接结果。None = rootd 未安装（降级路径，§23.2）。

@@ -84,7 +84,7 @@ ordered-stream = "0.2"
 pipewire = "0.10"
 tempfile = "3"
 clap = { version = "4", features = ["derive"] }
-zbus = { version = "5", default-features = false, features = ["tokio"] }
+zbus = { version = "5", default-features = false, features = ["tokio", "blocking-api"] }
 futures-util = "0.3"
 regex = "1"
 async-trait = "0.1"
