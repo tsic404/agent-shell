@@ -6349,35 +6349,29 @@ agent-shell doctor
 
 ```toml
 [workspace.dependencies]
-# 核心
-tokio = { version = "1", features = ["full"] }
+which = "7"
+libc = "0.2"
+ordered-stream = "0.2"
+pipewire = "0.10"
+tempfile = "3"
+clap = { version = "4", features = ["derive"] }
+zbus = { version = "5", default-features = false, features = ["tokio", "blocking-api"] }
+futures-util = "0.3"
+regex = "1"
+async-trait = "0.1"
+futures = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+parking_lot = "0.12"
+thiserror = "1"
+tokio = { version = "1", features = ["full"] }
+glob-match = "0.2"
 tracing = "0.1"
-tracing-subscriber = "0.3"
-clap = { version = "4", features = ["derive"] }     # CLI
-anyhow = "1"
+uuid = { version = "1", features = ["v4", "serde"] }
 
-# D-Bus
-zbus = "5"                    # 异步 D-Bus（核心，几乎所有模块用）
-zbus_macros = "5"
-
-# Wayland (运行时依赖：合成器 crates 直连协议绑定)
-wayland-client = "0.31"
-wayland-protocols = "0.32"
-
-# 截图
-pipewire = "0.8"              # ScreenCast 流解析
-
-# 无障碍
-atspi = "0.27"
-
-# 测试
-criterion = "0.5"             # 性能基准
-mockall = "0.13"              # backend mock
-
-# JSON-RPC (CLI↔daemon)
-jsonrpsee = "0.24"            # 或手动实现（协议简单）
+zvariant = "5.0"
+zbus_macros = "5.0"
+futures-lite = "2"
 ```
 
 ---
