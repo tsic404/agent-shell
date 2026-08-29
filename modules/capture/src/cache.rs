@@ -119,7 +119,7 @@ mod tests {
         assert!(cache.has_changed(&base));
         // 5% 像素整体变白 → 超过 1% 阈值。
         let mut next = base.clone();
-        for px in next.chunks_exact_mut(4).step_by(20) {
+        for px in next.as_chunks_mut::<4>().0.iter_mut().step_by(20) {
             px[0] = 250;
             px[1] = 250;
             px[2] = 250;

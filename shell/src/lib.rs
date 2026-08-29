@@ -122,7 +122,6 @@ fn unsupported(feature: &str) -> AgentShellError {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
 
     /// TTY 装配在无显示服务器时应返回仅含系统服务的注册表。
     /// 本测试在 CI 无 DBus/Systemd 环境下 init_system/session_manager 可能为 None，

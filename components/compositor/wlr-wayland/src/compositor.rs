@@ -886,8 +886,10 @@ mod tests {
     #[test]
     fn toplevel_info_state_parsing() {
         // 验证 state_bytes → is_maximized/is_minimized 等的位匹配逻辑。
-        let mut info = ToplevelInfo::default();
-        info.state_bytes = vec![ToplevelState::Maximized as u8];
+        let mut info = ToplevelInfo {
+            state_bytes: vec![ToplevelState::Maximized as u8],
+            ..Default::default()
+        };
         assert!(info.is_maximized());
         assert!(!info.is_minimized());
 
@@ -921,13 +923,13 @@ mod tests {
 
     #[test]
     fn wlr_state_snapshot_empty() {
-        let mut state = WlrState::new();
+        let state = WlrState::new();
         assert!(state.snapshot().is_empty());
     }
 
     #[test]
     fn wlr_state_find_handle_empty() {
-        let mut state = WlrState::new();
+        let state = WlrState::new();
         assert!(state.find_handle("nonexistent").is_none());
     }
 }

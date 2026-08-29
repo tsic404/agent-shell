@@ -996,7 +996,7 @@ mod tests {
                 );
                 // 每个像素都应是填充色（首像素为基准，全窗均匀）。
                 assert_ne!(u32::from_ne_bytes(data[0..4].try_into().unwrap()), 0);
-                for px in data.chunks_exact(4) {
+                for px in data.as_chunks::<4>().0 {
                     assert_eq!(px, &data[0..4], "all pixels must equal the fill color");
                 }
             }
@@ -1084,7 +1084,7 @@ mod tests {
         match server.capture_window_shm(win, 16, 16, 64) {
             Ok(data) => {
                 assert_eq!(data.len(), 16 * 64);
-                for px in data.chunks_exact(4) {
+                for px in data.as_chunks::<4>().0 {
                     assert_eq!(px, &data[0..4], "uniform fill");
                 }
             }
