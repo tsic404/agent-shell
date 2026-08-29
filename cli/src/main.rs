@@ -71,6 +71,7 @@ async fn dispatch_command(command: Command, out: OutputFormat) -> CmdResult {
         Command::Fs(cmd) => fs_cmd(&mut c, cmd).await,
         Command::Log(cmd) => log_cmd(&mut c, cmd).await,
         Command::Hostname(cmd) => hostname_cmd(&mut c, cmd).await,
+        Command::Kill { pid, signal } => kill_cmd(&mut c, pid, signal).await,
     }
 }
 
@@ -523,6 +524,35 @@ async fn service_cmd(c: &mut DaemonClient, cmd: cli::ServiceCommand) -> CmdResul
     Ok(0)
 }
 
+/// `kill` 命令（rootd ProcessKill，§23.4）。
+///
+/// 错误分两类处理：
+/// - rootd 直传的校验/系统调用错误（BackendError 1005）与 rootd 未安装
+///   （BackendUnavailable 1002）——映射为 issue 错误表要求的干净信息；
+/// - 其余错误（权限 gate ConfirmationRequired、daemon 连接失败等）保留
+///   `rpc error N: …` 原始形态，由 `run` 统一 `error: {e}` 打印。
+async fn kill_cmd(c: &mut DaemonClient, pid: i32, signal: i32) -> CmdResult {
+    match c
+        .call(
+            method::PROCESS_KILL,
+            json!({ "pid": pid, "signal": signal }),
+        )
+        .await
+    {
+        Ok(_) => {
+            println!("kill {pid} (signal {signal}): accepted");
+            Ok(0)
+        }
+        Err(e) => match process_rootd_error(&e) {
+            Some((code, msg)) => {
+                eprintln!("error: {msg}");
+                Ok(code)
+            }
+            None => Err(e),
+        },
+    }
+}
+
 /// `log` 查询的 CLI 侧超时（秒）：大于 daemon→rootd 链路最长 90s 的容错余量，
 /// 到点主动失败并给明确提示（TSI-2493），而非静默挂起。
 const LOG_QUERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
@@ -740,6 +770,32 @@ mod tests {
         // 非本链路错误（权限 gate 等）→ None，保留 RPC 原始形态。
         assert_eq!(
             process_rootd_error("rpc error 1006: hostname.set (always)"),
+            None
+        );
+
+        // kill：pid/signal 校验 → 剥 zbus 错误名前缀，保留 rootd 原文（exit 1）。
+        assert_eq!(
+            process_rootd_error(
+                "rpc error 1005: rootd: org.freedesktop.DBus.Error.Failed: pid must be a positive integer"
+            ),
+            Some((1, "pid must be a positive integer".into()))
+        );
+        assert_eq!(
+            process_rootd_error(
+                "rpc error 1005: rootd: org.freedesktop.DBus.Error.Failed: signal must be in range 1-31, got 99"
+            ),
+            Some((1, "signal must be in range 1-31, got 99".into()))
+        );
+        // kill polkit 拒绝 → authentication required（exit 2）。
+        assert_eq!(
+            process_rootd_error(
+                "rpc error 1005: rootd: org.freedesktop.DBus.Error.AuthFailed: polkit denied action: com.agentshell.process.kill"
+            ),
+            Some((2, "authentication required: com.agentshell.process.kill".into()))
+        );
+        // 非本链路错误（权限 gate 等）→ None，保留 RPC 原始形态。
+        assert_eq!(
+            process_rootd_error("rpc error 1006: process.kill (Always)"),
             None
         );
     }

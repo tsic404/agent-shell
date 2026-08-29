@@ -102,6 +102,7 @@ pub async fn dispatch(daemon: &mut Daemon, req: &Request) -> Response {
         // ── rootd 特权代理（§23.4）──
         method::SERVICE_CONTROL => service_control(daemon, req).await,
         method::SYSTEM_LOG_VIEW => system_log_view(daemon, req).await,
+        method::PROCESS_KILL => process_kill(daemon, req).await,
         method::ROOTD_HELLO => rootd_hello(daemon).await,
         method::HOSTNAME_SET => hostname_set(daemon, req).await,
         method::MOUNT => mount(daemon, req).await,
@@ -186,6 +187,7 @@ fn operation_for(method_name: &str, params: &Option<Value>) -> Option<Operation>
         (method::TIMER_NEXT, L0),
         (method::SERVICE_CONTROL, L3),
         (method::SYSTEM_LOG_VIEW, L0),
+        (method::PROCESS_KILL, L3),
         (method::ROOTD_HELLO, L0),
         (method::HOSTNAME_SET, L3),
         (method::MOUNT, L4),
@@ -835,6 +837,46 @@ async fn hostname_set(_d: &mut Daemon, req: &Request) -> RpcResult {
     Ok(json!({ "accepted": true, "hostname": hostname }))
 }
 
+/// 杀进程（rootd ProcessKill，§23.4）。
+///
+/// 参数：{ "pid": 1234, "signal": 15 }
+/// pid/signal 的语义校验在 rootd `process_kill` 完成——daemon 纯路由，
+/// 不重复校验（rootd 是唯一的权威边界）。此处仅做表示层窄化：JSON 取值为
+/// i64，而 D-Bus 签名为 i32，超范围必须拒绝而非静默截断（`2³²+1234` 截断
+/// 成 `1234` 会绕过 rootd 校验并对无关进程发信号）。rootd 未安装时返回降级错误。
+async fn process_kill(_d: &mut Daemon, req: &Request) -> RpcResult {
+    let params = params_of(req)?;
+    let pid = params
+        .get("pid")
+        .and_then(|v| v.as_i64())
+        .ok_or((RpcErrorCode::InvalidParams, "missing pid".into()))?;
+    let signal = params
+        .get("signal")
+        .and_then(|v| v.as_i64())
+        .ok_or((RpcErrorCode::InvalidParams, "missing signal".into()))?;
+    // 表示层窄化（i64 JSON → i32 D-Bus）：超范围拒绝，与 rootd `i32::try_from`
+    // 语义一致，防 `pid > i32::MAX` / 回绕值绕过 rootd 校验。
+    let pid = i32::try_from(pid)
+        .map_err(|_| (RpcErrorCode::InvalidParams, "pid out of i32 range".into()))?;
+    let signal = i32::try_from(signal).map_err(|_| {
+        (
+            RpcErrorCode::InvalidParams,
+            "signal out of i32 range".into(),
+        )
+    })?;
+
+    let proxy = crate::rootd_client::connect().await.ok_or((
+        RpcErrorCode::BackendUnavailable,
+        "rootd not installed — privileged operation unavailable".into(),
+    ))?;
+
+    proxy
+        .process_kill(pid, signal)
+        .await
+        .map_err(|e| (RpcErrorCode::BackendError, format!("rootd: {e}")))?;
+    Ok(json!({ "accepted": true, "pid": pid, "signal": signal }))
+}
+
 // ───────────────────────── mount / unmount（§23.4） ─────────────────────────
 
 /// 挂载文件系统（rootd Mount）。
@@ -1174,6 +1216,71 @@ mod tests {
             resp.error.expect("error").code,
             RpcErrorCode::ConfirmationRequired as i32
         );
+    }
+
+    #[tokio::test]
+    async fn process_kill_default_config_returns_confirmation_required() {
+        // process.kill（L3）与 service.control 同级：默认配置需确认，
+        // 在 handler 之前短路——不触碰 rootd。
+        let mut d = Daemon::connect(Duration::from_secs(1)).await;
+        let resp = dispatch(
+            &mut d,
+            &req(
+                method::PROCESS_KILL,
+                Some(json!({ "pid": 1234, "signal": 15 })),
+            ),
+        )
+        .await;
+        assert_eq!(
+            resp.error.expect("error").code,
+            RpcErrorCode::ConfirmationRequired as i32
+        );
+    }
+
+    #[tokio::test]
+    async fn process_kill_gate_pass_reaches_handler() {
+        // L4 白名单放行后进入 handler：缺失 pid 必须报 InvalidParams
+        //（证明门禁放行且 handler 已执行，而非 Denied 短路）。
+        let mut d = Daemon::connect(Duration::from_secs(1)).await;
+        d.caller_id = "trusted".into();
+        d.security
+            .config
+            .permissions
+            .allow
+            .insert("trusted".into(), vec![PermissionLevel::L4]);
+        for params in [json!({}), json!({ "signal": 15 }), json!({ "pid": 1234 })] {
+            let resp = dispatch(&mut d, &req(method::PROCESS_KILL, Some(params))).await;
+            assert_eq!(
+                resp.error.expect("error").code,
+                RpcErrorCode::InvalidParams as i32
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn process_kill_rejects_pid_out_of_i32_range() {
+        // L4 放行后进入 handler：`pid > i32::MAX` 与回绕值（2³²+1234 → 1234）
+        // 必须在 daemon 侧拒绝，否则 rootd 只见截断后的合法正数、对无关进程发信号。
+        let mut d = Daemon::connect(Duration::from_secs(1)).await;
+        d.caller_id = "trusted".into();
+        d.security
+            .config
+            .permissions
+            .allow
+            .insert("trusted".into(), vec![PermissionLevel::L4]);
+        let wrap = (1i64 << 32) + 1234;
+        for params in [
+            json!({ "pid": (i32::MAX as i64) + 1, "signal": 15 }),
+            json!({ "pid": wrap, "signal": 15 }),
+            json!({ "pid": 1234, "signal": (i32::MAX as i64) + 1 }),
+            json!({ "pid": 1234, "signal": wrap }),
+        ] {
+            let resp = dispatch(&mut d, &req(method::PROCESS_KILL, Some(params))).await;
+            assert_eq!(
+                resp.error.expect("error").code,
+                RpcErrorCode::InvalidParams as i32
+            );
+        }
     }
 
     #[tokio::test]

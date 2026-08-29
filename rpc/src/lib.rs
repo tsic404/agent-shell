@@ -186,6 +186,8 @@ pub mod method {
     pub const MOUNT: &str = "mount.mount";
     /// 卸载文件系统（rootd Unmount，§23.4）。
     pub const UNMOUNT: &str = "mount.unmount";
+    /// 杀进程（rootd ProcessKill，§23.4）。
+    pub const PROCESS_KILL: &str = "process.kill";
     /// rootd 版本对账（rootd Hello）。
     pub const ROOTD_HELLO: &str = "rootd.hello";
     /// 设置系统主机名（rootd HostnameSet）。

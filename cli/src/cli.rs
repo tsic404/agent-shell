@@ -92,10 +92,19 @@ pub enum Command {
     /// 文件系统挂载/卸载（rootd 特权链路，§23.4）
     #[command(subcommand)]
     Fs(FsCommand),
+    /// 系统日志查看（rootd 特权链路，§23.4）
     Log(LogCommand),
     /// 主机名管理（rootd 特权链路，§23.4）
     #[command(subcommand)]
     Hostname(HostnameCommand),
+    /// 进程管理（rootd 特权链路，§23.4）
+    Kill {
+        /// 目标进程 PID
+        pid: i32,
+        /// 信号编号（默认 15 = SIGTERM）
+        #[arg(long, default_value = "15")]
+        signal: i32,
+    },
 }
 
 // ───────────────────────── windows ─────────────────────────
