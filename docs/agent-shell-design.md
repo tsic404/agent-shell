@@ -4374,7 +4374,7 @@ portal 公共降级（Clipboard/Notification/OpenURI/…）没有独立 crate：
 **实现要点：**
 
 ```rust
-// components/init/systemd.rs
+// components/systemd/src/lib.rs (SystemdComponent)
 
 pub struct SystemdManager {
     proxy: Systemd1ManagerProxy,  // org.freedesktop.systemd1.Manager
@@ -4448,7 +4448,8 @@ pub enum UnitAction { Start, Stop, Restart, Reload, Enable, Disable, Mask, Unmas
 **实现要点：**
 
 ```rust
-// components/init/journal.rs
+// 未实现（部分）：查询落地 rootd/src/lib.rs 的 JournalQuery（daemon 经 system.log.view 调用）；
+// --follow / --disk-usage / LogControl1 级别控制未实现
 
 pub struct JournalReader {
     log_control: LogControl1Proxy,  // org.freedesktop.LogControl1 (可选)
@@ -4547,7 +4548,7 @@ pub struct JournalFilter {
 **实现要点：**
 
 ```rust
-// core/dbus.rs
+// 未实现：core 无 dbus.rs（D-Bus 服务管理能力未落地）
 
 pub struct DBusInspector {
     session_dbus: DBusProxy,
@@ -4622,7 +4623,7 @@ pub struct DBusIntrospectNode {
 **实现要点：**
 
 ```rust
-// components/misc/system_info.rs
+// 未实现：无 components/misc（系统信息读取未落地；仅 rootd/src/lib.rs 承载 HostnameSet 设置特权路径）
 
 pub struct SystemInfo {
     hostnamed: Hostname1Proxy,    // org.freedesktop.hostname1
@@ -4707,7 +4708,7 @@ pub struct DiskInfo {
 **实现要点：**
 
 ```rust
-// components/misc/process.rs
+// 未实现：无 components/misc；kill 特权路径为 rootd/src/lib.rs 的 ProcessKill（仅发送信号）
 
 pub struct ProcessManager;
 
@@ -4814,18 +4815,11 @@ Tool::new("kill_process").description("发送信号给进程").input_schema(...)
 
 ### 21.20 项目结构扩展
 
-```
-agent-shell/
-├── services/                     # 新增: 基础设施模块
-│   └── src/
-│       ├── systemd.rs           # 新增: systemd 服务管理
-│       ├── journal.rs           # 新增: 日志查询
-│       ├── dbus_services.rs     # 新增: D-Bus 服务管理
-│       ├── system_info.rs       # 新增: 系统信息（hostname/time/disk）
-│       └── process.rs           # 新增: 进程管理
-│
-├── components/ + backends/       # 公共组件 + backend 装配
-```
+> 本节规划的基础设施模块未按此树落地：无 `services/` crate、无
+> `components/init`、无 `components/misc`。systemd 能力在
+> `components/systemd/src/lib.rs`，进程/日志/挂载等特权操作在
+> `rootd/src/lib.rs`，systemd 相关数据类型在 `core/src/services.rs`。
+> 实际目录树见 §21.12。
 
 ### 21.21 安全与授权模型
 
@@ -4950,7 +4944,7 @@ xdg-desktop-portal 支持：
 ScreenCast / RemoteDesktop / Clipboard / InputCapture 等 portal 需要长会话，必须统一管理。
 
 ```rust
-// core/src/portal_session.rs
+// daemon/src/portal_sessions.rs (PortalSessionManager；token 持久化按 kind 存取)
 
 pub struct PortalSessionManager {
     sessions: HashMap<PortalSessionId, PortalSession>,
@@ -5083,7 +5077,7 @@ agent 想输入中文 "你好世界" 到文本输入框：
 #### 21.23.4 实现
 
 ```rust
-// components/input/input_method.rs
+// daemon/src/ime_session.rs (ImeSession)
 
 pub struct ImeManager {
     ibus: IBusProxy,          // org.freedesktop.IBus
@@ -5208,7 +5202,7 @@ systemctl --user status agent-shell
 | **Wayland** | `wlr-gamma-control` / `wlr-output-management` | 经 wlroots 协议（需 compositor 支持） |
 
 ```rust
-// components/power/brightness.rs
+// 未实现（pending）：daemon 仅 stub_ok 占位（brightness.get/set）
 
 pub struct BrightnessController {
     // 实现根据 DE 选择后端
@@ -5249,7 +5243,7 @@ Agent 常需要浏览文件系统（"打开这个文件"、"找到 Downloads 目
 | **基础文件操作** | 直接文件系统访问 | agent 本身有文件工具，这里是"桌面角度"的封装 |
 
 ```rust
-// components/misc/filesystem.rs
+// 未实现（pending）：daemon 仅 stub_ok 占位（file.pick/trash/open_directory）
 
 pub struct FilesystemService { /* ... */ }
 
@@ -5290,7 +5284,7 @@ impl FilesystemService {
 | 浏览器 | `xdg-settings get default-web-browser` | 查询默认浏览器 |
 
 ```rust
-// components/launcher/mime.rs
+// 未实现（pending）：daemon 仅 stub_ok 占位（mime.get/set/default_browser）
 
 pub struct MimeService;
 
@@ -5334,7 +5328,7 @@ Wayland 下启动应用后聚焦的**核心机制**。没有 token，启动的�
 **实现要点**：
 
 ```rust
-// components/compositor/activation.rs
+// 未实现（pending）：无 xdg_activation_v1 客户端
 
 pub struct ActivationTokenManager {
     wl: WaylandConnection,   // agent-shell 自身的 wayland 客户端连接
@@ -5381,7 +5375,7 @@ impl ActivationTokenManager {
 | `org.bluez.Agent1` | 自定义 | 配对代理: `RequestPinCode`, `RequestConfirmation`, `AuthorizeService` |
 
 ```rust
-// components/network/bluetooth.rs
+// 未实现（pending）：daemon 仅 stub_ok 占位（bluetooth.*）
 
 pub struct BluetoothManager {
     adapter: BluezAdapter1Proxy,
@@ -5441,7 +5435,7 @@ pub struct BtDevice {
 | **发行版 CLI** | `apt` / `dnf` / `pacman` | 直接调用，注意权限 |
 
 ```rust
-// components/launcher/software.rs
+// 未实现（pending）：daemon 仅 stub_ok 占位（flatpak.list/install、software.updates）
 
 pub struct SoftwareManager {
     pkgkit: PackageKitProxy,     // org.freedesktop.PackageKit
@@ -5489,7 +5483,7 @@ impl SoftwareManager {
 用途：agent 安全存储 API 密钥、WiFi 密码、数据库凭证。
 
 ```rust
-// components/misc/secret.rs
+// 未实现（pending）：daemon 仅 stub_ok 占位（secret.set/get）
 
 pub struct SecretService {
     service: SecretServiceProxy,   // org.freedesktop.Secret.Service
@@ -5551,7 +5545,7 @@ impl SecretService {
 | 启用 timer | `EnableUnitFiles` + `StartUnit` | 标准流程 |
 
 ```rust
-// components/init/systemd.rs (扩展)
+// 未实现（pending）：SystemdComponent 未实现 list_timers；SystemdTimer 类型在 core/src/services.rs
 impl SystemdManager {
     /// 列出所有 timer
     pub async fn list_timers(&self) -> Result<Vec<SystemdTimer>> {
@@ -6119,7 +6113,7 @@ CLI/MCP/daemon 命令
 
 **实现层分离**：
 - `core/security.rs`：纯逻辑（配置解析、级别判定、audit 写入），无 IO 依赖可测试
-- `daemon/safety.rs`：确认 UI 交互、通知、超时处理
+- `daemon/src/dispatch.rs`：确认判定（返回 `ConfirmationRequired`）；交互确认 UI / 通知 / 超时未实现
 
 ---
 
@@ -6225,7 +6219,7 @@ CLI 结果 {"committed": "你好世界", "verified": true}
 **实现**：
 
 ```rust
-// core/src/backend.rs
+// backends/{kde,dde,gnome}/src/assemble.rs（装配逻辑分散在各 backend crate）
 #[cfg(feature = "kde")]
 pub mod kde { pub fn assemble() -> Box<dyn AgentShell> { ... } }
 #[cfg(feature = "dde")]
