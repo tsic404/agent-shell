@@ -38,13 +38,14 @@ mod tests {
 
     /// 编译期契约检查：任一 `WaylandCompositor` 实现必然也是
     /// `CompositorComponent`（继承层次表第一行）。占位类型只参与
-    /// trait-bound 断言，不构造显示服务器连接。
-    #[test]
-    fn wayland_compositor_requires_compositor_component() {
-        // Assert 仅参与 trait-bound 求解、从不被具名使用：dead_code 是设计使然。
-        #[allow(dead_code)]
-        trait Assert<T: CompositorComponent> {}
-        // 若 WaylandCompositor 不再是 CompositorComponent 的子 trait，
-        // 上行 impl 将编译失败——这正是要守住的契约。
+    /// trait-bound 求解，不构造显示服务器连接。
+    ///
+    /// 若 `WaylandCompositor` 不再是 `CompositorComponent` 的子 trait，
+    /// 下方 `_requires_compositor_component::<T>()` 无法通过类型检查——
+    /// 这正是要守住的契约。
+    #[allow(dead_code)]
+    fn _assert<T: WaylandCompositor>() {
+        fn _requires_compositor_component<T: CompositorComponent>() {}
+        _requires_compositor_component::<T>();
     }
 }
