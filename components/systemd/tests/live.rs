@@ -22,6 +22,14 @@ fn skip(reason: &str) {
     eprintln!("SKIP: {reason}");
 }
 
+/// 环境受限（缺 polkit 授权 / manager degraded / 状态变更被拒）时的跳过：
+/// 在 `skip` 基础上追加「环境性跳过」意图短语，与 logind 侧
+/// 「缺 polkit 授权（环境性跳过）」共用同一 grep 关键字，
+/// 便于 CI 区分环境跳过与授权回归误报。
+fn skip_environment(reason: &str) {
+    eprintln!("SKIP: {reason}（环境性跳过）");
+}
+
 #[test]
 fn active_state_mapping() {
     assert_eq!(
@@ -77,7 +85,7 @@ async fn live_systemd_start_stop_unit_status_transitions() {
     // 某些容器（PID 1 非 systemd 管理器或 manager degraded）会拒绝/悬挂
     // 状态变更调用；此时跳过而非失败。
     if let Err(e) = c.start_unit(name).await {
-        skip(&format!("environment disallows unit state changes: {e}"));
+        skip_environment(&format!("environment disallows unit state changes: {e}"));
         return;
     }
     let after_start = c.unit_status(name).await.unwrap();
@@ -92,7 +100,7 @@ async fn live_systemd_start_stop_unit_status_transitions() {
 async fn live_systemd_daemon_reload_succeeds() {
     let c = SystemdComponent::connect().await.unwrap();
     if let Err(e) = c.daemon_reload().await {
-        skip(&format!("environment disallows daemon-reload: {e}"));
+        skip_environment(&format!("environment disallows daemon-reload: {e}"));
         return;
     }
 }
