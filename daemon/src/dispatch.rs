@@ -234,7 +234,7 @@ async fn doctor(d: &mut Daemon) -> RpcResult {
     // 2. 合成器通道（daemon 持久化连接的真实状态）。
     match d.compositor_health() {
         Ok(_) => {
-            lines.push("✓ 合成器         : kwin-compositor".into());
+            lines.push(format!("✓ 合成器         : {}", d.compositor_name()));
             let comp_lines = compositor_doctor_lines(d).await;
             lines.extend(comp_lines);
         }
@@ -251,8 +251,8 @@ async fn doctor(d: &mut Daemon) -> RpcResult {
 
 async fn compositor_doctor_lines(d: &Daemon) -> Vec<String> {
     if d.has_compositor() {
-        // KWinCompositor::doctor_lines_async 需要实例引用；经 state 层暴露。
-        // 异步版本先补齐 /Scripting 懒探测，再渲染桥接行（TSI-2486）。
+        // 异步版本先补齐 /Scripting 懒探测，再渲染桥接行（TSI-2486）；
+        // DDE 会话经 DdeCompositor::doctor_lines_async 呈现 deepin-kwin 分支。
         d.doctor_lines_async().await
     } else {
         Vec::new()

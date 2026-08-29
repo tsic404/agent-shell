@@ -3,14 +3,15 @@
 //! 复合装配（§10.4 / 决策 D9）：
 //!
 //! ```text
-//! pub enum Compositor { DeepinKwin(KWinCompositor), Treeland(Treeland), X11(X11DisplayServer) }
+//! pub enum Compositor { DeepinKwin(KWinCompositor), Treeland(Treeland), X11(KWinCompositor) }
 //! pub struct DdeCompositor { compositor: Compositor, dde: DdeApi, version: DdeVersion }
 //! ```
 //!
 //! - **窗口管理**全部委托给 `compositor` 分支后端：
 //!   deepin-kwin → 复用 [`KWinCompositor`] 双通道（org_kde_* 协议基础 +
 //!   Scripting 补充，不重写）；Treeland → treeland_* 私有协议通道
-//!   （T3b 事件聚合落地前窗口查询显式 NotImplemented）；X11 → EWMH/ICCCM。
+//!   （T3b 事件聚合落地前窗口查询显式 NotImplemented）；X11 → 复用
+//!   [`KWinCompositor::new_x11`]（EWMH/ICCCM + org.kde.KWin D-Bus 桥）。
 //! - **DDE 系统服务**（音量/显示/电源/通知/壁纸）走 `DdeApi`——会话无关，
 //!   Wayland/X11 共享；版本路由见 [`crate::version`]。
 //!
@@ -48,8 +49,8 @@ pub enum Compositor {
         /// treeland_* 协议绑定集合。
         bindings: TreelandBindings,
     },
-    /// X11 会话：EWMH/ICCCM 基础通道 + dde-api D-Bus。
-    X11,
+    /// X11 会话：复用 [`KWinCompositor::new_x11`]（EWMH/ICCCM + org.kde.KWin D-Bus 桥）。
+    X11(Box<KWinCompositor>),
 }
 
 impl std::fmt::Debug for Compositor {
@@ -64,7 +65,7 @@ impl std::fmt::Debug for Compositor {
                 .field("display_server", display_server)
                 .field("bindings", bindings)
                 .finish(),
-            Self::X11 => f.write_str("X11"),
+            Self::X11(_) => f.write_str("X11(KWinCompositor)"),
         }
     }
 }
@@ -75,7 +76,7 @@ impl Compositor {
         match self {
             Self::DeepinKwin(_) => CompositorKind::DeepinKwin,
             Self::Treeland { .. } => CompositorKind::Treeland,
-            Self::X11 => CompositorKind::X11,
+            Self::X11(_) => CompositorKind::X11,
         }
     }
 }
@@ -112,7 +113,8 @@ impl DdeCompositor {
                     bindings,
                 }
             }
-            _ => {
+            CompositorKind::X11 => Compositor::X11(Box::new(KWinCompositor::new_x11().await?)),
+            CompositorKind::Unknown => {
                 return Err(AgentShellError::BackendUnavailable(format!(
                     "no usable DDE compositor channel detected (kind={kind:?})"
                 )));
@@ -161,8 +163,13 @@ impl DdeCompositor {
             Compositor::Treeland { bindings, .. } => {
                 lines.push(treeland_doctor_line(bindings));
             }
-            Compositor::X11 => {
-                lines.push("✓ Compositor  : X11 (EWMH/ICCCM + dde-api D-Bus)".to_string());
+            Compositor::X11(kwin) => {
+                lines.extend(
+                    kwin.doctor_lines_async()
+                        .await
+                        .into_iter()
+                        .map(|l| l.replace("KWin 服务", "deepin-kwin")),
+                );
             }
         }
         lines.push(format!(
@@ -255,7 +262,7 @@ impl DesktopComponent for DdeCompositor {
                     ComponentHealth::Degraded("treeland protocols partial".into())
                 }
             }
-            Compositor::X11 => ComponentHealth::Healthy,
+            Compositor::X11(kwin) => kwin.health().await,
         }
     }
 }
@@ -266,7 +273,7 @@ impl DesktopComponent for DdeCompositor {
 /// |------|---------|
 /// | DeepinKwin | KWinCompositor 双通道原样复用（含协议/Scripting 回退语义） |
 /// | Treeland | T3b 事件聚合前显式 NotImplemented（请求通道已就绪，见 treeland.rs） |
-/// | X11 | T1g 兜底合成器统一实现（本任务不含 x11rb 组装） |
+/// | X11 | KWinCompositor::new_x11 复用（EWMH/ICCCM + org.kde.KWin D-Bus 桥） |
 ///
 /// Treeland 分支返回带明确原因的错误而非静默空列表——调用方据此走
 /// FallbackChain（core/src/fallback.rs）降级到 portal/AT-SPI。
@@ -279,13 +286,7 @@ impl CompositorComponent for DdeCompositor {
                 window_management: false, // 查询未就绪（T3b）；操作通道见 treeland.rs
                 ..BackendCapabilities::default()
             },
-            Compositor::X11 => BackendCapabilities {
-                window_management: true,
-                workspace_management: true,
-                monitor_layout: true,
-                native_input: true, // XTest（原生 X11 会话）
-                ..BackendCapabilities::default()
-            },
+            Compositor::X11(kwin) => kwin.capabilities(),
         }
     }
 
@@ -297,7 +298,7 @@ impl CompositorComponent for DdeCompositor {
         match &self.compositor {
             Compositor::DeepinKwin(k) => k.get_active_window().await,
             Compositor::Treeland { .. } => Err(treeland_pending()),
-            Compositor::X11 => Err(x11_pending()),
+            Compositor::X11(k) => k.get_active_window().await,
         }
     }
 
@@ -305,7 +306,7 @@ impl CompositorComponent for DdeCompositor {
         match &self.compositor {
             Compositor::DeepinKwin(k) => k.focus_window(id).await,
             Compositor::Treeland { .. } => Err(treeland_pending()),
-            Compositor::X11 => Err(x11_pending()),
+            Compositor::X11(k) => k.focus_window(id).await,
         }
     }
 
@@ -313,7 +314,7 @@ impl CompositorComponent for DdeCompositor {
         match &self.compositor {
             Compositor::DeepinKwin(k) => k.move_window(id, x, y).await,
             Compositor::Treeland { .. } => Err(treeland_pending()),
-            Compositor::X11 => Err(x11_pending()),
+            Compositor::X11(k) => k.move_window(id, x, y).await,
         }
     }
 
@@ -321,7 +322,7 @@ impl CompositorComponent for DdeCompositor {
         match &self.compositor {
             Compositor::DeepinKwin(k) => k.resize_window(id, w, h).await,
             Compositor::Treeland { .. } => Err(treeland_pending()),
-            Compositor::X11 => Err(x11_pending()),
+            Compositor::X11(k) => k.resize_window(id, w, h).await,
         }
     }
 
@@ -329,7 +330,7 @@ impl CompositorComponent for DdeCompositor {
         match &self.compositor {
             Compositor::DeepinKwin(k) => k.minimize_window(id).await,
             Compositor::Treeland { .. } => Err(treeland_pending()),
-            Compositor::X11 => Err(x11_pending()),
+            Compositor::X11(k) => k.minimize_window(id).await,
         }
     }
 
@@ -337,7 +338,7 @@ impl CompositorComponent for DdeCompositor {
         match &self.compositor {
             Compositor::DeepinKwin(k) => k.unminimize_window(id).await,
             Compositor::Treeland { .. } => Err(treeland_pending()),
-            Compositor::X11 => Err(x11_pending()),
+            Compositor::X11(k) => k.unminimize_window(id).await,
         }
     }
 
@@ -345,7 +346,7 @@ impl CompositorComponent for DdeCompositor {
         match &self.compositor {
             Compositor::DeepinKwin(k) => k.maximize_window(id).await,
             Compositor::Treeland { .. } => Err(treeland_pending()),
-            Compositor::X11 => Err(x11_pending()),
+            Compositor::X11(k) => k.maximize_window(id).await,
         }
     }
 
@@ -353,7 +354,7 @@ impl CompositorComponent for DdeCompositor {
         match &self.compositor {
             Compositor::DeepinKwin(k) => k.close_window(id).await,
             Compositor::Treeland { .. } => Err(treeland_pending()),
-            Compositor::X11 => Err(x11_pending()),
+            Compositor::X11(k) => k.close_window(id).await,
         }
     }
 
@@ -361,7 +362,7 @@ impl CompositorComponent for DdeCompositor {
         match &self.compositor {
             Compositor::DeepinKwin(k) => k.set_window_geometry(id, geo).await,
             Compositor::Treeland { .. } => Err(treeland_pending()),
-            Compositor::X11 => Err(x11_pending()),
+            Compositor::X11(k) => k.set_window_geometry(id, geo).await,
         }
     }
 
@@ -369,7 +370,7 @@ impl CompositorComponent for DdeCompositor {
         match &self.compositor {
             Compositor::DeepinKwin(k) => k.get_window_info(id).await,
             Compositor::Treeland { .. } => Err(treeland_pending()),
-            Compositor::X11 => Err(x11_pending()),
+            Compositor::X11(k) => k.get_window_info(id).await,
         }
     }
 
@@ -377,7 +378,7 @@ impl CompositorComponent for DdeCompositor {
         match &self.compositor {
             Compositor::DeepinKwin(k) => k.list_workspaces().await,
             Compositor::Treeland { .. } => Err(treeland_pending()),
-            Compositor::X11 => Err(x11_pending()),
+            Compositor::X11(k) => k.list_workspaces().await,
         }
     }
 
@@ -385,7 +386,7 @@ impl CompositorComponent for DdeCompositor {
         match &self.compositor {
             Compositor::DeepinKwin(k) => k.activate_workspace(id).await,
             Compositor::Treeland { .. } => Err(treeland_pending()),
-            Compositor::X11 => Err(x11_pending()),
+            Compositor::X11(k) => k.activate_workspace(id).await,
         }
     }
 
@@ -393,7 +394,7 @@ impl CompositorComponent for DdeCompositor {
         match &self.compositor {
             Compositor::DeepinKwin(k) => k.move_window_to_workspace(wid, ws).await,
             Compositor::Treeland { .. } => Err(treeland_pending()),
-            Compositor::X11 => Err(x11_pending()),
+            Compositor::X11(k) => k.move_window_to_workspace(wid, ws).await,
         }
     }
 
@@ -401,7 +402,7 @@ impl CompositorComponent for DdeCompositor {
         match &self.compositor {
             Compositor::DeepinKwin(k) => k.list_monitors().await,
             Compositor::Treeland { .. } => Err(treeland_pending()),
-            Compositor::X11 => Err(x11_pending()),
+            Compositor::X11(k) => k.list_monitors().await,
         }
     }
 
@@ -411,7 +412,7 @@ impl CompositorComponent for DdeCompositor {
             Compositor::Treeland { .. } => Err(AgentShellError::NotImplemented(
                 "treeland event stream lands with TSI-2314 (T3b events)".into(),
             )),
-            Compositor::X11 => Err(x11_pending()),
+            Compositor::X11(k) => k.subscribe().await,
         }
     }
 }
@@ -424,32 +425,17 @@ fn treeland_pending() -> AgentShellError {
     )
 }
 
-fn x11_pending() -> AgentShellError {
-    AgentShellError::NotImplemented(
-        "DDE X11 window management lands with T1g generic X11 compositor wiring".into(),
-    )
-}
-
 impl DdeCompositor {
     /// list_windows 的分支实现（deepin-kwin 复用 KWin 批量脚本查询）。
     async fn delegate_list_windows(&self) -> Result<Vec<WindowInfo>> {
         match &self.compositor {
             Compositor::DeepinKwin(k) => k.list_windows().await,
             Compositor::Treeland { .. } => Err(treeland_pending()),
-            Compositor::X11 => Err(x11_pending()),
+            Compositor::X11(k) => k.list_windows().await,
         }
     }
 }
 
-/// DE 归属一致性检查：DDE 组件产出的所有 ID 必须带 `DesktopEnvironment::DDE`
-/// （跨 DE 去重契约，types.rs WindowId 文档）。KWin 内部实现打 KDE 标签，
-/// 本组件在 deepin-kwin 分支上做归一化包装。
-///
-/// 注：当前 KWinCompositor 直接产出 `DesktopEnvironment::KDE` 标签的
-/// WindowId。复用而非重写意味着 DDE 下拿到的窗口 id 带 KDE 标签——
-/// 同一会话内自洽（id 只在 registry 内部流转），跨 DE 场景由
-/// FallbackChain 层保证不会同时出现两个后端的 id。此处以单元测试固化
-/// 该约束，防止未来有人「顺手」改坏。
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -477,14 +463,6 @@ mod tests {
             ),
             CompositorKind::Treeland
         );
-    }
-
-    #[test]
-    fn name_follows_design_contract() {
-        // 组件名保持小写 kebab（registry 日志过滤用）；doctor 面向用户的
-        // 「DDE (Wayland, deepin-kwin)」行由 doctor_lines_async() 渲染。
-        let c = DdeCompositor::with_parts(Compositor::X11, DdeVersion::default());
-        assert_eq!(c.name(), "dde-compositor");
     }
 
     #[test]
@@ -631,19 +609,32 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn doctor_lines_async_render_without_panicking_for_x11_branch() {
-        let c = DdeCompositor::with_parts(Compositor::X11, DdeVersion::default());
+    async fn doctor_lines_async_x11_branch_delegates_to_kwin() {
+        let bus = TestBus::start().await;
+        // A1：X11 分支持有真实 `KWinCompositor`（`new_x11` 的 EWMH/ICCCM +
+        // D-Bus 桥）。离线用 `for_test` 注入最小实例——`protocols=None` 等价
+        // X11 会话，doctor 必须经 KWin 委托渲染并重命名服务行。
+        let kwin = KWinCompositor::for_test(bridge_on(&bus).await, None);
+        let c = DdeCompositor::with_parts(Compositor::X11(Box::new(kwin)), DdeVersion::default());
+
         let lines = c.doctor_lines_async().await;
-        assert_eq!(lines.len(), 3);
+
+        // 1 版本行 + 3 KWin 行（服务/桥接/事件脚本）+ 1 DDE 服务行。
+        assert_eq!(lines.len(), 5, "unexpected doctor line count: {lines:#?}");
         assert!(lines[0].contains("unknown"));
-        assert!(lines[2].contains("DDE 服务"));
+        assert!(lines[4].contains("DDE 服务"));
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("deepin-kwin") && l.contains("org.kde.KWin")),
+            "X11 branch must delegate to KWin and rename service line: {lines:#?}"
+        );
     }
 
-    #[tokio::test]
-    async fn major_label_used_in_doctor() {
+    #[test]
+    fn major_label_used_in_doctor() {
         let v = DdeVersion::from_probes([("display".into(), "org.deepin.dde.Display1".into())]);
         assert_eq!(v.major(), DdeMajor::V25);
-        let c = DdeCompositor::with_parts(Compositor::X11, v);
-        assert!(c.doctor_lines_async().await[0].contains("DDE 25"));
+        assert_eq!(v.major().label(), "DDE 25");
     }
 }

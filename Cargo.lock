@@ -386,6 +386,7 @@ name = "agent-shell-daemon"
 version = "0.1.0"
 dependencies = [
  "agent-shell-a11y",
+ "agent-shell-backend-dde",
  "agent-shell-capture",
  "agent-shell-compositor-kwin",
  "agent-shell-core",

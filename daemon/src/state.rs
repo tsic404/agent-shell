@@ -1,25 +1,105 @@
 //! daemon 核心状态：全部持久化连接的持有者（设计文档 §22.2 D1 / §23.2）。
 //!
 //! daemon 常驻用户会话，持有：
-//! - KWin 合成器通道（Wayland org_kde_* + Scripting 桥，含事件脚本）
+//! - 合成器通道（KDE → KWin；DDE → DdeCompositor，deepin-kwin 分支复用 KWin
+//!   双通道，doctor 输出经 daemon 呈现）
 //! - X11 通道（EWMH/ICCCM/XTest；XWayland 会话下输入注入降级用）
 //! - WindowStateCache（查询走缓存；T3b 事件归一化落地后改为事件驱动刷新，
 //!   当前以 TTL 短缓存近似——如实标注 `from_cache` 语义）
 
 use agent_shell_a11y::AtSpiComponent;
+use agent_shell_backend_dde::{CompositorKind, DdeCompositor};
 use agent_shell_capture::CaptureDispatcher;
 use agent_shell_compositor_kwin::KWinCompositor;
-use agent_shell_core::component::CompositorComponent;
+use agent_shell_core::component::{CompositorComponent, DesktopComponent};
 use agent_shell_core::types::WindowInfo;
 use event::{EventHub, EventRing};
 use std::time::{Duration, Instant};
+
+/// daemon 持有的合成器后端。KDE 会话装 KWin，DDE 会话装 DdeCompositor
+/// （其 deepin-kwin 分支复用 KWin 双通道，doctor 输出经 daemon 呈现）。
+enum CompositorBackend {
+    Kwin(Box<KWinCompositor>),
+    Dde(DdeCompositor),
+}
+
+impl CompositorBackend {
+    fn as_dyn(&self) -> &dyn CompositorComponent {
+        match self {
+            Self::Kwin(c) => c.as_ref(),
+            Self::Dde(c) => c,
+        }
+    }
+
+    /// doctor 报告用的后端展示名（KWin 保留历史值，DDE 委托 trait 方法）。
+    fn name(&self) -> &'static str {
+        match self {
+            Self::Kwin(_) => "kwin-compositor",
+            Self::Dde(c) => c.name(),
+        }
+    }
+
+    /// 事件源标注：KWin 会话按 Wayland/X11 细分；DDE 会话按合成器形态
+    /// 细分（deepin-kwin→KWinWayland / Treeland→Treeland / X11→X11Generic）。
+    fn event_source_kind(&self) -> event::EventSource {
+        match self {
+            Self::Kwin(c) => match c.session_kind() {
+                agent_shell_compositor_kwin::SessionKind::X11 => event::EventSource::KWinX11,
+                _ => event::EventSource::KWinWayland,
+            },
+            Self::Dde(c) => dde_event_source(c.compositor.kind()),
+        }
+    }
+
+    /// doctor 输出（与 `require_compositor` 一致的错误码映射在此不做——
+    /// 返回 Vec 由 dispatch 层渲染；分支内各自补齐懒探测证据）。
+    async fn doctor_lines_async(&self) -> Vec<String> {
+        match self {
+            Self::Kwin(c) => c.doctor_lines_async().await,
+            Self::Dde(c) => c.doctor_lines_async().await,
+        }
+    }
+
+    /// 会话后端对应的 `WindowId` 环境标签。KWin 内部打 KDE 标签
+    /// （deepin-kwin 分支复用 KWin 亦同口径）；DDE 其余分支标 DDE。
+    fn de_type(&self) -> agent_shell_core::types::DesktopEnvironment {
+        match self {
+            Self::Kwin(_) => agent_shell_core::types::DesktopEnvironment::KDE,
+            Self::Dde(c) => dde_de_type(c.compositor.kind()),
+        }
+    }
+}
+
+/// DDE 合成器形态 → 事件源标签（§18.1 映射；deepin-kwin 复用 org_kde
+/// 协议，与 KWinWayland 同源，不得误标 Treeland）。
+fn dde_event_source(kind: CompositorKind) -> event::EventSource {
+    match kind {
+        CompositorKind::DeepinKwin => event::EventSource::KWinWayland,
+        CompositorKind::Treeland => event::EventSource::Treeland,
+        CompositorKind::X11 | CompositorKind::Unknown => event::EventSource::X11Generic,
+    }
+}
+
+/// DDE 合成器形态 → `WindowId` 环境标签。deepin-kwin 与 X11 分支都复用
+/// KWin 实现（org_kde_* 协议 / EWMH-ICCCM + D-Bus 桥），内部 ID 一律打
+/// KDE 标签（同会话自洽）；Treeland 与 Unknown 标 DDE。
+fn dde_de_type(kind: CompositorKind) -> agent_shell_core::types::DesktopEnvironment {
+    match kind {
+        CompositorKind::DeepinKwin | CompositorKind::X11 => {
+            agent_shell_core::types::DesktopEnvironment::KDE
+        }
+        CompositorKind::Treeland | CompositorKind::Unknown => {
+            agent_shell_core::types::DesktopEnvironment::DDE
+        }
+    }
+}
 
 /// 缓存条目有效期。T3b（EventHub 归一化）落地后由事件失效替代。
 const CACHE_TTL: Duration = Duration::from_secs(2);
 
 /// daemon 会话状态。
 pub struct Daemon {
-    compositor: Option<KWinCompositor>,
+    compositor: Option<CompositorBackend>,
     cache: Vec<WindowInfo>,
     cached_at: Option<Instant>,
     /// 空闲退出时限（§22.2：默认 30min，可配置）。
@@ -50,14 +130,20 @@ impl Daemon {
     /// 存活以报告诊断细节，各方法在 `compositor=None` 时返回明确错误。
     pub async fn connect(idle_timeout: Duration) -> Self {
         let compositor = match session_kind().as_str() {
-            "kde" | "dde" => if std::env::var("WAYLAND_DISPLAY").is_ok() {
+            "kde" => if std::env::var("WAYLAND_DISPLAY").is_ok() {
                 KWinCompositor::new_wayland().await
             } else {
                 KWinCompositor::new_x11().await
             }
-            .map(Some)
+            .map(Box::new)
+            .map(CompositorBackend::Kwin)
             .map_err(|e| tracing::warn!("compositor assemble failed: {e}"))
-            .unwrap_or(None),
+            .ok(),
+            "dde" => DdeCompositor::connect()
+                .await
+                .map(CompositorBackend::Dde)
+                .map_err(|e| tracing::warn!("dde compositor assemble failed: {e}"))
+                .ok(),
             other => {
                 tracing::warn!("no compositor component for {other:?} (implemented: KDE, DDE)");
                 None
@@ -97,8 +183,8 @@ impl Daemon {
 
     fn require_compositor(
         &self,
-    ) -> Result<&KWinCompositor, (agent_shell_rpc::RpcErrorCode, String)> {
-        self.compositor.as_ref().ok_or_else(|| {
+    ) -> Result<&dyn CompositorComponent, (agent_shell_rpc::RpcErrorCode, String)> {
+        self.compositor.as_ref().map(|c| c.as_dyn()).ok_or_else(|| {
             (
                 agent_shell_rpc::RpcErrorCode::BackendUnavailable,
                 "compositor channel unavailable in this session".into(),
@@ -106,12 +192,12 @@ impl Daemon {
         })
     }
 
-    /// 当前 KWin 会话对应的 [`event::EventSource`]（审查建议 4：X11 会话
-    /// 不得错标为 KWinWayland）。
+    /// 当前会话对应的 [`event::EventSource`]（审查建议 4：X11 会话不得错标
+    /// 为 KWinWayland；DDE 会话标注 Treeland 源）。
     fn event_source_kind(&self) -> event::EventSource {
-        match self.compositor.as_ref().map(|c| c.session_kind()) {
-            Some(agent_shell_compositor_kwin::SessionKind::X11) => event::EventSource::KWinX11,
-            _ => event::EventSource::KWinWayland,
+        match self.compositor.as_ref() {
+            Some(c) => c.event_source_kind(),
+            None => event::EventSource::KWinWayland,
         }
     }
 
@@ -197,9 +283,14 @@ impl Daemon {
     ) -> Result<(), (agent_shell_rpc::RpcErrorCode, String)> {
         use agent_shell_rpc::WindowOpKind as K;
         let comp = self.require_compositor()?;
+        let de_type = self
+            .compositor
+            .as_ref()
+            .map(|c| c.de_type())
+            .unwrap_or(agent_shell_core::types::DesktopEnvironment::KDE);
         let id = agent_shell_core::types::WindowId {
             native_id: native_id.to_string(),
-            de_type: agent_shell_core::types::DesktopEnvironment::KDE,
+            de_type,
         };
         // 写前校验目标存在（避免协议通道乐观发送吞掉无效 uuid）。
         let windows = comp
@@ -283,6 +374,14 @@ impl Daemon {
         self.compositor.is_some()
     }
 
+    /// doctor 报告用的合成器后端名。
+    pub fn compositor_name(&self) -> &'static str {
+        self.compositor
+            .as_ref()
+            .map(|c| c.name())
+            .unwrap_or("unavailable")
+    }
+
     /// 当前窗口缓存条目数（daemon_status 报告用）。
     pub fn cache_len(&self) -> usize {
         self.cache.len()
@@ -299,7 +398,8 @@ fn session_kind() -> String {
     use agent_shell_core::de_detection::detect_desktop_environment;
     use agent_shell_core::types::DesktopEnvironment::*;
     match detect_desktop_environment() {
-        KDE | DDE => "kde".into(),
+        KDE => "kde".into(),
+        DDE => "dde".into(),
         GNOME => "gnome".into(),
         Tty | Unknown => "none".into(),
         _ => "other".into(),
@@ -329,6 +429,61 @@ mod tests {
             assert_eq!(code, agent_shell_rpc::RpcErrorCode::BackendUnavailable);
             assert!(msg.contains("unavailable"));
         }
+    }
+
+    #[test]
+    fn dde_event_source_maps_all_kinds() {
+        use agent_shell_backend_dde::CompositorKind as K;
+        assert_eq!(
+            dde_event_source(K::DeepinKwin),
+            event::EventSource::KWinWayland
+        );
+        assert_eq!(dde_event_source(K::Treeland), event::EventSource::Treeland);
+        assert_eq!(dde_event_source(K::X11), event::EventSource::X11Generic);
+        assert_eq!(dde_event_source(K::Unknown), event::EventSource::X11Generic);
+    }
+
+    #[test]
+    fn dde_de_type_maps_all_kinds() {
+        use agent_shell_backend_dde::CompositorKind as K;
+        use agent_shell_core::types::DesktopEnvironment as DE;
+        assert_eq!(dde_de_type(K::DeepinKwin), DE::KDE);
+        assert_eq!(dde_de_type(K::X11), DE::KDE);
+        assert_eq!(dde_de_type(K::Treeland), DE::DDE);
+        assert_eq!(dde_de_type(K::Unknown), DE::DDE);
+    }
+
+    #[test]
+    fn compositor_name_reports_unavailable_without_backend() {
+        // Compositor 变体在 A1 下均需 I/O 装配（KWinCompositor/Treeland），
+        // 单测无法离线构造；名称委托的 Dde 路径由 dde crate 的 name() 契约
+        // 覆盖。此处仅固化 None 路径（doctor 兜底展示名）。
+        let d = Daemon {
+            compositor: None,
+            cache: Vec::new(),
+            cached_at: None,
+            idle_timeout: Duration::from_secs(1),
+            capture: None,
+            portal_sessions: std::sync::Arc::new(
+                crate::portal_sessions::PortalSessionManager::new(
+                    crate::single_instance::state_dir(),
+                ),
+            ),
+            ime_session: crate::ime_session::ImeSession::new(),
+            security: agent_shell_core::security::SecurityManager::load_default().unwrap_or_else(
+                |_| {
+                    agent_shell_core::security::SecurityManager::with_config(
+                        agent_shell_core::security::AgentShellConfig::default(),
+                    )
+                },
+            ),
+            caller_id: "*".into(),
+            a11y: None,
+            hub: EventHub::new(),
+            ring: EventRing::default(),
+            subscriptions: Vec::new(),
+        };
+        assert_eq!(d.compositor_name(), "unavailable");
     }
 
     #[tokio::test]
