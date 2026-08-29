@@ -37,204 +37,252 @@
 
 ```
 agent-shell/
-├── Cargo.toml                    # Rust workspace
+├── Cargo.toml                    # Rust workspace（members + workspace.dependencies）
 ├── Cargo.lock
-├── package.json                  # npm 包装（可选 MCP 集成）
 │
 ├── core/                         # 核心抽象层（协议无关）
 │   ├── Cargo.toml
 │   └── src/
 │       ├── lib.rs
-│       ├── types.rs              # 统一类型定义
+│       ├── types.rs              # 统一类型定义（SemanticTarget/WindowInfo 等）
 │       ├── error.rs              # 统一错误类型
 │       ├── de_detection.rs       # 桌面环境检测（→ BackendKind）
-│       ├── dbus.rs               # D-Bus 连接管理
 │       ├── component.rs          # DesktopComponent / CompositorComponent trait
-│       └── fallback.rs           # 降级链编排
+│       ├── event.rs              # EventSource 枚举（事件源标识）
+│       ├── fallback.rs           # 降级链编排（FallbackChain）
+│       ├── registry.rs           # ComponentRegistry 装配槽
+│       ├── security.rs           # SecurityManager
+│       ├── audit.rs              # 审计
+│       └── services.rs           # 统一服务类型（BatteryState 等）
 │
-├── components/                   # 公共组件层（抽象接口 + 具体实例）
-│   ├── compositor/               # 合成器组件
-│   │   ├── wayland/              # Wayland 协议通道（wlr 协议绑定）
+├── components/
+│   ├── displayserver/            # 显示服务器协议层（协议通道基础，不实现 CompositorComponent）
+│   │   ├── wayland/
 │   │   │   ├── Cargo.toml
 │   │   │   └── src/
-│   │   │       ├── mod.rs        # WaylandDisplayServer（协议通道基础）
+│   │   │       ├── lib.rs        # WaylandDisplayServer
 │   │   │       ├── registry.rs   # wl_display 连接 + registry 遍历
-│   │   │       └── wlr_protocols.rs  # wlr 通用协议（foreign-toplevel/virtual-pointer/screencopy）
-│   │   ├── x11/                  # X11 协议通道（x11rb/EWMH）
+│   │   │       └── core_protocols.rs  # core 协议绑定接口
+│   │   └── x11/
+│   │       ├── Cargo.toml
+│   │       └── src/
+│   │           ├── lib.rs        # X11DisplayServer
+│   │           ├── ewmh/mod.rs   # EWMH 原子缓存
+│   │           ├── ewmh/server.rs
+│   │           └── icccm/mod.rs  # ICCCM 客户端消息
+│   │
+│   ├── compositor/               # 合成器组件
+│   │   ├── wayland-core/         # WaylandCompositor 抽象基类 trait（组合 WaylandDisplayServer）
 │   │   │   ├── Cargo.toml
 │   │   │   └── src/
-│   │   │       ├── mod.rs        # X11DisplayServer（协议通道基础）
-│   │   │       └── ewmh.rs       # EWMH 原子操作 + _NET_WM 协议
+│   │   │       ├── lib.rs
+│   │   │       └── compositor.rs # pub trait WaylandCompositor: CompositorComponent
+│   │   ├── wlr-wayland/          # WlrWaylandCompositor（wlr 标准协议绑定）
+│   │   │   ├── Cargo.toml
+│   │   │   └── src/
+│   │   │       ├── lib.rs
+│   │   │       ├── compositor.rs
+│   │   │       └── wlr_protocols.rs  # WlrBindings 7 项 + 版本协商
 │   │   ├── kwin/                 # KWinCompositor（KDE/DDE 共用，Wayland + X11 双模式）
 │   │   │   ├── Cargo.toml
 │   │   │   └── src/
-│   │   │       ├── mod.rs        # KWinCompositor（单 struct，内部 session 路由）
-│   │   │       ├── wayland.rs    # org_kde_* 私有协议 + KWin Scripting 桥接
+│   │   │       ├── lib.rs
+│   │   │       ├── kwin_compositor.rs  # KWinCompositor（单 struct，内部 session 路由）
+│   │   │       ├── wayland.rs    # org_kde_* 私有协议
+│   │   │       ├── dbus_bridge.rs    # D-Bus ↔ KWin Scripting 桥接（KWinBridge）
 │   │   │       ├── scripts.rs    # 预置 KWin JS 脚本
-│   │   │       └── event.rs      # 事件监听器
+│   │   │       ├── event_script.rs   # 长驻事件脚本管理
+│   │   │       ├── version.rs    # KWin 版本探测
+│   │   │       └── error.rs      # KWin 特有错误类型
 │   │   ├── mutter/               # MutterCompositor（GNOME）
 │   │   │   ├── Cargo.toml
 │   │   │   └── src/
-│   │   │       ├── mod.rs        # MutterCompositor
+│   │   │       ├── lib.rs
+│   │   │       ├── mutter_compositor.rs  # MutterCompositor
 │   │   │       ├── eval.rs       # org.gnome.Shell.Eval 路径
 │   │   │       ├── extension.rs  # Shell Extension 路径
-│   │   │       └── display_config.rs  # Mutter.DisplayConfig
+│   │   │       ├── display_config.rs    # Mutter.DisplayConfig
+│   │   │       ├── version.rs    # GNOME 版本探测
+│   │   │       └── error.rs      # Mutter 特有错误类型
 │   │   ├── hyprland/             # HyprlandCompositor（纯 Wayland）
 │   │   │   ├── Cargo.toml
 │   │   │   └── src/
-│   │   │       ├── mod.rs        # HyprlandCompositor
+│   │   │       ├── lib.rs
+│   │   │       ├── compositor.rs # HyprlandCompositor
 │   │   │       ├── hyprctl.rs    # hyprctl socket IPC
 │   │   │       ├── event_socket.rs  # .socket2.sock 事件流
-│   │   │       └── wayland.rs    # wlr + hyprland_* 私有协议
-│   │   ├── treeland/             # TreelandCompositor（DDE 未来）
-│   │   │   ├── Cargo.toml
-│   │   │   └── src/
-│   │   │       ├── mod.rs        # TreelandCompositor
-│   │   │       └── treeland.rs   # treeland_* 私有协议
+│   │   │       ├── wayland.rs    # wlr + hyprland_* 私有协议
+│   │   │       ├── cache.rs      # 窗口缓存（事件流持续更新）
+│   │   │       └── protocol_gen.rs   # hyprland 协议生成绑定
 │   │   ├── sway/                 # SwayCompositor（纯 Wayland）
 │   │   │   ├── Cargo.toml
 │   │   │   └── src/
-│   │   │       ├── mod.rs        # SwayCompositor
-│   │   │       └── ipc.rs        # Sway IPC（i3 兼容）
-│   │   └── generic/              # X11Compositor / WlrWaylandCompositor（兜底）
+│   │   │       ├── lib.rs        # SwayCompositor
+│   │   │       ├── ipc.rs        # Sway IPC（i3 兼容）
+│   │   │       └── event.rs      # Sway 事件流（SwayEventStream）
+│   │   └── x11/                  # X11Compositor（通用 X11 兜底）
 │   │       ├── Cargo.toml
 │   │       └── src/
-│   │           ├── mod.rs        # X11Compositor / WlrWaylandCompositor
-│   │           ├── commands.rs   # xdotool/wmctrl 命令封装（保底）
-│   │           └── event.rs      # XRecord 事件
+│   │           ├── lib.rs
+│   │           ├── compositor.rs # X11Compositor
+│   │           ├── ewmh.rs       # EWMH 原子操作
+│   │           ├── xtest.rs      # XTest 输入注入
+│   │           ├── capture.rs    # MIT-SHM / XGetImage 截图
+│   │           └── commands.rs   # xdotool/wmctrl 命令封装（保底）
 │   │
-│   ├── audio/                    # 音频：PipeWire / PulseAudio
+│   ├── audio/                    # 音频：PipeWire / PulseAudio / DePriorityRouter
 │   │   ├── Cargo.toml
 │   │   └── src/
-│   │       ├── mod.rs
+│   │       ├── lib.rs
 │   │       ├── pipewire.rs
 │   │       ├── pulseaudio.rs
-│   │       └── dispatcher.rs
+│   │       └── router.rs         # DePriorityRouter（DE 封装优先路由）
 │   ├── network/                  # 网络：NetworkManager / systemd-networkd
 │   │   ├── Cargo.toml
 │   │   └── src/
-│   │       ├── mod.rs
+│   │       ├── lib.rs
 │   │       ├── networkmanager.rs
-│   │       ├── systemd_networkd.rs
-│   │       └── dispatcher.rs
+│   │       └── networkd.rs
 │   ├── input/                    # 输入：Libei / Ydotool / XTest
 │   │   ├── Cargo.toml
 │   │   └── src/
-│   │       ├── mod.rs
+│   │       ├── lib.rs
 │   │       ├── libei.rs
 │   │       ├── ydotool.rs
 │   │       ├── xdotool.rs
-│   │       └── dispatcher.rs
-│   ├── capture/                  # 截图：portal ScreenCast / X11
-│   │   ├── Cargo.toml
-│   │   └── src/
-│   │       ├── mod.rs
-│   │       ├── portal_screencast.rs
-│   │       ├── portal_screenshot.rs
-│   │       ├── pipewire.rs
+│   │       ├── xtest.rs
+│   │       ├── keymap.rs
 │   │       └── dispatcher.rs
 │   ├── a11y/                     # 无障碍：AT-SPI
 │   │   ├── Cargo.toml
 │   │   └── src/
-│   │       ├── mod.rs
+│   │       ├── lib.rs
+│   │       ├── component.rs
 │   │       ├── atspi_bridge.rs
 │   │       ├── tree.rs
 │   │       ├── semantic_locator.rs
 │   │       └── action.rs
-│   ├── clipboard/                # 剪贴板：wl-clipboard / xclip
+│   ├── clipboard/                # 剪贴板
 │   │   ├── Cargo.toml
 │   │   └── src/
-│   │       ├── mod.rs
-│   │       ├── wl_clipboard.rs
-│   │       └── xclip.rs
-│   ├── power/                    # 电源：公共组件（UPower；DE 专有实现见 backends/）
+│   │       └── lib.rs
+│   ├── power/                    # 电源：UPower + login1（DE 专有实现见 backends/）
 │   │   ├── Cargo.toml
 │   │   └── src/
-│   │       ├── mod.rs              # PowerComponent trait + 探测
-│   │       └── upower.rs           # 公共 UPower 实现（DE 无封装时降级）
-│   ├── notification/             # 通知：公共组件（portal；DE 专有实现见 backends/）
+│   │       ├── lib.rs
+│   │       └── router.rs
+│   ├── notification/             # 通知（DE 专有实现见 backends/）
 │   │   ├── Cargo.toml
 │   │   └── src/
-│   │       ├── mod.rs              # NotificationComponent trait + 探测
-│   │       └── portal_notification.rs  # 公共 portal 通知（DE 无封装时降级）
-│   ├── appearance/               # 外观：公共组件（portal；DE 专有实现见 backends/）
+│   │       └── lib.rs
+│   ├── appearance/               # 外观（DE 专有实现见 backends/）
 │   │   ├── Cargo.toml
 │   │   └── src/
-│   │       ├── mod.rs              # AppearanceComponent trait + 探测
-│   │       └── portal_appearance.rs    # 公共 portal 外观（DE 无封装时降级）
-│   └── launcher/                 # 启动器：公共组件（portal；DE 专有实现见 backends/）
+│   │       └── lib.rs
+│   ├── launcher/                 # 启动器（DE 专有实现见 backends/）
+│   │   ├── Cargo.toml
+│   │   └── src/
+│   │       └── lib.rs
+│   ├── systemd/                  # systemd D-Bus 封装
+│   │   ├── Cargo.toml
+│   │   └── src/
+│   │       └── lib.rs
+│   └── logind/                   # logind D-Bus 封装
 │       ├── Cargo.toml
 │       └── src/
-│           ├── mod.rs              # LauncherComponent trait + 探测
-│           └── portal_launcher.rs  # 公共 portal 启动器（DE 无封装时降级）
+│           └── lib.rs
 │
-├── backends/                     # 桌面环境（backend = 装配器，只含装配清单）
+├── backends/                     # 桌面环境（backend = 装配器）
 │   ├── kde/                      # KDE backend
 │   │   ├── Cargo.toml
 │   │   └── src/
-│   │       ├── mod.rs             # KdeBackend（装配清单实现，DE 封装优先路由）
-│   │       ├── power.rs           # KdePowerDevil（DE 专有电源实现）
-│   │       ├── notification.rs    # KdeNotification（DE 专有通知实现）
-│   │       ├── appearance.rs      # KdeAppearance（DE 专有外观实现）
-│   │       ├── launcher.rs        # KdeLauncher（DE 专有启动器实现）
-│   │       ├── services.rs        # DE 封装服务路由（org.kde.* 优先 → 公共组件降级）
-│   │       └── version.rs         # KDE 版本探测
+│   │       ├── lib.rs
+│   │       ├── assemble.rs       # KdeBackend 装配清单
+│   │       └── services.rs       # org.kde.* 服务路由（DE 封装优先 → 公共降级）
 │   ├── dde/                      # DDE backend
 │   │   ├── Cargo.toml
 │   │   └── src/
-│   │       ├── mod.rs             # DdeBackend（装配清单实现，DE 封装优先路由）
-│   │       ├── power.rs           # DdePower（DE 专有电源实现）
-│   │       ├── notification.rs    # DdeNotification（DE 专有通知实现）
-│   │       ├── appearance.rs      # DdeAppearance（DE 专有外观实现）
-│   │       ├── launcher.rs        # DdeLauncher（DE 专有启动器实现）
-│   │       ├── dde_api.rs         # DDE 封装服务（org.deepin.dde.* 优先）
-│   │       ├── version.rs         # DDE 20 vs 25 版本兼容
-│   │       └── assembly.rs        # 合成器选择（deepin-kwin / Treeland）
+│   │       ├── lib.rs
+│   │       ├── assemble.rs       # DdeBackend 装配清单
+│   │       ├── compositor.rs     # 合成器形态检测（Treeland vs deepin-kwin vs X11）
+│   │       ├── dde_compositor.rs # DdeCompositor（复合装配）
+│   │       ├── dde_api.rs        # org.deepin.dde.* 服务封装
+│   │       ├── dde_audio.rs      # org.deepin.dde.Audio1 / com.deepin.daemon.Audio
+│   │       ├── treeland.rs       # treeland_* 私有协议客户端
+│   │       ├── protocol_gen.rs   # treeland 协议生成绑定
+│   │       └── version.rs        # DDE 20 vs 25 版本兼容
 │   ├── gnome/                    # GNOME backend
 │   │   ├── Cargo.toml
 │   │   └── src/
-│   │       ├── mod.rs             # GnomeBackend（装配清单实现，DE 封装优先路由）
-│   │       ├── power.rs           # GnomePower（DE 专有电源实现）
-│   │       ├── notification.rs    # GnomeNotification（DE 专有通知实现）
-│   │       ├── appearance.rs      # GnomeAppearance（DE 专有外观实现）
-│   │       ├── launcher.rs        # GnomeLauncher（DE 专有启动器实现）
-│   │       ├── services.rs        # DE 封装服务路由（org.gnome.* 优先 → 公共组件降级）
-│   │       └── version.rs         # GNOME 版本探测（Eval 边界）
+│   │       ├── lib.rs
+│   │       ├── assemble.rs       # GnomeBackend 装配清单
+│   │       └── services.rs       # org.gnome.* 服务路由
 │   ├── hyprland/                 # Hyprland backend
 │   │   ├── Cargo.toml
 │   │   └── src/
-│   │       └── mod.rs             # HyprlandBackend
+│   │       └── lib.rs
 │   ├── sway/                     # Sway backend
 │   │   ├── Cargo.toml
 │   │   └── src/
-│   │       └── mod.rs             # SwayBackend
-│   └── generic/                  # 通用兜底 backend
+│   │       └── lib.rs
+│   ├── generic/                  # 通用兜底 backend
+│   │   ├── Cargo.toml
+│   │   └── src/
+│   │       └── lib.rs
+│   └── tty/                      # TTY 后端
 │       ├── Cargo.toml
 │       └── src/
-│           └── mod.rs             # GenericBackend
+│           └── lib.rs
 │
 ├── router/                       # 语义路由（协议无关）
 │   ├── Cargo.toml
 │   └── src/
-│       ├── mod.rs
+│       ├── lib.rs
 │       ├── command.rs
-│       ├── matcher.rs
-│       ├── planner.rs
-│       └── executor.rs
+│       ├── dispatcher.rs
+│       └── executor/
+│           ├── mod.rs
+│           ├── executor.rs
+│           └── tests.rs
 │
-├── event/                        # 事件流系统（协议无关）
+├── event/                        # 事件流系统（归一化 + 环形缓冲）
+│   ├── Cargo.toml
+│   ├── src/
+│   │   ├── lib.rs
+│   │   ├── events.rs             # DesktopEvent 统一枚举
+│   │   ├── hub.rs                # EventHub
+│   │   ├── adapter.rs            # RawSource trait + EventNormalizer
+│   │   ├── normalize.rs          # 归一化映射
+│   │   └── ring.rs               # 事件环形缓冲
+│   └── tests/
+│       └── events.rs
+│
+├── modules/capture/              # 截图：portal ScreenCast / X11
 │   ├── Cargo.toml
 │   └── src/
-│       ├── mod.rs
-│       ├── stream.rs
-│       ├── hub.rs
-│       └── subscriber.rs
+│       ├── lib.rs
+│       ├── cache.rs
+│       ├── portal_common.rs
+│       ├── portal_screencast.rs
+│       ├── portal_screenshot.rs
+│       └── x11.rs
+│
+├── shell/                        # shell 能力（公共探测链组装）
+│   ├── Cargo.toml
+│   └── src/
+│       └── lib.rs
+│
+├── rpc/                          # RPC 协议（方法常量）
+│   ├── Cargo.toml
+│   └── src/
+│       └── lib.rs
 │
 ├── cli/                          # CLI 入口
 │   ├── Cargo.toml
 │   └── src/
 │       ├── main.rs
-│       ├── app.rs
+│       ├── cli.rs
+│       ├── client.rs
 │       ├── format.rs
 │       └── repl.rs
 │
@@ -242,26 +290,35 @@ agent-shell/
 │   ├── Cargo.toml
 │   └── src/
 │       ├── main.rs
-│       ├── server.rs
-│       └── tools.rs
+│       ├── lib.rs
+│       └── server.rs
 │
 ├── daemon/                       # user daemon（systemd --user 常驻）
 │   ├── Cargo.toml
 │   └── src/
 │       ├── main.rs
-│       └── service.rs
+│       ├── state.rs
+│       ├── dispatch.rs
+│       ├── a11y.rs
+│       ├── capture.rs
+│       ├── input.rs
+│       ├── ime_session.rs
+│       ├── portal_sessions.rs
+│       ├── rootd_client.rs
+│       └── single_instance.rs
 │
 ├── rootd/                        # root 守护（polkit 提权通道）
 │   ├── Cargo.toml
 │   └── src/
 │       ├── main.rs
-│       └── polkit.rs
+│       ├── lib.rs                # polkit action 映射（polkit_action_for）
+│       └── dbus.rs               # D-Bus 服务层
 │
-└── sdk/                          # 编程 SDK
-    ├── Cargo.toml
-    └── src/
-        ├── lib.rs
-        └── client.rs
+├── packaging/                    # 打包产物
+│   └── com.agentshell.policy     # polkit policy（12+1 action）
+│
+└── docs/                         # 设计文档
+    └── agent-shell-design.md
 ```
 
 ---
@@ -534,7 +591,7 @@ agent-shell 的项目结构分**两个抽象层次**：
 | KWinCompositor | WaylandDisplayServer + X11DisplayServer | org_kde_* 私有协议 | D-Bus / Scripting |
 | MutterCompositor | WaylandDisplayServer + X11DisplayServer | D-Bus Eval/Extension | AT-SPI |
 | HyprlandCompositor | WaylandDisplayServer | wlr + hyprland_* 私有协议 | hyprctl socket IPC |
-| TreelandCompositor | WaylandDisplayServer | treeland_* 私有协议 | dde-api D-Bus |
+| Treeland（backends/dde） | WaylandDisplayServer | treeland_* 私有协议（future D9） | dde-api D-Bus |
 | SwayCompositor | WaylandDisplayServer | wlr 标准协议 | Sway IPC |
 | X11Compositor | X11DisplayServer | EWMH/XTest 原生 | xdotool 保底 |
 | WlrWaylandCompositor | WaylandDisplayServer | wlr 标准协议 | portal/AT-SPI 降级 |
@@ -549,7 +606,7 @@ agent-shell 的项目结构分**两个抽象层次**：
 CompositorComponent（trait——所有合成器统一接口）
 ├── WaylandCompositor（抽象类，组合 WaylandDisplayServer）
 │   ├── WlrWaylandCompositor（wlroots 系基类，自身完整实现；子类叠加私有协议）
-│   │   ├── TreelandCompositor（+ treeland_* 私有协议）
+│   │   ├── Treeland 协议客户端（backends/dde/src/treeland.rs，future D9，非独立 compositor crate）
 │   │   ├── HyprlandCompositor（+ hyprland_* 私有协议）
 │   │   └── SwayCompositor（+ Sway IPC）
 │   ├── KWinCompositor（直接继承，org_kde_* 私有协议）
@@ -993,65 +1050,46 @@ impl AgentShell {
 
 ## 5. WaylandDisplayServer 组件（协议层）
 
-WaylandDisplayServer 是**显示服务器组件**（合成器组件的协议通道基础），提供 wl_display 连接管理、registry 遍历、通用 wlr 协议绑定。各合成器（KWinCompositor/DdeCompositor 等）在其上追加私有协议。
-
-### 5.1 职责
+WaylandDisplayServer 是**显示服务器组件**（合成器组件的协议通道基础），提供 `wl_display` 连接管理、registry 遍历、global 接口探测与 core 协议绑定。wlr 标准协议绑定位于 `WlrWaylandCompositor`（§8 前身见 §5.2 真值），各合成器（KWinCompositor/DdeCompositor 等）通过 `WaylandCompositor` trait 组合本层并追加私有协议。
 
 - 连接 wayland display（`$WAYLAND_DISPLAY`）
-- 遍历 registry，绑定所有可用的 wlr 标准协议
-- 提供各协议的操作接口
-- 子类通过 `WaylandExtension` 注册私有协议
+- 遍历 registry，建立 globals 快照（`WaylandDisplayServer`，纯 Wayland core）
+- wlr 标准协议绑定在 `components/compositor/wlr-wayland`（`WlrBindings`），不在此层
+- 各合成器通过 `WaylandCompositor`（`components/compositor/wayland-core`）组合本层并叠加私有协议
 
 ### 5.2 协议绑定探测
 
 ```rust
-/// Wayland 协议绑定集合
-pub struct WaylandBindings {
-    pub foreign_toplevel: Option<ZwlrForeignToplevelManagerV3>,  // v3
-    pub ext_workspace: Option<ExtWorkspaceManagerV1>,            // v1
-    pub virtual_pointer: Option<ZwlrVirtualPointerManagerV1>,     // v2
-    pub virtual_keyboard: Option<ZwpVirtualKeyboardManagerV1>,    // v1
-    pub screencopy: Option<ZwlrScreencopyManagerV3>,             // v3
-    pub output_management: Option<ZwlrOutputManagerV1>,           // v1
-    pub data_control: Option<ExtDataControlManagerV1>,            // v1
-}
+// components/compositor/wlr-wayland/src/wlr_protocols.rs
 
-impl WaylandDisplayServer {
-    pub fn connect() -> Result<Self> {
-        let conn = Connection::connect_to_env()?;
-        let mut bindings = WaylandBindings::default();
-
-        // Registry 遍历：每个 global 携带接口名 + 版本号
-        // 必须匹配「接口名」和「请求版本 ≤ global 版本」
-        conn.registry(|global| {
-            let Ok(ver) = u32::from_str(&global.version) else { return };
-            match global.interface.as_str() {
-                "zwlr_foreign_toplevel_manager_v3" if ver >= 3 =>
-                    bindings.foreign_toplevel = Some(global.bind::<ZwlrForeignToplevelManagerV3>(3)),
-                "ext_workspace_manager_v1" if ver >= 1 =>
-                    bindings.ext_workspace = Some(global.bind::<ExtWorkspaceManagerV1>(1)),
-                "zwlr_virtual_pointer_manager_v1" if ver >= 2 =>
-                    bindings.virtual_pointer = Some(global.bind::<ZwlrVirtualPointerManagerV1>(2)),
-                "zwp_virtual_keyboard_manager_v1" if ver >= 1 =>
-                    bindings.virtual_keyboard = Some(global.bind::<ZwpVirtualKeyboardManagerV1>(1)),
-                "zwlr_screencopy_manager_v3" if ver >= 3 =>
-                    bindings.screencopy = Some(global.bind::<ZwlrScreencopyManagerV3>(3)),
-                "zwlr_output_manager_v1" if ver >= 1 =>
-                    bindings.output_management = Some(global.bind::<ZwlrOutputManagerV1>(1)),
-                "ext_data_control_manager_v1" if ver >= 1 =>
-                    bindings.data_control = Some(global.bind::<ExtDataControlManagerV1>(1)),
-                _ => {}  // 忽略不关注的协议
-            }
-        });
-        // 绑定失败 → 对应字段为 None，不阻塞初始化
-        Ok(Self { conn, bindings })
-    }
+/// wlr 标准协议绑定集合（7 项，每字段独立可选）
+#[derive(Debug, Default)]
+pub struct WlrBindings {
+    pub foreign_toplevel: Option<ZwlrForeignToplevelManagerV1>,   // foreign-toplevel v3
+    pub output_management: Option<ZwlrOutputManagerV1>,           // output-management v4
+    pub screencopy: Option<ZwlrScreencopyManagerV1>,              // screencopy v3
+    pub virtual_pointer: Option<ZwlrVirtualPointerManagerV1>,     // virtual-pointer v2
+    pub ext_workspace: Option<ExtWorkspaceManagerV1>,             // ext-workspace v1
+    pub virtual_keyboard: Option<ZwpVirtualKeyboardManagerV1>,    // virtual-keyboard v1
+    pub data_control: Option<ExtDataControlManagerV1>,            // ext-data-control v1
+    pub bind_failures: Vec<(&'static str, String)>,               // 绑定失败明细（doctor）
 }
 ```
 
-**版本协商策略**：
-- 请求版本 = min(协议规范最低版本, global 公布版本)。例如 virtual-pointer 规范最低 v2，global 公布 v3 → 请求 v2
-- 绑定失败不抛出异常，仅标记对应字段为 None。后续操作由调用方检查 availability 并触发降级
+实现说明（现状）：
+- `WlrBindings` 位于 `wlr-wayland` crate（非 §1 旧树的 `wayland/`），7 个字段 + `bind_failures`；
+  `WaylandDisplayServer` 只提供 `connection` / `globals` 快照与 core 协议绑定接口，
+  不持有 wlr 协议字段。
+- foreign-toplevel 绑定的是 `wayland-protocols-wlr` 的
+  `foreign_toplevel::v1::client::zwlr_foreign_toplevel_manager_v1`（接口最高 v3）；
+  output-management 支持到 v4；virtual-pointer 接口规范最高 v2。
+- 绑定区间常量为 `protocol_versions::*`，上界不得越出接口版本，否则
+  `GlobalList::bind` 在取 min 前 panic（`wlr_protocols.rs` 测试回归约束）。
+
+- 请求版本 = min(接口支持上限, global 公布版本)，绑定区间以 `protocol_versions` 常量表达。
+  例如 virtual-pointer 区间固定 2..=2（接口最高 v2），output-management 区间 1..=4。
+- 绑定失败不抛出异常，仅标记对应字段为 `None` 并记入 `bind_failures`。
+  后续操作由调用方检查 availability 并触发降级。
 
 **协议依赖链**（假阳性控制）：
 ```
@@ -1067,7 +1105,7 @@ foreign-toplevel 不可用 → 降级 D-Bus / AT-SPI
 |------|---------|
 | KWinCompositor | org_kde_plasma_window_management, org_kde_kwin_fake_input, org_kde_plasma_virtual_desktop_management |
 | HyprlandCompositor | hyprland_toplevel_export, hyprland_focus_grab, hyprland_global_shortcuts |
-| TreelandCompositor | treeland_foreign_toplevel_manager, treeland_window_management, treeland_capture |
+| Treeland（backends/dde/src/treeland.rs） | treeland_foreign_toplevel_manager, treeland_window_management（future D9 通道） |
 | MutterCompositor | 无（Mutter 不实现私有协议） |
 | SwayCompositor | 无（纯 wlr） |
 | WlrWaylandCompositor | 无（纯 wlr 标准协议，子类叠加私有协议） |
@@ -1084,15 +1122,21 @@ foreign-toplevel 不可用 → 降级 D-Bus / AT-SPI
 ### 5.5 验证输出
 
 ```
-✓ Wayland 显示  : wayland-0 (wl_display connected)
-✓ wlr 协议      : 5/7 bound
+✓ Wayland 显示  : wayland-0 (wl_display connected, N globals)
+✓ wlr 协议      : N/7 bound
   ├─ foreign-toplevel : v3 ✓
-  ├─ virtual-pointer  : v2 ✓
-  ├─ virtual-keyboard : v1 ✓
+  ├─ output-mgmt      : v4 ✓
   ├─ screencopy       : v3 ✓
-  ├─ output-mgmt      : v1 ✓
-  ⚠ not bound : ext-workspace, data-control
+  ├─ virtual-pointer  : v2 ✓
+  ├─ ext-workspace    : v1 ✓
+  ├─ virtual-keyboard : v1 ✓
+  ├─ data-control     : v1 ✓
+  ⚠ not bound : <bind_failures 逐项>
 ```
+
+实际 doctor 行（`wlr-wayland/src/compositor.rs`）：`✓ wlr 协议 : N/7 bound`，
+分母 7 = `WlrBindings` 字段数；逐协议明细顺序为 foreign-toplevel / output-mgmt /
+screencopy / virtual-pointer / ext-workspace / virtual-keyboard / data-control。
 
 ---
 
@@ -1472,9 +1516,10 @@ Scripting（补充通道）。实现时确认 KWin 6.7 上任务栏与第三方�
 
 | 文件 | 职责 | 通道 |
 |------|------|------|
-| `mod.rs` | 模块根，KWinCompositor + CompositorComponent impl | -- |
+| `lib.rs` | 模块根 + re-export | -- |
+| `kwin_compositor.rs` | KWinCompositor + CompositorComponent impl | -- |
 | `wayland.rs` | Wayland 私有协议客户端（org_kde_* 协议族） | 基础 |
-| `dbus_bridge.rs` | D-Bus ↔ KWin Scripting 桥接（KWinBridge） | 补充 |
+| `dbus_bridge.rs` | D-Bus ↔ KWin Scripting 桥接（KWinBridge + ResponseService） | 补充 |
 | `scripts.rs` | 预置 JS 脚本模板 + 版本兼容层 | 补充 |
 | `event_script.rs` | 长期运行事件脚本管理 | 补充 |
 | `version.rs` | KWin 版本探测（supportInformation 解析） | 共享 |
@@ -1655,11 +1700,13 @@ GNOME/Mutter 明确不实现 `wlr-foreign-toplevel-management` / `ext-foreign-to
 
 | 文件 | 职责 |
 |------|------|
-| `mod.rs` | 模块根，MutterCompositor + CompositorComponent impl |
+| `lib.rs` | 模块根 + re-export |
+| `mutter_compositor.rs` | MutterCompositor + CompositorComponent impl |
 | `eval.rs` | org.gnome.Shell.Eval 路径 (GNOME <47) |
 | `extension.rs` | Shell Extension 路径 (GNOME 47+) |
 | `display_config.rs` | Mutter.DisplayConfig 显示器配置 |
 | `version.rs` | GNOME 版本探测 |
+| `error.rs` | Mutter 特有错误类型 |
 
 **核心接口**：
 
@@ -1673,7 +1720,22 @@ pub struct MutterCompositor {
 }
 ```
 
-**能力限制**：无 move/resize/workspace/事件流。GNOME 是**最受限的后端**，无原生事件流（通过 AT-SPI 补充）。
+**能力现状**（`capabilities()` 真值）：
+
+| 能力 | 值 | 说明 |
+|------|-----|------|
+| window_management | true | focus/close/minimize/maximize 经 Eval/Extension 可用 |
+| workspace_management | false | GNOME 工作区语义不在 Eval/Extension 方法集内 |
+| monitor_layout | true | 仅可读布局（GetCurrentState） |
+| window_events / workspace_events | false | Extension 三信号存在但归一化依赖 extension.js 部署，语义未定前不声明 |
+| native_input / native_capture | false | portal RemoteDesktop / ScreenCast 走输入与 capture 组件 |
+| virtual_desktops / effects_control | false | -- |
+
+`move_window` 已实现（Extension 路径 `ext.move_window(&id.native_id, x, y)`；
+Eval 路径返回 `NotImplemented("mutter: window move unavailable on Eval path")`），
+但能力矩阵不声明 move，仅供显式调用方使用。`resize_window` 恒 `NotImplemented`
+（GNOME 无协议，portal-only）。resize / workspace / 原生事件流仍无——GNOME 是**最受限的后端**，
+事件流通过 AT-SPI 补充。
 
 **Eval 路径**（GNOME <47）：
 ```rust
@@ -1701,7 +1763,7 @@ pub struct MutterCompositor {
 ✓ GNOME 版本   : GNOME 47.0 (Eval 受限)
 ✓ 后端路径     : Extension (agent-shell-bridge@multica.dev)
 ✓ D-Bus 接口   : org.gnome.Shell ✓, DisplayConfig ✓, ScreenSaver ✓
-⚠ 窗口操作     : 受限（无 move/resize/workspace）
+⚠ 窗口操作     : 受限（move 仅 Extension 路径；无 resize/workspace/事件流）
 ```
 
 ---
@@ -1813,7 +1875,7 @@ Hyprland 是 wlroots 系 compositor，支持全部 wlr 标准扩展 + Hyprland �
 | 协议 | 能力 |
 |------|------|
 | `wlr-foreign-toplevel-management` (v3) | 窗口列表+激活/关闭/状态（maximize/minimize/fullscreen） |
-| `ext-foreign-toplevel-list` (staging) | 标准化只读窗口列表 |
+| `ext-foreign-toplevel-list` (staging) | **未绑定**——仅被 hyprland toplevel-mapping 协议 XML 作为外部接口引用，非独立绑定字段 |
 | `ext-workspace` (staging) | 工作区列举与切换 |
 | `wlr-virtual-pointer` | 鼠标注入 |
 | `zwp-virtual-keyboard` | 键盘注入 |
@@ -1821,16 +1883,16 @@ Hyprland 是 wlroots 系 compositor，支持全部 wlr 标准扩展 + Hyprland �
 | `wlr-output-management` | 输出配置 |
 | `ext-data-control` (staging) | 剪贴板数据控制 |
 
-**Hyprland 私有协议**：
+**Hyprland 私有协议**（`hyprland/src/wayland.rs` 绑定 4 项）：
 
 | 协议 | 版本 | 能力 |
 |------|:----:|------|
-| `hyprland_toplevel_export` | 2 | 窗口级内容捕获（WindowId 截图首选） |
-| `hyprland_focus_grab` | 1 | 输入焦点白名单限制 |
-| `hyprland_global_shortcuts` | - | 全局快捷键注册 |
-| `hyprland-toplevel-mapping` | - | toplevel → 窗口地址映射 |
+| `hyprland_toplevel_export_manager_v1` | 2 | 窗口级内容捕获（WindowId 截图首选） |
+| `hyprland_focus_grab_manager_v1` | 1 | 输入焦点白名单限制 |
+| `hyprland_global_shortcuts_manager_v1` | 1 | 全局快捷键注册 |
+| `hyprland_toplevel_mapping_manager_v1` | 1 | toplevel → 窗口地址映射 |
 
-**实现思路**：窗口管理走 wlr-foreign-toplevel-management（纯协议，无 socket 命令解析），窗口截图走 hyprland_toplevel_export，输入注入走 wlr-virtual-pointer/virtual-keyboard；hyprctl socket 保留为扩展能力（dispatch exec 等）与版本探测后备。
+**实现思路**：窗口管理走 wlr-foreign-toplevel-management（纯协议，无 socket 命令解析），窗口截图走 hyprland_toplevel_export_manager_v1，输入注入走 wlr-virtual-pointer/virtual-keyboard；hyprctl socket 保留为扩展能力（dispatch exec 等）与版本探测后备。
 
 ### 9.5 实现设计
 
@@ -1838,11 +1900,13 @@ Hyprland 是 wlroots 系 compositor，支持全部 wlr 标准扩展 + Hyprland �
 
 | 文件 | 职责 |
 |------|------|
-| `mod.rs` | 模块根，HyprlandCompositor + CompositorComponent impl |
+| `lib.rs` | 模块根 + re-export（HyprlandCompositor） |
+| `compositor.rs` | HyprlandCompositor + CompositorComponent impl |
 | `hyprctl.rs` | UNIX Socket IPC — hyprctl 同步请求 |
 | `event_socket.rs` | 事件流 — .socket2.sock 长期连接 |
 | `wayland.rs` | wlr 标准扩展 + Hyprland 私有协议客户端 |
 | `cache.rs` | 窗口缓存（事件流持续更新） |
+| `protocol_gen.rs` | hyprland 协议生成绑定 |
 
 **核心接口**：
 
@@ -1890,7 +1954,7 @@ pub async fn dispatch(&self, action: &str) -> Result<()> { /* dispatch ... */ }
 **验证输出**：
 
 ✓ Hyprland 会话  : HYPRLAND_INSTANCE_SIGNATURE=abc123
-✓ Wayland 协议   : 8/12 globals bound (foreign-toplevel v3, virtual-pointer v2, hyprland-export v2)
+✓ Wayland 协议   : 8/11 globals bound (foreign-toplevel v3, virtual-pointer v2, hyprland-export v2)
 ✓ hyprctl socket : OK (<1ms, 12 windows, 2 monitors, 4 workspaces)
 ✓ 事件流        : connected (openwindow, closewindow, activewindow, workspacev2)
 ```
@@ -1977,10 +2041,14 @@ deepin 新一代 compositor **Treeland**（基于 wlroots，deepin 25+ 过渡）
 
 | 文件 | 职责 |
 |------|------|
-| `mod.rs` | 模块根，DdeCompositor + CompositorComponent impl |
+| `lib.rs` | 模块根 + re-export（DdeBackend / DdeCompositor） |
+| `assemble.rs` | DdeBackend 装配清单（合成器 + 系统服务装配） |
 | `compositor.rs` | Compositor 检测（Treeland vs deepin-kwin vs X11） |
+| `dde_compositor.rs` | DdeCompositor + CompositorComponent impl |
 | `dde_api.rs` | DDE 系统服务 D-Bus 封装（7+ 服务） |
+| `dde_audio.rs` | org.deepin.dde.Audio1 / com.deepin.daemon.Audio 音频封装 |
 | `treeland.rs` | Treeland Wayland 协议客户端 |
+| `protocol_gen.rs` | treeland 协议生成绑定 |
 | `version.rs` | DDE 版本探测（20 vs 25） |
 
 **核心接口**：
@@ -2049,7 +2117,7 @@ pub async fn detect_compositor() -> CompositorType {
 `X11Compositor` 实现 CompositorComponent，**通用 X11 兜底合成器**。组合 `X11DisplayServer`，通过 x11rb 原生协议实现全部窗口操作，CLI 工具仅作最后保底。
 
 ```rust
-// display/x11/src/adapter.rs
+// components/displayserver/x11/src/lib.rs（协议层，非合成器）
 
 pub struct X11DisplayServer { conn: x11rb::Connection }
 
@@ -2066,14 +2134,31 @@ impl X11DisplayServer {
 ### 11.1 实现设计
 
 **WlrWaylandCompositor**：wlroots 系合成器的基类，**自身就是完整实现**，可直接装配使用；
-TreelandCompositor、HyprlandCompositor、SwayCompositor 继承自它并叠加各自私有协议扩展。
+TreelandCompositor、HyprlandCompositor、SwayCompositor **组合**它（`self.base`）并叠加各自私有协议扩展。
 组合 `WaylandDisplayServer` 并绑定 `wlr-*` 协议族（foreign-toplevel-management、virtual-pointer、screencopy 等），
 实现全部 CompositorComponent 能力（窗口列表/聚焦/移动/关闭/工作区/截图），无需外部工具。
 
+继承层次（Rust 无实现继承，`WlrWaylandCompositor` 是 struct，子类组合非继承）：
+
+```text
+CompositorComponent（trait）
+└── WaylandCompositor（components/compositor/wayland-core——抽象基类，组合 WaylandDisplayServer）
+    ├── WlrWaylandCompositor（components/compositor/wlr-wayland，叠加 wlr 标准协议）
+    │   └── HyprlandCompositor / SwayCompositor（组合 self.base；Treeland 协议客户端在 backends/dde/src/treeland.rs）
+    ├── KWinCompositor（org_kde_* 私有协议）
+    └── MutterCompositor（D-Bus Eval/Extension）
+```
+
 ```rust
-// components/compositor/generic/src/wlr.rs
+// components/compositor/wayland-core/src/compositor.rs
+pub trait WaylandCompositor: CompositorComponent {
+    fn display_server(&self) -> &WaylandDisplayServer;
+}
+
+// components/compositor/wlr-wayland/src/compositor.rs
 pub struct WlrWaylandCompositor {
-    wayland: WaylandDisplayServer,   // wl_display 连接 + wlr-* 协议绑定
+    display: WaylandDisplayServer,   // wl_display 连接
+    bindings: WlrBindings,           // wlr-* 协议绑定（7 项）
     windows: WindowCache,            // foreign-toplevel 事件驱动缓存
 }
 
@@ -2084,31 +2169,35 @@ impl CompositorComponent for WlrWaylandCompositor {
     // 全部基于 wlr-* 协议，portal/AT-SPI 仅作补充降级
 }
 
-// 子类只追加私有协议，复用父类全部实现：
+// 子类组合基类，追加私有协议；不复制 wlr 实现：
 pub struct HyprlandCompositor {
-    base: WlrWaylandCompositor,      // 继承 wlr 完整实现
+    base: WlrWaylandCompositor,      // 组合 wlr 完整实现
+    bindings: HyprlandBindings,      // hyprland_* 私有协议
     hyprctl: Hyprctl,                // + hyprland 专有通道
 }
 ```
 
 因此可实例化场景：
 1. **无法识别具体 DE**（无 KDE/DDE/GNOME/Hyprland/Sway 特征）的 Wayland 会话 → 直接装配本类
-2. **wlroots 系 DE 的基类**（Treeland/Hyprland/Sway 继承，叠加私有协议覆盖/增强）
+2. **wlroots 系 DE 的基类**（Treeland/Hyprland/Sway 组合，叠加私有协议覆盖/增强）
 所有窗口操作走 wlr 协议原生路径，portal/AT-SPI 仅当 wlr 协议缺失时降级。
 
 **X11Compositor**：当检测到 X11 会话但无法识别具体 WM，装配 `X11Compositor`。
-组合 `X11DisplayServer`，通过 x11rb 原生协议实现全部操作。
+组合 `X11DisplayServer`（协议层在 `components/displayserver/x11/`，非合成器），通过 x11rb 原生协议实现全部操作。
 
-**模块结构**（`display/x11/src/`）：
+**模块结构**（`components/compositor/x11/src/`）：
 
 | 文件 | 职责 | 层级 |
 |------|------|------|
-| `mod.rs` | 模块根，X11DisplayServer + CompositorComponent impl | 主入口 |
+| `lib.rs` | 模块根 + re-export（X11Compositor） | 主入口 |
+| `compositor.rs` | X11Compositor + CompositorComponent impl | 主入口 |
 | `ewmh.rs` | EWMH/_NET_WM 原子操作（原生 x11rb） | 原生 |
 | `xtest.rs` | XTest 扩展输入注入（原生 x11rb） | 原生 |
 | `capture.rs` | MIT-SHM / XGetImage 截图（原生 x11rb） | 原生 |
 | `commands.rs` | xdotool/wmctrl 命令封装（仅保底） | 降级 |
-| `event.rs` | XDamage/XRecord 事件监听 | 原生 |
+
+> 协议层 `X11DisplayServer` 在 `components/displayserver/x11/src/`（lib.rs / ewmh/{mod,server}.rs / icccm/mod.rs），
+> 不在此合成器 crate 内；本 crate 无 `event.rs`（X11 无合成器级原生事件流，XDamage/XRecord 可选）。
 
 **核心接口**：
 
@@ -2635,50 +2724,69 @@ impl Executor {
             SemanticTarget::Active =>
                 self.backend.get_active_window().await?
                     .ok_or_else(|| AgentShellError::WindowNotFound("no active".into())),
+            SemanticTarget::ById(id) => self.backend.get_window_info(id).await,
             SemanticTarget::ByAppId(id) => {
                 let windows = self.backend.list_windows().await?;
                 windows.into_iter().find(|w| w.app_id == *id)
-                    .ok_or_else(|| AgentShellError::WindowNotFound(format!("app '{}'", id)))
+                    .ok_or_else(|| AgentShellError::WindowNotFound(format!("app '{id}'")))
             }
             SemanticTarget::ByTitle(title, mode) => {
                 let windows = self.backend.list_windows().await?;
-                windows.into_iter().find(|w| match mode {
-                    TitleMatchMode::Substring => w.title.contains(title),
-                    TitleMatchMode::Exact => w.title == *title,
-                    TitleMatchMode::Regex => regex::Regex::new(title).ok()
-                        .map(|r| r.is_match(&w.title)).unwrap_or(false),
-                    TitleMatchMode::Glob => glob_match::glob_match(title, &w.title),
-                }).ok_or_else(|| AgentShellError::WindowNotFound(format!("title '{}'", title)))
+                windows.into_iter().find(|w| title_matches(mode, title, &w.title))
+                    .ok_or_else(|| AgentShellError::WindowNotFound(format!("title '{title}'")))
             }
             SemanticTarget::ByAccessibility { .. } => {
-                // AT-SPI 定位 → 找到所属窗口 → 匹配 backend 窗口列表
-                let elements = self.locator.locate(target).await?;
-                if let Some(el) = elements.first() {
-                    let window = el.find_parent_window().await?;
-                    let title = window.name().await?;
-                    let windows = self.backend.list_windows().await?;
-                    windows.into_iter().find(|w| title.contains(&w.app_id) || w.title.contains(&title))
-                        .ok_or_else(|| AgentShellError::WindowNotFound("AT-SPI window".into()))
-                } else {
-                    Err(AgentShellError::WindowNotFound("AT-SPI element".into()))
-                }
+                // AT-SPI 定位 → 找到所属窗口 → 匹配 backend 窗口列表。
+                // 双向子串匹配（有意为之）：Wayland 下 AT-SPI window name 常
+                // 等于 app_id，X11 下常为标题子串——两者无规范映射。
+                let elements = self.a11y.locate(target).await?;
+                let el = elements.first()
+                    .ok_or_else(|| AgentShellError::WindowNotFound("AT-SPI element".into()))?;
+                let title = el.find_parent_window_name().await?;
+                let windows = self.backend.list_windows().await?;
+                windows.into_iter()
+                    .find(|w| title.contains(&w.app_id) || w.title.contains(&title))
+                    .ok_or_else(|| AgentShellError::WindowNotFound("AT-SPI window".into()))
             }
-            _ => Err(AgentShellError::NotImplemented("target resolution".into()))
+            // ByPid / ByDesktopFile / ByCoordinate / ByRegion 未实现——
+            // SemanticTarget 枚举保留这些 variant，resolve 落 NotImplemented。
+            other => Err(AgentShellError::NotImplemented(format!(
+                "router: target resolution for {other:?}"
+            ))),
         }
+    }
+}
+
+/// 标题匹配（§15.3：子串 → 精确 → 正则 → glob）。
+/// 正则编译失败按「不匹配」处理，不向上抛错。
+fn title_matches(mode: &TitleMatchMode, pattern: &str, title: &str) -> bool {
+    match mode {
+        TitleMatchMode::Substring => title.contains(pattern),
+        TitleMatchMode::Exact => title == pattern,
+        TitleMatchMode::Regex => regex::Regex::new(pattern)
+            .map(|r| r.is_match(title)).unwrap_or(false),
+        TitleMatchMode::Glob => glob_match::glob_match(pattern, title),
     }
 }
 ```
 
 ### 15.3 语义定位优先级
 
+`resolve_target` 实际分支（实现现状）：
+
 ```
-1. WindowId（精确，最可靠）
-2. app_id + AT-SPI (元素级语义定位)
-3. 窗口标题（子串 → 精确 → 正则 → glob）
-4. PID
-5. 桌面文件
-6. 坐标（最终降级）
+1. Active —— get_active_window()（直查）
+2. ById —— get_window_info(id)（直查，WindowId 已可直查）
+3. ByAppId —— list_windows().find(app_id 相等)
+4. ByTitle —— list_windows().find(title_matches：子串 → 精确 → 正则 → glob)
+5. ByAccessibility —— AT-SPI locate → 窗口名/标题与 backend 列表双向子串匹配
+other —— NotImplemented（target resolution）
 ```
+
+`SemanticTarget`（`core/src/types.rs`）保留 `ByPid` / `ByDesktopFile` /
+`ByCoordinate` / `ByRegion` variant，但 `resolve_target` 不处理——
+当前**未实现**，落 `NotImplemented`。窗口 ID（`ById`）不再需要
+`list_windows` 扫描，直接 `get_window_info` 查询。
 
 ---
 
@@ -2827,7 +2935,7 @@ agent-shell              # 交互模式（tab 补全）
 ### 17.3 MCP 服务器（工具定义）
 
 ```rust
-// mcp/src/tools.rs
+// mcp/src/server.rs
 
 router.register(Tool::new("list_windows")
     .description("列出所有窗口，含 app_id/title/pid/geometry/workspace")
@@ -2910,38 +3018,42 @@ router.register(Tool::new("subscribe_events")
     })));
 ```
 
-### 17.4 SDK 编程接口
+### 17.4 SDK 编程接口（已并入 shell + rpc）
+
+> 早期草案规划的独立 `sdk/` crate 未建立。顶层入口为 `shell` crate 的
+> `AgentShell`，线协议类型在 `rpc` crate。不存在 `AgentShellClient`——
+> 下文是设计的调用意图，以 shell/rpc 实际 API 形态呈现。
 
 ```rust
-// sdk/src/lib.rs
+// shell/src/lib.rs
 
-pub struct AgentShellClient {
-    backend: Box<dyn CompositorComponent>,
-    executor: Executor,
+/// 顶层 AgentShell：事件枢纽 + 当前 backend + 公共组件装配结果。
+pub struct AgentShell {
+    pub event_hub: EventHub,
+    pub backend: BackendKind,
+    pub components: ComponentRegistry,
 }
 
-impl AgentShellClient {
-    pub async fn connect(backend: Box<dyn CompositorComponent>) -> Self;
-    pub async fn exec(&self, cmd: impl Into<Command>) -> Result<CommandResult>;
-    pub async fn start_task(&self, cmd: impl Into<Command>) -> Result<TaskHandle>;
-    pub async fn subscribe(&self, filter: EventFilter) -> impl Stream<Item = DesktopEvent>;
+impl AgentShell {
+    /// 检测环境 → 选定 backend → 装配组件（§4.2 装配流程）。
+    pub async fn detect_and_assemble() -> Result<Self> { ... }
 }
 
-// 使用示例
-let client = AgentShellClient::connect(assemble_wm(detect_desktop_environment())?).await?;
-client.exec(LaunchApp { desktop_file: "firefox" }).await?;
-let win = client.exec(WaitForWindow { app_id: "firefox", timeout: 15s }).await?;
-client.exec(MoveWindow { target: win.id, x: 0, y: 0 }).await?;
-client.exec(SendKey { combo: parse("ctrl+l") }).await?;
-client.exec(TypeText { text: "https://example.com", target: None }).await?;
+// rpc/src/lib.rs —— JSON-RPC 2.0 线协议类型（非 typed client）：
+//   Request::new(id, method, params) / Response::ok / Notification::event(params)
+//   及 WindowEntry / InputParams / CaptureParams / DoctorResult 等参数与结果 DTO。
 ```
+
+调用方通过 `AgentShell::detect_and_assemble()` 得到 `ComponentRegistry`，直接
+调用组件方法；跨进程/网络走 `rpc` 的 Request/Response/Notification 与 `cli`/
+`mcp`/`daemon` 网关。
 
 **验证输出**：
 ```
-✓ Agent 形态    : CLI ✓, MCP ✓, JSON-RPC ✓, D-Bus ✓, SDK ✓
+✓ Agent 形态    : CLI ✓, MCP ✓, JSON-RPC ✓, D-Bus ✓, shell ✓
 ✓ CLI 命令集     : 21 commands (window/workspace/monitor/system/agent)
 ✓ MCP 工具集     : 18 tools registered (list_windows, focus, move, ...)
-✓ SDK 绑定       : rust ✓, python ✓
+✓ shell 绑定     : rust ✓（无独立 SDK crate，已并入 shell + rpc）
 ```
 
 ---
@@ -2951,7 +3063,8 @@ client.exec(TypeText { text: "https://example.com", target: None }).await?;
 ### 18.1 事件模型
 
 ```rust
-// event/src/mod.rs
+// core/src/event.rs
+
 
 /// 事件优先级
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3170,32 +3283,33 @@ impl DesktopEvent {
 ```
 
 ### 18.2 事件归一化
-
-每个 backend 的 `subscribe()` 返回原始事件流，由 `EventNormalizer` 统一映射并推入 EventHub：
-
+合成器侧 `CompositorComponent::subscribe()` 返回 `core::event::EventStream`，由具体
+组件包装为 `RawSource`（`event/src/adapter.rs`）再交 `EventNormalizer` 归一化推入 EventHub。
+`EventSource` 保留为事件源标识枚举（core/src/event.rs / event/src/events.rs 两处同形，
+见 §18.1）——与 `RawSource` trait 不同名、不同物。
 ```rust
 // event/src/adapter.rs
-
-pub trait EventSource {
+pub trait RawSource: Send + Sync {
     fn source_name(&self) -> &'static str;
+    fn source_kind(&self) -> crate::EventSource;
     fn events(&self) -> BoxStream<'static, RawEvent>;
 }
 
-pub struct EventNormalizer { sources: Vec<Box<dyn EventSource>>, hub: EventHub }
+/// 设计文档 §18.2 中 `EventSource` trait 的别名——crate 内 `EventSource`
+/// 名称已被 core 的事件源标识枚举占用（§18.1）。
+pub type SourceAdapter = dyn RawSource;
+
+pub struct EventNormalizer {
+    hub: EventHub,
+    sources: Vec<Box<dyn RawSource>>,
+    resolve: Option<crate::normalize::WindowResolver>,
+    ring: crate::ring::EventRing,
+}
 
 impl EventNormalizer {
-    pub fn run(self) {
-        for source in self.sources {
-            let hub = self.hub.clone();
-            tokio::spawn(async move {
-                let mut events = source.events();
-                while let Some(raw) = events.next().await {
-                    if let Some(evt) = normalize(source.source_name(), raw) {
-                        hub.publish(evt);
-                    }
-                }
-            });
-        }
+    pub fn run(self) -> Vec<&'static str> {
+        // 为每个源 spawn 一个 tokio task，归一化后 publish + 写入环形缓冲。
+        // 返回启动的源名列表（供 doctor 输出）。
     }
 }
 ```
@@ -3208,7 +3322,7 @@ impl EventNormalizer {
 ### 18.3 事件归一化伪代码
 
 ```rust
-// events/src/normalize.rs
+// event/src/normalize.rs
 
 pub async fn normalize(raw: RawEvent) -> DesktopEvent {
     match raw {
@@ -3235,8 +3349,7 @@ pub async fn normalize(raw: RawEvent) -> DesktopEvent {
 ### 18.4 事件风暴与背压
 
 - EventHub 使用 `tokio::sync::mpsc` 有界通道（capacity=1024），超限丢弃 `Low` 优先级事件
-- 事件优先级：`High`（窗口焦点/开关——必须送达）> `Medium`（工作区切换/监视器变化）> `Low`（音量/DPMS/外观）
-- 组件事件源统一实现 `EventSource` trait，上游背压通过 `poll_ready()` 显式反馈
+- 组件事件源统一实现 `RawSource` trait（`SourceAdapter = dyn RawSource`），上游背压通过 `poll_ready()` 显式反馈
 
 ### 18.5 验证输出
 
@@ -3255,12 +3368,25 @@ pub async fn normalize(raw: RawEvent) -> DesktopEvent {
 ```rust
 // core/src/fallback.rs
 
+pub trait FallbackStep<T>: Send + Sync {
+    fn name(&self) -> &'static str;
+    fn run(&self) -> Pin<Box<dyn Future<Output = Result<T>> + Send + '_>>;
+}
+
 pub struct FallbackChain<T> {
     steps: Vec<Box<dyn FallbackStep<T>>>,
 }
 
 impl<T> FallbackChain<T> {
-    pub fn step(name: &'static str, f: impl AsyncFn() -> Result<T>) -> Self;
+    pub fn new() -> Self { ... }
+
+    /// `AsyncFn` 在当前稳定版尚不能作为 trait object 存储，
+    /// 等价的 boxed future trait 表达如下——对外签名语义不变（设计 §19.1 允许）。
+    pub fn step<F, Fut>(mut self, name: &'static str, f: F) -> Self
+    where
+        F: Fn() -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<T>> + Send + 'static,
+    { ... }
 
     /// 按顺序执行步骤，全部失败返回最后错误
     pub async fn execute(&self) -> Result<T> {
@@ -3333,7 +3459,45 @@ impl<T> FallbackChain<T> {
 
 ```toml
 [workspace]
-members = ["core", "components/*", "backends/*", "router", "event", "cli", "mcp", "daemon", "rootd", "sdk"]
+members = [
+    "components/input",
+    "components/displayserver/wayland",
+    "components/displayserver/x11",
+    "components/compositor/wayland-core",
+    "components/compositor/wlr-wayland",
+    "components/compositor/kwin",
+    "components/compositor/sway",
+    "components/compositor/hyprland",
+    "components/compositor/mutter",
+    "components/compositor/x11",
+    "components/systemd",
+    "components/logind",
+    "components/notification",
+    "components/appearance",
+    "components/launcher",
+    "components/clipboard",
+    "components/network",
+    "components/a11y",
+    "router",
+    "backends/kde",
+    "backends/dde",
+    "backends/gnome",
+    "backends/hyprland",
+    "backends/sway",
+    "backends/generic",
+    "backends/tty",
+    "shell",
+    "cli",
+    "rpc",
+    "daemon",
+    "rootd",
+    "modules/capture",
+    "mcp",
+    "event",
+]
+
+> `core` / `components/audio` / `components/power` 仅在 `[workspace.dependencies]`
+> 以 path 出现，**不是** workspace members。
 
 [workspace.dependencies]
 zbus = "5"
@@ -3383,17 +3547,31 @@ strip = true
 
 ```
 members = [
-    "core",                    # 类型系统 + 组件 trait + 错误
-    "components/compositor/kwin", "components/compositor/mutter", "components/compositor/hyprland", "components/compositor/treeland", "components/compositor/sway", "components/compositor/generic",  # 合成器组件
-    "components/compositor/wayland", "components/compositor/x11",   # 显示服务器组件
-    "components/audio", "components/network", "components/input", "components/capture", "components/a11y", "components/clipboard", "components/power", "components/notification", "components/appearance", "components/launcher",  # 公共组件
-    "input", "capture", "a11y",   # InputService / ScreenCapture / Accessibility 组件
-    "router", "event",         # 语义路由 + 事件流
-    "cli", "mcp", "sdk", "daemon",  # Agent 接口层
+    # 显示服务器协议层（不实现 CompositorComponent）
+    "components/displayserver/wayland", "components/displayserver/x11",
+    # 合成器组件
+    "components/compositor/wayland-core", "components/compositor/wlr-wayland",
+    "components/compositor/kwin", "components/compositor/sway",
+    "components/compositor/hyprland", "components/compositor/mutter",
+    "components/compositor/x11",
+    # 系统与公共组件
+    "components/systemd", "components/logind", "components/network",
+    "components/a11y", "components/input", "components/notification",
+    "components/appearance", "components/launcher", "components/clipboard",
+    # 语义路由 + 事件流 + 截图
+    "router", "event", "modules/capture",
+    # 后端装配器
+    "backends/kde", "backends/dde", "backends/gnome", "backends/hyprland",
+    "backends/sway", "backends/generic", "backends/tty",
+    # Agent 接口层 + 守护
+    "shell", "cli", "rpc", "mcp", "daemon", "rootd",
 ]
 ```
 
-每个组件 crate 可独立编译测试：`cargo test -p components-compositor-kwin`（组件级）→ `cargo test --workspace`（集成）。
+`core` / `components/audio` / `components/power` 不在 members——仅
+`[workspace.dependencies]` path 依赖，由引用方 crate 消费。
+
+每个组件 crate 可独立编译测试：`cargo test -p agent-shell-compositor-kwin`（组件级）→ `cargo test --workspace`（集成）。
 
 ### 20.6 打包依赖清单
 
@@ -3413,13 +3591,19 @@ members = [
 ```
 cli ──┐
 mcp ──┤
-sdk ──┼──► router ──► core (types/backend/fallback)
-event ─┘         │
-                 ├──► components/compositor/{kwin,mutter,hyprland,treeland,sway,generic} + backends/*
-                 ├──► components/input/{libei,ydotool,xdotool}
-                 ├──► components/capture/{screencast,screenshot,native}
-                 └──► components/a11y/{atspi_bridge,locator,actions}
+rpc ──┼──► router ──► core (types/backend/fallback)
+shell─┘         │
+                ├──► components/compositor/{kwin,mutter,hyprland,sway,x11,
+                │     wayland-core,wlr-wayland} + backends/*
+                ├──► components/displayserver/{wayland,x11}
+                ├──► components/input/
+                ├──► modules/capture/
+                └──► components/a11y/
 ```
+
+> DDE 的 Treeland 私有协议客户端在 `backends/dde/src/treeland.rs`（非
+> `components/compositor/treeland/`）；截图在 `modules/capture/`（非
+> `components/capture/`）。
 
 ## 附录 B：核心设计决策
 
@@ -3595,7 +3779,7 @@ event ─┘         │
 
 /// 公共组件接口：屏幕布局（components/compositor/x11 + DE 封装优先）
 #[async_trait]
-pub trait DisplayLayout: DesktopComponent {
+pub trait DisplayLayoutComponent: DesktopComponent {
     async fn get_monitor_layout(&self) -> Result<MonitorLayout, AgentShellError>;
     async fn apply_monitor_layout(&self, layout: &MonitorLayout) -> Result<(), AgentShellError>;
     async fn set_dpms(&self, monitor_id: &MonitorId, on: bool) -> Result<(), AgentShellError>;
@@ -3603,7 +3787,7 @@ pub trait DisplayLayout: DesktopComponent {
 
 /// 公共组件接口：音频（components/audio）
 #[async_trait]
-pub trait AudioComponent: DesktopComponent {
+pub trait AudioServerComponent: DesktopComponent {
     async fn get_volume(&self) -> Result<AudioState, AgentShellError>;
     async fn set_volume(&self, volume: f64) -> Result<(), AgentShellError>;
     async fn set_mute(&self, muted: bool) -> Result<(), AgentShellError>;
@@ -3643,7 +3827,7 @@ pub trait PowerComponent: DesktopComponent {
     async fn suspend(&self) -> Result<(), AgentShellError>;
     async fn hibernate(&self) -> Result<(), AgentShellError>;
     async fn power_off(&self) -> Result<(), AgentShellError>;
-    async fn get_battery_status(&self) -> Result<BatteryStatus, AgentShellError>;
+    async fn get_battery_status(&self) -> Result<BatteryState, AgentShellError>;
 }
 
 /// 公共组件接口：剪贴板（components/clipboard）
@@ -3847,11 +4031,11 @@ DE 检测 → 选定 backend → 按装配清单初始化公共组件实例
 │   ├── 通知:       KdeNotification（org.freedesktop.Notifications KDE 后端）→ PortalNotification
 │   ├── 外观:       KdeAppearance（plasma-apply-wallpaperimage CLI + portal）→ PortalAppearance
 │   ├── 启动器:     KdeLauncher（org.kde.klauncher）→ PortalLauncher
-│   ├── 输入/截图/无障碍/剪贴板: 公共探测链（components/{input,capture,a11y,clipboard}/）
+│   ├── 输入/截图/无障碍/剪贴板: 公共探测链（components/{input,a11y,clipboard}/ + modules/capture/）
 │   └── 内部路由:   services.rs 探测 org.kde.Solid.PowerManagement → 命中用 KDE 封装，否则回退 UPower/portal
 
 ├── DDE backend（backends/dde/）
-│   ├── 合成器:     KWinCompositor(deepin-kwin)（components/compositor/kwin/）/ Treeland（components/compositor/treeland/）
+│   ├── 合成器:     KWinCompositor(deepin-kwin)（components/compositor/kwin/）/ Treeland（backends/dde/src/treeland.rs）
 │   ├── 音频:       PipeWireAudioServer（components/audio/）；DDE 封装：org.deepin.dde.Audio1（session bus）
 │   ├── 网络:       DDE 25: dde-network-core + NetworkManager ❓需真机确认；DDE 20: com.deepin.daemon.Network
 │   ├── 电源:       DdePower（org.deepin.dde.Power1，system bus）→ UPower
@@ -3859,7 +4043,7 @@ DE 检测 → 选定 backend → 按装配清单初始化公共组件实例
 │   ├── 通知:       DdeNotification ❓需真机确认（dde-daemon 无 org.deepin.dde.Notification1，可能在 dde-shell 中）
 │   ├── 外观:       DdeAppearance ❓需真机确认（org.deepin.dde.Appearance1，服务文件不在 dde-daemon）
 │   ├── 启动器:     DdeLauncher ❓需真机确认（org.deepin.dde.Application1 或 dde-am，服务文件不在 dde-daemon）
-│   ├── 输入/截图/无障碍/剪贴板: 公共探测链（components/{input,capture,a11y,clipboard}/）
+│   ├── 输入/截图/无障碍/剪贴板: 公共探测链（components/{input,a11y,clipboard}/ + modules/capture/）
 │   └── 内部路由:   dde_api.rs 探测 org.deepin.dde.Audio1（session bus）/ Power1（system bus）→ 命中用 DE 封装，否则回退公共组件
 
 ├── GNOME backend（backends/gnome/）
@@ -3871,7 +4055,7 @@ DE 检测 → 选定 backend → 按装配清单初始化公共组件实例
 │   ├── 通知:       GnomeNotification（org.freedesktop.Notifications GNOME 后端）→ PortalNotification
 │   ├── 外观:       GnomeAppearance（gsettings org.gnome.desktop.background + portal）→ PortalAppearance
 │   ├── 启动器:     GnomeLauncher（gio launch + portal）→ PortalLauncher
-│   ├── 输入/截图/无障碍/剪贴板: 公共探测链（components/{input,capture,a11y,clipboard}/）
+│   ├── 输入/截图/无障碍/剪贴板: 公共探测链（components/{input,a11y,clipboard}/ + modules/capture/）
 │   └── 内部路由:   services.rs 探测 org.gnome.SettingsDaemon.Power → 命中用 GNOME 封装，否则回退 UPower/portal
 
 ├── Hyprland backend（backends/hyprland/）
@@ -3884,45 +4068,126 @@ DE 检测 → 选定 backend → 按装配清单初始化公共组件实例
 │   └── 其余:       公共组件探测链 + xdg-desktop-portal-wlr（ScreenCast/Screenshot 仅）+ portal-gtk 兜底
 
 └── Generic backend（backends/generic/）
-    ├── 合成器:     X11Compositor / WlrWaylandCompositor（components/compositor/generic/）
+    ├── 合成器:     X11Compositor / WlrWaylandCompositor（components/compositor/x11/ + components/compositor/wlr-wayland/）
     └── 其余:       公共组件探测链 + portal-gtk 兜底
 ```
-### 21.7 实现示例：DDE 音频
+### 21.7 实现示例：DDE 音频 + DePriorityRouter
+
+#### DDE 音频两级调用（`backends/dde/src/dde_audio.rs`）
 
 ```rust
-// backends/dde/src/dde_api.rs（音频）
+// 服务名按版本探测：DDE25 主名 org.deepin.dde.Audio1，
+// 失败回退 DDE20 com.deepin.daemon.Audio（DDE25 上为别名）。
+pub const DDE25_AUDIO: &str = "org.deepin.dde.Audio1";
+pub const DDE20_AUDIO: &str = "com.deepin.daemon.Audio";
+
+// 两版根对象路径约定：/{base}/Audio1 或 /{base}/Audio。
+const ROOT_PATH_CANDIDATES: [&str; 3] = [
+    "/org/deepin/dde/Audio1",
+    "/com/deepin/daemon/Audio",
+    "/org/deepin/daemon/Audio",
+];
 
 pub struct DdeAudio {
-    audio1: Audio1Proxy,   // org.deepin.dde.Audio1
+    conn: zbus::Connection,
+    variant: AudioServiceVariant,
+    root_path: OwnedObjectPath,
 }
 
 impl DdeAudio {
-    pub async fn new() -> Result<Self> {
-        let conn = zbus::Connection::session().await?;
-        let audio1 = Audio1Proxy::new(&conn).await?;
-        Ok(Self { audio1 })
+    /// 探测：服务名在位 + DefaultSink 属性可读才视为命中。
+    pub async fn with_connection(conn: &zbus::Connection) -> Result<Self> { ... }
+
+    /// 根对象只暴露属性与 Sink 子对象枚举，不直接暴露音量方法——
+    /// 控制必须落到 DefaultSink 指向的 Sink 子对象。
+    async fn default_sink_path(&self) -> Result<OwnedObjectPath> {
+        let p = self.root_proxy().await?;
+        let v: OwnedValue = p.get_property("DefaultSink").await?;
+        OwnedObjectPath::try_from(v).map_err(|e| dbus_err("sink path decode", e))
+    }
+}
+
+impl AudioServerComponent for DdeAudio {
+    async fn get_volume(&self) -> Result<AudioState> {
+        let path = self.default_sink_path().await?;
+        let p = self.sink_proxy(&path).await?;
+        let volume: f64 = p.get_property("Volume").await?;   // Sink 子对象
+        let muted: bool = p.get_property("Mute").await?;      // Sink 子对象
+        Ok(AudioState { volume: volume.clamp(0.0, 1.0), muted,
+                        default_sink: Self::sink_name(&path) })
     }
 
-    pub async fn get_volume_and_mute(&self) -> Result<AudioState> {
-        // DDE Audio1 以属性形式暴露
-        let vol: f64 = self.audio1.volume().await?;       // 0.0 - 1.0
-        let muted: bool = self.audio1.mute().await?;
-        let sink: String = self.audio1.default_sink().await?;
-        Ok(AudioState { volume: vol, muted, default_sink: sink })
-    }
-
-    pub async fn set_volume(&self, volume: f64) -> Result<()> {
-        // SetVolume(double v, bool isPlay)
-        self.audio1.set_volume(volume.clamp(0.0, 1.0), false).await?;
+    async fn set_volume(&self, volume: f64) -> Result<()> {
+        let path = self.default_sink_path().await?;
+        let p = self.sink_proxy(&path).await?;
+        // SetVolume(double)——Sink 子对象方法，非根对象；值 clamp 到 0.0-1.0。
+        let _: () = p.call("SetVolume", &(volume.clamp(0.0, 1.0),)).await?;
         Ok(())
     }
 
-    pub async fn set_mute(&self, muted: bool) -> Result<()> {
-        self.audio1.set_mute(muted).await?;
+    async fn set_mute(&self, muted: bool) -> Result<()> {
+        let path = self.default_sink_path().await?;
+        let p = self.sink_proxy(&path).await?;
+        let _: () = p.call("SetMute", &(muted,)).await?;      // Sink 子对象
+        Ok(())
+    }
+
+    async fn set_default_sink(&self, sink_name: &str) -> Result<()> {
+        // Sinks 列表按子对象短名匹配后，根对象 SetDefaultSink(o)；未匹配报结构化错误。
+        let target = self.sink_paths().await?
+            .iter().find(|p| Self::sink_name(p) == sink_name)
+            .ok_or_else(|| AgentShellError::DBus(format!("unknown sink {sink_name:?}")))?;
+        let p = self.root_proxy().await?;
+        let _: () = p.call("SetDefaultSink", &(target,)).await?;
         Ok(())
     }
 }
 ```
+
+#### DePriorityRouter：trait 注入解耦（`components/audio/src/router.rs`）
+
+```rust
+pub enum AudioChannel {
+    DeWrapper(&'static str), PipeWireCli, PulseAudioCli,
+}
+
+/// DE 专有音频封装回调接口——由各 backend 的 DdeAudio 实现；
+/// router 只依赖此 trait，不反向依赖具体 backend crate。
+pub trait DeAudioWrapper: Send + Sync {
+    async fn service_exists(&self) -> bool;          // DefaultSink 可读为判据
+    fn service_name(&self) -> &'static str;          // 实际命中服务名
+    fn inner(&self) -> &dyn AudioServerComponent;    // 委托底层实现
+}
+
+pub struct DePriorityRouter {
+    de: BackendKind,
+    fallback: Box<dyn AudioServerComponent>,
+    de_wrapper: Option<Box<dyn DeAudioWrapper>>,
+    last_channel: std::sync::atomic::AtomicU8,
+}
+
+impl DePriorityRouter {
+    pub fn new(de: BackendKind,
+               fallback: Box<dyn AudioServerComponent>,
+               fallback_channel: AudioChannel,
+               de_wrapper: Option<Box<dyn DeAudioWrapper>>) -> Self { ... }
+
+    /// 路由决策核心：DE 封装服务在位 → 委托 DE 实现；
+    /// 否则 → 公共降级实例（wpctl/pactl）。
+    async fn resolve(&self) -> (&dyn AudioServerComponent, bool) {
+        if let Some(w) = &self.de_wrapper {
+            if w.service_exists().await { return (w.inner(), true); }
+        }
+        (self.fallback.as_ref(), false)
+    }
+}
+
+// DePriorityRouter 自身实现 AudioServerComponent，
+// 每个方法 resolve().await 后委托给返回的实现。
+```
+
+DDE 装配（`backends/dde/src/assemble.rs`）：先试 `DdeAudio`（服务在位 + 属性可读），
+失败回退 `agent_shell_audio::router::assemble_audio_router(BackendKind::Dde)`。
 
 ### 21.8 实现示例：GNOME 屏幕布局
 
@@ -4041,62 +4306,40 @@ Tool::new("set_color_scheme").description("切换深色/浅色模式").input_sch
 
 ### 21.12 项目结构扩展
 
+> 本设计早期草案曾规划 `services/`（系统服务能力层）与 `components/portal/`
+> （跨 DE portal 公共降级）两个 crate。实现落地后两者均未建立——系统服务能力
+> 由 `components/{audio,network,power,clipboard,…}` 与 `core/src/services.rs`
+> 承担，portal 降级落在各 component 内部或 backend 装配层。下为实际结构：
+
 ```
 agent-shell/
-├── services/                     # 新增: 系统服务能力层
-│   ├── Cargo.toml
-│   └── src/
-│       ├── mod.rs               # 各组件接口 + DePriorityRouter（DE 封装优先）
-│       ├── display.rs           # MonitorLayout 类型 + 公共工具
-│       ├── audio.rs             # AudioState 类型 + PulseAudio 公共封装
-│       ├── network.rs           # NetworkManager 公共封装
-│       ├── apps.rs              # .desktop 解析 + 应用列表
-│       ├── notifications.rs     # Notifications 公共封装
-│       ├── power.rs             # login1 + UPower 公共封装
-│       ├── clipboard.rs         # portal Clipboard + wl-clipboard 公共封装
-│       └── appearance.rs        # Settings + Wallpaper portal 公共封装
-│
-├── backends/                    # DE 专有实现（每个 DE 一个模块）
-│   ├── dde/                     # DDE backend
-│   │   ├── mod.rs              # DdeBackend 装配清单（DE 封装优先路由）
-│   │   ├── display.rs          # org.deepin.dde.Display1
-│   │   ├── audio.rs            # org.deepin.dde.Audio1
-│   │   ├── network.rs          # org.deepin.dde.Network1（调研确认）
-│   │   ├── apps.rs             # org.deepin.dde.Application1 / dde-am
-│   │   ├── notifications.rs    # org.deepin.dde.Notification1
-│   │   ├── power.rs            # org.deepin.dde.Power1 + LockService1
-│   │   └── appearance.rs       # org.deepin.dde.Appearance1
-│   ├── kde/                     # KDE backend
-│   │   ├── mod.rs              # KdeBackend 装配清单（DE 封装优先路由）
-│   │   ├── display.rs          # org.kde.KScreen
-│   │   ├── power.rs            # org.kde.Solid.PowerManagement + kscreenlocker
-│   │   ├── notification.rs     # KdeNotification
-│   │   ├── appearance.rs       # KdeAppearance
-│   │   └── apps.rs             # org.kde.klauncher
-│   ├── gnome/                   # GNOME backend
-│   │   ├── mod.rs              # GnomeBackend 装配清单（DE 封装优先路由）
-│   │   ├── display.rs          # org.gnome.Mutter.DisplayConfig
-│   │   ├── audio.rs            # org.gnome.SettingsDaemon.Audio
-│   │   ├── power.rs            # org.gnome.SettingsDaemon.Power + ScreenSaver
-│   │   ├── notification.rs     # GnomeNotification
-│   │   └── appearance.rs       # GnomeAppearance
-│   └── hyprland/                # Hyprland backend
-│       ├── mod.rs              # HyprlandBackend 装配清单
-│       └── display.rs          # hyprctl output + keyword monitor
-│
-└── components/portal/           # 跨 DE portal 公共降级（components/ 下）
-    ├── Cargo.toml
-    └── src/
-        ├── mod.rs              # Portal 公共组件（DE 无封装时降级用）
-        ├── clipboard.rs        # org.freedesktop.portal.Clipboard
-        ├── notifications.rs    # org.freedesktop.portal.Notification
-        ├── network.rs          # org.freedesktop.portal.NetworkMonitor
-        ├── power.rs            # org.freedesktop.portal.PowerProfileMonitor
-        ├── settings.rs         # org.freedesktop.portal.Settings
-        ├── wallpaper.rs        # org.freedesktop.portal.Wallpaper
-        ├── openuri.rs          # org.freedesktop.portal.OpenURI
-        └── dynamic_launcher.rs # org.freedesktop.portal.DynamicLauncher
+├── core/                         # 类型系统 + 组件 trait + 错误（非 member，path 依赖）
+│   └── src/ { component.rs, registry.rs, services.rs, error.rs, … }
+├── components/
+│   ├── audio/                    # { lib.rs, router.rs, pipewire.rs, pulseaudio.rs }
+│   ├── network/                  # { lib.rs, networkmanager.rs, networkd.rs }
+│   ├── power/                    # { lib.rs, router.rs }
+│   ├── input/ a11y/ clipboard/ notification/ appearance/ launcher/
+│   ├── systemd/ logind/          # systemd / logind 能力
+│   ├── displayserver/ {wayland, x11}/
+│   └── compositor/ {wayland-core, wlr-wayland, kwin, sway, hyprland, mutter, x11}/
+├── backends/                     # DE 专有装配（每个 DE 一个 crate）
+│   ├── dde/                      # { lib.rs, assemble.rs, dde_api.rs, dde_audio.rs,
+│   │                             #   dde_compositor.rs, compositor.rs, treeland.rs,
+│   │                             #   protocol_gen.rs, version.rs }
+│   ├── kde/                      # { lib.rs, assemble.rs, services.rs }
+│   ├── gnome/                    # { lib.rs, assemble.rs, services.rs }
+│   ├── hyprland/ sway/ generic/ tty/
+├── router/                       # 语义路由
+├── event/                        # 事件流 + 归一化
+├── modules/capture/              # 截图
+├── shell/                        # 聚合 shell（原设计 SDK 并入）
+├── rpc/ cli/ mcp/ daemon/ rootd/ # Agent 接口层 + 守护
+└── packaging/                    # polkit policy + 打包
 ```
+
+portal 公共降级（Clipboard/Notification/OpenURI/…）没有独立 crate：公共组件内部
+优先 portal 标准接口、失败回退 CLI/协议，具体见 §21.6 装配矩阵与各组件章节。
 
 ### 21.13 systemd 服务管理
 
@@ -5667,75 +5910,78 @@ impl AgentShell {
 **响应服务注册**（Rust 侧）：
 
 ```rust
-// core/src/kwin_bridge.rs
+// components/compositor/kwin/src/dbus_bridge.rs
 
-pub struct KwinBridge {
-    conn: zbus::Connection,
-    pending: tokio::sync::Mutex<HashMap<String, oneshot::Sender<String>>>,
-    script_manifest: Vec<&'static str>,   // 预置脚本名
+/// 按请求 id 分发回传的共享表（ResponseService 写、查询协程读删）。
+#[derive(Default)]
+struct ResponseRouter {
+    waiters: HashMap<String, oneshot::Sender<String>>,
+}
+type SharedRouter = Arc<Mutex<ResponseRouter>>;
+
+/// D-Bus ↔ KWin Scripting 桥接（补充通道入口）。
+pub struct KWinBridge {
+    conn: Connection,                          // session bus 保活句柄
+    router: SharedRouter,                      // 按请求 id 的回传路由表
+    event_rx: Mutex<Option<mpsc::UnboundedReceiver<Value>>>,  // subscribe 取走
+}
+
+/// `com.agent_shell.Response` 响应服务。
+struct ResponseService {
+    router: SharedRouter,
+    events: mpsc::UnboundedSender<Value>,
 }
 
 #[zbus::interface(name = "com.agent_shell.Response")]
-impl KwinBridge {
-    /// KWin JS 调用：sendResult(JSON字符串)
-    async fn send_result(&self, payload: String) -> zbus::fdo::Result<()> {
-        let mut pending = self.pending.lock().await;
-        if let Some(tx) = pending.remove(call_token()) {
-            let _ = tx.send(payload);
+impl ResponseService {
+    /// JS 侧 `callDBus(..., "sendResult", json)` 的接收端。
+    /// 必须 camelCase 注解：zbus v5 默认导出 PascalCase `SendResult`，
+    /// 与脚本常量 RESPONSE_METHOD 不一致会致 UnknownMethod 5s timeout。
+    #[zbus(name = "sendResult")]
+    async fn send_result(&self, payload: String) {
+        // {"req": "<uuid>", "result": <json>} → 按 req 路由到等待者；
+        // 无 req 字段 → 整条 JSON 进事件队列（event_monitor.js）。
+        match serde_json::from_str::<Value>(&payload) {
+            Ok(v) => match v.get("req").and_then(Value::as_str) {
+                Some(req_id) => {
+                    let matched = self.router.lock().await.dispatch(req_id, payload);
+                    if !matched { tracing::debug!(req = req_id, "no waiter (late/dup)"); }
+                }
+                None => { let _ = self.events.send(v); }
+            },
+            Err(e) => tracing::warn!("sendResult non-JSON payload dropped: {e}"),
         }
-        Ok(())
-    }
-}
-
-impl KwinBridge {
-    /// 执行一个 KWin 脚本并等待结果
-    pub async fn eval(&self, script_body: &str) -> Result<String> {
-        // 生成唯一 token
-        let token = format!("req-{}", uuid());
-        let (tx, rx) = oneshot::channel();
-        self.pending.lock().await.insert(token.clone(), tx);
-
-        // 构造内联脚本：包装用户代码 + callDBus 回传
-        let wrapped = format!(
-            r#"(function() {{
-                var __result;
-                try {{ __result = ({}); }}
-                catch (e) {{ __result = {{ error: String(e) }}; }}
-                callDBus("com.agent_shell.Response", "/com/agent_shell/response",
-                         "com.agent_shell.Response", "sendResult",
-                         JSON.stringify({{ token: "{}", data: __result }}));
-            }})();
-            "#, script_body, token
-        );
-
-        // loadScript → run → 等待 → stop
-        self.load_and_run(&wrapped).await?;
-        tokio::time::timeout(Duration::from_secs(5), rx)
-            .await
-            .map_err(|_| AgentShellError::Timeout("kwin script".into()))?
-            .map_err(Into::into)
     }
 }
 ```
 
-**预置脚本清单**（内嵌 `include_str!`，随二进制打包）：
+方法名常量在 `components/compositor/kwin/src/scripts.rs` 与回传模板共享：
+`RESPONSE_METHOD = "sendResult"`，响应服务 `#[zbus(name = "sendResult")]` 与之
+对齐（§22.4 D3 方案 + TSI-2436 实测）。
+
+**预置脚本清单**（`scripts.rs` 的 `ScriptTemplate` 枚举，模板 inline 渲染而非文件目录）：
 
 ```
-core/kwin_scripts/
+components/compositor/kwin/src/scripts.rs  →  ScriptTemplate 变体：
 ├── list_windows.js
 ├── get_active_window.js
-├── get_window_props.js
-├── move_window.js
-├── set_geometry.js
 ├── focus_window.js
-├── minmax_close.js
-├── list_desktops.js
-├── monitor_layout.js
-├── event_subscribe.js      ← 长驻事件脚本
-└── helpers.js              ← 通用工具函数
+├── move_window.js
+├── resize_window.js
+├── close_window.js
+├── set_window_geometry.js
+├── minimize_window.js
+├── maximize_window.js
+├── list_workspaces.js
+├── switch_workspace.js
+├── move_window_to_workspace.js
+├── list_monitors.js
+└── event_monitor.js                        ← 长驻事件脚本
 ```
 
-**事件订阅**：`event_subscribe.js` 常驻运行，把 KWin signals 转成 callDBus 事件；daemon 里 EventHub 统一接收。
+**事件订阅**：`event_monitor.js` 常驻运行（KWin 5/6 兼容由 `scripts.rs` 的 `Compat`
+内联生成），把 KWin signals 转成 callDBus 事件；响应服务无 `req` 字段的 payload
+整条进事件队列（§22.4 响应服务分支），daemon 里 EventHub 统一接收。
 
 **性能指标目标**：
 - 单次 eval 往返：≤ 50ms
@@ -6202,6 +6448,7 @@ jsonrpsee = "0.24"            # 或手动实现（协议简单）
 <policyconfig>
   <vendor>Agent Shell</vendor>
 
+  <!-- 软件包 -->
   <action id="com.agentshell.pkexec.install-package">
     <description>Install a software package</description>
     <message>Authentication is required to install packages</message>
@@ -6214,6 +6461,34 @@ jsonrpsee = "0.24"            # 或手动实现（协议简单）
     <annotate key="org.freedesktop.policykit.exec.allow_gui">true</annotate>
   </action>
 
+  <action id="com.agentshell.package.remove">
+    <description>Remove a software package</description>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+  </action>
+
+  <action id="com.agentshell.package.update">
+    <description>Update software packages</description>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+  </action>
+
+  <action id="com.agentshell.package.refresh">
+    <description>Refresh package metadata cache</description>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+  </action>
+
+  <!-- systemd system 单元 -->
   <action id="com.agentshell.service.control">
     <description>Start/stop/restart a system service</description>
     <defaults>
@@ -6232,9 +6507,19 @@ jsonrpsee = "0.24"            # 或手动实现（协议简单）
     </defaults>
   </action>
 
+  <!-- 系统日志 -->
   <action id="com.agentshell.system-log.view">
     <description>View full system journal</description>
-    <message>Authentication is required to view system logs</message>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+  </action>
+
+  <!-- 系统配置 -->
+  <action id="com.agentshell.sysctl.get">
+    <description>Read kernel parameters</description>
     <defaults>
       <allow_any>no</allow_any>
       <allow_inactive>no</allow_inactive>
@@ -6248,6 +6533,45 @@ jsonrpsee = "0.24"            # 或手动实现（协议简单）
       <allow_any>no</allow_any>
       <allow_inactive>no</allow_inactive>
       <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+  </action>
+
+  <action id="com.agentshell.hostname.set">
+    <description>Set system hostname</description>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+  </action>
+
+  <!-- 进程管理 -->
+  <action id="com.agentshell.process.kill">
+    <description>Kill a process (cross-user)</description>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+  </action>
+
+  <!-- 挂载 -->
+  <action id="com.agentshell.mount">
+    <description>Mount or unmount filesystems</description>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+  </action>
+
+  <!-- 只读特例：Job 状态查询无系统副作用 -->
+  <action id="com.agentshell.job.status">
+    <description>Query package operation job status</description>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>yes</allow_active>
     </defaults>
   </action>
 </policyconfig>
