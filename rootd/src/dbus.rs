@@ -6,10 +6,14 @@
 //! - 非白名单方法由 lib `dispatch` 拒绝（默认拒绝）
 //! - `JobProgress`/`JobDone` 信号经 `job_snapshot`/`job_drain_done` 驱动
 use crate::{
-    dispatch, job_drain_done, job_snapshot, polkit_action_for, JobState, COMMAND_TIMEOUT,
-    JOURNAL_QUERY_TIMEOUT,
+    dispatch, dispatch_with_pid, job_drain_done, job_snapshot, kill_via_pidfd, polkit_action_for,
+    JobState, COMMAND_TIMEOUT, JOURNAL_QUERY_TIMEOUT, MAX_CONCURRENT_BLOCKING_COMMANDS,
 };
 use serde_json::Value;
+use std::os::fd::OwnedFd;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+use tokio::sync::Semaphore;
 use zbus::fdo;
 use zbus::message::Header;
 use zbus::object_server::Interface;
@@ -131,6 +135,14 @@ fn process_start_time(pid: u32) -> Option<u64> {
     tokens.get(19)?.parse::<u64>().ok()
 }
 
+/// 阻塞命令并发准入闸（TSI-2504）：`call_method` 分派前必须取得许可。
+/// 上限 [`MAX_CONCURRENT_BLOCKING_COMMANDS`] 远低于 tokio blocking 线程池
+/// 上限，防止调用潮耗尽线程与 spawn 的短生命周期子进程。
+///
+/// 范围仅覆盖经 `spawn_blocking` 执行的同步阻塞命令；Package* 后台 job
+/// 在 `spawn_package_job` 的独立线程中异步执行，不经此闸。
+static BLOCKING_SEMAPHORE: Semaphore = Semaphore::const_new(MAX_CONCURRENT_BLOCKING_COMMANDS);
+
 /// D-Bus 接口 `org.agentshell.Rootd`（§23.4.3 白名单）。
 pub struct RootdInterface;
 
@@ -162,8 +174,8 @@ impl RootdInterface {
         // （journalctl/systemctl/sysctl/hostnamectl/mount/umount），必须从
         // tokio worker 移出，否则单次长查询会占住 rootd 事件循环，后续调用
         // 全部排队超时（TSI-2493：全量 journalctl 200s，本应 0.4s 的
-        // --lines=50 排队）。
-        dispatch_with_timeout(method, args)
+        // --lines=50 排队）。TSI-2504：分派前经 Semaphore 限制并发阻塞命令数。
+        dispatch_with_semaphore(method, args, &BLOCKING_SEMAPHORE)
             .await
             .map_err(fdo::Error::Failed)
     }
@@ -172,32 +184,86 @@ impl RootdInterface {
 /// 带超时与事件循环隔离地执行一次 dispatch（§23.4.3 白名单方法）。
 ///
 /// 同步 `dispatch` 可能执行阻塞性系统命令；`spawn_blocking` 将阻塞工作移出
-/// tokio worker，`tokio::time::timeout` 在超时后放弃等待（底层阻塞线程与
-/// 子进程继续运行至自然结束——超时不 kill，见 §开放问题）。
+/// tokio worker，`tokio::time::timeout` 在超时后放弃等待（TSI-2504：随后
+/// kill 已 spawn 的子进程，杜绝超时后的孤儿进程）。
 /// 独立成 async 纯函数，使「超时 + spawn_blocking 包装」可被 `#[tokio::test]`
 /// 直接断言：把包装改回同步 `dispatch` 会使超时测试失败。
 async fn dispatch_with_timeout(method: &str, args: Vec<Value>) -> Result<Value, String> {
+    dispatch_with_timeout_tracked(method, args).await.0
+}
+
+/// `dispatch_with_timeout` 的实现，额外返回超时分支中被 kill 子进程的
+/// pidfd（`Option<OwnedFd>`）供测试断言 kill 确实发生；生产路径忽略该值。
+async fn dispatch_with_timeout_tracked(
+    method: &str,
+    args: Vec<Value>,
+) -> (Result<Value, String>, Option<OwnedFd>) {
     let timeout = command_timeout_for(method);
     let method_name = method.to_string();
+    let pidfd_slot: Arc<Mutex<Option<OwnedFd>>> = Arc::new(Mutex::new(None));
+    let slot = Arc::clone(&pidfd_slot);
     let result = tokio::time::timeout(
         timeout,
-        tokio::task::spawn_blocking(move || dispatch(&method_name, &args)),
+        tokio::task::spawn_blocking(move || dispatch_with_pid(&method_name, &args, &slot)),
     )
-    .await
-    .map_err(|_| format!("{method} timed out after {timeout:?}"))?
-    .map_err(|e| format!("{method} task join failed: {e}"))?;
-    result
+    .await;
+    match result {
+        // spawn_blocking 成功完成，内层为 dispatch 结果。
+        Ok(Ok(dispatch_result)) => (dispatch_result, None),
+        // spawn_blocking join 失败（blocking 线程 panic/中止）。
+        Ok(Err(join_err)) => (Err(format!("{method} task join failed: {join_err}")), None),
+        // 超时：短暂等待阻塞线程把子进程 pidfd 写入 slot 后 kill（TSI-2504）。
+        Err(_) => {
+            let killed = wait_for_pidfd(&pidfd_slot, Duration::from_millis(200))
+                .await
+                .inspect(kill_via_pidfd);
+            (Err(format!("{method} timed out after {timeout:?}")), killed)
+        }
+    }
+}
+
+/// 并发准入 + 超时隔离的分派（TSI-2504）。
+///
+/// 先取得 Semaphore 许可再进入 `dispatch_with_timeout`：许可只限并发
+/// 准入，不消耗命令自身的超时预算——排队等待不因本函数超时而失败。
+async fn dispatch_with_semaphore(
+    method: &str,
+    args: Vec<Value>,
+    sem: &Semaphore,
+) -> Result<Value, String> {
+    let _permit = sem
+        .acquire()
+        .await
+        .map_err(|_| "blocking semaphore closed".to_string())?;
+    dispatch_with_timeout(method, args).await
+}
+
+/// 轮询等待 pidfd 写入（阻塞线程已 spawn 子进程），最多 `grace` 时长。
+///
+/// Semaphore 许可先于 `spawn_blocking` 取得，16 上限远小于 blocking 线程池
+/// 512 容量，spawn 应在毫秒内发生；200ms 宽限覆盖调度抖动，避免 kill 落空。
+async fn wait_for_pidfd(slot: &Arc<Mutex<Option<OwnedFd>>>, grace: Duration) -> Option<OwnedFd> {
+    let deadline = std::time::Instant::now() + grace;
+    loop {
+        if let Some(fd) = slot.lock().expect("pidfd slot poisoned").take() {
+            return Some(fd);
+        }
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 }
 
 /// 方法对应的命令超时：`JournalQuery` 走专项超时（60s），其余走默认（30s）。
 ///
 /// 纯函数便于单测分支；阻塞性命令实际执行仍经 `dispatch_with_timeout` 的
-/// `spawn_blocking` + `timeout` 包装。`TestSlowMethod` 为测试专用慢方法，
-/// 映射亚秒超时保证回归测试在 CI 快速完成，而非真等 30s。
+/// `spawn_blocking` + `timeout` 包装。`TestSlowMethod`/`TestSpawnSleep` 为
+/// 测试专用，映射亚秒超时保证回归测试在 CI 快速完成，而非真等 30s。
 fn command_timeout_for(method: &str) -> std::time::Duration {
     if method == "JournalQuery" {
         JOURNAL_QUERY_TIMEOUT
-    } else if method == "TestSlowMethod" {
+    } else if method == "TestSlowMethod" || method == "TestSpawnSleep" {
         std::time::Duration::from_millis(100)
     } else {
         COMMAND_TIMEOUT
@@ -604,8 +670,12 @@ pub async fn drive_signals(
 }
 #[cfg(test)]
 mod tests {
-    use super::{command_timeout_for, dispatch_with_timeout, process_start_time};
+    use super::{
+        command_timeout_for, dispatch_with_semaphore, dispatch_with_timeout,
+        dispatch_with_timeout_tracked, process_start_time,
+    };
     use crate::{COMMAND_TIMEOUT, JOURNAL_QUERY_TIMEOUT};
+    use std::os::fd::AsRawFd;
 
     #[test]
     fn journal_query_uses_dedicated_timeout() {
@@ -637,6 +707,59 @@ mod tests {
     async fn fast_dispatch_returns_through_wrapper() {
         let r = dispatch_with_timeout("Hello", vec![]).await;
         assert!(r.is_ok(), "fast command must succeed: {r:?}");
+    }
+
+    #[tokio::test]
+    async fn semaphore_limits_concurrency() {
+        // 许可为 1：先占满，再分派必须排队等待，而非立即通过。
+        let sem = tokio::sync::Semaphore::new(1);
+        let permit = sem.try_acquire().expect("initial permit");
+        let fut = dispatch_with_semaphore("Hello", vec![], &sem);
+        tokio::pin!(fut);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut fut)
+                .await
+                .is_err(),
+            "dispatch must wait for a permit while semaphore is exhausted",
+        );
+        drop(permit);
+        assert!(fut.await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn timeout_kills_spawned_child() {
+        // TestSpawnSleep spawn `sleep 30` 后阻塞等待；100ms 超时后必须
+        // kill 子进程，不留孤儿。被 kill 的 pidfd 由包装函数返回，避免
+        // 全局状态在多测试并行下互相覆盖；pidfd 探测与 PID 无关，不惧复用。
+        let (r, killed) = dispatch_with_timeout_tracked("TestSpawnSleep", vec![]).await;
+        let err = r.expect_err("spawning slow command must time out");
+        assert!(err.contains("timed out"), "{err}");
+        let pidfd = killed.expect("timed-out child pidfd must be captured");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let rc = unsafe {
+                libc::syscall(
+                    libc::SYS_pidfd_send_signal,
+                    pidfd.as_raw_fd(),
+                    0,
+                    std::ptr::null::<libc::siginfo_t>(),
+                    0u32,
+                )
+            };
+            if rc != 0 {
+                assert_eq!(
+                    std::io::Error::last_os_error().raw_os_error(),
+                    Some(libc::ESRCH),
+                    "child should be gone; probe returned unexpected error",
+                );
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "child not killed within 2s",
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
     }
 
     #[test]

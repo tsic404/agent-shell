@@ -13,10 +13,10 @@
 pub mod dbus;
 use serde_json::{json, Value};
 use std::collections::HashMap;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
-
 /// 阻塞性系统命令的默认超时（秒）。
 ///
 /// `journalctl` 全量查询在超大 journal（数百万条）上可运行数分钟——
@@ -25,6 +25,19 @@ use std::time::Duration;
 /// （systemctl/sysctl/hostnamectl/mount/umount）的上界；Package* 方法
 /// 只返回 job id 不阻塞执行，30s 对其是无实际约束的兜底。
 pub const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// 并发阻塞命令的准入上限（TSI-2504）。
+///
+/// D-Bus 服务层用 [`tokio::sync::Semaphore`] 限制同时运行、经 `spawn_blocking`
+/// 执行并受 [`COMMAND_TIMEOUT`] 约束的**同步阻塞命令**数（journalctl/
+/// sysctl/hostnamectl/mount/umount，及 systemd D-Bus 调用）：16 路并发足以
+/// 覆盖正常负载，且远低于 tokio 默认 512 个 blocking 线程的上限——防止
+/// 恶意或失控的调用潮耗尽线程池与 spawn 的短生命周期子进程。
+///
+/// 注意：Package* 类方法只注册 job 即返回，真实包管理器进程在
+/// `spawn_package_job` 的独立线程中异步执行，不占用 blocking 线程池，
+/// 也不受本闸约束。
+pub const MAX_CONCURRENT_BLOCKING_COMMANDS: usize = 16;
 
 /// `JournalQuery` 专项超时（秒）。
 ///
@@ -46,16 +59,75 @@ pub const DEFAULT_JOURNAL_SINCE: &str = "-24h";
 ///
 /// 同步阻塞实现——调用方（D-Bus 服务层）负责经 `spawn_blocking` +
 /// `tokio::time::timeout` 包装，本函数自身不含超时，便于单测。
-fn run_command(cmd: &str, args: &[&str]) -> Result<String, String> {
-    let output = std::process::Command::new(cmd)
+///
+/// 子进程句柄经 [`Command`](std::process::Command) 的 `spawn()` 取得后立即
+/// 克隆为 pidfd 写入 `pid_slot`——超时后的 kill 据此以无 PID 复用竞态的
+/// 方式精确作用于本函数产生的进程（TSI-2504）。返回前清除 slot。
+fn run_command(
+    cmd: &str,
+    args: &[&str],
+    pid_slot: &Mutex<Option<OwnedFd>>,
+) -> Result<String, String> {
+    let mut child = std::process::Command::new(cmd)
         .args(args)
-        .output()
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
         .map_err(|e| format!("{cmd} execution failed: {e}"))?;
+    if let Ok(pidfd) = child_pidfd(&mut child) {
+        *pid_slot.lock().expect("pid_slot mutex poisoned") = Some(pidfd);
+    }
+    let output = match child.wait_with_output() {
+        Ok(out) => out,
+        Err(e) => {
+            *pid_slot.lock().expect("pid_slot mutex poisoned") = None;
+            return Err(format!("{cmd} wait failed: {e}"));
+        }
+    };
+    *pid_slot.lock().expect("pid_slot mutex poisoned") = None;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(format!("{cmd} failed: {stderr}"));
     }
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// 为已 spawn 的 [`Child`](std::process::Child) 生成 pidfd。
+///
+/// pidfd 引用进程本体而非 PID 数值，`pidfd_send_signal` 因此不受 PID 复用
+/// 竞态影响。项目 Linux-only，`SYS_pidfd_open` 常量随目标编译；老内核
+/// （< 5.3）或容器环境禁用 pidfd 时失败，调用方退化为不跟踪。
+fn child_pidfd(child: &mut std::process::Child) -> std::io::Result<OwnedFd> {
+    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, child.id(), 0) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: 非负返回值是内核分配的有效 fd，所有权转入 OwnedFd。
+    Ok(unsafe { OwnedFd::from_raw_fd(fd as i32) })
+}
+
+/// 通过 pidfd 向目标进程发送 SIGKILL（TSI-2504 超时后终结子进程）。
+///
+/// pidfd 引用进程本体，不因 PID 复用错杀；`ESRCH` 表示进程已自然退出，
+/// 属预期竞态，静默忽略。其余错误以 warn 记录——rootd 以 root 运行，
+/// kill 失败需要可见。
+pub fn kill_via_pidfd(pidfd: &OwnedFd) {
+    // SAFETY: pidfd 由 `child_pidfd` 保证有效（内核分配，OwnedFd 持有生命周期）。
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_pidfd_send_signal,
+            pidfd.as_raw_fd(),
+            libc::SIGKILL,
+            std::ptr::null::<libc::siginfo_t>(),
+            0u32,
+        )
+    };
+    if rc != 0 {
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() != Some(libc::ESRCH) {
+            tracing::warn!(error = %err, "pidfd_send_signal(SIGKILL) failed");
+        }
+    }
 }
 
 /// 当前安全模型版本（§23.4.3 版本对账字段）。
@@ -241,6 +313,24 @@ pub fn job_snapshot() -> Vec<JobState> {
 /// `polkit_action_for` 获取 action id 并完成 polkit 授权校验。本函数
 /// 不重复 polkit 校验——它是薄代理的业务逻辑层，授权是传输层职责。
 pub fn dispatch(method: &str, args: &[Value]) -> RootResult {
+    dispatch_with_pid(method, args, &Mutex::new(None))
+}
+
+/// 分派一个 rootd 方法调用，并允许跟踪产生的子进程（TSI-2504）。
+///
+/// 与 [`dispatch`] 唯一区别：产生子进程的五个方法（journalctl/sysctl/
+/// hostnamectl/mount/umount）将子进程 pidfd 写入 `pid_slot`，供调用方在
+/// 超时后 kill。其余方法忽略 slot。非白名单方法一律拒绝——rootd 的安全
+/// 模型是「默认拒绝 + 显式白名单」。
+///
+/// **polkit 前置**：调用方（D-Bus 服务层）必须在调用本函数**之前**经
+/// `polkit_action_for` 获取 action id 并完成 polkit 授权校验。本函数
+/// 不重复 polkit 校验——它是薄代理的业务逻辑层，授权是传输层职责。
+pub fn dispatch_with_pid(
+    method: &str,
+    args: &[Value],
+    pid_slot: &Mutex<Option<OwnedFd>>,
+) -> RootResult {
     match method {
         // 版本对账
         "Hello" => hello(),
@@ -254,26 +344,32 @@ pub fn dispatch(method: &str, args: &[Value]) -> RootResult {
         | "ServiceReload" => service_control(method, args),
         "DaemonReload" => daemon_reload(),
         // 系统日志
-        "JournalQuery" => journal_query(args),
+        "JournalQuery" => journal_query(args, pid_slot),
         // 系统配置
         "SysctlGet" => sysctl_get(args),
-        "SysctlSet" => sysctl_set(args),
-        "HostnameSet" => hostname_set(args),
+        "SysctlSet" => sysctl_set(args, pid_slot),
+        "HostnameSet" => hostname_set(args, pid_slot),
         // 进程（跨用户）
         "ProcessKill" => process_kill(args),
         // 挂载
-        "Mount" => mount(args),
-        "Unmount" => unmount(args),
+        "Mount" => mount(args, pid_slot),
+        "Unmount" => unmount(args, pid_slot),
         // job 状态查询（issue「job：status / progress 查询」）
         "JobStatus" => job_status_dispatch(args),
         // 会话 Token 管理（可选，无系统副作用）
         "SetToken" => set_token(args),
-        // 测试专用慢方法（仅 cfg(test)）：为 dbus 层超时回归测试提供真实
-        // 阻塞源，验证 spawn_blocking+timeout 包装确实隔离事件循环。
+        // 测试专用方法（仅 cfg(test)）：为 dbus 层超时回归测试提供真实
+        // 阻塞源（TestSlowMethod）与可被 kill 的子进程（TestSpawnSleep），
+        // 验证 spawn_blocking+timeout 包装隔离事件循环并终结子进程。
         #[cfg(test)]
         "TestSlowMethod" => {
             std::thread::sleep(std::time::Duration::from_secs(2));
             Ok(json!({"slow": true}))
+        }
+        #[cfg(test)]
+        "TestSpawnSleep" => {
+            run_command("sleep", &["30"], pid_slot)?;
+            Ok(json!({"spawned": true}))
         }
         _ => Err(format!("method not in whitelist: {method}")),
     }
@@ -568,7 +664,9 @@ fn run_job(program: &str, args: &[String]) -> (bool, Option<i32>, String) {
 
 /// spawn 后台包管理器进程并驱动 job 进度（JobProgress → JobDone）。
 ///
-/// 使用独立线程 + std `Command` 同步执行——不阻塞调用方；
+/// 使用独立线程 + std `Command` 同步执行——不阻塞调用方；该线程不经
+/// `spawn_blocking`、不受 [`MAX_CONCURRENT_BLOCKING_COMMANDS`] 闸约束，
+/// 进度经 job 注册表（`job_progress`/`job_done`）对外可见。
 fn spawn_package_job(job_id: String, method: String, cmd: Vec<String>) {
     std::thread::spawn(move || {
         job_progress(&job_id, 0.1); // queued
@@ -781,7 +879,7 @@ fn build_journal_args(filter_obj: &serde_json::Map<String, Value>) -> Vec<String
     cmd_args
 }
 
-fn journal_query(args: &[Value]) -> RootResult {
+fn journal_query(args: &[Value], pid_slot: &Mutex<Option<OwnedFd>>) -> RootResult {
     let filter = str_arg(args, 0)?;
     // 过滤表达式必须是合法 JSON 对象（结构化查询，非自由文本拼接）。
     let parsed: Value = serde_json::from_str(filter)
@@ -808,7 +906,7 @@ fn journal_query(args: &[Value]) -> RootResult {
     let mut cmd_args: Vec<String> = vec!["--output=json".into()];
     cmd_args.extend(build_journal_args(filter_obj));
     let refs: Vec<&str> = cmd_args.iter().map(|s| s.as_str()).collect();
-    let output = run_command("journalctl", &refs)?;
+    let output = run_command("journalctl", &refs, pid_slot)?;
     Ok(json!({
         "output": output,
         "output_format": "json-stream",
@@ -825,7 +923,7 @@ fn sysctl_get(args: &[Value]) -> RootResult {
     Ok(json!({ "key": key, "value": value.trim() }))
 }
 
-fn sysctl_set(args: &[Value]) -> RootResult {
+fn sysctl_set(args: &[Value], pid_slot: &Mutex<Option<OwnedFd>>) -> RootResult {
     let key = str_arg(args, 0)?;
     validate_sysctl_key(key)?;
     let value = args.get(1).ok_or("arg[1] (value) required")?;
@@ -846,7 +944,7 @@ fn sysctl_set(args: &[Value]) -> RootResult {
     );
     // 实际执行：sysctl -w key=value
     let arg = format!("{key}={value_str}");
-    run_command("sysctl", &["-w", &arg])?;
+    run_command("sysctl", &["-w", &arg], pid_slot)?;
     Ok(json!({ "accepted": true, "key": key }))
 }
 
@@ -865,7 +963,7 @@ fn validate_sysctl_key(key: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn hostname_set(args: &[Value]) -> RootResult {
+fn hostname_set(args: &[Value], pid_slot: &Mutex<Option<OwnedFd>>) -> RootResult {
     let hostname = str_arg(args, 0)?;
     validate_hostname(hostname)?;
     tracing::info!(
@@ -873,7 +971,7 @@ fn hostname_set(args: &[Value]) -> RootResult {
         "hostname set requested (polkit action: com.agentshell.hostname.set)",
     );
     // 实际执行：hostnamectl set-hostname
-    run_command("hostnamectl", &["set-hostname", hostname])?;
+    run_command("hostnamectl", &["set-hostname", hostname], pid_slot)?;
     Ok(json!({ "accepted": true, "hostname": hostname }))
 }
 
@@ -943,7 +1041,7 @@ fn process_kill(args: &[Value]) -> RootResult {
 // §23.4.3 Mount/Unmount。device/target/fstype/options 校验防注入。
 // 实际执行走 mount(2) 系统调用或 `mount` 命令。
 
-fn mount(args: &[Value]) -> RootResult {
+fn mount(args: &[Value], pid_slot: &Mutex<Option<OwnedFd>>) -> RootResult {
     let device = str_arg(args, 0)?;
     let target = str_arg(args, 1)?;
     let fstype = str_arg(args, 2)?;
@@ -964,7 +1062,7 @@ fn mount(args: &[Value]) -> RootResult {
     // 实际执行：mount -t fstype -o options device target
     let opts_str = options.join(",");
     let mount_args = vec!["-t", fstype, "-o", &opts_str, device, target];
-    run_command("mount", &mount_args)?;
+    run_command("mount", &mount_args, pid_slot)?;
     Ok(json!({
         "accepted": true,
         "device": device,
@@ -974,7 +1072,7 @@ fn mount(args: &[Value]) -> RootResult {
     }))
 }
 
-fn unmount(args: &[Value]) -> RootResult {
+fn unmount(args: &[Value], pid_slot: &Mutex<Option<OwnedFd>>) -> RootResult {
     let target = str_arg(args, 0)?;
     validate_mount_path(target, "target")?;
     tracing::info!(
@@ -982,7 +1080,7 @@ fn unmount(args: &[Value]) -> RootResult {
         "unmount requested (polkit action: com.agentshell.mount)",
     );
     // 实际执行：umount target
-    run_command("umount", &[target])?;
+    run_command("umount", &[target], pid_slot)?;
     Ok(json!({ "accepted": true, "target": target }))
 }
 
