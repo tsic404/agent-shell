@@ -13,6 +13,30 @@ use serde_json::{json, Value};
 use std::process::Stdio;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
+/// 结构化调用错误：RPC 错误携带 code，便于调用方按退出码分派
+/// （如 mount 的 polkit 拒绝 → exit 2，其余 → exit 1）。
+pub enum CallError {
+    /// JSON-RPC 错误响应（code + message）。
+    Rpc { code: i32, message: String },
+    /// 传输/协议错误（无 RPC code）。
+    Other(String),
+}
+
+impl std::fmt::Display for CallError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CallError::Rpc { code, message } => write!(f, "rpc error {code}: {message}"),
+            CallError::Other(msg) => write!(f, "{msg}"),
+        }
+    }
+}
+
+impl From<String> for CallError {
+    fn from(msg: String) -> Self {
+        CallError::Other(msg)
+    }
+}
+
 /// 一个 daemon 连接上的客户端会话。
 pub struct DaemonClient {
     child: Option<tokio::process::Child>,
@@ -71,7 +95,7 @@ impl DaemonClient {
 
     /// 单次请求往返。响应与 `events.notify` 通知共享行流，通知无 `id`——
     /// 读到通知即跳过，直到拿到匹配本请求 id 的响应。
-    pub async fn call(&mut self, method: &str, params: Value) -> Result<Value, String> {
+    pub async fn call_rpc(&mut self, method: &str, params: Value) -> Result<Value, CallError> {
         let id = self.next_id;
         self.next_id += 1;
         let req = if params.is_null() {
@@ -98,16 +122,33 @@ impl DaemonClient {
             }
             let resp = Response::from_line(&line)?;
             if resp.id != id {
-                return Err(format!("response id mismatch: got {} want {}", resp.id, id));
+                return Err(CallError::Other(format!(
+                    "response id mismatch: got {} want {}",
+                    resp.id, id
+                )));
             }
             match (resp.result, resp.error) {
                 (Some(v), None) => return Ok(v),
                 (None, Some(err)) => {
-                    return Err(format!("rpc error {}: {}", err.code, err.message))
+                    return Err(CallError::Rpc {
+                        code: err.code,
+                        message: err.message,
+                    })
                 }
-                _ => return Err("malformed response: neither result nor error".into()),
+                _ => {
+                    return Err(CallError::Other(
+                        "malformed response: neither result nor error".into(),
+                    ))
+                }
             }
         }
+    }
+
+    /// 单次请求往返（字符串错误，兼容既有调用方）。
+    pub async fn call(&mut self, method: &str, params: Value) -> Result<Value, String> {
+        self.call_rpc(method, params)
+            .await
+            .map_err(|e| e.to_string())
     }
 
     /// 无参调用。

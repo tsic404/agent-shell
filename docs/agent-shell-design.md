@@ -4814,6 +4814,10 @@ agent-shell service disable nginx.service
 agent-shell service mask nginx.service
 agent-shell service unmask nginx.service
 
+# 文件系统挂载/卸载
+agent-shell fs mount /dev/sda1 /mnt/data --fstype ext4 [--options rw,noatime]
+agent-shell fs unmount /mnt/data
+
 # 日志
 agent-shell journal query -u nginx.service --since "-1h" --priority err
 agent-shell journal follow -u nginx.service

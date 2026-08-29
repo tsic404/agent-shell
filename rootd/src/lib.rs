@@ -163,7 +163,7 @@ pub fn polkit_action_for(method: &str) -> Option<&'static str> {
         "SysctlSet" => Some("com.agentshell.sysctl.set"),
         "HostnameSet" => Some("com.agentshell.hostname.set"),
         "ProcessKill" => Some("com.agentshell.process.kill"),
-        "Mount" | "Unmount" => Some("com.agentshell.mount"),
+        "Mount" | "Unmount" => Some(agent_shell_rpc::MOUNT_POLKIT_ACTION),
         "JobStatus" => Some("com.agentshell.job.status"),
         "SetToken" => None, // 内部 token 管理，无系统副作用
         "Hello" => None,    // 版本对账，无副作用
@@ -1065,9 +1065,15 @@ fn mount(args: &[Value], pid_slot: &Mutex<Option<OwnedFd>>) -> RootResult {
         ?options,
         "mount requested (polkit action: com.agentshell.mount)",
     );
-    // 实际执行：mount -t fstype -o options device target
+    // 实际执行：mount -t fstype [-o options] device target
     let opts_str = options.join(",");
-    let mount_args = vec!["-t", fstype, "-o", &opts_str, device, target];
+    let mut mount_args: Vec<&str> = vec!["-t", fstype];
+    if !options.is_empty() {
+        mount_args.push("-o");
+        mount_args.push(&opts_str);
+    }
+    mount_args.push(device);
+    mount_args.push(target);
     run_command("mount", &mount_args, pid_slot)?;
     Ok(json!({
         "accepted": true,
@@ -1316,8 +1322,14 @@ mod tests {
             polkit_action_for("ProcessKill"),
             Some("com.agentshell.process.kill")
         );
-        assert_eq!(polkit_action_for("Mount"), Some("com.agentshell.mount"));
-        assert_eq!(polkit_action_for("Unmount"), Some("com.agentshell.mount"));
+        assert_eq!(
+            polkit_action_for("Mount"),
+            Some(agent_shell_rpc::MOUNT_POLKIT_ACTION)
+        );
+        assert_eq!(
+            polkit_action_for("Unmount"),
+            Some(agent_shell_rpc::MOUNT_POLKIT_ACTION)
+        );
         assert_eq!(
             polkit_action_for("JobStatus"),
             Some("com.agentshell.job.status")

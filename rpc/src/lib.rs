@@ -182,11 +182,18 @@ pub mod method {
     pub const SERVICE_CONTROL: &str = "service.control";
     /// 查看系统日志（rootd JournalQuery）。
     pub const SYSTEM_LOG_VIEW: &str = "system-log.view";
+    /// 挂载文件系统（rootd Mount，§23.4）。
+    pub const MOUNT: &str = "mount.mount";
+    /// 卸载文件系统（rootd Unmount，§23.4）。
+    pub const UNMOUNT: &str = "mount.unmount";
     /// rootd 版本对账（rootd Hello）。
     pub const ROOTD_HELLO: &str = "rootd.hello";
     /// 设置系统主机名（rootd HostnameSet）。
     pub const HOSTNAME_SET: &str = "hostname.set";
 }
+
+/// Mount/Unmount 共用的 polkit action id（§23.4.2）。
+pub const MOUNT_POLKIT_ACTION: &str = "com.agentshell.mount";
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Request {

@@ -89,6 +89,9 @@ pub enum Command {
     /// 系统服务控制（rootd 特权链路，§23.4）
     #[command(subcommand)]
     Service(ServiceCommand),
+    /// 文件系统挂载/卸载（rootd 特权链路，§23.4）
+    #[command(subcommand)]
+    Fs(FsCommand),
     Log(LogCommand),
     /// 主机名管理（rootd 特权链路，§23.4）
     #[command(subcommand)]
@@ -405,6 +408,31 @@ pub struct LogCommand {
 pub enum HostnameCommand {
     /// 设置系统主机名
     Set { name: String },
+}
+
+// ───────────────────────── fs（rootd 特权链路） ─────────────────────────
+
+/// 文件系统挂载/卸载命令（rootd Mount/Unmount，§23.4）。
+#[derive(Subcommand, Debug)]
+pub enum FsCommand {
+    /// 挂载文件系统
+    Mount {
+        /// 块设备路径（如 /dev/sda1）
+        device: String,
+        /// 挂载点路径
+        target: String,
+        /// 文件系统类型
+        #[arg(long)]
+        fstype: String,
+        /// 挂载选项（逗号分隔，如 rw,noatime）
+        #[arg(long, value_delimiter = ',')]
+        options: Option<Vec<String>>,
+    },
+    /// 卸载文件系统
+    Unmount {
+        /// 挂载点路径
+        target: String,
+    },
 }
 
 // ───────────────────────── 解析辅助 ─────────────────────────

@@ -9,10 +9,10 @@ mod client;
 mod format;
 mod repl;
 
-use agent_shell_rpc::{method, WindowOpKind};
+use agent_shell_rpc::{method, WindowOpKind, MOUNT_POLKIT_ACTION};
 use clap::Parser;
 use cli::{Cli, Command, OutputFormat};
-use client::DaemonClient;
+use client::{CallError, DaemonClient};
 use serde_json::{json, Value};
 
 fn main() {
@@ -68,6 +68,7 @@ async fn dispatch_command(command: Command, out: OutputFormat) -> CmdResult {
         Command::Shortcut(cmd) => shortcut(&mut c, cmd).await,
         Command::Timer(cmd) => timer(&mut c, cmd).await,
         Command::Service(cmd) => service_cmd(&mut c, cmd).await,
+        Command::Fs(cmd) => fs_cmd(&mut c, cmd).await,
         Command::Log(cmd) => log_cmd(&mut c, cmd).await,
         Command::Hostname(cmd) => hostname_cmd(&mut c, cmd).await,
     }
@@ -550,6 +551,71 @@ async fn log_cmd(c: &mut DaemonClient, cmd: cli::LogCommand) -> CmdResult {
     Ok(0)
 }
 
+/// 文件系统挂载/卸载（rootd Mount/Unmount，§23.4）。
+async fn fs_cmd(c: &mut DaemonClient, cmd: cli::FsCommand) -> CmdResult {
+    match cmd {
+        cli::FsCommand::Mount {
+            device,
+            target,
+            fstype,
+            options,
+        } => {
+            let r = c
+                .call_rpc(
+                    method::MOUNT,
+                    json!({
+                        "device": device,
+                        "target": target,
+                        "fstype": fstype,
+                        "options": options.unwrap_or_default(),
+                    }),
+                )
+                .await;
+            match r {
+                Ok(_) => {
+                    println!("mount {device} → {target} (fstype {fstype}): accepted");
+                    Ok(0)
+                }
+                Err(e) => fs_rpc_error(e),
+            }
+        }
+        cli::FsCommand::Unmount { target } => {
+            let r = c
+                .call_rpc(method::UNMOUNT, json!({ "target": target }))
+                .await;
+            match r {
+                Ok(_) => {
+                    println!("unmount {target}: accepted");
+                    Ok(0)
+                }
+                Err(e) => fs_rpc_error(e),
+            }
+        }
+    }
+}
+
+/// fs 命令 RPC 错误 → `CmdResult`：polkit 拒绝映射为 exit 2 与固定
+/// stderr，其余沿用统一 `rpc error {code}: {message}` + exit 1。
+fn fs_rpc_error(e: CallError) -> CmdResult {
+    match &e {
+        CallError::Rpc { code, message } if is_auth_required(*code, message) => {
+            eprintln!("error: authentication required: {}", MOUNT_POLKIT_ACTION);
+            Ok(2)
+        }
+        _ => Err(e.to_string()),
+    }
+}
+
+/// 判定 RPC 错误是否为 mount/unmount 的授权拒绝。
+///
+/// daemon 把 rootd 的 polkit 拒绝与挂载失败都折叠为 1005，仅消息可区分；
+/// 1004/1006 则按语义直接视为授权拒绝。
+fn is_auth_required(code: i32, message: &str) -> bool {
+    matches!(code, 1004 | 1006)
+        || (code == 1005
+            && message.contains(&format!("polkit denied action: {MOUNT_POLKIT_ACTION}")))
+}
+
 /// 把 `--filter` 原始字符串解析为 JSON 对象（§23.4 JournalQuery 参数契约）。
 fn parse_log_filter(raw: &str) -> Result<Value, String> {
     let v: Value =
@@ -623,7 +689,8 @@ fn process_rootd_error(e: &str) -> Option<(i32, String)> {
 #[cfg(test)]
 mod tests {
     use super::{
-        log_query_timeout_error, parse_log_filter, process_rootd_error, LOG_QUERY_TIMEOUT,
+        is_auth_required, log_query_timeout_error, parse_log_filter, process_rootd_error,
+        LOG_QUERY_TIMEOUT,
     };
 
     #[test]
@@ -690,5 +757,23 @@ mod tests {
     fn filter_non_object_rejected() {
         assert!(parse_log_filter(r#""free text""#).is_err());
         assert!(parse_log_filter("not json").is_err());
+    }
+
+    #[test]
+    fn auth_required_matches_confirmation_and_denied() {
+        assert!(is_auth_required(1006, "mount.mount (Always)"));
+        assert!(is_auth_required(1004, "operation denied"));
+    }
+
+    #[test]
+    fn auth_required_matches_polkit_message_only() {
+        let denied =
+            "rootd: org.freedesktop.DBus.Error.AuthFailed: polkit denied action: com.agentshell.mount";
+        assert!(is_auth_required(1005, denied));
+
+        let mount_failure =
+            "rootd: org.freedesktop.DBus.Error.Failed: mount failed: mount: /mnt: bad superblock";
+        assert!(!is_auth_required(1005, mount_failure));
+        assert!(!is_auth_required(1003, "not found"));
     }
 }

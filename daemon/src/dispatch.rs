@@ -104,6 +104,8 @@ pub async fn dispatch(daemon: &mut Daemon, req: &Request) -> Response {
         method::SYSTEM_LOG_VIEW => system_log_view(daemon, req).await,
         method::ROOTD_HELLO => rootd_hello(daemon).await,
         method::HOSTNAME_SET => hostname_set(daemon, req).await,
+        method::MOUNT => mount(daemon, req).await,
+        method::UNMOUNT => unmount(daemon, req).await,
         other => {
             return Response::err(
                 req.id,
@@ -186,6 +188,8 @@ fn operation_for(method_name: &str, params: &Option<Value>) -> Option<Operation>
         (method::SYSTEM_LOG_VIEW, L0),
         (method::ROOTD_HELLO, L0),
         (method::HOSTNAME_SET, L3),
+        (method::MOUNT, L4),
+        (method::UNMOUNT, L4),
     ];
     OPS.iter()
         .find(|(m, _)| *m == method_name)
@@ -831,6 +835,90 @@ async fn hostname_set(_d: &mut Daemon, req: &Request) -> RpcResult {
     Ok(json!({ "accepted": true, "hostname": hostname }))
 }
 
+// ───────────────────────── mount / unmount（§23.4） ─────────────────────────
+
+/// 挂载文件系统（rootd Mount）。
+///
+/// 参数：{ "device": "/dev/sda1", "target": "/mnt/data", "fstype": "ext4",
+///         "options": ["rw", "noatime"] }
+/// rootd 未安装时返回降级错误。
+async fn mount(_d: &mut Daemon, req: &Request) -> RpcResult {
+    let params = params_of(req)?;
+    let device = params
+        .get("device")
+        .and_then(|v| v.as_str())
+        .ok_or((RpcErrorCode::InvalidParams, "missing device".into()))?;
+    let target = params
+        .get("target")
+        .and_then(|v| v.as_str())
+        .ok_or((RpcErrorCode::InvalidParams, "missing target".into()))?;
+    let fstype = params
+        .get("fstype")
+        .and_then(|v| v.as_str())
+        .ok_or((RpcErrorCode::InvalidParams, "missing fstype".into()))?;
+    let options: Vec<String> = params
+        .get("options")
+        .map(parse_mount_options)
+        .transpose()?
+        .unwrap_or_default();
+
+    let proxy = crate::rootd_client::connect().await.ok_or((
+        RpcErrorCode::BackendUnavailable,
+        "rootd not installed — privileged operation unavailable".into(),
+    ))?;
+
+    proxy
+        .mount(device, target, fstype, options.clone())
+        .await
+        .map_err(|e| (RpcErrorCode::BackendError, format!("rootd: {e}")))?;
+    Ok(json!({
+        "accepted": true,
+        "device": device,
+        "target": target,
+        "fstype": fstype,
+        "options": options,
+    }))
+}
+
+/// 卸载文件系统（rootd Unmount）。
+///
+/// 参数：{ "target": "/mnt/data" }
+/// rootd 未安装时返回降级错误。
+async fn unmount(_d: &mut Daemon, req: &Request) -> RpcResult {
+    let params = params_of(req)?;
+    let target = params
+        .get("target")
+        .and_then(|v| v.as_str())
+        .ok_or((RpcErrorCode::InvalidParams, "missing target".into()))?;
+
+    let proxy = crate::rootd_client::connect().await.ok_or((
+        RpcErrorCode::BackendUnavailable,
+        "rootd not installed — privileged operation unavailable".into(),
+    ))?;
+
+    proxy
+        .unmount(target)
+        .await
+        .map_err(|e| (RpcErrorCode::BackendError, format!("rootd: {e}")))?;
+    Ok(json!({ "accepted": true, "target": target }))
+}
+
+/// 解析 `options` 参数：必须是字符串数组，逐项取 `&str`。
+fn parse_mount_options(v: &Value) -> Result<Vec<String>, (RpcErrorCode, String)> {
+    let arr = v.as_array().ok_or((
+        RpcErrorCode::InvalidParams,
+        "options must be an array".into(),
+    ))?;
+    arr.iter()
+        .map(|e| {
+            e.as_str().map(str::to_owned).ok_or((
+                RpcErrorCode::InvalidParams,
+                "option must be a string".into(),
+            ))
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1187,6 +1275,18 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mount_requires_confirmation_without_whitelist() {
+        // 默认配置无白名单 → mount（L4）需确认，且在 handler 之前短路
+        // （rootd 未安装时不会走到 BackendUnavailable）。
+        let mut d = Daemon::connect(Duration::from_secs(1)).await;
+        let resp = dispatch(&mut d, &req(method::MOUNT, Some(json!({})))).await;
+        assert_eq!(
+            resp.error.expect("error").code,
+            RpcErrorCode::ConfirmationRequired as i32
+        );
+    }
+
+    #[tokio::test]
     async fn hostname_set_gate_pass_reaches_handler() {
         // L4 白名单放行后进入 handler：缺失/非字符串 hostname 必须报
         // InvalidParams（证明门禁放行且 handler 已执行，而非 Denied 短路）。
@@ -1208,6 +1308,21 @@ mod tests {
                 RpcErrorCode::InvalidParams as i32
             );
         }
+    }
+
+    #[tokio::test]
+    async fn mount_validates_params_after_gate_passes() {
+        let mut d = Daemon::connect(Duration::from_secs(1)).await;
+        d.caller_id = "trusted".into();
+        d.security
+            .config
+            .permissions
+            .allow
+            .insert("trusted".into(), vec![PermissionLevel::L4]);
+        let resp = dispatch(&mut d, &req(method::MOUNT, Some(json!({})))).await;
+        let err = resp.error.expect("error");
+        assert_eq!(err.code, RpcErrorCode::InvalidParams as i32);
+        assert_eq!(err.message, "missing device");
     }
 
     #[tokio::test]
@@ -1233,6 +1348,37 @@ mod tests {
         assert_eq!(
             resp.error.expect("error").code,
             RpcErrorCode::BackendUnavailable as i32
+        );
+    }
+
+    #[tokio::test]
+    async fn unmount_validates_target_after_gate_passes() {
+        let mut d = Daemon::connect(Duration::from_secs(1)).await;
+        d.caller_id = "trusted".into();
+        d.security
+            .config
+            .permissions
+            .allow
+            .insert("trusted".into(), vec![PermissionLevel::L4]);
+        let resp = dispatch(&mut d, &req(method::UNMOUNT, Some(json!({})))).await;
+        let err = resp.error.expect("error");
+        assert_eq!(err.code, RpcErrorCode::InvalidParams as i32);
+        assert_eq!(err.message, "missing target");
+    }
+
+    #[test]
+    fn mount_options_rejects_non_array_and_non_string() {
+        assert_eq!(
+            parse_mount_options(&json!("rw")).unwrap_err().0,
+            RpcErrorCode::InvalidParams
+        );
+        assert_eq!(
+            parse_mount_options(&json!([1, 2])).unwrap_err().0,
+            RpcErrorCode::InvalidParams
+        );
+        assert_eq!(
+            parse_mount_options(&json!(["rw", "noatime"])).unwrap(),
+            vec!["rw".to_string(), "noatime".to_string()]
         );
     }
 }
