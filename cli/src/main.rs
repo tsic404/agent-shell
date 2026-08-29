@@ -608,12 +608,17 @@ fn fs_rpc_error(e: CallError) -> CmdResult {
 
 /// 判定 RPC 错误是否为 mount/unmount 的授权拒绝。
 ///
-/// daemon 把 rootd 的 polkit 拒绝与挂载失败都折叠为 1005，仅消息可区分；
-/// 1004/1006 则按语义直接视为授权拒绝。
+/// daemon 把 rootd 的 polkit 拒绝、polkit 基础设施故障与挂载失败都折叠为
+/// 1005，仅消息可区分：`polkit denied action:` 是明确拒绝，`polkit check:` /
+/// `polkit proxy:` 是 polkitd 不可达等授权协商故障，均归入授权拒绝；其余
+/// 1005（挂载失败、相对路径拒绝等）仍为普通后端错误。1004/1006 按语义直接
+/// 视为授权拒绝。
 fn is_auth_required(code: i32, message: &str) -> bool {
     matches!(code, 1004 | 1006)
         || (code == 1005
-            && message.contains(&format!("polkit denied action: {MOUNT_POLKIT_ACTION}")))
+            && (message.contains(&format!("polkit denied action: {MOUNT_POLKIT_ACTION}"))
+                || message.contains("polkit check:")
+                || message.contains("polkit proxy:")))
 }
 
 /// 把 `--filter` 原始字符串解析为 JSON 对象（§23.4 JournalQuery 参数契约）。
@@ -775,5 +780,28 @@ mod tests {
             "rootd: org.freedesktop.DBus.Error.Failed: mount failed: mount: /mnt: bad superblock";
         assert!(!is_auth_required(1005, mount_failure));
         assert!(!is_auth_required(1003, "not found"));
+    }
+
+    #[test]
+    fn auth_required_matches_polkit_infra_failure() {
+        // polkitd 不可达（CheckAuthorization 调用失败）→ 授权协商故障，exit 2。
+        let check =
+            "rootd: org.freedesktop.DBus.Error.AuthFailed: polkit check: org.freedesktop.DBus.Error.ServiceUnknown: The name org.freedesktop.PolicyKit1 was not provided by any .service files";
+        assert!(is_auth_required(1005, check));
+
+        // polkit 代理构建失败 → 同样归入授权拒绝。
+        let proxy = "rootd: org.freedesktop.DBus.Error.AuthFailed: polkit proxy: connection closed";
+        assert!(is_auth_required(1005, proxy));
+    }
+
+    #[test]
+    fn auth_required_rejects_non_auth_1005() {
+        // 相对路径 / 非法 fstype 等 rootd 校验错误折叠进 1005，仍 exit 1。
+        let rel_device =
+            "rootd: org.freedesktop.DBus.Error.Failed: device must be an absolute path";
+        assert!(!is_auth_required(1005, rel_device));
+
+        let bad_fstype = "rootd: org.freedesktop.DBus.Error.Failed: invalid fstype: \"ex;t4\"";
+        assert!(!is_auth_required(1005, bad_fstype));
     }
 }
