@@ -196,6 +196,11 @@ pub struct JobState {
 /// 测试串行闸：`JOBS` 是进程级全局静态，lib 内 job 测试与 dbus 内
 /// `drive_signals` 循环测试（后者每 200ms `job_drain_done`，会抽走前者
 /// 尚未断言完成的 job）必须互斥。parking_lot 守护可跨 `.await` 持有。
+///
+/// 同一把闸同时覆盖可注入 seam [`JOB_RUNNER`]：写入/清除 runner 的测试
+/// 辅助函数（`set_job_runner`/`clear_job_runner`）要求传入本锁的守护，
+/// 从编译期强制任何注入 runner 的测试先取得闸，防止未来新增的并行 job
+/// runner 测试在进程级全局 seam 上互相竞争。
 #[cfg(test)]
 pub(crate) static JOB_TEST_MUTEX: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
@@ -626,6 +631,10 @@ fn package_op(method: &str, args: &[Value]) -> RootResult {
 type JobRunner = fn(&str, &[String]) -> (bool, Option<i32>, String);
 
 /// 测试注入的包管理器执行器；`None` = 使用默认真实执行器。
+///
+/// 测试中的写入必须持有 [`JOB_TEST_MUTEX`]（经 `set_job_runner`/
+/// `clear_job_runner` 的守护参数强制），与 `JOBS` 注册表共享同一把测试
+/// 串行闸，杜绝并行测试在进程级全局 seam 上竞争。
 static JOB_RUNNER: Mutex<Option<JobRunner>> = Mutex::new(None);
 
 /// 按 UTF-8 字节边界截断 stderr 到 `max_bytes`（与 JobState「前 4 KiB」一致）。
@@ -1348,7 +1357,7 @@ mod tests {
     fn package_job_tracks_success() {
         let _guard = JOB_TEST_MUTEX.lock();
         let _ = job_drain_done();
-        set_job_runner(fake_success_runner);
+        set_job_runner(&_guard, fake_success_runner);
         let id = job_create("PackageInstall");
         spawn_package_job(
             id.clone(),
@@ -1362,7 +1371,7 @@ mod tests {
         let job = wait_job_done(&id);
         assert!(job.success, "{job:?}");
         assert_eq!(job.exit_code, Some(0));
-        clear_job_runner();
+        clear_job_runner(&_guard);
         let _ = job_drain_done();
     }
 
@@ -1370,7 +1379,7 @@ mod tests {
     fn package_job_tracks_failure() {
         let _guard = JOB_TEST_MUTEX.lock();
         let _ = job_drain_done();
-        set_job_runner(fake_failure_runner);
+        set_job_runner(&_guard, fake_failure_runner);
         let id = job_create("PackageRemove");
         spawn_package_job(
             id.clone(),
@@ -1385,8 +1394,38 @@ mod tests {
         assert!(!job.success, "{job:?}");
         assert_eq!(job.exit_code, Some(1));
         assert_eq!(job.stderr, "permission denied");
-        clear_job_runner();
+        clear_job_runner(&_guard);
         let _ = job_drain_done();
+    }
+
+    #[test]
+    fn job_runner_seam_defaults_to_real_executor() {
+        let _guard = JOB_TEST_MUTEX.lock();
+        // 未注入 runner 时走默认真实 spawn：`true` 成功、`false` 非零退出。
+        let (ok, code, stderr) = run_job("true", &[]);
+        assert!(ok);
+        assert_eq!(code, Some(0));
+        assert_eq!(stderr, "");
+
+        let (ok, code, _) = run_job("false", &[]);
+        assert!(!ok);
+        assert_eq!(code, Some(1));
+    }
+
+    #[test]
+    fn job_runner_seam_injects_and_clears() {
+        let _guard = JOB_TEST_MUTEX.lock();
+        set_job_runner(&_guard, fake_failure_runner);
+        let (ok, code, stderr) = run_job("apt-get", &["install".to_string()]);
+        assert!(!ok);
+        assert_eq!(code, Some(1));
+        assert_eq!(stderr, "permission denied");
+
+        clear_job_runner(&_guard);
+        // 清除后恢复默认真实执行器。
+        let (ok, code, _) = run_job("true", &[]);
+        assert!(ok);
+        assert_eq!(code, Some(0));
     }
 
     #[test]
@@ -1423,11 +1462,15 @@ mod tests {
         (false, Some(1), "permission denied".to_string())
     }
 
-    fn set_job_runner(r: JobRunner) {
+    /// 注入测试 runner。要求传入 [`JOB_TEST_MUTEX`] 的守护——从类型上保证
+    /// 任何触碰进程级全局 seam 的测试先持有测试串行闸（与 `JOBS` 注册表
+    /// 同闸），防止并行 job runner 测试互相竞争。
+    fn set_job_runner(_guard: &parking_lot::MutexGuard<'_, ()>, r: JobRunner) {
         *JOB_RUNNER.lock().expect("JOB_RUNNER mutex poisoned") = Some(r);
     }
 
-    fn clear_job_runner() {
+    /// 清除注入的 runner 并恢复默认真实执行器。要求持有 [`JOB_TEST_MUTEX`]。
+    fn clear_job_runner(_guard: &parking_lot::MutexGuard<'_, ()>) {
         *JOB_RUNNER.lock().expect("JOB_RUNNER mutex poisoned") = None;
     }
 
