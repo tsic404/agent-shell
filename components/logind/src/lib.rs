@@ -14,9 +14,18 @@ use async_trait::async_trait;
 use std::fmt::Display;
 use zbus::zvariant::{ObjectPath, OwnedObjectPath};
 
-/// D-Bus 错误归一化：任何传输层错误 → [`AgentShellError::DBus`]。
+/// D-Bus 错误归一化：`org.freedesktop.DBus.Error.AccessDenied` → [`AgentShellError::Permission`]，
+/// 其余错误 → [`AgentShellError::DBus`]。
+///
+/// 权限类错误单独归一是降级链/测试判断的依据：缺 polkit 授权是环境状态，
+/// 而非调用失败或组件缺陷。
 fn dbus_err<E: Display>(e: E) -> AgentShellError {
-    AgentShellError::DBus(e.to_string())
+    let msg = e.to_string();
+    if msg.contains("org.freedesktop.DBus.Error.AccessDenied") {
+        AgentShellError::Permission(msg)
+    } else {
+        AgentShellError::DBus(msg)
+    }
 }
 
 /// `org.freedesktop.login1.Manager` 的 zbus proxy。
@@ -124,7 +133,7 @@ impl LogindComponent {
             .map_err(dbus_err)?
             .get_session(id)
             .await
-            .map_err(|e| AgentShellError::DBus(format!("GetSession({id}): {e}")))?;
+            .map_err(|e| dbus_err(format!("GetSession({id}): {e}")))?;
         Ok(owned.into_inner())
     }
 
@@ -192,7 +201,7 @@ impl SessionManagerComponent for LogindComponent {
             .map_err(dbus_err)?
             .list_sessions()
             .await
-            .map_err(|e| AgentShellError::DBus(format!("ListSessions: {e}")))?;
+            .map_err(|e| dbus_err(format!("ListSessions: {e}")))?;
         let mut infos = Vec::with_capacity(sessions.len());
         for (_, _, _, _, path) in sessions {
             infos.push(self.read_session(path.into_inner()).await?);
@@ -211,7 +220,7 @@ impl SessionManagerComponent for LogindComponent {
             .map_err(dbus_err)?
             .lock()
             .await
-            .map_err(|e| AgentShellError::DBus(format!("Session.Lock({id}): {e}")))
+            .map_err(|e| dbus_err(format!("Session.Lock({id}): {e}")))
     }
 
     async fn unlock_session(&self, id: &str) -> Result<()> {
@@ -221,7 +230,7 @@ impl SessionManagerComponent for LogindComponent {
             .map_err(dbus_err)?
             .unlock()
             .await
-            .map_err(|e| AgentShellError::DBus(format!("Session.Unlock({id}): {e}")))
+            .map_err(|e| dbus_err(format!("Session.Unlock({id}): {e}")))
     }
 
     async fn can_reboot(&self) -> Result<bool> {
@@ -231,7 +240,7 @@ impl SessionManagerComponent for LogindComponent {
             .map_err(dbus_err)?
             .can_reboot()
             .await
-            .map_err(|e| AgentShellError::DBus(format!("CanReboot: {e}")))?;
+            .map_err(|e| dbus_err(format!("CanReboot: {e}")))?;
         Ok(can_bool(&answer))
     }
 
@@ -242,7 +251,7 @@ impl SessionManagerComponent for LogindComponent {
             .map_err(dbus_err)?
             .reboot(false)
             .await
-            .map_err(|e| AgentShellError::DBus(format!("Reboot: {e}")))
+            .map_err(|e| dbus_err(format!("Reboot: {e}")))
     }
 
     async fn can_poweroff(&self) -> Result<bool> {
@@ -252,7 +261,7 @@ impl SessionManagerComponent for LogindComponent {
             .map_err(dbus_err)?
             .can_power_off()
             .await
-            .map_err(|e| AgentShellError::DBus(format!("CanPowerOff: {e}")))?;
+            .map_err(|e| dbus_err(format!("CanPowerOff: {e}")))?;
         Ok(can_bool(&answer))
     }
 
@@ -262,6 +271,22 @@ impl SessionManagerComponent for LogindComponent {
             .map_err(dbus_err)?
             .power_off(false)
             .await
-            .map_err(|e| AgentShellError::DBus(format!("PowerOff: {e}")))
+            .map_err(|e| dbus_err(format!("PowerOff: {e}")))
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn access_denied_maps_to_permission() {
+        let e = dbus_err("CanReboot: org.freedesktop.DBus.Error.AccessDenied: Permission denied");
+        assert!(matches!(e, AgentShellError::Permission(_)));
+    }
+
+    #[test]
+    fn other_errors_map_to_dbus() {
+        let e = dbus_err("list sessions failed");
+        assert!(matches!(e, AgentShellError::DBus(_)));
     }
 }

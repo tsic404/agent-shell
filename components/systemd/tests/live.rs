@@ -6,6 +6,7 @@
 //! 纯映射单元测试无环境依赖；`*_live` 测试需要 system bus。
 
 use agent_shell_core::component::{SessionManagerComponent, SystemComponent};
+use agent_shell_core::error::AgentShellError;
 use agent_shell_core::types::UnitStatus;
 use agent_shell_logind::LogindComponent;
 use agent_shell_systemd::SystemdComponent;
@@ -127,7 +128,25 @@ async fn live_logind_list_sessions_returns_current() {
 async fn live_logind_can_reboot_can_poweroff_booleans() {
     let c = LogindComponent::connect().await.unwrap();
     // 只查询能力位，绝不触发实际关机/重启。
-    let reboot = c.can_reboot().await.unwrap();
-    let poweroff = c.can_poweroff().await.unwrap();
+    let reboot = match c.can_reboot().await {
+        Ok(v) => v,
+        // CI runner 无 polkit 授权时 CanReboot/CanPowerOff 恒回 AccessDenied；
+        // 这是环境权限不足，非组件缺陷——按本文件 skip 约定放行。
+        Err(AgentShellError::Permission(reason)) => {
+            skip(&format!("CanReboot 缺 polkit 授权（环境性跳过）: {reason}"));
+            return;
+        }
+        Err(e) => panic!("CanReboot failed: {e}"),
+    };
+    let poweroff = match c.can_poweroff().await {
+        Ok(v) => v,
+        Err(AgentShellError::Permission(reason)) => {
+            skip(&format!(
+                "CanPowerOff 缺 polkit 授权（环境性跳过）: {reason}"
+            ));
+            return;
+        }
+        Err(e) => panic!("CanPowerOff failed: {e}"),
+    };
     eprintln!("can_reboot={reboot} can_poweroff={poweroff}");
 }
