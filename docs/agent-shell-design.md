@@ -3641,33 +3641,7 @@ strip = true
 
 ### 20.5 Cargo workspace 完整成员
 
-```
-members = [
-    # 显示服务器协议层（不实现 CompositorComponent）
-    "components/displayserver/wayland", "components/displayserver/x11",
-    # 合成器组件
-    "components/compositor/wayland-core", "components/compositor/wlr-wayland",
-    "components/compositor/kwin", "components/compositor/sway",
-    "components/compositor/hyprland", "components/compositor/mutter",
-    "components/compositor/x11",
-    # 系统与公共组件
-    "components/systemd", "components/logind", "components/network",
-    "components/a11y", "components/input", "components/notification",
-    "components/appearance", "components/launcher", "components/clipboard",
-    # 语义路由 + 事件流 + 截图
-    "router", "event", "modules/capture",
-    # 后端装配器
-    "backends/kde", "backends/dde", "backends/gnome", "backends/hyprland",
-    "backends/sway", "backends/generic", "backends/tty",
-    # Agent 接口层 + 守护
-    "shell", "cli", "rpc", "mcp", "daemon", "rootd",
-]
-```
-
-`core` / `components/audio` / `components/power` 不在 members——仅
-`[workspace.dependencies]` path 依赖，由引用方 crate 消费。
-
-每个组件 crate 可独立编译测试：`cargo test -p agent-shell-compositor-kwin`（组件级）→ `cargo test --workspace`（集成）。
+成员清单见 §20.1 的 `[workspace] members`（唯一声明处）。每个组件 crate 可独立编译测试：`cargo test -p agent-shell-compositor-kwin`（组件级）→ `cargo test --workspace`（集成）。
 
 ### 20.6 打包依赖清单
 
