@@ -1924,9 +1924,17 @@ mod tests {
 
     #[test]
     fn daemon_reload_maps_to_reload() {
-        // CI 无 systemd system bus → D-Bus 连接失败，预期 Err
-        let e = dispatch("DaemonReload", &[]).unwrap_err();
-        assert!(e.contains("systemd"), "{e}");
+        // systemd system bus 可达（本机 root）时 Reload 调用成功返回 Ok；
+        // 无 system bus 的 CI 环境 D-Bus 连接失败返回 Err。两方向都给出
+        // 可辨别的断言依据：Ok 侧校验 accepted/systemd_method，Err 侧校验
+        // 错误来自 systemd D-Bus 层（连接/proxy/调用任一失败均含 "systemd"）。
+        match dispatch("DaemonReload", &[]) {
+            Ok(v) => {
+                assert_eq!(v["accepted"], json!(true), "{v}");
+                assert_eq!(v["systemd_method"], json!("Reload"), "{v}");
+            }
+            Err(e) => assert!(e.contains("systemd"), "{e}"),
+        }
     }
 
     // ── 系统日志 ──
