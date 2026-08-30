@@ -1842,6 +1842,113 @@ mod tests {
         assert!(dispatch("HostnameSet", &[json!("myhost")]).is_err());
     }
 
+    // ── 主机名快照/恢复（TSI-2630：共享容器 /etc/hostname 漂移） ──
+
+    /// 读取 hostnamed 报告的静态/瞬时主机名；hostnamed 不可用时回落到
+    /// `/etc/hostname` 与内核 hostname。共享容器内二者都是跨 run 可变的
+    /// 全局状态——夹具必须原值进出、失败也回滚。
+    fn current_hostnames() -> (String, String) {
+        fn hostnamectl_out(args: &[&str]) -> Option<String> {
+            std::process::Command::new("hostnamectl")
+                .args(args)
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                .filter(|s| !s.is_empty())
+        }
+        let static_ = hostnamectl_out(&["--static"]).unwrap_or_else(|| {
+            std::fs::read_to_string("/etc/hostname")
+                .map(|s| s.trim().to_string())
+                .unwrap_or_default()
+        });
+        let transient = hostnamectl_out(&["--transient"]).unwrap_or_else(|| {
+            std::fs::read_to_string("/proc/sys/kernel/hostname")
+                .map(|s| s.trim().to_string())
+                .unwrap_or_default()
+        });
+        (static_, transient)
+    }
+
+    /// 快照/恢复守卫：构造时读取当前主机名，`Drop` 写回。断言失败也会
+    /// 触发 `Drop`——漂移绝不泄漏到共享容器的后续 run。
+    struct HostnameGuard {
+        original: (String, String),
+    }
+
+    impl HostnameGuard {
+        fn snapshot() -> Self {
+            Self {
+                original: current_hostnames(),
+            }
+        }
+
+        /// 独立于被测代码直接调用 hostnamectl 写回：即便 `HostnameSet`
+        /// 路径本身有缺陷，恢复也不依赖它。任一写回失败都返回错误并记录，
+        /// 绝不让 `Drop` 兜底契约静默假绿。
+        fn restore(&self) -> Result<(), String> {
+            let (static_, transient) = &self.original;
+            let mut failures = Vec::new();
+            for (flag, value) in [("--static", static_), ("--transient", transient)] {
+                if let Err(e) = run_command(
+                    "hostnamectl",
+                    &["set-hostname", flag, value.as_str()],
+                    &Mutex::new(None),
+                ) {
+                    eprintln!("HostnameGuard restore {flag} 失败: {e}");
+                    failures.push(e);
+                }
+            }
+            if failures.is_empty() {
+                Ok(())
+            } else {
+                Err(failures.join("; "))
+            }
+        }
+    }
+
+    impl Drop for HostnameGuard {
+        fn drop(&mut self) {
+            if let Err(e) = self.restore() {
+                eprintln!("HostnameGuard Drop 兜底恢复失败: {e}");
+            }
+        }
+    }
+
+    /// 实况夹具入口见 `scripts/hostname-fixture.sh`：root 下跑 ignored 测试，
+    /// 前后抓取主机名断言无漂移。托管 CI 无 systemd-hostnamed，不能跑。
+    #[test]
+    #[ignore = "requires root/hostnamed; live snapshot/restore fixture (TSI-2630)"]
+    fn hostname_set_snapshot_and_restore_live() {
+        // 非 root 无法写回主机名：跳过而非假失败。真实验证需以 root 运行
+        // （rootd 部署即 root），CI 默认忽略本测试。
+        if unsafe { libc::geteuid() } != 0 {
+            eprintln!("SKIP: 非 root 无法写回主机名（环境性跳过）");
+            return;
+        }
+        let guard = HostnameGuard::snapshot();
+        let (orig_static, orig_transient) = guard.original.clone();
+        let target = "agent-shell-tsi2630";
+        assert_ne!(orig_static, target, "原主机名与夹具目标值冲突");
+
+        // 走真实分派路径（hostname_set → hostnamectl set-hostname）。
+        let r = dispatch("HostnameSet", &[json!(target)]);
+        assert!(r.is_ok(), "HostnameSet 失败: {r:?}");
+        assert_eq!(
+            current_hostnames().0,
+            target,
+            "set-hostname 后静态主机名未变更"
+        );
+
+        // 显式恢复并断言；即使此处断言失败，Drop 兜底也已写回原值。
+        guard.restore().expect("HostnameGuard restore 返回错误");
+        assert_eq!(
+            current_hostnames(),
+            (orig_static, orig_transient),
+            "主机名未恢复原始值"
+        );
+    }
+
     // ── 进程管理 ──
 
     #[test]
