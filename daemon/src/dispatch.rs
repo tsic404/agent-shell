@@ -1165,6 +1165,12 @@ mod tests {
         }
     }
 
+    /// rootd 在线时，rootd-degrade 测试的前置条件（rootd 缺席）不成立：
+    /// 环境性跳过（与 systemd `skip_environment` 同语义），保持 1002 断言不变。
+    async fn rootd_is_online() -> bool {
+        crate::rootd_client::connect().await.is_some()
+    }
+
     #[tokio::test]
     async fn unknown_method_returns_method_not_found() {
         let mut d = Daemon::connect(Duration::from_secs(1)).await;
@@ -1573,6 +1579,10 @@ mod tests {
         // L4 放行后进入 handler：enable/disable/reload 经参数提取到达 rootd
         // 连接。本环境无 rootd → BackendUnavailable 降级，证明扩展动作的
         // 前置链路（参数解析 + 门禁放行）完整；rootd Ok 分支需实机。
+        if rootd_is_online().await {
+            eprintln!("SKIP: rootd 在线 → 非降级路径（环境性跳过）");
+            return;
+        }
         let mut d = Daemon::connect(Duration::from_secs(1)).await;
         d.caller_id = "trusted".into();
         d.security
@@ -1601,6 +1611,10 @@ mod tests {
     async fn daemon_reload_reaches_rootd_degrade() {
         // L4 放行后进入 handler：daemon.reload 无参数直达 rootd 连接。
         // 本环境无 rootd → BackendUnavailable 降级。
+        if rootd_is_online().await {
+            eprintln!("SKIP: rootd 在线 → 非降级路径（环境性跳过）");
+            return;
+        }
         let mut d = Daemon::connect(Duration::from_secs(1)).await;
         d.caller_id = "trusted".into();
         d.security
@@ -1883,6 +1897,10 @@ mod tests {
         // L4 放行后进入 handler：合法 hostname 通过参数提取，到达 rootd
         // 连接。本环境无 rootd → BackendUnavailable 降级，证明成功路径的
         // 前置链路（参数解析 + 门禁放行）完整；rootd Ok 分支需实机。
+        if rootd_is_online().await {
+            eprintln!("SKIP: rootd 在线 → 非降级路径（环境性跳过）");
+            return;
+        }
         let mut d = Daemon::connect(Duration::from_secs(1)).await;
         // 隔离 ambient config：清除 connect 从磁盘/env 读到的持久化 grant/deny。
         d.security = SecurityManager::with_config(AgentShellConfig::default());
@@ -1996,6 +2014,10 @@ mod tests {
         // L4 放行后进入 handler：无参数，到达 rootd 连接。本环境无 rootd
         // → BackendUnavailable 降级，证明成功路径前置链路（门禁放行 +
         // handler 执行）完整；rootd Ok 分支需实机。
+        if rootd_is_online().await {
+            eprintln!("SKIP: rootd 在线 → 非降级路径（环境性跳过）");
+            return;
+        }
         let mut d = Daemon::connect(Duration::from_secs(1)).await;
         d.caller_id = "trusted".into();
         d.security
