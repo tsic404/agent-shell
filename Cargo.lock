@@ -530,6 +530,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "which",
  "zbus",
  "zbus_macros",
  "zvariant",

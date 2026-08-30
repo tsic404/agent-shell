@@ -14,8 +14,9 @@ pub mod dbus;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 /// 阻塞性系统命令的默认超时（秒）。
 ///
@@ -64,16 +65,18 @@ pub const DEFAULT_JOURNAL_SINCE: &str = "-24h";
 /// 克隆为 pidfd 写入 `pid_slot`——超时后的 kill 据此以无 PID 复用竞态的
 /// 方式精确作用于本函数产生的进程（TSI-2504）。返回前清除 slot。
 fn run_command(
-    cmd: &str,
+    cmd: impl AsRef<Path>,
     args: &[&str],
     pid_slot: &Mutex<Option<OwnedFd>>,
 ) -> Result<String, String> {
-    let mut child = std::process::Command::new(cmd)
+    let cmd_path = cmd.as_ref();
+    let cmd_name = cmd_path.display().to_string();
+    let mut child = std::process::Command::new(cmd_path)
         .args(args)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
-        .map_err(|e| format!("{cmd} execution failed: {e}"))?;
+        .map_err(|e| format!("{cmd_name} execution failed: {e}"))?;
     if let Ok(pidfd) = child_pidfd(&mut child) {
         *pid_slot.lock().expect("pid_slot mutex poisoned") = Some(pidfd);
     }
@@ -81,13 +84,13 @@ fn run_command(
         Ok(out) => out,
         Err(e) => {
             *pid_slot.lock().expect("pid_slot mutex poisoned") = None;
-            return Err(format!("{cmd} wait failed: {e}"));
+            return Err(format!("{cmd_name} wait failed: {e}"));
         }
     };
     *pid_slot.lock().expect("pid_slot mutex poisoned") = None;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("{cmd} failed: {stderr}"));
+        return Err(format!("{cmd_name} failed: {stderr}"));
     }
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
@@ -1093,6 +1096,29 @@ fn process_kill(args: &[Value]) -> RootResult {
 //
 // §23.4.3 Mount/Unmount。device/target/fstype/options 校验防注入。
 // 实际执行走 mount(2) 系统调用或 `mount` 命令。
+/// 解析 `mount`/`umount` 可执行文件绝对路径，成功后进程内缓存。
+///
+/// rootd 以 root 运行，`PATH` 与用户 shell 可能不同（systemd system unit
+/// 默认不继承用户环境），故不硬编码绝对路径：经 `which` 按当前 `PATH`
+/// 探测，命中即缓存（`OnceLock`）。缓存的是绝对路径而非内容；rootd 是
+/// 系统级单例，进程生命周期内 `PATH` 与挂载布局稳定，二进制被替换后
+/// 同一路径仍有效。失败不缓存——若启动时二进制暂缺（如 /usr 后挂载），
+/// 后续调用可自愈；命中后每次调用不再触发 PATH 扫描，消除原有每次调用
+/// 两条 ENOENT execve 尝试（TSI-2616）。
+fn mount_bin(name: &str) -> Result<&'static Path, String> {
+    static MOUNT_BIN: OnceLock<PathBuf> = OnceLock::new();
+    static UMOUNT_BIN: OnceLock<PathBuf> = OnceLock::new();
+    let slot = match name {
+        "mount" => &MOUNT_BIN,
+        "umount" => &UMOUNT_BIN,
+        other => return Err(format!("unsupported mount binary: {other}")),
+    };
+    if let Some(path) = slot.get() {
+        return Ok(path.as_path());
+    }
+    let path = which::which(name).map_err(|e| format!("{name} not found in PATH: {e}"))?;
+    Ok(slot.get_or_init(|| path).as_path())
+}
 
 fn mount(args: &[Value], pid_slot: &Mutex<Option<OwnedFd>>) -> RootResult {
     let device = str_arg(args, 0)?;
@@ -1121,7 +1147,7 @@ fn mount(args: &[Value], pid_slot: &Mutex<Option<OwnedFd>>) -> RootResult {
     }
     mount_args.push(device);
     mount_args.push(target);
-    run_command("mount", &mount_args, pid_slot)?;
+    run_command(mount_bin("mount")?, &mount_args, pid_slot)?;
     Ok(json!({
         "accepted": true,
         "device": device,
@@ -1139,7 +1165,7 @@ fn unmount(args: &[Value], pid_slot: &Mutex<Option<OwnedFd>>) -> RootResult {
         "unmount requested (polkit action: com.agentshell.mount)",
     );
     // 实际执行：umount target
-    run_command("umount", &[target], pid_slot)?;
+    run_command(mount_bin("umount")?, &[target], pid_slot)?;
     Ok(json!({ "accepted": true, "target": target }))
 }
 
@@ -1898,6 +1924,26 @@ mod tests {
         assert!(dispatch("Unmount", &[json!("relpath")]).is_err());
         // 有效输入通过校验——umount 在 CI 无挂载 → Err
         assert!(dispatch("Unmount", &[json!("/mnt/data")]).is_err());
+    }
+
+    #[test]
+    fn mount_bin_resolves_and_caches_absolute_paths() {
+        // 标准 Linux 环境必有 mount/umount；缺失属环境问题，直接失败（而非
+        // 静默放行），避免无 binary 环境假绿。
+        for name in ["mount", "umount"] {
+            let first = mount_bin(name).unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert!(
+                first.is_absolute(),
+                "{name} path must be absolute: {first:?}"
+            );
+            let second = mount_bin(name).expect("cached binary path");
+            // OnceLock 缓存：两次调用必须返回同一静态路径引用，证明只解析一次。
+            assert!(
+                std::ptr::eq(first, second),
+                "mount_bin must cache its resolution result"
+            );
+        }
+        assert!(mount_bin("unsupported").is_err());
     }
 
     // ── Token 管理 ──
