@@ -474,19 +474,54 @@ pub fn dispatch(method: &str, args: &[Value]) -> RootResult {
     dispatch_with_slot(method, args, &CommandSlot::new())
 }
 
+/// 产生子进程的方法集合：单一事实源（TSI-2637）。
+///
+/// `SPAWN_CALLERS` 与 `dispatch_spawn` 由同一宏展开派生——新增产生子进程的
+/// 方法只需在此登记一次，dbus 层 `method_spawns_child` 据此分类、等价性测试
+/// 据此对比，不再需要手工镜像列表。`TestSpawnSleep` 仅 `cfg(test)` 存在，
+/// 因此 `SPAWN_CALLERS` 非测试构建 5 项、测试构建 6 项。
+macro_rules! spawn_callers {
+    ($( $(#[cfg($attr:meta)])? $name:literal => $handler:expr ),* $(,)?) => {
+        /// 产生子进程的方法名（与 `dispatch_spawn` 的 match 分支一一对应）。
+        pub(crate) const SPAWN_CALLERS: &[&str] = &[$( $(#[cfg($attr)])? $name ),*];
+
+        /// 分派产生子进程的方法；`None` = 本方法不在 spawn 集合内。
+        fn dispatch_spawn(method: &str, args: &[Value], slot: &CommandSlot) -> Option<RootResult> {
+            match method {
+                $( $(#[cfg($attr)])? $name => Some($handler(args, slot)), )*
+                _ => None,
+            }
+        }
+    };
+}
+
+spawn_callers!(
+    "JournalQuery" => journal_query,
+    "SysctlSet" => sysctl_set,
+    "HostnameSet" => hostname_set,
+    "Mount" => mount,
+    "Unmount" => unmount,
+    #[cfg(test)]
+    "TestSpawnSleep" => test_spawn_sleep,
+);
+
 /// 分派一个 rootd 方法调用，并允许跟踪产生的子进程（TSI-2504/TSI-2545）。
 ///
-/// 与 [`dispatch`] 唯一区别：产生子进程的五个方法（journalctl/sysctl/
-/// hostnamectl/mount/umount）将子进程 pidfd 写入 `slot`，供调用方在
-/// 超时后 kill。其余方法忽略 slot。分派结束（正常或异常）后置位
-/// `CommandSlot::finished`，使超时分支的 kill 目标等待可据此结束，不再
-/// 依赖固定宽限时长。非白名单方法一律拒绝——rootd 的安全模型是
-/// 「默认拒绝 + 显式白名单」。
+/// 产生子进程的方法（journalctl/sysctl/hostnamectl/mount/umount）将子进程
+/// pidfd 写入 `slot`，供调用方在超时后 kill。其余方法忽略 slot。分派结束
+/// （正常或异常）后置位 `CommandSlot::finished`，使超时分支的 kill 目标等待
+/// 可据此结束，不再依赖固定宽限时长。非白名单方法一律拒绝——rootd 的安全
+/// 模型是「默认拒绝 + 显式白名单」。
 ///
 /// **polkit 前置**：调用方（D-Bus 服务层）必须在调用本函数**之前**经
 /// `polkit_action_for` 获取 action id 并完成 polkit 授权校验。本函数
 /// 不重复 polkit 校验——它是薄代理的业务逻辑层，授权是传输层职责。
 pub(crate) fn dispatch_with_slot(method: &str, args: &[Value], slot: &CommandSlot) -> RootResult {
+    // spawn 集合（`SPAWN_CALLERS` 单一事实源）单独分派；命中即返回。
+    if let Some(result) = dispatch_spawn(method, args, slot) {
+        slot.mark_finished();
+        return result;
+    }
     let result = match method {
         // 版本对账
         "Hello" => hello(),
@@ -499,38 +534,34 @@ pub(crate) fn dispatch_with_slot(method: &str, args: &[Value], slot: &CommandSlo
         "ServiceStart" | "ServiceStop" | "ServiceRestart" | "ServiceEnable" | "ServiceDisable"
         | "ServiceReload" => service_control(method, args),
         "DaemonReload" => daemon_reload(),
-        // 系统日志
-        "JournalQuery" => journal_query(args, slot),
         // 系统配置
         "SysctlGet" => sysctl_get(args),
-        "SysctlSet" => sysctl_set(args, slot),
-        "HostnameSet" => hostname_set(args, slot),
         // 进程（跨用户）
         "ProcessKill" => process_kill(args),
-        // 挂载
-        "Mount" => mount(args, slot),
-        "Unmount" => unmount(args, slot),
         // job 状态查询（issue「job：status / progress 查询」）
         "JobStatus" => job_status_dispatch(args),
         // 会话 Token 管理（可选，无系统副作用）
         "SetToken" => set_token(args),
         // 测试专用方法（仅 cfg(test)）：为 dbus 层超时回归测试提供真实
-        // 阻塞源（TestSlowMethod）与可被 kill 的子进程（TestSpawnSleep），
-        // 验证 spawn_blocking+timeout 包装隔离事件循环并终结子进程。
+        // 阻塞源，验证 spawn_blocking+timeout 包装隔离事件循环。
         #[cfg(test)]
         "TestSlowMethod" => {
             std::thread::sleep(std::time::Duration::from_secs(2));
             Ok(json!({"slow": true}))
         }
-        #[cfg(test)]
-        "TestSpawnSleep" => {
-            run_command("sleep", &["30"], slot)?;
-            Ok(json!({"spawned": true}))
-        }
         _ => Err(format!("method not in whitelist: {method}")),
     };
     slot.mark_finished();
     result
+}
+
+/// `TestSpawnSleep` 的实现体（仅 cfg(test)）：spawn 30s sleep 并写入 pidfd，
+/// 供 dbus 层超时回归测试验证可被 kill 的子进程被终结。
+#[cfg(test)]
+fn test_spawn_sleep(args: &[Value], slot: &CommandSlot) -> RootResult {
+    let _ = args;
+    run_command("sleep", &["30"], slot)?;
+    Ok(json!({"spawned": true}))
 }
 
 // ───────────────────── 版本对账 ─────────────────────

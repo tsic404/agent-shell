@@ -250,11 +250,12 @@ async fn dispatch_with_semaphore(
 
 /// 方法是否会产生可被 kill 的子进程（TSI-2545 超时分支等待 kill 目标的
 /// 唯一白名单）。不产生子进程的方法超时后无需等待即可返回。
+///
+/// 名单来自 lib 层 [`crate::SPAWN_CALLERS`]——与 `dispatch_with_slot` 的 spawn
+/// 分支由同一宏展开派生（TSI-2637），新增产生子进程的方法只需在 lib 层登记
+/// 一次，不再需要在此手工镜像。
 fn method_spawns_child(method: &str) -> bool {
-    matches!(
-        method,
-        "JournalQuery" | "SysctlSet" | "HostnameSet" | "Mount" | "Unmount" | "TestSpawnSleep"
-    )
+    crate::SPAWN_CALLERS.contains(&method)
 }
 
 /// 方法对应的命令超时：`JournalQuery` 走专项超时（60s），其余走默认（30s）。
@@ -920,26 +921,17 @@ mod tests {
     }
 
     /// `method_spawns_child` 是超时分支等待 kill 目标的唯一白名单，必须与
-    /// dispatch 中实际经 `run_command(…, slot)` 产生子进程的方法保持 1:1。
-    /// 两侧独立来源：`SPAWN_CALLERS` 硬编码 dispatch 的 spawn 分支（与
-    /// `dispatch_with_slot` 手工同步），候选全集 `callers` = D-Bus 白名单 ∪
-    /// dispatch。`method_spawns_child` 只作为被比较的分类结果，不参与任何
-    /// 一侧的推导——漏加 spawn 方法时该方法仍留在硬编码列表中，断言即红。
+    /// dispatch 中实际产生子进程的方法保持 1:1。TSI-2637 起两者不再各自维护：
+    /// `crate::SPAWN_CALLERS` 与 `dispatch_spawn` 的 match 分支由同一宏展开派生，
+    /// 是唯一事实源；本测试的候选全集 = D-Bus 白名单 ∪ `crate::SPAWN_CALLERS`，
+    /// 逐个断言 `method_spawns_child` 的分类与单一事实源一致——若有人把
+    /// `method_spawns_child` 改回手工镜像列表，任何漏登方法在候选集内断言即红。
     #[test]
     fn method_spawns_child_matches_run_command_callers() {
-        const SPAWN_CALLERS: &[&str] = &[
-            "JournalQuery",
-            "SysctlSet",
-            "HostnameSet",
-            "Mount",
-            "Unmount",
-            "TestSpawnSleep",
-        ];
-
-        // 候选全集：D-Bus 白名单 ∪ dispatch spawn 分支。TestSpawnSleep 是
+        // 候选全集：D-Bus 白名单 ∪ spawn 单一事实源。TestSpawnSleep 是
         // cfg(test) 专用方法，不在白名单内，须显式并入。
         let mut callers: Vec<&str> = whitelist_methods().to_vec();
-        for method in SPAWN_CALLERS.iter().copied() {
+        for method in crate::SPAWN_CALLERS.iter().copied() {
             if !callers.contains(&method) {
                 callers.push(method);
             }
@@ -948,7 +940,7 @@ mod tests {
         for method in callers {
             assert_eq!(
                 method_spawns_child(method),
-                SPAWN_CALLERS.contains(&method),
+                crate::SPAWN_CALLERS.contains(&method),
                 "method_spawns_child({method:?}) 与 dispatch spawn 分支不一致",
             );
         }
