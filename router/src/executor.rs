@@ -1,5 +1,15 @@
 //! 执行引擎（design/07 §15.2）。
 //!
+//! ⚠️ 测试用实现：本模块无任何生产调用点。全仓 `Executor::new` 仅命中
+//! `router/src/executor/tests.rs`（7 处）；daemon 的 `windows.list` /
+//! `screenshot.capture` 及其余命令 handler 均直调 `Daemon` / `CaptureDispatcher`
+//! 与合成器后端，不经 [`Executor::execute`]。
+//!
+//! 因此本文件的 `record_execution` 审计落盘只覆盖单元测试路径，不构成生产
+//! 审计入口；不得以「router 统一安全检查（D6）」为由省略 daemon 侧 gate
+//! 或审计。若日后 router 演变为真实分派层（daemon handler 改走
+//! `Executor::execute`），移除本标注并同步接线与审计契约。
+//!
 //! [`Executor`] 持有合成器后端与四个能力 dispatcher；`execute` 把
 //! [`Command`] 翻译为具体调用。带 `SemanticTarget` 的窗口类命令一律先过
 //! [`Executor::resolve_target`] 再调 backend。
