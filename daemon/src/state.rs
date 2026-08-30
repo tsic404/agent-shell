@@ -11,7 +11,7 @@ use agent_shell_a11y::AtSpiComponent;
 use agent_shell_backend_dde::{CompositorKind, DdeCompositor};
 use agent_shell_capture::CaptureDispatcher;
 use agent_shell_compositor_kwin::KWinCompositor;
-use agent_shell_core::component::{CompositorComponent, DesktopComponent};
+use agent_shell_core::component::{BackendCapabilities, CompositorComponent, DesktopComponent};
 use agent_shell_core::types::WindowInfo;
 use event::{EventHub, EventRing};
 use std::time::{Duration, Instant};
@@ -372,6 +372,15 @@ impl Daemon {
 
     pub fn has_compositor(&self) -> bool {
         self.compositor.is_some()
+    }
+
+    /// 合成器能力真值（`info` 能力位表数据源）。无合成器时返回全 false
+    /// ——能力位表与后端声明一致，不硬编码任何字段。
+    pub fn compositor_capabilities(&self) -> BackendCapabilities {
+        self.compositor
+            .as_ref()
+            .map(|c| c.as_dyn().capabilities())
+            .unwrap_or_default()
     }
 
     /// doctor 报告用的合成器后端名。

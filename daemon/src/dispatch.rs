@@ -271,21 +271,21 @@ async fn compositor_doctor_lines(d: &Daemon) -> Vec<String> {
 
 async fn info(d: &Daemon) -> RpcResult {
     let detection = agent_shell_core::de_detection::detect_report_for_doctor();
-    let mut capabilities = if d.has_compositor() {
-        vec![
-            ("window_management".into(), true),
-            ("workspace_management".into(), true),
-            ("monitor_layout".into(), true),
-            ("window_events".into(), false), // T3b
-            ("native_input".into(), false),  // T2a portal 会话
-            ("virtual_desktops".into(), true),
-            ("effects_control".into(), false),
-        ]
-    } else {
-        Vec::new()
-    };
-    // capture 组件独立于 compositor——纯 X11 会话仍可截图（审查项 #3）。
-    capabilities.push(("native_capture".into(), d.capture.is_some()));
+    // 能力位表逐字段来自合成器声明（TSI-2501/2486 反模式：不得硬编码）。
+    // capture 组件独立于 compositor（纯 X11 会话仍可截图），native_capture
+    // 由 capture 探针真值决定（与 TSI-2569 的 Treeland window_management:false 同源）。
+    let caps = d.compositor_capabilities();
+    let capabilities = vec![
+        ("window_management".into(), caps.window_management),
+        ("workspace_management".into(), caps.workspace_management),
+        ("monitor_layout".into(), caps.monitor_layout),
+        ("window_events".into(), caps.window_events),
+        ("workspace_events".into(), caps.workspace_events),
+        ("native_input".into(), caps.native_input),
+        ("native_capture".into(), d.capture.is_some()),
+        ("virtual_desktops".into(), caps.virtual_desktops),
+        ("effects_control".into(), caps.effects_control),
+    ];
     let r = InfoResult {
         detection,
         capabilities,
@@ -1026,6 +1026,61 @@ mod tests {
         let r: DoctorResult = serde_json::from_value(v).expect("DoctorResult");
         assert!(!r.lines.is_empty());
         assert!(r.lines[0].starts_with("✓ DE 检测"));
+    }
+
+    #[tokio::test]
+    async fn info_reports_capabilities_from_compositor_truth() {
+        let mut d = Daemon::connect(Duration::from_secs(1)).await;
+        let resp = dispatch(&mut d, &req(method::INFO, None)).await;
+        let v = resp.result.expect("ok");
+        let r: InfoResult = serde_json::from_value(v).expect("InfoResult");
+
+        // 能力位表固定 9 行且名称顺序稳定（TSI-2569：不得硬编码）。
+        let names: Vec<&str> = r.capabilities.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "window_management",
+                "workspace_management",
+                "monitor_layout",
+                "window_events",
+                "workspace_events",
+                "native_input",
+                "native_capture",
+                "virtual_desktops",
+                "effects_control"
+            ]
+        );
+
+        // 逐字段等于合成器能力真值；native_capture 例外——capture 组件
+        // 独立于 compositor（纯 X11 会话仍可截图）。
+        let caps = d.compositor_capabilities();
+        for (name, enabled) in &r.capabilities {
+            let expected = match name.as_str() {
+                "window_management" => caps.window_management,
+                "workspace_management" => caps.workspace_management,
+                "monitor_layout" => caps.monitor_layout,
+                "window_events" => caps.window_events,
+                "workspace_events" => caps.workspace_events,
+                "native_input" => caps.native_input,
+                "native_capture" => d.capture.is_some(),
+                "virtual_desktops" => caps.virtual_desktops,
+                "effects_control" => caps.effects_control,
+                other => panic!("unknown capability row: {other}"),
+            };
+            assert_eq!(*enabled, expected, "capability row {name}");
+        }
+
+        // 无合成器（CI/headless）不得硬编码 window_management:true。
+        if !d.has_compositor() {
+            let wm = r
+                .capabilities
+                .iter()
+                .find(|(n, _)| n == "window_management")
+                .map(|(_, enabled)| *enabled)
+                .expect("window_management row");
+            assert!(!wm, "headless must report window_management=false");
+        }
     }
 
     #[tokio::test]
