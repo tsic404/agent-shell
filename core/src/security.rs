@@ -333,7 +333,8 @@ impl SecurityManager {
         }
     }
 
-    /// 判定入口（§21.21.3 伪代码顺序）。成功与否都走 `record` 审计旁路。
+    /// 判定入口（§21.21.3 伪代码顺序）。判定结果落审计旁路；执行结果由
+    /// 调用方在 handler 返回后经 [`SecurityManager::record_execution`] 落盘。
     pub fn check_permission(&self, agent_id: &str, op: &Operation) -> PermissionDecision {
         let decision = self.decide(agent_id, op);
         self.record(agent_id, op, &decision);
@@ -358,17 +359,30 @@ impl SecurityManager {
         PermissionDecision::Allow
     }
 
-    /// 审计旁路：`Allow` 记 result=true，其余记 result=false（未执行）。
+    /// 审计旁路：只记门禁判定——`allow` / `confirm` / `deny`，`result` 恒为
+    /// `false`（未执行态）。真实执行结果由 [`SecurityManager::record_execution`]
+    /// 在 handler 返回后追加，二者独立、先后有序。
     fn record(&self, agent_id: &str, op: &Operation, decision: &PermissionDecision) {
         if !self.config.security.audit_log {
             return;
         }
-        let (decision_str, result) = match decision {
-            PermissionDecision::Allow => ("allow", true),
-            PermissionDecision::Confirm(_) => ("confirm", false),
-            PermissionDecision::Deny(_) => ("deny", false),
+        let decision_str = match decision {
+            PermissionDecision::Allow => "allow",
+            PermissionDecision::Confirm(_) => "confirm",
+            PermissionDecision::Deny(_) => "deny",
         };
-        self.audit.log(agent_id, op.name(), decision_str, result);
+        self.audit.log(agent_id, op.name(), decision_str, false);
+    }
+
+    /// 执行结果审计：handler 返回后由 dispatch 层调用，按 RPC 结果回写
+    /// `result`（成功 `true`，失败 `false`），使 `decision=allow` 不再与
+    /// 「已执行」划等号——后端不可用等运行期失败同样留下 allow+false 痕迹
+    /// （TSI-2659）。
+    pub fn record_execution(&self, agent_id: &str, op: &Operation, success: bool) {
+        if !self.config.security.audit_log {
+            return;
+        }
+        self.audit.log(agent_id, op.name(), "allow", success);
     }
 
     /// agent 的最高自动放行级别：白名单精确匹配 > `"*"` 通配 > 默认

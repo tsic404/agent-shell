@@ -56,6 +56,17 @@ impl Executor {
                 )))
             }
         }
+        // 执行审计统一在收尾：`?` 只能在 `run` 内部提前返回，任何成败路径
+        // 都会流出到此处回写执行态（TSI-2659 复审：失败路径同样落 2 条记录，
+        // 与 daemon 侧契约一致）。
+        let result = self.run(cmd).await;
+        self.security.record_execution("*", &op, result.is_ok());
+        result
+    }
+
+    /// 门禁放行后的命令执行体。`execute` 已完成权限判定；本函数内允许
+    /// `?` 提前返回，执行结果审计由 `execute` 统一落盘。
+    async fn run(&self, cmd: Command) -> Result<CommandResult> {
         match cmd {
             // ── 窗口 ──
             Command::ListWindows { filter } => {
@@ -202,7 +213,7 @@ impl Executor {
             Command::WaitForText { text, timeout } => {
                 // 轮询 A11y 树文本匹配（事件驱动等待为后续演进点，见 wait_for_window 注释）。
                 let start = Instant::now();
-                loop {
+                'poll: loop {
                     if let Ok(elements) = self
                         .a11y
                         .locate(&SemanticTarget::ByAccessibility {
@@ -215,12 +226,12 @@ impl Executor {
                     {
                         for el in &elements {
                             if el.text().await.map(|t| t.contains(&text)).unwrap_or(false) {
-                                return Ok(CommandResult::Success);
+                                break 'poll Ok(CommandResult::Success);
                             }
                         }
                     }
                     if start.elapsed() > timeout {
-                        return Err(AgentShellError::Timeout(format!(
+                        break Err(AgentShellError::Timeout(format!(
                             "text '{}' not appeared",
                             text
                         )));

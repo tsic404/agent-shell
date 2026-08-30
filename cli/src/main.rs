@@ -316,19 +316,26 @@ fn security_request(cmd: &cli::SecurityCommand) -> (&'static str, Value) {
             agent_id,
             op,
             decision,
+            result,
         } => (
             method::SECURITY_AUDIT,
-            security_audit_params(agent_id.as_deref(), op.as_deref(), decision.as_deref()),
+            security_audit_params(
+                agent_id.as_deref(),
+                op.as_deref(),
+                decision.as_deref(),
+                *result,
+            ),
         ),
     }
 }
 
 /// `security.audit` 参数构造：`None` 过滤条件省略键，而非序列化为 JSON
-/// `null`（与 `a11y.query` 同约定；daemon 空串 = 不限制该维度）。
+/// `null`（与 `a11y.query` 同约定；daemon 空串 / 缺键 = 不限制该维度）。
 fn security_audit_params(
     agent_id: Option<&str>,
     op: Option<&str>,
     decision: Option<&str>,
+    result: Option<bool>,
 ) -> Value {
     let mut params = serde_json::Map::new();
     if let Some(v) = agent_id {
@@ -339,6 +346,9 @@ fn security_audit_params(
     }
     if let Some(v) = decision {
         params.insert("decision".into(), json!(v));
+    }
+    if let Some(v) = result {
+        params.insert("result".into(), json!(v));
     }
     Value::Object(params)
 }
@@ -1317,18 +1327,20 @@ mod tests {
     }
 
     /// `security.audit` 过滤条件与 `a11y.query` 同约定：`None` 条件省略键，
-    /// 而非序列化为 JSON `null`（daemon 空串 = 不限制该维度）。
+    /// 而非序列化为 JSON `null`（daemon 空串 / 缺键 = 不限制该维度）。
     #[test]
     fn security_audit_params_omits_none_keys() {
-        let v = security_audit_params(Some("alice"), None, Some("deny"));
+        let v = security_audit_params(Some("alice"), None, Some("deny"), None);
         let obj = v.as_object().expect("params must be object");
         assert_eq!(obj.get("agent_id").and_then(|v| v.as_str()), Some("alice"));
         assert_eq!(obj.get("decision").and_then(|v| v.as_str()), Some("deny"));
         assert!(!obj.contains_key("op"), "None op must be omitted");
+        assert!(!obj.contains_key("result"), "None result must be omitted");
 
-        let v = security_audit_params(None, Some("windows.list"), None);
+        let v = security_audit_params(None, Some("windows.list"), None, Some(true));
         let obj = v.as_object().expect("params must be object");
         assert_eq!(obj.get("op").and_then(|v| v.as_str()), Some("windows.list"));
+        assert_eq!(obj.get("result").and_then(|v| v.as_bool()), Some(true));
         assert!(
             !obj.contains_key("agent_id"),
             "None agent_id must be omitted"
@@ -1338,7 +1350,7 @@ mod tests {
             "None decision must be omitted"
         );
 
-        let v = security_audit_params(None, None, None);
+        let v = security_audit_params(None, None, None, None);
         assert!(
             v.as_object().expect("params must be object").is_empty(),
             "all-None params must be empty object"
@@ -1372,8 +1384,12 @@ mod tests {
             agent_id: Some("alice".into()),
             op: None,
             decision: Some("deny".into()),
+            result: Some(false),
         });
         assert_eq!(m, "security.audit");
-        assert_eq!(p, json!({ "agent_id": "alice", "decision": "deny" }));
+        assert_eq!(
+            p,
+            json!({ "agent_id": "alice", "decision": "deny", "result": false })
+        );
     }
 }

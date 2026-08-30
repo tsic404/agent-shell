@@ -38,7 +38,8 @@ pub async fn dispatch(daemon: &mut Daemon, req: &Request) -> Response {
             return Response::err(req.id, RpcErrorCode::Denied, reason);
         }
     }
-    if let Some(op) = operation_for(&req.method, &req.params) {
+    let gated_op = operation_for(&req.method, &req.params);
+    if let Some(op) = gated_op {
         let caller = daemon.caller_id.clone();
         match daemon.security.check_permission(&caller, &op) {
             PermissionDecision::Allow => {}
@@ -129,6 +130,14 @@ pub async fn dispatch(daemon: &mut Daemon, req: &Request) -> Response {
             )
         }
     };
+    let executed = result.is_ok();
+    if let Some(op) = gated_op {
+        // 运行期结果审计：`decision=allow` 的执行态独立于门禁判定——
+        // 后端不可用等 handler 失败也留下 allow+false 痕迹（TSI-2659）。
+        daemon
+            .security
+            .record_execution(&daemon.caller_id, &op, executed);
+    }
     match result {
         Ok(v) => Response::ok(req.id, v),
         Err((code, msg)) => Response::err(req.id, code, msg),
@@ -573,7 +582,10 @@ async fn security_revoke(d: &mut Daemon, req: &Request) -> RpcResult {
     Ok(json!({"revoked": agent_id}))
 }
 
-/// `security.audit [{agent_id}, {op}, {decision}]` —— 过滤读回审计日志。
+/// `security.audit [{agent_id}, {op}, {decision}, {result}]` —— 过滤读回审计日志。
+/// `result` 为可选布尔（`true` = 仅已执行成功，`false` = 仅未执行/失败）；
+/// 省略 = 不按执行态过滤。`--decision allow` 需结合 `result` 判读（TSI-2659：
+/// 门禁判定记录恒 `result=false`，执行结果另落一条独立记录）。
 async fn security_audit(d: &mut Daemon, req: &Request) -> RpcResult {
     let params = req.params.as_ref().cloned().unwrap_or_default();
     let agent_id = params
@@ -585,7 +597,8 @@ async fn security_audit(d: &mut Daemon, req: &Request) -> RpcResult {
         .get("decision")
         .and_then(|v| v.as_str())
         .unwrap_or("");
-    let entries = d.security.audit.query(agent_id, op, decision);
+    let result = params.get("result").and_then(|v| v.as_bool());
+    let entries = d.security.audit.query(agent_id, op, decision, result);
     Ok(json!({"entries": entries}))
 }
 
@@ -1271,6 +1284,96 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn screenshot_backend_unavailable_audits_allow_result_false() {
+        // TSI-2659 回归锚定：门禁 allow（screenshot.capture=L2 自动放行）但
+        // handler 失败时，执行结果审计必须落 result=false，绝不能再出现
+        // allow+result=true 的失真实记录。`d.capture = None` 在连接后确定性
+        // 触发 BackendUnavailable，不依赖宿主是否可达 portal/X11 后端。
+        let mut d = Daemon::connect(Duration::from_secs(1)).await;
+        // 隔离 ambient config：独立审计路径 + 默认权限（`"*"` 自动放行 L2）。
+        let audit_path = std::env::temp_dir().join(format!(
+            "agent-shell-dispatch-tsi2659-{}.jsonl",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&audit_path);
+        let mut cfg = AgentShellConfig::default();
+        cfg.security.audit_log_path = Some(audit_path.to_string_lossy().into_owned());
+        d.security = SecurityManager::with_config(cfg);
+        d.caller_id = "*".into();
+        d.capture = None;
+
+        let resp = dispatch(
+            &mut d,
+            &req(
+                method::SCREENSHOT_CAPTURE,
+                Some(json!({"output_path": "/tmp/tsi2659-never-written.ppm"})),
+            ),
+        )
+        .await;
+        assert!(resp.error.is_some(), "must fail without capture backend");
+
+        let entries = d.security.audit.query("", "screenshot.capture", "", None);
+        assert!(!entries.is_empty(), "audit must record the allow decision");
+        let allow_entries: Vec<_> = entries.iter().filter(|e| e.decision == "allow").collect();
+        assert_eq!(
+            allow_entries.len(),
+            2,
+            "gate allow + execution outcome: {entries:?}"
+        );
+        assert!(
+            allow_entries.iter().all(|e| !e.result),
+            "backend-unavailable allow must have result=false: {entries:?}"
+        );
+        let _ = std::fs::remove_file(&audit_path);
+    }
+
+    #[tokio::test]
+    async fn security_audit_filters_by_result() {
+        // TSI-2659：`security.audit` 新增 `result` 过滤键——同一 allow 操作
+        // 现在双记录（门禁 false + 执行结果），按执行态区分只读已执行/未执行。
+        let mut d = Daemon::connect(Duration::from_secs(1)).await;
+        let audit_path = std::env::temp_dir().join(format!(
+            "agent-shell-dispatch-audit-result-{}.jsonl",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&audit_path);
+        let mut cfg = AgentShellConfig::default();
+        cfg.security.audit_log_path = Some(audit_path.to_string_lossy().into_owned());
+        d.security = SecurityManager::with_config(cfg);
+        d.security.audit.log("agent-a", "op.x", "allow", false);
+        d.security.audit.log("agent-a", "op.x", "allow", true);
+        d.security.audit.log("agent-b", "op.x", "deny", false);
+
+        let executed = security_audit(
+            &mut d,
+            &req(method::SECURITY_AUDIT, Some(json!({ "result": true }))),
+        )
+        .await
+        .expect("audit query must succeed");
+        let entries = executed["entries"].as_array().expect("entries array");
+        assert!(!entries.is_empty(), "must find executed entries");
+        assert!(
+            entries.iter().all(|e| e["result"].as_bool() == Some(true)),
+            "result=true filter must return only executed: {entries:?}"
+        );
+
+        let failed = security_audit(
+            &mut d,
+            &req(method::SECURITY_AUDIT, Some(json!({ "result": false }))),
+        )
+        .await
+        .expect("audit query must succeed");
+        let entries = failed["entries"].as_array().expect("entries array");
+        assert_eq!(
+            entries.len(),
+            2,
+            "gate allow(false) + deny(false) both match result=false: {entries:?}"
+        );
+        assert!(entries.iter().all(|e| e["result"].as_bool() == Some(false)));
+        let _ = std::fs::remove_file(&audit_path);
+    }
+
+    #[tokio::test]
     async fn a11y_query_non_string_role_name_is_invalid_params() {
         // TSI-2480 QA 回归锚定：类型校验先于后端可用性判定，
         // headless（无 AT-SPI bus）环境也须返回 InvalidParams。
@@ -1663,7 +1766,7 @@ mod tests {
                 "{m}"
             );
         }
-        let denies = d.security.audit.query("", "", "deny");
+        let denies = d.security.audit.query("", "", "deny", None);
         assert!(!denies.is_empty(), "audit.jsonl must record deny entries");
         assert!(denies.iter().all(|e| e.agent_id == "agent-x" && !e.result));
         let _ = std::fs::remove_file(&audit_path);

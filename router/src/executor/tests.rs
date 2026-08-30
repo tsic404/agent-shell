@@ -154,6 +154,82 @@ impl CompositorComponent for MockCompositor {
     }
 }
 
+/// 合成器 mock：`list_windows` 恒失败——驱动失败路径的执行审计断言。
+struct FailingListCompositor;
+
+#[async_trait]
+impl DesktopComponent for FailingListCompositor {
+    fn name(&self) -> &'static str {
+        "failing-list-compositor"
+    }
+    fn component_type(&self) -> ComponentType {
+        ComponentType::Compositor
+    }
+    fn is_available(&self) -> bool {
+        true
+    }
+    async fn health(&self) -> ComponentHealth {
+        ComponentHealth::Healthy
+    }
+}
+
+#[async_trait]
+impl CompositorComponent for FailingListCompositor {
+    fn capabilities(&self) -> BackendCapabilities {
+        BackendCapabilities::default()
+    }
+    async fn list_windows(&self) -> Result<Vec<WindowInfo>> {
+        Err(AgentShellError::BackendUnavailable(
+            "mock compositor down".into(),
+        ))
+    }
+    async fn get_active_window(&self) -> Result<Option<WindowInfo>> {
+        Ok(None)
+    }
+    async fn focus_window(&self, _id: &WindowId) -> Result<()> {
+        Ok(())
+    }
+    async fn move_window(&self, _id: &WindowId, _x: i32, _y: i32) -> Result<()> {
+        Ok(())
+    }
+    async fn resize_window(&self, _id: &WindowId, _w: i32, _h: i32) -> Result<()> {
+        Ok(())
+    }
+    async fn minimize_window(&self, _id: &WindowId) -> Result<()> {
+        Ok(())
+    }
+    async fn unminimize_window(&self, _id: &WindowId) -> Result<()> {
+        Ok(())
+    }
+    async fn maximize_window(&self, _id: &WindowId) -> Result<()> {
+        Ok(())
+    }
+    async fn close_window(&self, _id: &WindowId) -> Result<()> {
+        Ok(())
+    }
+    async fn set_window_geometry(&self, _id: &WindowId, _geo: Rect) -> Result<()> {
+        Ok(())
+    }
+    async fn get_window_info(&self, id: &WindowId) -> Result<WindowInfo> {
+        Err(AgentShellError::WindowNotFound(id.native_id.clone()))
+    }
+    async fn list_workspaces(&self) -> Result<Vec<WorkspaceInfo>> {
+        Ok(vec![])
+    }
+    async fn activate_workspace(&self, _id: &WorkspaceId) -> Result<()> {
+        Ok(())
+    }
+    async fn move_window_to_workspace(&self, _wid: &WindowId, _ws: &WorkspaceId) -> Result<()> {
+        Ok(())
+    }
+    async fn list_monitors(&self) -> Result<Vec<MonitorInfo>> {
+        Ok(vec![])
+    }
+    async fn subscribe(&self) -> Result<Box<dyn agent_shell_core::event::EventStream>> {
+        Err(AgentShellError::NotImplemented("mock event stream".into()))
+    }
+}
+
 // ───────────────────────── mock 输入 ─────────────────────────
 
 #[derive(Default)]
@@ -603,6 +679,98 @@ async fn confirm_override_returns_confirmation_required() {
         .await
         .expect_err("confirm override must gate");
     assert!(matches!(err, AgentShellError::ConfirmationRequired(_)));
+}
+
+#[tokio::test]
+async fn allow_command_records_execution_outcome() {
+    // TSI-2659 回归锚定：router 门禁放行后须在命令返回后落执行结果审计——
+    // 门禁判定记录 result=false + 执行结果记录 result=true，二者独立有序。
+    let audit_path = std::env::temp_dir().join(format!(
+        "agent-shell-router-audit-{}.jsonl",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&audit_path);
+    let mut cfg = AgentShellConfig::default();
+    cfg.security.audit_log_path = Some(audit_path.to_string_lossy().into_owned());
+    let security = Arc::new(SecurityManager::with_config(cfg));
+
+    let ex = Executor::new(
+        Box::new(MockCompositor::new(vec![])),
+        Arc::new(MockInput::default()),
+        Arc::new(MockCapture),
+        Arc::new(FailingSetTextA11y),
+        security.clone(),
+    );
+
+    ex.execute(Command::GetDesktopInfo)
+        .await
+        .expect("system.desktop_info must succeed");
+
+    let op_entries: Vec<_> = security
+        .audit
+        .read_all()
+        .into_iter()
+        .filter(|e| e.op == "system.desktop_info")
+        .collect();
+    assert_eq!(
+        op_entries.len(),
+        2,
+        "gate allow + execution outcome: {op_entries:?}"
+    );
+    assert!(
+        op_entries.iter().any(|e| !e.result),
+        "gate record must be result=false: {op_entries:?}"
+    );
+    assert!(
+        op_entries.iter().any(|e| e.result),
+        "execution record must be result=true: {op_entries:?}"
+    );
+    let _ = std::fs::remove_file(&audit_path);
+}
+
+#[tokio::test]
+async fn allow_command_failure_still_records_execution_outcome() {
+    // TSI-2659 复审：`?` 提前返回不得绕过执行结果审计——失败路径同样落
+    // 门禁 allow+false + 执行结果 false 两条记录，与 daemon 侧契约一致。
+    let audit_path = std::env::temp_dir().join(format!(
+        "agent-shell-router-audit-fail-{}.jsonl",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&audit_path);
+    let mut cfg = AgentShellConfig::default();
+    cfg.security.audit_log_path = Some(audit_path.to_string_lossy().into_owned());
+    let security = Arc::new(SecurityManager::with_config(cfg));
+
+    let ex = Executor::new(
+        Box::new(FailingListCompositor),
+        Arc::new(MockInput::default()),
+        Arc::new(MockCapture),
+        Arc::new(FailingSetTextA11y),
+        security.clone(),
+    );
+
+    let err = ex
+        .execute(Command::ListWindows { filter: None })
+        .await
+        .expect_err("backend failure must propagate");
+    assert!(matches!(err, AgentShellError::BackendUnavailable(_)));
+
+    let op_entries: Vec<_> = security
+        .audit
+        .read_all()
+        .into_iter()
+        .filter(|e| e.op == "windows.list")
+        .collect();
+    assert_eq!(
+        op_entries.len(),
+        2,
+        "gate allow + failed execution outcome: {op_entries:?}"
+    );
+    assert!(
+        op_entries.iter().all(|e| !e.result),
+        "both records must be result=false on failure: {op_entries:?}"
+    );
+    let _ = std::fs::remove_file(&audit_path);
 }
 
 #[tokio::test]

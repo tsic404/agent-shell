@@ -267,7 +267,7 @@ pub enum SecurityCommand {
         /// agent 标识
         agent_id: String,
     },
-    /// 读回审计日志（可按 agent_id / op / decision 过滤）
+    /// 读回审计日志（可按 agent_id / op / decision / result 过滤）
     Audit {
         /// 按 agent 过滤
         #[arg(long)]
@@ -278,6 +278,9 @@ pub enum SecurityCommand {
         /// 按判定结果过滤（allow / confirm / deny）
         #[arg(long)]
         decision: Option<String>,
+        /// 按执行态过滤（true = 仅已执行成功，false = 仅未执行/失败）
+        #[arg(long)]
+        result: Option<bool>,
     },
 }
 

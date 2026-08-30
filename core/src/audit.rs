@@ -2,10 +2,9 @@
 //!
 //! `AuditLogger` 将每次权限判定写为一行 JSON（JSONL），落盘到 XDG 运行时
 //! 状态目录（默认 `~/.local/state/agent-shell/audit.jsonl`）。`security.audit`
-//! RPC 通过 [`AuditLogger::query`] 读回并按 `agent_id` / `op` / `decision`
-//! 过滤。日志只追加、不覆盖；IO 失败只降级为 tracing 告警，不使业务路径
-//! 失败——审计是旁路记录，不是权限判定的前置依赖。
-
+//! RPC 通过 [`AuditLogger::query`] 读回并按 `agent_id` / `op` / `decision` /
+//! `result` 过滤。日志只追加、不覆盖；IO 失败只降级为 tracing 告警，不使业务
+//! 路径失败——审计是旁路记录，不是权限判定的前置依赖。
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -19,9 +18,11 @@ pub struct AuditEntry {
     pub agent_id: String,
     /// 操作名（如 `windows.list`、`input.send`）。
     pub op: String,
-    /// 权限判定：`allow` / `confirm` / `deny`。
+    /// 门禁判定结果（`allow` / `confirm` / `deny`）。
     pub decision: String,
-    /// 最终执行结果（`true` = 已执行，`false` = 未执行）。
+    /// 操作是否已执行（`true` = 执行成功，`false` = 未执行或执行失败）。
+    /// 门禁判定记录恒为 `false`；`allow` 的执行结果由 dispatch 层在
+    /// handler 返回后追加一条独立记录回写（TSI-2659）。
     pub result: bool,
 }
 
@@ -96,13 +97,26 @@ impl AuditLogger {
             .collect()
     }
 
-    /// 按 `agent_id` / `op` / `decision` 过滤（空串 = 不限制该维度）。
-    pub fn query(&self, agent_id: &str, op: &str, decision: &str) -> Vec<AuditEntry> {
+    /// 按 `agent_id` / `op` / `decision` / `result` 过滤（空串 / `None` =
+    /// 不限制该维度）。`result` 区分执行态——同一 `allow` 操作会先落一条
+    /// 门禁判定记录（`result=false`），执行后再追加一条结果记录（TSI-2659），
+    /// 只关心「已执行成功」须同时给 `decision=allow` + `result=Some(true)`。
+    pub fn query(
+        &self,
+        agent_id: &str,
+        op: &str,
+        decision: &str,
+        result: Option<bool>,
+    ) -> Vec<AuditEntry> {
         self.read_all()
             .into_iter()
             .filter(|e| agent_id.is_empty() || e.agent_id == agent_id)
             .filter(|e| op.is_empty() || e.op == op)
             .filter(|e| decision.is_empty() || e.decision == decision)
+            .filter(|e| match result {
+                Some(r) => e.result == r,
+                None => true,
+            })
             .collect()
     }
 
