@@ -109,6 +109,7 @@ pub async fn dispatch(daemon: &mut Daemon, req: &Request) -> Response {
         method::TIMER_LIST => stub_ok("timer.list"),
         // ── rootd 特权代理（§23.4）──
         method::SERVICE_CONTROL => service_control(daemon, req).await,
+        method::DAEMON_RELOAD => daemon_reload(daemon).await,
         method::SYSTEM_LOG_VIEW => system_log_view(daemon, req).await,
         method::PROCESS_KILL => process_kill(daemon, req).await,
         method::JOB_STATUS => job_status(daemon, req).await,
@@ -199,6 +200,7 @@ fn operation_for(method_name: &str, params: &Option<Value>) -> Option<Operation>
         (method::TIMER_LIST, L0),
         (method::TIMER_NEXT, L0),
         (method::SERVICE_CONTROL, L3),
+        (method::DAEMON_RELOAD, L3),
         (method::SYSTEM_LOG_VIEW, L0),
         (method::PROCESS_KILL, L3),
         (method::JOB_STATUS, L0),
@@ -765,10 +767,11 @@ async fn rootd_hello(_d: &mut Daemon) -> RpcResult {
     }
 }
 
-/// 启停系统服务（rootd ServiceStart/Stop/Restart）。
+/// 控制系统服务（rootd ServiceStart/Stop/Restart/Enable/Disable/Reload）。
 ///
-/// 参数：{ "action": "start|stop|restart", "unit": "nginx.service" }
-/// rootd 未安装时返回降级错误。
+/// 参数：{ "action": "start|stop|restart|enable|disable|reload", "unit": "nginx.service" }
+/// unit 名与 action 的语义校验在 rootd `service_control` 完成——daemon 纯路由，
+/// 不重复校验（rootd 是唯一的权威边界）。rootd 未安装时返回降级错误。
 async fn service_control(_d: &mut Daemon, req: &Request) -> RpcResult {
     let params = params_of(req)?;
     let action = params
@@ -784,7 +787,6 @@ async fn service_control(_d: &mut Daemon, req: &Request) -> RpcResult {
         RpcErrorCode::BackendUnavailable,
         "rootd not installed — privileged operation unavailable".into(),
     ))?;
-
     match action {
         "start" => proxy
             .service_start(unit)
@@ -798,14 +800,44 @@ async fn service_control(_d: &mut Daemon, req: &Request) -> RpcResult {
             .service_restart(unit)
             .await
             .map_err(|e| (RpcErrorCode::BackendError, format!("rootd: {e}")))?,
+        "enable" => proxy
+            .service_enable(unit)
+            .await
+            .map_err(|e| (RpcErrorCode::BackendError, format!("rootd: {e}")))?,
+        "disable" => proxy
+            .service_disable(unit)
+            .await
+            .map_err(|e| (RpcErrorCode::BackendError, format!("rootd: {e}")))?,
+        "reload" => proxy
+            .service_reload(unit)
+            .await
+            .map_err(|e| (RpcErrorCode::BackendError, format!("rootd: {e}")))?,
         other => {
             return Err((
                 RpcErrorCode::InvalidParams,
-                format!("unknown action: {other} (expected start/stop/restart)"),
+                format!(
+                    "unknown action: {other} (expected start/stop/restart/enable/disable/reload)"
+                ),
             ))
         }
     }
     Ok(json!({ "accepted": true, "action": action, "unit": unit }))
+}
+
+/// 重载 systemd 管理器配置（rootd DaemonReload）。
+///
+/// 无参数。rootd 未安装时返回降级错误。
+async fn daemon_reload(_d: &mut Daemon) -> RpcResult {
+    let proxy = crate::rootd_client::connect().await.ok_or((
+        RpcErrorCode::BackendUnavailable,
+        "rootd not installed — privileged operation unavailable".into(),
+    ))?;
+
+    proxy
+        .daemon_reload()
+        .await
+        .map_err(|e| (RpcErrorCode::BackendError, format!("rootd: {e}")))?;
+    Ok(json!({ "accepted": true }))
 }
 
 /// 查看系统日志（rootd JournalQuery）。
@@ -1418,6 +1450,65 @@ mod tests {
         assert_eq!(
             resp.error.expect("error").code,
             RpcErrorCode::ConfirmationRequired as i32
+        );
+    }
+
+    #[tokio::test]
+    async fn daemon_reload_default_config_returns_confirmation_required() {
+        // daemon.reload（L3）与 service.control 同级：默认配置需确认，
+        // 在 handler 之前短路——不触碰 rootd。
+        let mut d = Daemon::connect(Duration::from_secs(1)).await;
+        let resp = dispatch(&mut d, &req(method::DAEMON_RELOAD, None)).await;
+        assert_eq!(
+            resp.error.expect("error").code,
+            RpcErrorCode::ConfirmationRequired as i32
+        );
+    }
+
+    #[tokio::test]
+    async fn service_control_extended_actions_reach_rootd_degrade() {
+        // L4 放行后进入 handler：enable/disable/reload 经参数提取到达 rootd
+        // 连接。本环境无 rootd → BackendUnavailable 降级，证明扩展动作的
+        // 前置链路（参数解析 + 门禁放行）完整；rootd Ok 分支需实机。
+        let mut d = Daemon::connect(Duration::from_secs(1)).await;
+        d.caller_id = "trusted".into();
+        d.security
+            .config
+            .permissions
+            .allow
+            .insert("trusted".into(), vec![PermissionLevel::L4]);
+        for action in ["enable", "disable", "reload"] {
+            let resp = dispatch(
+                &mut d,
+                &req(
+                    method::SERVICE_CONTROL,
+                    Some(json!({ "action": action, "unit": "nginx.service" })),
+                ),
+            )
+            .await;
+            assert_eq!(
+                resp.error.expect("error").code,
+                RpcErrorCode::BackendUnavailable as i32,
+                "action {action}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn daemon_reload_reaches_rootd_degrade() {
+        // L4 放行后进入 handler：daemon.reload 无参数直达 rootd 连接。
+        // 本环境无 rootd → BackendUnavailable 降级。
+        let mut d = Daemon::connect(Duration::from_secs(1)).await;
+        d.caller_id = "trusted".into();
+        d.security
+            .config
+            .permissions
+            .allow
+            .insert("trusted".into(), vec![PermissionLevel::L4]);
+        let resp = dispatch(&mut d, &req(method::DAEMON_RELOAD, None)).await;
+        assert_eq!(
+            resp.error.expect("error").code,
+            RpcErrorCode::BackendUnavailable as i32
         );
     }
 

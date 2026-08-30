@@ -178,8 +178,10 @@ pub mod method {
     /// Timer 下次触发。
     pub const TIMER_NEXT: &str = "timer.next";
     // ── rootd 特权代理（§23.4）──
-    /// 启停系统服务（rootd ServiceStart/Stop/Restart）。
+    /// 启停/启用/禁用/重载系统服务（rootd ServiceStart/Stop/Restart/Enable/Disable/Reload）。
     pub const SERVICE_CONTROL: &str = "service.control";
+    /// 重载 systemd 管理器配置（rootd DaemonReload）。
+    pub const DAEMON_RELOAD: &str = "daemon.reload";
     /// 查看系统日志（rootd JournalQuery）。
     pub const SYSTEM_LOG_VIEW: &str = "system-log.view";
     /// 挂载文件系统（rootd Mount，§23.4）。

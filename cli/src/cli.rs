@@ -431,7 +431,7 @@ pub enum TimerCommand {
 
 // ───────────────────────── service（rootd 特权链路） ─────────────────────────
 
-/// 系统服务控制命令（rootd ServiceStart/Stop/Restart，§23.4）。
+/// 系统服务控制命令（rootd ServiceStart/Stop/Restart/Enable/Disable/Reload，§23.4）。
 #[derive(Subcommand, Debug)]
 pub enum ServiceCommand {
     /// 启动系统服务
@@ -440,6 +440,14 @@ pub enum ServiceCommand {
     Stop { unit: String },
     /// 重启系统服务
     Restart { unit: String },
+    /// 启用系统服务（开机自启）
+    Enable { unit: String },
+    /// 禁用系统服务（取消开机自启）
+    Disable { unit: String },
+    /// 重载系统服务配置
+    Reload { unit: String },
+    /// 重载 systemd 管理器配置（daemon-reload）
+    DaemonReload,
 }
 
 // ───────────────────────── log（rootd 特权链路） ─────────────────────────

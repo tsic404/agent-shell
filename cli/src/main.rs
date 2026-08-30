@@ -574,22 +574,80 @@ async fn timer(c: &mut DaemonClient, cmd: cli::TimerCommand) -> CmdResult {
 
 // ───────────────────────── service / log（rootd 特权链路，§23.4） ─────────────────────────
 
-async fn service_cmd(c: &mut DaemonClient, cmd: cli::ServiceCommand) -> CmdResult {
-    let (action, unit) = match cmd {
-        cli::ServiceCommand::Start { unit } => ("start", unit),
-        cli::ServiceCommand::Stop { unit } => ("stop", unit),
-        cli::ServiceCommand::Restart { unit } => ("restart", unit),
-    };
-    let _ = c
+/// `service.control` 扩展动作（enable/disable/reload）共用的错误映射：
+/// rootd 未安装/校验失败/系统调用失败 → 干净 stderr + exit 1，polkit 拒绝 →
+/// exit 2；其余错误保留 `rpc error N: …` 原始形态，由 `run` 统一打印。
+async fn service_extended(c: &mut DaemonClient, action: &str, unit: &str) -> CmdResult {
+    match c
         .call(
             method::SERVICE_CONTROL,
             json!({ "action": action, "unit": unit }),
         )
-        .await?;
-    // service_control 的错误由 RPC error 层处理（call() 已返回 Err）。
-    // 成功到达此处的 result 不含 error 字段——只检查 accepted。
-    println!("service {action} {unit}: accepted");
-    Ok(0)
+        .await
+    {
+        Ok(_) => {
+            println!("service {action} {unit}: accepted");
+            Ok(0)
+        }
+        Err(e) => match process_rootd_error(&e) {
+            Some((code, msg)) => {
+                eprintln!("error: {msg}");
+                Ok(code)
+            }
+            None => Err(e),
+        },
+    }
+}
+
+async fn service_cmd(c: &mut DaemonClient, cmd: cli::ServiceCommand) -> CmdResult {
+    match cmd {
+        cli::ServiceCommand::Start { unit } => {
+            let _ = c
+                .call(
+                    method::SERVICE_CONTROL,
+                    json!({ "action": "start", "unit": unit }),
+                )
+                .await?;
+            println!("service start {unit}: accepted");
+            Ok(0)
+        }
+        cli::ServiceCommand::Stop { unit } => {
+            let _ = c
+                .call(
+                    method::SERVICE_CONTROL,
+                    json!({ "action": "stop", "unit": unit }),
+                )
+                .await?;
+            println!("service stop {unit}: accepted");
+            Ok(0)
+        }
+        cli::ServiceCommand::Restart { unit } => {
+            let _ = c
+                .call(
+                    method::SERVICE_CONTROL,
+                    json!({ "action": "restart", "unit": unit }),
+                )
+                .await?;
+            println!("service restart {unit}: accepted");
+            Ok(0)
+        }
+        cli::ServiceCommand::Enable { unit } => service_extended(c, "enable", &unit).await,
+        cli::ServiceCommand::Disable { unit } => service_extended(c, "disable", &unit).await,
+        cli::ServiceCommand::Reload { unit } => service_extended(c, "reload", &unit).await,
+        cli::ServiceCommand::DaemonReload => match c.call0(method::DAEMON_RELOAD).await {
+            Ok(_) => {
+                println!("daemon-reload: accepted");
+                Ok(0)
+            }
+            Err(e) => match process_rootd_error(&e) {
+                Some((code, msg)) => {
+                    eprintln!("error: {msg}");
+                    Ok(code)
+                }
+                None => Err(e),
+            },
+        },
+    }
 }
 
 /// `kill` 命令（rootd ProcessKill，§23.4）。
