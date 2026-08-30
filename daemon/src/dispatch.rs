@@ -1411,6 +1411,9 @@ mod tests {
     async fn above_level_without_whitelist_returns_confirmation_required() {
         // 默认配置：`"*"` 无白名单 → service.control（L3）需确认。
         let mut d = Daemon::connect(Duration::from_secs(1)).await;
+        // 隔离 ambient config：清除 connect 从磁盘/env 读到的持久化 grant/deny。
+        d.security = SecurityManager::with_config(AgentShellConfig::default());
+        d.caller_id = "*".into();
         let resp = dispatch(&mut d, &req(method::SERVICE_CONTROL, Some(json!({})))).await;
         assert_eq!(
             resp.error.expect("error").code,
@@ -1599,6 +1602,9 @@ mod tests {
         // hostname.set（L3）与 service.control/process.kill 同级：
         // 默认配置需确认，在 handler 之前短路——不触碰 rootd。
         let mut d = Daemon::connect(Duration::from_secs(1)).await;
+        // 隔离 ambient config：清除 connect 从磁盘/env 读到的持久化 grant/deny。
+        d.security = SecurityManager::with_config(AgentShellConfig::default());
+        d.caller_id = "*".into();
         let resp = dispatch(
             &mut d,
             &req(
@@ -1629,6 +1635,9 @@ mod tests {
         // 默认配置无白名单 → mount（L4）需确认，且在 handler 之前短路
         // （rootd 未安装时不会走到 BackendUnavailable）。
         let mut d = Daemon::connect(Duration::from_secs(1)).await;
+        // 隔离 ambient config：清除 connect 从磁盘/env 读到的持久化 grant/deny。
+        d.security = SecurityManager::with_config(AgentShellConfig::default());
+        d.caller_id = "*".into();
         let resp = dispatch(&mut d, &req(method::MOUNT, Some(json!({})))).await;
         assert_eq!(
             resp.error.expect("error").code,
@@ -1681,6 +1690,8 @@ mod tests {
         // 连接。本环境无 rootd → BackendUnavailable 降级，证明成功路径的
         // 前置链路（参数解析 + 门禁放行）完整；rootd Ok 分支需实机。
         let mut d = Daemon::connect(Duration::from_secs(1)).await;
+        // 隔离 ambient config：清除 connect 从磁盘/env 读到的持久化 grant/deny。
+        d.security = SecurityManager::with_config(AgentShellConfig::default());
         d.caller_id = "trusted".into();
         d.security
             .config
