@@ -56,6 +56,7 @@ async fn dispatch_command(command: Command, out: OutputFormat) -> CmdResult {
         Command::A11y(cmd) => a11y(&mut c, cmd).await,
         Command::Events(cmd) => events(&mut c, cmd).await,
         Command::Daemon(cmd) => daemon_cmd(&mut c, cmd).await,
+        Command::Security(cmd) => security_cmd(&mut c, cmd).await,
         Command::Ime(cmd) => ime(&mut c, cmd).await,
         Command::Brightness(cmd) => brightness(&mut c, cmd).await,
         Command::File(cmd) => file_cmd(&mut c, cmd).await,
@@ -275,6 +276,71 @@ async fn daemon_cmd(c: &mut DaemonClient, cmd: cli::DaemonCommand) -> CmdResult 
         }
     }
     Ok(0)
+}
+
+// ───────────────────────── security ─────────────────────────
+
+/// `security.*` 策略面 RPC 透传（§22.7 D6）。
+///
+/// daemon 侧 status/audit 只读、免普通级别 gate；grant/revoke 是提权原语，
+/// 按 caller_id 门禁（仅 `"*"` 本地调用方放行，见 daemon `dispatch.rs`
+/// `check_management_permission`）。CLI 子进程未注入 `AGENT_SHELL_AGENT_ID`
+/// 时即以 `"*"` 运行，具备管理面权限。
+///
+/// 方法名与参数形状由纯函数 [`security_request`] 产出，测试锚定其契约。
+async fn security_cmd(c: &mut DaemonClient, cmd: cli::SecurityCommand) -> CmdResult {
+    let (method_name, params) = security_request(&cmd);
+    let r = if params.is_null() {
+        c.call0(method_name).await?
+    } else {
+        c.call(method_name, params).await?
+    };
+    println!("{}", serde_json::to_string_pretty(&r).unwrap_or_default());
+    Ok(0)
+}
+
+/// `security.*` 分派表：子命令 → (RPC 方法名, 参数)。独立纯函数，
+/// 供测试锚定方法名与参数形状；audit 省略键约定由 `security_audit_params`
+/// 保证（与 `a11y.query` 同源约定）。
+fn security_request(cmd: &cli::SecurityCommand) -> (&'static str, Value) {
+    match cmd {
+        cli::SecurityCommand::Status => (method::SECURITY_STATUS, Value::Null),
+        cli::SecurityCommand::Grant { agent_id, level } => (
+            method::SECURITY_GRANT,
+            json!({ "agent_id": agent_id, "level": level }),
+        ),
+        cli::SecurityCommand::Revoke { agent_id } => {
+            (method::SECURITY_REVOKE, json!({ "agent_id": agent_id }))
+        }
+        cli::SecurityCommand::Audit {
+            agent_id,
+            op,
+            decision,
+        } => (
+            method::SECURITY_AUDIT,
+            security_audit_params(agent_id.as_deref(), op.as_deref(), decision.as_deref()),
+        ),
+    }
+}
+
+/// `security.audit` 参数构造：`None` 过滤条件省略键，而非序列化为 JSON
+/// `null`（与 `a11y.query` 同约定；daemon 空串 = 不限制该维度）。
+fn security_audit_params(
+    agent_id: Option<&str>,
+    op: Option<&str>,
+    decision: Option<&str>,
+) -> Value {
+    let mut params = serde_json::Map::new();
+    if let Some(v) = agent_id {
+        params.insert("agent_id".into(), json!(v));
+    }
+    if let Some(v) = op {
+        params.insert("op".into(), json!(v));
+    }
+    if let Some(v) = decision {
+        params.insert("decision".into(), json!(v));
+    }
+    Value::Object(params)
 }
 
 // ───────────────────────── ime ─────────────────────────
@@ -899,9 +965,10 @@ fn process_rootd_error(e: &str) -> Option<(i32, String)> {
 mod tests {
     use super::{
         is_auth_required, job_status_outcome, log_query_timeout_error, parse_log_filter,
-        pkg_failed_job_line, process_rootd_error, wait_for_job_impl, JobStatusSource,
-        LOG_QUERY_TIMEOUT,
+        pkg_failed_job_line, process_rootd_error, security_audit_params, security_request,
+        wait_for_job_impl, JobStatusSource, LOG_QUERY_TIMEOUT,
     };
+
     use serde_json::{json, Value};
     use std::collections::VecDeque;
     use std::time::Duration;
@@ -1189,5 +1256,66 @@ mod tests {
             pkg_failed_job_line(&json!({})),
             "error: job failed (exit unknown): "
         );
+    }
+
+    /// `security.audit` 过滤条件与 `a11y.query` 同约定：`None` 条件省略键，
+    /// 而非序列化为 JSON `null`（daemon 空串 = 不限制该维度）。
+    #[test]
+    fn security_audit_params_omits_none_keys() {
+        let v = security_audit_params(Some("alice"), None, Some("deny"));
+        let obj = v.as_object().expect("params must be object");
+        assert_eq!(obj.get("agent_id").and_then(|v| v.as_str()), Some("alice"));
+        assert_eq!(obj.get("decision").and_then(|v| v.as_str()), Some("deny"));
+        assert!(!obj.contains_key("op"), "None op must be omitted");
+
+        let v = security_audit_params(None, Some("windows.list"), None);
+        let obj = v.as_object().expect("params must be object");
+        assert_eq!(obj.get("op").and_then(|v| v.as_str()), Some("windows.list"));
+        assert!(
+            !obj.contains_key("agent_id"),
+            "None agent_id must be omitted"
+        );
+        assert!(
+            !obj.contains_key("decision"),
+            "None decision must be omitted"
+        );
+
+        let v = security_audit_params(None, None, None);
+        assert!(
+            v.as_object().expect("params must be object").is_empty(),
+            "all-None params must be empty object"
+        );
+    }
+
+    /// `security.*` 分派锚定：方法名与参数形状必须与 daemon RPC 契约一致。
+    /// status 走无参形态（`Value::Null`），grant/revoke/audit 各带精确键。
+    #[test]
+    fn security_request_matches_rpc_contract() {
+        use crate::cli::SecurityCommand as S;
+
+        let (m, p) = security_request(&S::Status);
+        assert_eq!(m, "security.status");
+        assert!(p.is_null(), "status params must be null");
+
+        let (m, p) = security_request(&S::Grant {
+            agent_id: "alice".into(),
+            level: "L2".into(),
+        });
+        assert_eq!(m, "security.grant");
+        assert_eq!(p, json!({ "agent_id": "alice", "level": "L2" }));
+
+        let (m, p) = security_request(&S::Revoke {
+            agent_id: "alice".into(),
+        });
+        assert_eq!(m, "security.revoke");
+        assert_eq!(p, json!({ "agent_id": "alice" }));
+
+        let (m, p) = security_request(&S::Audit {
+            agent_id: Some("alice".into()),
+            op: None,
+            decision: Some("deny".into()),
+        });
+        assert_eq!(m, "security.audit");
+        assert_eq!(p, json!({ "agent_id": "alice", "decision": "deny" }));
     }
 }

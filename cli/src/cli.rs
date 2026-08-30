@@ -51,6 +51,9 @@ pub enum Command {
     /// daemon 管理（§22.2）
     #[command(subcommand)]
     Daemon(DaemonCommand),
+    /// 安全策略管理（status / grant / revoke / audit，§22.7 D6）
+    #[command(subcommand)]
+    Security(SecurityCommand),
     /// 输入法（§22.8 D7）
     #[command(subcommand)]
     Ime(ImeCommand),
@@ -243,6 +246,39 @@ pub enum DaemonCommand {
     Status,
     /// portal 会话
     Sessions,
+}
+
+// ───────────────────────── security ─────────────────────────
+
+/// 安全策略管理（§22.7 D6）：策略面 RPC 的 CLI 透传。
+#[derive(Subcommand, Debug)]
+pub enum SecurityCommand {
+    /// 当前安全配置真值（默认确认级别、白/黑名单、审计路径）
+    Status,
+    /// 授权 agent 到指定级别（L0..L4）
+    Grant {
+        /// agent 标识
+        agent_id: String,
+        /// 权限级别（L0..L4）
+        level: String,
+    },
+    /// 撤销 agent 白名单
+    Revoke {
+        /// agent 标识
+        agent_id: String,
+    },
+    /// 读回审计日志（可按 agent_id / op / decision 过滤）
+    Audit {
+        /// 按 agent 过滤
+        #[arg(long)]
+        agent_id: Option<String>,
+        /// 按操作名过滤
+        #[arg(long)]
+        op: Option<String>,
+        /// 按判定结果过滤（allow / confirm / deny）
+        #[arg(long)]
+        decision: Option<String>,
+    },
 }
 
 // ───────────────────────── ime ─────────────────────────
