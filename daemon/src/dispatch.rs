@@ -103,6 +103,7 @@ pub async fn dispatch(daemon: &mut Daemon, req: &Request) -> Response {
         method::SERVICE_CONTROL => service_control(daemon, req).await,
         method::SYSTEM_LOG_VIEW => system_log_view(daemon, req).await,
         method::PROCESS_KILL => process_kill(daemon, req).await,
+        method::JOB_STATUS => job_status(daemon, req).await,
         method::ROOTD_HELLO => rootd_hello(daemon).await,
         method::HOSTNAME_SET => hostname_set(daemon, req).await,
         method::MOUNT => mount(daemon, req).await,
@@ -188,6 +189,7 @@ fn operation_for(method_name: &str, params: &Option<Value>) -> Option<Operation>
         (method::SERVICE_CONTROL, L3),
         (method::SYSTEM_LOG_VIEW, L0),
         (method::PROCESS_KILL, L3),
+        (method::JOB_STATUS, L0),
         (method::ROOTD_HELLO, L0),
         (method::HOSTNAME_SET, L3),
         (method::MOUNT, L4),
@@ -961,6 +963,37 @@ fn parse_mount_options(v: &Value) -> Result<Vec<String>, (RpcErrorCode, String)>
         .collect()
 }
 
+/// 查询 job 状态（rootd JobStatus）。
+///
+/// 参数：{ "job_id": "job-3" }。返回 rootd 的 JSON
+/// `{found, method, progress, done, success, exit_code, stderr}`；
+/// 未知 job 时 rootd 返回 `{"found": false}`（job 可能已被 drain 淘汰）。
+/// rootd 未安装 → `BackendUnavailable` 降级错误。
+async fn job_status(_d: &mut Daemon, req: &Request) -> RpcResult {
+    let params = params_of(req)?;
+    let job_id = params
+        .get("job_id")
+        .and_then(|v| v.as_str())
+        .ok_or((RpcErrorCode::InvalidParams, "missing job_id".into()))?;
+
+    let proxy = crate::rootd_client::connect().await.ok_or((
+        RpcErrorCode::BackendUnavailable,
+        "rootd not installed — job status unavailable".into(),
+    ))?;
+
+    let result = proxy
+        .job_status(job_id)
+        .await
+        .map_err(|e| (RpcErrorCode::BackendError, format!("rootd: {e}")))?;
+    let parsed: Value = serde_json::from_str(&result).map_err(|e| {
+        (
+            RpcErrorCode::BackendError,
+            format!("rootd JobStatus parse: {e}"),
+        )
+    })?;
+    Ok(parsed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1382,6 +1415,17 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn job_status_missing_job_id_is_invalid_params() {
+        // headless 环境：job_id 缺省先于 rootd 可用性判定报 InvalidParams。
+        let mut d = Daemon::connect(Duration::from_secs(1)).await;
+        let resp = dispatch(&mut d, &req(method::JOB_STATUS, Some(json!({})))).await;
+        assert_eq!(
+            resp.error.expect("error").code,
+            RpcErrorCode::InvalidParams as i32
+        );
+    }
+
+    #[tokio::test]
     async fn mount_requires_confirmation_without_whitelist() {
         // 默认配置无白名单 → mount（L4）需确认，且在 handler 之前短路
         // （rootd 未安装时不会走到 BackendUnavailable）。
@@ -1486,6 +1530,16 @@ mod tests {
         assert_eq!(
             parse_mount_options(&json!(["rw", "noatime"])).unwrap(),
             vec!["rw".to_string(), "noatime".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn job_status_requires_params() {
+        let mut d = Daemon::connect(Duration::from_secs(1)).await;
+        let resp = dispatch(&mut d, &req(method::JOB_STATUS, None)).await;
+        assert_eq!(
+            resp.error.expect("error").code,
+            RpcErrorCode::InvalidParams as i32
         );
     }
 }

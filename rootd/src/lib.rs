@@ -207,10 +207,30 @@ pub(crate) static JOB_TEST_MUTEX: parking_lot::Mutex<()> = parking_lot::Mutex::n
 /// 进程内 job 注册表（D-Bus 服务层轮询/订阅以发射信号）。
 static JOBS: Mutex<Option<HashMap<String, JobState>>> = Mutex::new(None);
 
+/// 已完成 job 的最终快照缓存（含 `success`/`exit_code`/`stderr`）。
+///
+/// `job_drain_done` 淘汰已完成 job 后，`job_status` 查询活动注册表
+/// 未命中时回落到此缓存——查询方（CLI `wait_for_job` 轮询、`job status`
+/// 人工查询）在 drain 后仍能读到确定正确的最终状态，而非 `{"found":false}`
+/// （否则完成快的 job 会被误报为「未找到」，见 TSI-2561 审查 #1）。
+/// 缓存仅追加最近一批完成项，完成即定稿、不可变；大小受
+/// [`COMPLETED_JOBS_MAX`] 上界约束。
+static COMPLETED_JOBS: Mutex<Vec<JobState>> = Mutex::new(Vec::new());
+
+/// 已完成 job 缓存的上界：超出后按完成顺序淘汰最旧项。
+/// 只保留最近完成的 64 个 job——查询方在 drain 后数分钟内追查
+/// 足够，且 rootd 常驻进程不因此无限增长。
+const COMPLETED_JOBS_MAX: usize = 64;
+
 fn jobs_lock<'a>() -> std::sync::MutexGuard<'a, Option<HashMap<String, JobState>>> {
     JOBS.lock().expect("JOBS mutex poisoned")
 }
 
+fn completed_jobs_lock<'a>() -> std::sync::MutexGuard<'a, Vec<JobState>> {
+    COMPLETED_JOBS
+        .lock()
+        .expect("COMPLETED_JOBS mutex poisoned")
+}
 fn next_job_id() -> String {
     let n = JOB_SEQ.fetch_add(1, Ordering::Relaxed);
     format!("job-{n}")
@@ -268,15 +288,23 @@ pub fn job_done_with(id: &str, success: bool, exit_code: Option<i32>, stderr: St
 }
 
 /// 查询单个 job 状态（Issue「job：status / progress 查询」）。
+///
+/// 先查活动注册表；未命中再查已完成缓存——`job_drain_done` 淘汰后
+/// 的完成 job 仍可查询到确定正确的最终状态。
 pub fn job_status(id: &str) -> Option<JobState> {
     let jobs = jobs_lock();
-    jobs.as_ref().and_then(|m| m.get(id)).cloned()
+    if let Some(state) = jobs.as_ref().and_then(|m| m.get(id)).cloned() {
+        return Some(state);
+    }
+    drop(jobs);
+    completed_jobs_lock().iter().find(|j| j.id == id).cloned()
 }
 
 /// `JobStatus(job_id)` 方法分派：把 `JobState` 序列化为 JSON 出参。
 ///
 /// 未知 id 返回 `{"found": false}` 而非错误——查询语义下「不存在」是
-/// 合法结果（job 可能已被 drain 淘汰），错误会误导调用方为调用失败。
+/// 合法结果，错误会误导调用方为调用失败。drain 淘汰后的完成 job
+/// 由 [`COMPLETED_JOBS`] 缓存兜底，仍返回 `found=true`。
 fn job_status_dispatch(args: &[Value]) -> RootResult {
     let job_id = str_arg(args, 0)?;
     let Some(state) = job_status(job_id) else {
@@ -293,13 +321,23 @@ fn job_status_dispatch(args: &[Value]) -> RootResult {
     }))
 }
 
-/// 取走并淘汰已完成 job（D-Bus 服务层发射 JobDone 后调用）。
+/// 取走并淘汰已完成 job（D-Bus 服务层发射 JobDone 后调用），
+/// 同时把最终快照移入 [`COMPLETED_JOBS`] 缓存供后续查询。
 /// 防止注册表无限增长——rootd 是常驻进程，不淘汰会内存泄漏。
 pub fn job_drain_done() -> Vec<JobState> {
     let mut jobs = jobs_lock();
     if let Some(map) = jobs.as_mut() {
         let drained: Vec<JobState> = map.values().filter(|j| j.done).cloned().collect();
         map.retain(|_, job| !job.done);
+        drop(jobs);
+        let mut completed = completed_jobs_lock();
+        for state in &drained {
+            completed.push(state.clone());
+        }
+        if completed.len() > COMPLETED_JOBS_MAX {
+            let overflow = completed.len() - COMPLETED_JOBS_MAX;
+            completed.drain(0..overflow);
+        }
         drained
     } else {
         Vec::new()
@@ -1542,6 +1580,48 @@ mod tests {
         // 精确 4096 字节边界：整体保留
         let exact = "a".repeat(4096);
         assert_eq!(truncate_utf8(&exact, 4096).len(), 4096);
+    }
+
+    #[test]
+    fn job_status_after_drain_reads_completed_cache() {
+        let _guard = JOB_TEST_MUTEX.lock();
+        // 清空活动注册表与完成缓存，隔离历史状态。
+        let _ = job_drain_done();
+        completed_jobs_lock().clear();
+        let id = job_create("PackageInstall");
+        job_done_with(&id, true, Some(0), String::new());
+        // drain 后活动注册表不再含该 job，但完成缓存保留最终快照。
+        let _ = job_drain_done();
+        let state = job_status(&id).expect("job readable from completed cache");
+        assert!(state.done);
+        assert!(state.success);
+        assert_eq!(state.exit_code, Some(0));
+        // 分派层同样命中缓存：found=true 而非 found=false。
+        let v = dispatch("JobStatus", &[json!(id.clone())]).expect("job status");
+        assert_eq!(v["found"], json!(true));
+        assert_eq!(v["success"], json!(true));
+    }
+
+    #[test]
+    fn job_drain_done_cache_evicts_oldest_beyond_bound() {
+        let _guard = JOB_TEST_MUTEX.lock();
+        let _ = job_drain_done();
+        completed_jobs_lock().clear();
+        // 创建并完成 COMPLETED_JOBS_MAX + 1 个 job，逐个 drain 注入缓存。
+        let ids: Vec<String> = (0..=COMPLETED_JOBS_MAX)
+            .map(|_| {
+                let id = job_create("PackageInstall");
+                job_done(&id, true);
+                let _ = job_drain_done();
+                id
+            })
+            .collect();
+        // 最旧的已淘汰，最新仍可查。
+        assert!(job_status(&ids[0]).is_none(), "oldest must be evicted");
+        let newest = job_status(ids.last().expect("has newest")).expect("newest cached");
+        assert!(newest.success);
+        // 缓存大小不超过上界。
+        assert!(completed_jobs_lock().len() <= COMPLETED_JOBS_MAX);
     }
 
     #[test]

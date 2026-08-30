@@ -680,7 +680,9 @@ mod tests {
     // ── drive_signals 信号循环 ──
 
     use super::{drive_signals, RootdInterface};
-    use crate::{job_create, job_done_with, job_progress, job_status, JOB_TEST_MUTEX};
+    use crate::{
+        completed_jobs_lock, job_create, job_done_with, job_progress, job_status, JOB_TEST_MUTEX,
+    };
     use futures_util::StreamExt;
     use std::io::Read as _;
     use std::process::{ChildStdout, Stdio};
@@ -874,7 +876,10 @@ mod tests {
         assert_eq!(job_id, id);
         assert!(success, "job must report success");
 
-        // drain 在 JobDone 发射后同步发生——该 job 必须已从注册表淘汰。
+        // drain 在 JobDone 发射后同步发生——活动注册表已淘汰该 job，
+        // 最终快照进入完成缓存。先清空缓存，把查询限定在活动注册表，
+        // 才能断言「已从注册表淘汰」而非被缓存兜底命中。
+        completed_jobs_lock().clear();
         assert!(
             job_status(&id).is_none(),
             "done job must be drained from registry"

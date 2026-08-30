@@ -192,6 +192,8 @@ pub mod method {
     pub const ROOTD_HELLO: &str = "rootd.hello";
     /// 设置系统主机名（rootd HostnameSet）。
     pub const HOSTNAME_SET: &str = "hostname.set";
+    /// 查询 job 状态（rootd JobStatus）。
+    pub const JOB_STATUS: &str = "job.status";
 }
 
 /// Mount/Unmount 共用的 polkit action id（§23.4.2）。

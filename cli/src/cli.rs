@@ -105,6 +105,9 @@ pub enum Command {
         #[arg(long, default_value = "15")]
         signal: i32,
     },
+    /// Job 状态查询（rootd 特权链路，§23.4）
+    #[command(subcommand)]
+    Job(JobCommand),
 }
 
 // ───────────────────────── windows ─────────────────────────
@@ -442,6 +445,15 @@ pub enum FsCommand {
         /// 挂载点路径
         target: String,
     },
+}
+
+// ───────────────────────── job（rootd 特权链路） ─────────────────────────
+
+/// Job 状态查询命令（rootd JobStatus，§23.4）。
+#[derive(Subcommand, Debug)]
+pub enum JobCommand {
+    /// 查询 job 状态
+    Status { job_id: String },
 }
 
 // ───────────────────────── 解析辅助 ─────────────────────────

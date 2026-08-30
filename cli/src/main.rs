@@ -72,6 +72,7 @@ async fn dispatch_command(command: Command, out: OutputFormat) -> CmdResult {
         Command::Log(cmd) => log_cmd(&mut c, cmd).await,
         Command::Hostname(cmd) => hostname_cmd(&mut c, cmd).await,
         Command::Kill { pid, signal } => kill_cmd(&mut c, pid, signal).await,
+        Command::Job(cmd) => job_cmd(&mut c, cmd).await,
     }
 }
 
@@ -651,6 +652,97 @@ fn is_auth_required(code: i32, message: &str) -> bool {
                 || message.contains("polkit proxy:")))
 }
 
+// ───────────────────────── job（rootd 特权链路，§23.4） ─────────────────────────
+
+/// `wait_for_job` / `job_cmd` 的 job 状态来源抽象——生产走
+/// `DaemonClient.call(method::JOB_STATUS)`，测试以脚本化 mock 驱动各分支。
+trait JobStatusSource {
+    async fn job_status(&mut self, job_id: &str) -> Result<Value, String>;
+}
+
+impl JobStatusSource for DaemonClient {
+    async fn job_status(&mut self, job_id: &str) -> Result<Value, String> {
+        self.call(method::JOB_STATUS, json!({ "job_id": job_id }))
+            .await
+    }
+}
+
+/// `job status` 查询：输出 rootd 返回的完整 JSON（found/method/progress/
+/// done/success/exit_code/stderr）。RPC 成功即退出码 0（无论 found 真假）。
+async fn job_cmd(c: &mut DaemonClient, cmd: cli::JobCommand) -> CmdResult {
+    let cli::JobCommand::Status { job_id } = cmd;
+    let out = job_status_outcome(c.job_status(&job_id).await)?;
+    println!("{out}");
+    Ok(0)
+}
+
+/// `job status` 的展示与退出码决策：RPC 成功 → pretty JSON（退出 0，
+/// 无论 found 真假）；RPC 失败 → 错误上抛（`run()` 打印并退出 1）。
+fn job_status_outcome(rpc: Result<Value, String>) -> Result<String, String> {
+    rpc.map(|v| serde_json::to_string_pretty(&v).unwrap_or_default())
+}
+
+/// `job status` 轮询的超时（秒）。
+const JOB_POLL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// `job status` 轮询间隔（毫秒）。
+const JOB_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// 轮询 `job.status` 直到 `done=true`，返回 `success`。
+///
+/// 供 `pkg --wait`（TSI-2558）复用。超时 300s 返回错误。
+pub async fn wait_for_job(client: &mut DaemonClient, job_id: &str) -> Result<bool, String> {
+    wait_for_job_impl(client, job_id, JOB_POLL_TIMEOUT, JOB_POLL_INTERVAL).await
+}
+
+/// 轮询实现（间隔/超时可注入，供测试驱动）。
+///
+/// `found=false` 只可能是「从未成功观测到」或「观测到后被 rootd drain」。
+/// 两种情况下本函数都无法给出确定的 `success` 值：rootd 已保留完成
+/// job 的最终快照缓存（见 `rootd` `job_drain_done`），正常轮询到
+/// `done=true` 时才返回成功；此处落在缓存兜底之外的 drain 窗口，只能
+/// 诚实报错，绝不猜测一个布尔值（会把成功 job 误报为失败）。
+async fn wait_for_job_impl<S: JobStatusSource>(
+    src: &mut S,
+    job_id: &str,
+    timeout: std::time::Duration,
+    interval: std::time::Duration,
+) -> Result<bool, String> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let v = src.job_status(job_id).await?;
+        match v.get("found").and_then(Value::as_bool) {
+            Some(true) => {
+                if v.get("done").and_then(Value::as_bool) == Some(true) {
+                    return job_success(&v);
+                }
+            }
+            Some(false) => {
+                return Err("job drained before completion result observed".into());
+            }
+            None => {
+                return Err(format!(
+                    "job.status returned malformed response (missing `found`): {v}"
+                ))
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!(
+                "job {job_id} did not finish within {}s",
+                timeout.as_secs()
+            ));
+        }
+        tokio::time::sleep(interval).await;
+    }
+}
+
+/// 从响应中取 `success` 布尔（缺省即 malformed 响应）。
+fn job_success(v: &Value) -> Result<bool, String> {
+    v.get("success")
+        .and_then(Value::as_bool)
+        .ok_or_else(|| "job.status response missing `success`".to_string())
+}
+
 /// 把 `--filter` 原始字符串解析为 JSON 对象（§23.4 JournalQuery 参数契约）。
 fn parse_log_filter(raw: &str) -> Result<Value, String> {
     let v: Value =
@@ -724,9 +816,12 @@ fn process_rootd_error(e: &str) -> Option<(i32, String)> {
 #[cfg(test)]
 mod tests {
     use super::{
-        is_auth_required, log_query_timeout_error, parse_log_filter, process_rootd_error,
-        LOG_QUERY_TIMEOUT,
+        is_auth_required, job_status_outcome, log_query_timeout_error, parse_log_filter,
+        process_rootd_error, wait_for_job_impl, JobStatusSource, LOG_QUERY_TIMEOUT,
     };
+    use serde_json::{json, Value};
+    use std::collections::VecDeque;
+    use std::time::Duration;
 
     #[test]
     fn process_rootd_error_maps_all_five_branches() {
@@ -798,6 +893,145 @@ mod tests {
             process_rootd_error("rpc error 1006: process.kill (Always)"),
             None
         );
+    }
+
+    /// 脚本化 job 状态源：按队列返回，耗尽后可选地循环返回同一响应。
+    struct ScriptedSource {
+        queue: VecDeque<Value>,
+        endless: Option<Value>,
+    }
+
+    impl ScriptedSource {
+        fn queue(responses: Vec<Value>) -> Self {
+            Self {
+                queue: responses.into(),
+                endless: None,
+            }
+        }
+        fn endless(v: Value) -> Self {
+            Self {
+                queue: VecDeque::new(),
+                endless: Some(v),
+            }
+        }
+    }
+
+    impl JobStatusSource for ScriptedSource {
+        async fn job_status(&mut self, _job_id: &str) -> Result<Value, String> {
+            if let Some(v) = self.queue.pop_front() {
+                return Ok(v);
+            }
+            if let Some(v) = &self.endless {
+                return Ok(v.clone());
+            }
+            panic!("ScriptedSource exhausted");
+        }
+    }
+
+    fn found(v: bool, done: bool, success: bool) -> Value {
+        json!({ "found": v, "done": done, "success": success })
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn wait_for_job_done_returns_success() {
+        let mut s = ScriptedSource::queue(vec![found(true, true, true)]);
+        assert_eq!(
+            wait_for_job_impl(
+                &mut s,
+                "j",
+                Duration::from_secs(1),
+                Duration::from_millis(1)
+            )
+            .await,
+            Ok(true)
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn wait_for_job_done_returns_failure() {
+        let mut s = ScriptedSource::queue(vec![found(true, true, false)]);
+        assert_eq!(
+            wait_for_job_impl(
+                &mut s,
+                "j",
+                Duration::from_secs(1),
+                Duration::from_millis(1)
+            )
+            .await,
+            Ok(false)
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn wait_for_job_not_found_errors() {
+        // 从未观测到 found=true 的 found=false：无法区分「真的不存在」
+        // 与「已完成但最终结果未观测到」，统一诚实报错。
+        let mut s = ScriptedSource::queue(vec![found(false, false, false)]);
+        let e = wait_for_job_impl(
+            &mut s,
+            "j",
+            Duration::from_secs(1),
+            Duration::from_millis(1),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            e.contains("job drained before completion result observed"),
+            "{e}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn wait_for_job_drained_before_done_errors() {
+        // 真实模型：rootd 在 done=true 之前 success 恒 false；job 在
+        // 两次轮询间完成并被 drain 后，下一次查询 found=false。此时
+        // 不可猜测 success，必须报错而非误报成功/失败。
+        let mut s =
+            ScriptedSource::queue(vec![found(true, false, false), found(false, false, false)]);
+        let e = wait_for_job_impl(
+            &mut s,
+            "j",
+            Duration::from_secs(1),
+            Duration::from_millis(1),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            e.contains("job drained before completion result observed"),
+            "{e}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn wait_for_job_times_out() {
+        let mut s = ScriptedSource::endless(found(true, false, false));
+        let e = wait_for_job_impl(
+            &mut s,
+            "j",
+            Duration::from_millis(5),
+            Duration::from_millis(1),
+        )
+        .await
+        .unwrap_err();
+        assert!(e.contains("did not finish within"), "{e}");
+    }
+
+    #[test]
+    fn job_cmd_outcome_found_true_exits_zero_equivalent() {
+        let out = job_status_outcome(Ok(found(true, true, true))).expect("ok");
+        assert!(out.contains("\"found\": true"), "{out}");
+        assert!(out.contains("\"success\": true"), "{out}");
+    }
+
+    #[test]
+    fn job_cmd_outcome_found_false_exits_zero_equivalent() {
+        let out = job_status_outcome(Ok(found(false, false, false))).expect("ok");
+        assert!(out.contains("\"found\": false"), "{out}");
+    }
+
+    #[test]
+    fn job_cmd_outcome_rpc_error_propagates() {
+        assert_eq!(job_status_outcome(Err("boom".into())), Err("boom".into()));
     }
 
     #[test]
