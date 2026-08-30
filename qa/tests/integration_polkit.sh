@@ -41,8 +41,17 @@ bad() { FAIL=$((FAIL + 1)); printf '  FAIL  %s\n        %s\n' "$CURRENT" "$1"; }
 
 # rules.d is 750 root:polkitd, so unprivileged listing fails even though we
 # can write through sudo. Every inspection goes through sudo.
+#
+# sroot is deliberately not delegated to pk_priv: this script's skip guards
+# run before qa/pkkit.sh is sourced, and this file is meant to stand alone.
+# Dispatch on id -u so the header claim ("root-or-sudo") is true: on a
+# root CI runner the direct path is taken, otherwise `sudo -n`.
 RULES_DIR=/etc/polkit-1/rules.d
-sroot() { sudo -n "$@"; }
+sroot() {
+  if [ "$(id -u)" = 0 ]; then "$@"
+  else sudo -n "$@"
+  fi
+}
 
 # An action whose default is auth_admin_keep, so an explicit rule is needed
 # to authorize anything and the effect of every rule is observable.

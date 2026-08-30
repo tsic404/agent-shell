@@ -559,12 +559,66 @@ else
   bad "$CURRENT" 'rc=0 though unmask failed'
 fi
 
-t "pk_restore still releases the lock when the restore fails"
-if [ "${PK_LOCK_HELD:-0}" = 0 ]; then
+t "pk_restore emits 'incomplete —' on stderr when unmask fails"
+# Radian 🟡#3: the new "verified teardown" contract promised rc=1 and a
+# diagnostic on stderr, but no test drove the failure branch. This stubs
+# systemctl unmask to fail and asserts both halves.
+:: > "$PK_SCT_LOG"
+PK_UNMASK_RC=1 pk_restore >/dev/null 2>"$WORK/pk_err"
+rc=$?
+if [ "$rc" != 0 ] && grep -q 'incomplete —' "$WORK/pk_err"; then
   ok
 else
-  bad "$CURRENT" "PK_LOCK_HELD=${PK_LOCK_HELD:-unset}"
+  bad "$CURRENT" "rc=$rc stderr=$(tr '\n' ' ' < "$WORK/pk_err" 2>/dev/null)"
 fi
+
+echo
+echo "== pk_gate_unreachable: exhaustive driver (gate_case.sh) =="
+
+# The stubs above exercise the MISMATCH path (mask logged but unmask
+# missing) via pgrep's derived state. The 5 reachable code paths of
+# pk_gate_unreachable — the fail-fast branches plus the happy path —
+# are driven by gate_case.sh: one process per case, PATH-level stubs
+# (bash function stubs are unreliable under `>/dev/null 2>&1` on bash
+# 5.3), and `mv` forwarded to the real binary so the file-presence
+# assertion at the end of the gate still proves something.
+#
+# CASE 3 requires a non-root shell: it fails hide by chmod-a-w-ing the
+# parent of the activation file, which root ignores. The driver
+# documents this in its header; we skip the assertion on root hosts
+# rather than silently passing.
+gate_case() {
+  PK_KIT="$KIT" WORKDIR="$WORK" CASE="$1" bash "$HERE/gate_case.sh" 2>&1 | tail -1
+}
+
+t "CASE 1: happy path — rc=0, activation hidden"
+out="$(gate_case 1)"
+printf '%s' "$out" | grep -q '^rc=0 hidden=y dir=n$' && ok "$CURRENT" \
+  || bad "$CURRENT" "got: $out"
+
+t "CASE 2: mask fails — rc=1, nothing hidden"
+out="$(gate_case 2)"
+printf '%s' "$out" | grep -q '^rc=1 hidden=n dir=y$' && ok "$CURRENT" \
+  || bad "$CURRENT" "got: $out"
+
+if [ "$(id -u)" = 0 ]; then
+  printf '  SKIP  CASE 3: hide-fails branch requires non-root (root ignores dir perms)\n'
+else
+  t "CASE 3: hide fails — rc=1, activation still present"
+  out="$(gate_case 3)"
+  printf '%s' "$out" | grep -q '^rc=1 hidden=n dir=y$' && ok "$CURRENT" \
+    || bad "$CURRENT" "got: $out"
+fi
+
+t "CASE 4: pgrep still alive after stop — rc=1, restored"
+out="$(gate_case 4)"
+printf '%s' "$out" | grep -q '^rc=1 hidden=n dir=y$' && ok "$CURRENT" \
+  || bad "$CURRENT" "got: $out"
+
+t "CASE 5: stop fails after mask — rc=1, restored"
+out="$(gate_case 5)"
+printf '%s' "$out" | grep -q '^rc=1 hidden=n dir=y$' && ok "$CURRENT" \
+  || bad "$CURRENT" "got: $out"
 
 unset PK_START_RC PK_UNMASK_RC
 PATH="$save_path"
@@ -586,6 +640,56 @@ unset PK_RULE_NAME
 name="$(env -u PK_RULE_NAME MULTICA_TASK_ID=01a05223-7075-7228 PK_SUDO=direct PK_PKCHECK=pkcheck bash -c "source '$KIT'; pk_init; printf '%s' \"\$PK_RULE_NAME\"")"
 [ "$name" = "01a05223-7075-7228" ] && ok "$CURRENT" || bad "$CURRENT" "PK_RULE_NAME='$name'"
 export PK_RULE_NAME=verity-task-a
+
+echo
+echo "== pk_init: PK_SUDO enumeration (TSI-2614) =="
+
+# The kit validates PK_SUDO at source time: any value outside `direct`,
+# `sudo -n`, `auto` is refused before pk_init runs, so the diagnostic
+# arrives from the enumeration itself rather than from a later call.
+# Drive it through a child shell — the enumeration uses `return 2` when
+# sourced, and the return value must not be swallowed by the enclosing
+# command substitution.
+run_sudo() {
+  local val="$1" script out rc
+  script="source '$KIT'; rc=\$?; printf '%s' \"\$PK_SUDO\"; exit \$rc"
+  out="$(env PK_SUDO="$val" PK_PKCHECK=pkcheck PK_RULE_NAME=verity-task-a \
+              PK_RULE_DIR="$WORK/rules.d" PK_LOCK_DIR="$WORK/locks" \
+              bash -c "$script" 2>&1)"
+  rc=$?
+  PK_SUDO_RC=$rc
+  PK_SUDO_OUT=$out
+}
+
+t "pk_init rejects a free-form PK_SUDO prefix"
+run_sudo "sudo -n -E -l"
+[ "$PK_SUDO_RC" != 0 ] && ok "$CURRENT" || bad "$CURRENT" "accepted free-form prefix: '$PK_SUDO_OUT'"
+
+t "the rejection names the value and the reason"
+run_sudo "sudo -u nobody"
+if printf '%s\n' "$PK_SUDO_OUT" | grep -q 'PK_SUDO must be' && \
+   printf '%s\n' "$PK_SUDO_OUT" | grep -q 'sudo -u nobody'; then ok "$CURRENT"
+else bad "$CURRENT" "diagnostic missing: $PK_SUDO_OUT"
+fi
+
+t "a swallowing prefix is refused (the PK_SUDO=true case)"
+run_sudo "true"
+[ "$PK_SUDO_RC" != 0 ] && ok "$CURRENT" || bad "$CURRENT" "PK_SUDO=true was accepted"
+
+t "a failing prefix is refused (the PK_SUDO=false case)"
+run_sudo "false"
+[ "$PK_SUDO_RC" != 0 ] && ok "$CURRENT" || bad "$CURRENT" "PK_SUDO=false was accepted"
+
+t "PK_SUDO=auto resolves from id -u (non-root -> sudo -n)"
+run_sudo "auto"
+if [ "$(id -u)" = 0 ]; then want=direct; else want="sudo -n"; fi
+[ "$PK_SUDO_RC" = 0 ] && [ "$PK_SUDO_OUT" = "$want" ] && ok "$CURRENT" \
+  || bad "$CURRENT" "rc=$PK_SUDO_RC PK_SUDO='$PK_SUDO_OUT' want='$want'"
+
+t "PK_SUDO=direct is accepted unchanged"
+run_sudo "direct"
+[ "$PK_SUDO_RC" = 0 ] && [ "$PK_SUDO_OUT" = "direct" ] && ok "$CURRENT" \
+  || bad "$CURRENT" "rc=$PK_SUDO_RC PK_SUDO='$PK_SUDO_OUT'"
 
 echo
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"

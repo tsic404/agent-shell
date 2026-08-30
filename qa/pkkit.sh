@@ -76,15 +76,28 @@
 #   PK_SUDO        privilege mode (default: auto)
 #                      auto    root -> direct, otherwise `sudo -n`
 #                      direct  always run unprivileged (already root)
-#                      sudo    always `sudo -n`
-#                      <cmd>   literal prefix, e.g. `sudo -n`
+#                      sudo -n always `sudo -n`
+#   (no free-form prefix — see the enumeration below)
 #   PK_PKCHECK     pkcheck binary (default: pkcheck)
 #   PK_SUBJECT_PID polkit subject PID; polkit 127 requires a real process,
 #                  so the default is the caller's own PID
 #   PK_TIMEOUT     gate poll deadline in seconds (default 45)
 #   PK_POLL        gate poll interval in seconds (default 1)
 
-set -u
+#
+# Precondition asymmetry in integration_polkit.sh:
+#   - `pkcheck` not installed, or /etc/polkit-1/rules.d not writable, means
+#     this host cannot run the suite at all — the integration test exits 0
+#     with an explicit "skipping" line, because the unit suite covers the
+#     kit's logic independently of the host and a host that lacks the
+#     toolchain is not a defect.
+#   - A missing policy action (packaging/com.agentshell.policy not installed,
+#     or its `auth_admin_keep` default has drifted) means the QA image is
+#     broken: silent-skipping would hide a broken build from the CI report.
+#     The integration test asserts this and fails.
+#   The distinction matters because the first case is "cannot measure" and
+#   the second is "measured and broken"; conflating them turns a broken
+#   image into a green CI line.
 
 : "${PK_ACTION:=com.agentshell.mount}"
 : "${PK_RULE_DIR:=/etc/polkit-1/rules.d}"
@@ -103,14 +116,43 @@ set -u
 # array under the configured prefix. A word-list prefix cannot accidentally
 # swallow the command itself the way `PK_SUDO=true mv file` would — `true`
 # takes no arguments and would silently do nothing.
+#
+# PK_SUDO is an enumeration, not a template. Only `direct` and `sudo -n`
+# are legal values, resolved at source time from `id -u`.
+#
+# This is a hard constraint, not a style choice: a free-form prefix is
+# silently dangerous. `PK_SUDO=true` makes `pk_priv mv -f A B` expand to
+# `true mv -f A B` — `true` ignores every argument and returns 0, so every
+# privileged operation becomes a successful no-op. A rule that was never
+# written would then read as if it were in effect, which is the TSI-2614
+# defect class verbatim. The same applies to `false`: rc 1 for the whole
+# kit. Restricting the values makes the failure loud instead.
 PK_SUDO="${PK_SUDO:-auto}"
-if [ "$PK_SUDO" = "auto" ]; then
-  if [ "$(id -u)" = 0 ]; then
-    PK_SUDO="direct"
-  else
-    PK_SUDO="sudo -n"
-  fi
-fi
+case "$PK_SUDO" in
+  auto)
+    if [ "$(id -u)" = 0 ]; then
+      PK_SUDO="direct"
+    else
+      PK_SUDO="sudo -n"
+    fi
+    ;;
+esac
+case "$PK_SUDO" in
+  direct|"sudo -n") : ;;
+  *)
+    echo "pkkit.sh: PK_SUDO must be 'direct', 'sudo -n', or 'auto', got '$PK_SUDO'" >&2
+    echo "  a free-form prefix can swallow the command it was meant to run" >&2
+    # `return` inside `case` is unreliable in bash 5.x: it exits the
+    # sourced file but does not propagate the status, so the caller sees
+    # rc 0 and the value stays unvalidated. Wrap in an `if` so the
+    # return is a top-level statement in the sourced body.
+    if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+      exit 2
+    else
+      return 2
+    fi
+    ;;
+esac
 
 pk_priv() {
   if [ "$PK_SUDO" = "direct" ]; then
@@ -475,10 +517,42 @@ pk_gate_unreachable() {
   pk_lock_acquire || return 1
   PK_LOCK_HELD=1
 
-  pk_priv systemctl mask --runtime polkit.service >/dev/null 2>&1
-  pk_priv mv -f "$PK_ACTIVATE" "$PK_ACTIVATE.verity-hidden" 2>/dev/null
-  pk_priv systemctl stop polkit.service >/dev/null 2>&1
-  pk_priv pkill -x polkitd 2>/dev/null
+  # Every state change below is a precondition for "unreachable", so a
+  # failure here means the state cannot be proved and the gate must abort.
+  # Swallowing these is what made the previous version unproven: a failed
+  # mask leaves polkitd unmasked (any pkcheck call can revive it), and a
+  # failed mv leaves the activation file in place, so a later D-Bus call
+  # on com.dbus reactivates polkitd on demand and the gate reads as if it
+  # had never masked anything — the TSI-2614 defect class verbatim.
+  pk_priv systemctl mask --runtime polkit.service >/dev/null 2>&1 || {
+    echo "pk_gate_unreachable FAILED: could not mask polkit.service" >&2
+    if ! pk_restore_state; then
+      echo "  (restore was partial; pk_restore should be retried)" >&2
+    fi
+    pk_lock_release
+    return 1
+  }
+  if [ -e "$PK_ACTIVATE" ]; then
+    pk_priv mv -f "$PK_ACTIVATE" "$PK_ACTIVATE.verity-hidden" 2>/dev/null || {
+      echo "pk_gate_unreachable FAILED: could not hide $PK_ACTIVATE" >&2
+      if ! pk_restore_state; then
+        echo "  (restore was partial; pk_restore should be retried)" >&2
+      fi
+      pk_lock_release
+      return 1
+    }
+  fi
+  pk_priv systemctl stop polkit.service >/dev/null 2>&1 || {
+    echo "pk_gate_unreachable FAILED: could not stop polkit.service" >&2
+    if ! pk_restore_state; then
+      echo "  (restore was partial; pk_restore should be retried)" >&2
+    fi
+    pk_lock_release
+    return 1
+  }
+  # The one step allowed to miss: `systemctl stop` may already have ended
+  # polkitd, and `pkill` returns 1 when nothing matched.
+  pk_priv pkill -x polkitd 2>/dev/null || true
 
   local i
   for ((i = 1; i <= 15; i++)); do
@@ -501,7 +575,20 @@ pk_gate_unreachable() {
     pk_lock_release
     return 1
   fi
-  echo "pk_gate_unreachable: action=$1 polkitd procs=0 activation=$(if [ -f "$PK_ACTIVATE" ]; then echo present; else echo removed; fi)"
+  # Both facts must hold at once, or the gate has proved nothing: no live
+  # process AND no on-demand activation left to revive one. A missing
+  # pgrep but a still-present activation file is not unreachable — a
+  # later D-Bus call on com.dbus would restart polkitd and any subsequent
+  # pkcheck would read as an authorization, which is the TSI-2614 defect.
+  if [ -e "$PK_ACTIVATE" ]; then
+    echo "pk_gate_unreachable MISMATCH: activation file still present at $PK_ACTIVATE" >&2
+    if ! pk_restore_state; then
+      echo "  (restore was partial; pk_restore should be retried)" >&2
+    fi
+    pk_lock_release
+    return 1
+  fi
+  echo "pk_gate_unreachable: action=$1 polkitd procs=0 activation=removed"
   return 0
 }
 
@@ -543,7 +630,6 @@ pk_restore_state() {
 # pk_restore — restore machine-global state and drop this task's rules.
 # Safe to call more than once; the drop is scoped to this task's own
 # filenames, so an extra call cannot touch another task's rules.
-#
 # Locked, because unmasking, reloading the daemon and restarting polkitd
 # restore state for the whole host — the mirror image of
 # pk_gate_unreachable. If a prior run held the lock without releasing it
@@ -556,6 +642,9 @@ pk_restore() {
 
   pk_restore_state
   local rc=$?
+  if [ "$rc" != 0 ]; then
+    echo "pk_restore: incomplete — activation=$([ -e "$PK_ACTIVATE" ] && echo present || echo missing) polkitd=$(pgrep -x polkitd | wc -l) procs" >&2
+  fi
   pk_lock_release
   return "$rc"
 }
@@ -564,10 +653,14 @@ pk_restore() {
 pk_init() {
   local missing=""
   command -v "$PK_PKCHECK" >/dev/null || missing="$missing pkcheck"
-  case "$PK_SUDO" in
-    direct|auto) : ;;
-    *) command -v sudo >/dev/null || missing="$missing sudo" ;;
-  esac
+  # PK_SUDO is validated at source time by the enumeration above, so by the
+  # time pk_init runs the value is either `direct` or `sudo -n`. No need to
+  # re-derive; the earlier free-form case is already rejected.
+  # `sudo -n` implies the sudo binary must exist: `command -v sudo` runs
+  # once and is not the hot path.
+  if [ "$PK_SUDO" = "sudo -n" ] && ! command -v sudo >/dev/null; then
+    missing="$missing sudo"
+  fi
   if [ -n "$missing" ]; then
     echo "pk_init: missing tools:$missing" >&2
     return 1
