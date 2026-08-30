@@ -11,24 +11,8 @@ use agent_shell_core::types::UnitStatus;
 use agent_shell_logind::LogindComponent;
 use agent_shell_systemd::SystemdComponent;
 
-/// 环境受限（polkit 拒绝 / 单元缺失）时的跳过：打印带原因的 SKIP 行后由
-/// 调用方提前 `return`，测试按 ok 收尾。
-///
-/// 不用 `std::process::exit`：那会终止整个测试进程，并行测试被静默丢弃；
-/// 不用 panic 冒充跳过：标准 libtest 没有 "skipped" panic 协议（那是
-/// libtest-mimic 的约定），panic 一律计为 FAILED 且退出码非 0。
-/// 跳过原因始终输出可见，避免静默跳过掩盖验收覆盖面。
-fn skip(reason: &str) {
-    eprintln!("SKIP: {reason}");
-}
-
-/// 环境受限（缺 polkit 授权 / manager degraded / 状态变更被拒）时的跳过：
-/// 在 `skip` 基础上追加「环境性跳过」意图短语，与 logind 侧
-/// 「缺 polkit 授权（环境性跳过）」共用同一 grep 关键字，
-/// 便于 CI 区分环境跳过与授权回归误报。
-fn skip_environment(reason: &str) {
-    eprintln!("SKIP: {reason}（环境性跳过）");
-}
+mod common;
+use common::{skip, skip_environment};
 
 #[test]
 fn active_state_mapping() {
@@ -79,7 +63,7 @@ async fn live_systemd_start_stop_unit_status_transitions() {
     let name = "systemd-sysctl.service";
     let before = c.unit_status(name).await.unwrap();
     if matches!(before, UnitStatus::Unknown) {
-        skip(&format!("{name} not present on this host"));
+        skip_environment(&format!("{name} not present on this host"));
         return;
     }
     // 某些容器（PID 1 非 systemd 管理器或 manager degraded）会拒绝/悬挂
@@ -141,7 +125,7 @@ async fn live_logind_can_reboot_can_poweroff_booleans() {
         // CI runner 无 polkit 授权时 CanReboot/CanPowerOff 恒回 AccessDenied；
         // 这是环境权限不足，非组件缺陷——按本文件 skip 约定放行。
         Err(AgentShellError::Permission(reason)) => {
-            skip(&format!("CanReboot 缺 polkit 授权（环境性跳过）: {reason}"));
+            skip_environment(&format!("CanReboot 缺 polkit 授权: {reason}"));
             return;
         }
         Err(e) => panic!("CanReboot failed: {e}"),
@@ -149,9 +133,7 @@ async fn live_logind_can_reboot_can_poweroff_booleans() {
     let poweroff = match c.can_poweroff().await {
         Ok(v) => v,
         Err(AgentShellError::Permission(reason)) => {
-            skip(&format!(
-                "CanPowerOff 缺 polkit 授权（环境性跳过）: {reason}"
-            ));
+            skip_environment(&format!("CanPowerOff 缺 polkit 授权: {reason}"));
             return;
         }
         Err(e) => panic!("CanPowerOff failed: {e}"),
