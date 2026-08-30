@@ -1634,6 +1634,9 @@ mod tests {
         // process.kill（L3）与 service.control 同级：默认配置需确认，
         // 在 handler 之前短路——不触碰 rootd。
         let mut d = Daemon::connect(Duration::from_secs(1)).await;
+        // 隔离 ambient config：清除 connect 从磁盘/env 读到的持久化 grant/deny。
+        d.security = SecurityManager::with_config(AgentShellConfig::default());
+        d.caller_id = "*".into();
         let resp = dispatch(
             &mut d,
             &req(
