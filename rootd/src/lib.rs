@@ -1213,7 +1213,8 @@ fn hostname_set(args: &[Value], slot: &CommandSlot) -> RootResult {
     Ok(json!({ "accepted": true, "hostname": hostname }))
 }
 
-/// 主机名校验：RFC 1123 简化——字母数字 + `-` `.`，不以 `-` 开头/结尾。
+/// 主机名校验：RFC 1123 简化——字母数字 + `-` `.`，不以 `-`/`.` 开头/结尾，
+/// 且不产生空 label（连续点段）。
 fn validate_hostname(h: &str) -> Result<(), String> {
     if h.is_empty() || h.len() > 253 {
         return Err("invalid hostname length".into());
@@ -1229,6 +1230,13 @@ fn validate_hostname(h: &str) -> Result<(), String> {
     }
     if h.ends_with('-') || h.ends_with('.') {
         return Err("hostname must not end with '-' or '.'".into());
+    }
+    // 连续点产生空 label（RFC 1123 禁止）。结尾点 `b.` 已被上述后缀检查拦截；
+    // 全点串 `..` 被前缀检查（1228 行）先行拦截，错误文案为「must not start
+    // with '.'」——二者均保持既有错误优先级。此处覆盖 `a..b` 这类前后缀均非点
+    // 的内部空 label。
+    if h.split('.').any(|label| label.is_empty()) {
+        return Err("hostname must not contain empty labels".into());
     }
     Ok(())
 }
@@ -2022,8 +2030,31 @@ mod tests {
         assert!(dispatch("HostnameSet", &[json!("-bad")]).is_err());
         assert!(dispatch("HostnameSet", &[json!("bad-")]).is_err());
         assert!(dispatch("HostnameSet", &[json!("host; rm -rf /")]).is_err());
+        // 连续点段：必须被校验拒绝，而非一路落到 hostnamectl 失败
+        let e = dispatch("HostnameSet", &[json!("a..b")]).unwrap_err();
+        assert!(e.contains("empty labels"), "{e}");
+        // 结尾点：由既有前后缀检查拒绝，回归断言固定该行为
+        let e = dispatch("HostnameSet", &[json!("b.")]).unwrap_err();
+        assert!(e.contains("end with '-' or '.'"), "{e}");
         // 有效 hostname 通过校验——hostnamectl 在 CI 无权限/无 polkit → Err
         assert!(dispatch("HostnameSet", &[json!("myhost")]).is_err());
+        // 合法带点 hostname `a.b` 必须通过校验并触达写回 seam：注入 recorder，
+        // 断言 seam 收到 `hostnamectl set-hostname a.b`，证明未被校验拦截——
+        // 仅 `is_err()` 无法区分「校验拒绝」与「CI 无 hostnamectl 的 spawn 失败」。
+        clear_hostname_call_log();
+        set_hostname_command_runner(&_guard, record_hostname_command);
+        let r = dispatch("HostnameSet", &[json!("a.b")]);
+        clear_hostname_command_runner(&_guard);
+        assert!(r.is_ok(), "a.b 应通过校验并走 seam: {r:?}");
+        let calls = recorded_hostname_calls();
+        assert_eq!(calls.len(), 1, "{calls:?}");
+        assert_eq!(
+            calls[0],
+            (
+                "hostnamectl".to_string(),
+                vec!["set-hostname".to_string(), "a.b".to_string()],
+            )
+        );
     }
 
     // ── hostname 写回 seam（TSI-2695） ──
