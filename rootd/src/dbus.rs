@@ -797,6 +797,9 @@ mod tests {
         // 会抽走其他 job 测试尚未断言完成的 job——必须串行。parking_lot
         // 守护跨 `.await` 持有（await_holding_lock 由此豁免）。
         let _guard = JOB_TEST_MUTEX.lock();
+        // 幂等冗余调用：正常返回空 Vec——真正的清理由本测试 abort 后的
+        // post-drain（下方 851 行）及各 job 测试尾部 post-drain 完成；保留
+        // 仅为防御前一测试 panic 中断清理时残留的 job。
         let _ = crate::job_drain_done();
 
         let bus = TestBus::start().await;
