@@ -53,7 +53,11 @@ for u in $UNITS; do
     && ok "mask symlink present: /run/systemd/system/$u" \
     || bad "expected mask symlink for $u under /run/systemd/system"
 done
-verity_restore_polkit >/dev/null 2>&1 && ok "restore rc=0" || bad "restore rc!=0"
+out=$(verity_restore_polkit) && ok "restore rc=0" || bad "restore rc!=0"
+case "$out" in
+  *"removed 3 mask symlink(s)"*) ok "report counts 3 mask symlinks" ;;
+  *) bad "report missing 'removed 3 mask symlink(s)': ${out:-<empty>}" ;;
+esac
 for u in $UNITS; do
   verity_is_masked "$u" && bad "$u still masked" || ok "$u unmasked"
 done

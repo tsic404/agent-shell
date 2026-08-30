@@ -109,7 +109,7 @@ verity_restore_polkit() {
     for d in $(verity_maskdirs); do
       if verity_path_is_mask "$d/$unit"; then
         sudo -n rm -f -- "$d/$unit"
-        removed=1
+        removed=$((removed + 1))
       fi
     done
   done
