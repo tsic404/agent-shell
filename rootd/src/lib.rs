@@ -2000,7 +2000,7 @@ mod tests {
                 if let Err(e) = run_command(
                     "hostnamectl",
                     &["set-hostname", flag, value.as_str()],
-                    &Mutex::new(None),
+                    &CommandSlot::new(),
                 ) {
                     eprintln!("HostnameGuard restore {flag} 失败: {e}");
                     failures.push(e);
