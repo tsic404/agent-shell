@@ -27,6 +27,14 @@ pub async fn dispatch(daemon: &mut Daemon, req: &Request) -> Response {
     let management = security_operation_for(&req.method);
     if management {
         if let Some(reason) = check_management_permission(&daemon.caller_id) {
+            // 管理面 caller 门禁拒绝与普通权限拒绝同审计语义：deny 必须落痕
+            //（TSI-2513：越权尝试此前零记录）。
+            if daemon.security.config.security.audit_log {
+                daemon
+                    .security
+                    .audit
+                    .log(&daemon.caller_id, &req.method, "deny", false);
+            }
             return Response::err(req.id, RpcErrorCode::Denied, reason);
         }
     }
@@ -1533,6 +1541,38 @@ mod tests {
         let err = resp.error.expect("error");
         assert_eq!(err.code, RpcErrorCode::Denied as i32);
         assert!(!d.security.config.permissions.allow.contains_key("agent-x"));
+    }
+
+    #[tokio::test]
+    async fn management_deny_is_audited() {
+        // TSI-2513 回归锚定：具名 caller 越权调用 security.grant/revoke 被拒后，
+        // audit.jsonl 必须至少 1 行 deny（此前管理面拒绝完全无痕）。
+        let mut d = Daemon::connect(Duration::from_secs(1)).await;
+        d.caller_id = "agent-x".into();
+        let audit_path = std::env::temp_dir().join(format!(
+            "agent-shell-dispatch-audit-{}.jsonl",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&audit_path);
+        let mut cfg = AgentShellConfig::default();
+        cfg.security.audit_log_path = Some(audit_path.to_string_lossy().into_owned());
+        d.security = SecurityManager::with_config(cfg);
+        for m in [method::SECURITY_GRANT, method::SECURITY_REVOKE] {
+            let resp = dispatch(
+                &mut d,
+                &req(m, Some(json!({"agent_id": "agent-x", "level": "L4"}))),
+            )
+            .await;
+            assert_eq!(
+                resp.error.expect("error").code,
+                RpcErrorCode::Denied as i32,
+                "{m}"
+            );
+        }
+        let denies = d.security.audit.query("", "", "deny");
+        assert!(!denies.is_empty(), "audit.jsonl must record deny entries");
+        assert!(denies.iter().all(|e| e.agent_id == "agent-x" && !e.result));
+        let _ = std::fs::remove_file(&audit_path);
     }
 
     #[tokio::test]
