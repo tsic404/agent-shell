@@ -104,6 +104,10 @@ pub async fn dispatch(daemon: &mut Daemon, req: &Request) -> Response {
         method::SYSTEM_LOG_VIEW => system_log_view(daemon, req).await,
         method::PROCESS_KILL => process_kill(daemon, req).await,
         method::JOB_STATUS => job_status(daemon, req).await,
+        method::PACKAGE_INSTALL => package_install(daemon, req).await,
+        method::PACKAGE_REMOVE => package_remove(daemon, req).await,
+        method::PACKAGE_UPDATE => package_update(daemon, req).await,
+        method::PACKAGE_REFRESH => package_refresh(daemon).await,
         method::ROOTD_HELLO => rootd_hello(daemon).await,
         method::HOSTNAME_SET => hostname_set(daemon, req).await,
         method::MOUNT => mount(daemon, req).await,
@@ -190,6 +194,10 @@ fn operation_for(method_name: &str, params: &Option<Value>) -> Option<Operation>
         (method::SYSTEM_LOG_VIEW, L0),
         (method::PROCESS_KILL, L3),
         (method::JOB_STATUS, L0),
+        (method::PACKAGE_INSTALL, L3),
+        (method::PACKAGE_REMOVE, L3),
+        (method::PACKAGE_UPDATE, L3),
+        (method::PACKAGE_REFRESH, L3),
         (method::ROOTD_HELLO, L0),
         (method::HOSTNAME_SET, L3),
         (method::MOUNT, L4),
@@ -994,6 +1002,102 @@ async fn job_status(_d: &mut Daemon, req: &Request) -> RpcResult {
     Ok(parsed)
 }
 
+// ───────────────────────── pkg（rootd 特权链路，§23.4） ─────────────────────────
+
+/// 提取 `packages` 参数：必须存在且为字符串数组。
+fn packages_param(req: &Request) -> Result<Vec<String>, (RpcErrorCode, String)> {
+    let params = params_of(req)?;
+    params
+        .get("packages")
+        .map(parse_packages)
+        .transpose()?
+        .ok_or((RpcErrorCode::InvalidParams, "missing packages".into()))
+}
+
+/// 解析 `packages` 数组：逐项必须是字符串。
+fn parse_packages(v: &Value) -> Result<Vec<String>, (RpcErrorCode, String)> {
+    let arr = v.as_array().ok_or((
+        RpcErrorCode::InvalidParams,
+        "packages must be an array".into(),
+    ))?;
+    arr.iter()
+        .map(|e| {
+            e.as_str().map(str::to_owned).ok_or((
+                RpcErrorCode::InvalidParams,
+                "package must be a string".into(),
+            ))
+        })
+        .collect()
+}
+
+/// 解析 rootd 返回的 job JSON（`{job_id, pm}`）并原样上抛。
+fn parse_package_result(result: &str) -> RpcResult {
+    serde_json::from_str::<Value>(result).map_err(|e| {
+        (
+            RpcErrorCode::BackendError,
+            format!("rootd package parse: {e}"),
+        )
+    })
+}
+
+/// 安装系统软件包（rootd PackageInstall，§23.4）。
+///
+/// 参数：{ "packages": ["nginx", "curl"] }。包名合法性由 rootd 校验
+/// （CLI/daemon 不重复校验）。返回 rootd 的 `{job_id, pm}`。
+async fn package_install(_d: &mut Daemon, req: &Request) -> RpcResult {
+    let packages = packages_param(req)?;
+    let proxy = crate::rootd_client::connect().await.ok_or((
+        RpcErrorCode::BackendUnavailable,
+        "rootd not installed — privileged operation unavailable".into(),
+    ))?;
+    let result = proxy
+        .package_install(packages)
+        .await
+        .map_err(|e| (RpcErrorCode::BackendError, format!("rootd: {e}")))?;
+    parse_package_result(&result)
+}
+
+/// 移除系统软件包（rootd PackageRemove，§23.4）。
+async fn package_remove(_d: &mut Daemon, req: &Request) -> RpcResult {
+    let packages = packages_param(req)?;
+    let proxy = crate::rootd_client::connect().await.ok_or((
+        RpcErrorCode::BackendUnavailable,
+        "rootd not installed — privileged operation unavailable".into(),
+    ))?;
+    let result = proxy
+        .package_remove(packages)
+        .await
+        .map_err(|e| (RpcErrorCode::BackendError, format!("rootd: {e}")))?;
+    parse_package_result(&result)
+}
+
+/// 升级系统软件包（rootd PackageUpdate，§23.4；空数组 = 全部升级）。
+async fn package_update(_d: &mut Daemon, req: &Request) -> RpcResult {
+    let packages = packages_param(req)?;
+    let proxy = crate::rootd_client::connect().await.ok_or((
+        RpcErrorCode::BackendUnavailable,
+        "rootd not installed — privileged operation unavailable".into(),
+    ))?;
+    let result = proxy
+        .package_update(packages)
+        .await
+        .map_err(|e| (RpcErrorCode::BackendError, format!("rootd: {e}")))?;
+    parse_package_result(&result)
+}
+
+/// 刷新包元数据缓存（rootd PackageRefresh，§23.4；无参数）。
+async fn package_refresh(_d: &mut Daemon) -> RpcResult {
+    let proxy = crate::rootd_client::connect().await.ok_or((
+        RpcErrorCode::BackendUnavailable,
+        "rootd not installed — privileged operation unavailable".into(),
+    ))?;
+    let result = proxy
+        .package_refresh()
+        .await
+        .map_err(|e| (RpcErrorCode::BackendError, format!("rootd: {e}")))?;
+    parse_package_result(&result)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1595,6 +1699,69 @@ mod tests {
         assert_eq!(
             resp.error.expect("error").code,
             RpcErrorCode::InvalidParams as i32
+        );
+    }
+
+    #[tokio::test]
+    async fn package_install_default_config_returns_confirmation_required() {
+        // package.install（L3）与 service.control/process.kill 同级：
+        // 默认配置需确认，在 handler 之前短路——不触碰 rootd。
+        let mut d = Daemon::connect(Duration::from_secs(1)).await;
+        let resp = dispatch(
+            &mut d,
+            &req(
+                method::PACKAGE_INSTALL,
+                Some(json!({ "packages": ["nginx"] })),
+            ),
+        )
+        .await;
+        assert_eq!(
+            resp.error.expect("error").code,
+            RpcErrorCode::ConfirmationRequired as i32
+        );
+    }
+
+    #[tokio::test]
+    async fn package_install_bad_params_after_gate_pass_is_invalid_params() {
+        // L4 白名单放行后进入 handler：缺失/非数组/非字符串元素必须报
+        // InvalidParams（证明门禁放行且 handler 已执行，而非 Denied 短路）。
+        let mut d = Daemon::connect(Duration::from_secs(1)).await;
+        d.caller_id = "trusted".into();
+        d.security
+            .config
+            .permissions
+            .allow
+            .insert("trusted".into(), vec![PermissionLevel::L4]);
+        for params in [
+            json!({}),
+            json!({ "packages": 5 }),
+            json!({ "packages": [1] }),
+            json!({ "packages": ["ok", 2] }),
+        ] {
+            let resp = dispatch(&mut d, &req(method::PACKAGE_INSTALL, Some(params))).await;
+            assert_eq!(
+                resp.error.expect("error").code,
+                RpcErrorCode::InvalidParams as i32
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn package_refresh_gate_pass_reaches_rootd_degrade() {
+        // L4 放行后进入 handler：无参数，到达 rootd 连接。本环境无 rootd
+        // → BackendUnavailable 降级，证明成功路径前置链路（门禁放行 +
+        // handler 执行）完整；rootd Ok 分支需实机。
+        let mut d = Daemon::connect(Duration::from_secs(1)).await;
+        d.caller_id = "trusted".into();
+        d.security
+            .config
+            .permissions
+            .allow
+            .insert("trusted".into(), vec![PermissionLevel::L4]);
+        let resp = dispatch(&mut d, &req(method::PACKAGE_REFRESH, Some(json!({})))).await;
+        assert_eq!(
+            resp.error.expect("error").code,
+            RpcErrorCode::BackendUnavailable as i32
         );
     }
 }

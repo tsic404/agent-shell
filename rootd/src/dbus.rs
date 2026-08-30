@@ -301,10 +301,7 @@ impl RootdInterface {
         let r = self
             .call_method(conn, caller, "PackageInstall", vec![Value::from(packages)])
             .await?;
-        r.get("job_id")
-            .and_then(Value::as_str)
-            .map(String::from)
-            .ok_or_else(|| fdo::Error::Failed("missing job_id".into()))
+        serde_json::to_string(&r).map_err(|e| fdo::Error::Failed(e.to_string()))
     }
 
     async fn package_remove(
@@ -317,10 +314,7 @@ impl RootdInterface {
         let r = self
             .call_method(conn, caller, "PackageRemove", vec![Value::from(packages)])
             .await?;
-        r.get("job_id")
-            .and_then(Value::as_str)
-            .map(String::from)
-            .ok_or_else(|| fdo::Error::Failed("missing job_id".into()))
+        serde_json::to_string(&r).map_err(|e| fdo::Error::Failed(e.to_string()))
     }
 
     async fn package_update(
@@ -333,10 +327,7 @@ impl RootdInterface {
         let r = self
             .call_method(conn, caller, "PackageUpdate", vec![Value::from(packages)])
             .await?;
-        r.get("job_id")
-            .and_then(Value::as_str)
-            .map(String::from)
-            .ok_or_else(|| fdo::Error::Failed("missing job_id".into()))
+        serde_json::to_string(&r).map_err(|e| fdo::Error::Failed(e.to_string()))
     }
 
     async fn package_refresh(
@@ -348,10 +339,7 @@ impl RootdInterface {
         let r = self
             .call_method(conn, caller, "PackageRefresh", vec![])
             .await?;
-        r.get("job_id")
-            .and_then(Value::as_str)
-            .map(String::from)
-            .ok_or_else(|| fdo::Error::Failed("missing job_id".into()))
+        serde_json::to_string(&r).map_err(|e| fdo::Error::Failed(e.to_string()))
     }
 
     // ── systemd system 单元 ──

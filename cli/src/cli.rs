@@ -108,6 +108,9 @@ pub enum Command {
     /// Job 状态查询（rootd 特权链路，§23.4）
     #[command(subcommand)]
     Job(JobCommand),
+    /// 系统包管理（rootd 特权链路，§23.4）
+    #[command(subcommand)]
+    Pkg(PkgCommand),
 }
 
 // ───────────────────────── windows ─────────────────────────
@@ -456,7 +459,43 @@ pub enum JobCommand {
     Status { job_id: String },
 }
 
-// ───────────────────────── 解析辅助 ─────────────────────────
+// ───────────────────────── pkg（rootd 特权链路） ─────────────────────────
+
+/// 系统包管理命令（rootd 特权链路，§23.4）。
+#[derive(Subcommand, Debug)]
+pub enum PkgCommand {
+    /// 安装系统软件包
+    Install {
+        /// 待安装的软件包名
+        packages: Vec<String>,
+        /// 等待 job 完成（阻塞至退出）
+        #[arg(long)]
+        wait: bool,
+    },
+    /// 移除系统软件包
+    Remove {
+        /// 待移除的软件包名
+        packages: Vec<String>,
+        /// 等待 job 完成（阻塞至退出）
+        #[arg(long)]
+        wait: bool,
+    },
+    /// 升级系统软件包（无参数 = 全部升级）
+    Update {
+        /// 待升级的软件包名（省略 = 全部升级）
+        #[arg(num_args = 0..)]
+        packages: Vec<String>,
+        /// 等待 job 完成（阻塞至退出）
+        #[arg(long)]
+        wait: bool,
+    },
+    /// 刷新包元数据缓存
+    Refresh {
+        /// 等待 job 完成（阻塞至退出）
+        #[arg(long)]
+        wait: bool,
+    },
+}
 
 /// 解析 "ctrl+c" / "meta+t" 形式的按键组合。
 ///

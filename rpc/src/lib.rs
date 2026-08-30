@@ -194,6 +194,14 @@ pub mod method {
     pub const HOSTNAME_SET: &str = "hostname.set";
     /// 查询 job 状态（rootd JobStatus）。
     pub const JOB_STATUS: &str = "job.status";
+    /// 安装系统软件包（rootd PackageInstall）。
+    pub const PACKAGE_INSTALL: &str = "package.install";
+    /// 移除系统软件包（rootd PackageRemove）。
+    pub const PACKAGE_REMOVE: &str = "package.remove";
+    /// 升级系统软件包（rootd PackageUpdate）。
+    pub const PACKAGE_UPDATE: &str = "package.update";
+    /// 刷新包元数据缓存（rootd PackageRefresh）。
+    pub const PACKAGE_REFRESH: &str = "package.refresh";
 }
 
 /// Mount/Unmount 共用的 polkit action id（§23.4.2）。

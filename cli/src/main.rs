@@ -73,6 +73,7 @@ async fn dispatch_command(command: Command, out: OutputFormat) -> CmdResult {
         Command::Hostname(cmd) => hostname_cmd(&mut c, cmd).await,
         Command::Kill { pid, signal } => kill_cmd(&mut c, pid, signal).await,
         Command::Job(cmd) => job_cmd(&mut c, cmd).await,
+        Command::Pkg(cmd) => pkg_cmd(&mut c, cmd).await,
     }
 }
 
@@ -554,6 +555,87 @@ async fn kill_cmd(c: &mut DaemonClient, pid: i32, signal: i32) -> CmdResult {
     }
 }
 
+/// `pkg` 命令组（rootd PackageInstall/Remove/Update/Refresh，§23.4）。
+///
+/// rootd 返回 `{job_id, pm}`（pm = 检测到的包管理器类型）。无 `--wait`
+/// 时打印排队信息即退出；`--wait` 时复用 [`wait_for_job`] 轮询至完成。
+/// 错误分两类：rootd 直传错误走 [`process_rootd_error`] 干净映射，
+/// 其余（权限 gate、daemon 连接失败等）保留原始 RPC 错误形态。
+async fn pkg_cmd(c: &mut DaemonClient, cmd: cli::PkgCommand) -> CmdResult {
+    let (m, packages, wait) = match cmd {
+        cli::PkgCommand::Install { packages, wait } => (method::PACKAGE_INSTALL, packages, wait),
+        cli::PkgCommand::Remove { packages, wait } => (method::PACKAGE_REMOVE, packages, wait),
+        cli::PkgCommand::Update { packages, wait } => (method::PACKAGE_UPDATE, packages, wait),
+        cli::PkgCommand::Refresh { wait } => (method::PACKAGE_REFRESH, Vec::new(), wait),
+    };
+    pkg_cmd_impl(c, m, packages, wait).await
+}
+
+/// `pkg_cmd` 的公共实现：调用 → 取 job_id/pm → 按需等待。
+async fn pkg_cmd_impl(
+    c: &mut DaemonClient,
+    m: &str,
+    packages: Vec<String>,
+    wait: bool,
+) -> CmdResult {
+    let params = if m == method::PACKAGE_REFRESH {
+        json!({})
+    } else {
+        json!({ "packages": packages })
+    };
+    let v = match c.call(m, params).await {
+        Ok(v) => v,
+        Err(e) => {
+            return match process_rootd_error(&e) {
+                Some((code, msg)) => {
+                    eprintln!("error: {msg}");
+                    Ok(code)
+                }
+                None => Err(e),
+            }
+        }
+    };
+    let job_id = v
+        .get("job_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("malformed response (missing job_id): {v}"))?;
+    let pm = v.get("pm").and_then(Value::as_str).unwrap_or("unknown");
+    if !wait {
+        println!("job {job_id} queued (pm: {pm})");
+        return Ok(0);
+    }
+    match wait_for_job(c, job_id).await {
+        Ok(true) => {
+            println!("job {job_id} completed successfully");
+            Ok(0)
+        }
+        Ok(false) => {
+            let st = c
+                .job_status(job_id)
+                .await
+                .unwrap_or_else(|_| serde_json::json!({}));
+            eprintln!("{}", pkg_failed_job_line(&st));
+            Ok(1)
+        }
+        Err(e) if e.contains("did not finish within") => {
+            eprintln!("error: job timed out");
+            Ok(1)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// 构造 `--wait` 失败时的 job 摘要行。
+fn pkg_failed_job_line(v: &Value) -> String {
+    let code = v
+        .get("exit_code")
+        .and_then(Value::as_i64)
+        .map(|n| n.to_string())
+        .unwrap_or_else(|| "unknown".into());
+    let stderr = v.get("stderr").and_then(Value::as_str).unwrap_or("");
+    format!("error: job failed (exit {code}): {stderr}")
+}
+
 /// `log` 查询的 CLI 侧超时（秒）：大于 daemon→rootd 链路最长 90s 的容错余量，
 /// 到点主动失败并给明确提示（TSI-2493），而非静默挂起。
 const LOG_QUERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
@@ -817,7 +899,8 @@ fn process_rootd_error(e: &str) -> Option<(i32, String)> {
 mod tests {
     use super::{
         is_auth_required, job_status_outcome, log_query_timeout_error, parse_log_filter,
-        process_rootd_error, wait_for_job_impl, JobStatusSource, LOG_QUERY_TIMEOUT,
+        pkg_failed_job_line, process_rootd_error, wait_for_job_impl, JobStatusSource,
+        LOG_QUERY_TIMEOUT,
     };
     use serde_json::{json, Value};
     use std::collections::VecDeque;
@@ -1093,5 +1176,18 @@ mod tests {
 
         let bad_fstype = "rootd: org.freedesktop.DBus.Error.Failed: invalid fstype: \"ex;t4\"";
         assert!(!is_auth_required(1005, bad_fstype));
+    }
+
+    #[test]
+    fn pkg_failed_job_line_maps_exit_code_and_unknown() {
+        // exit_code 存在 → 内联数值；缺省 → unknown。
+        assert_eq!(
+            pkg_failed_job_line(&json!({ "exit_code": 1, "stderr": "boom" })),
+            "error: job failed (exit 1): boom"
+        );
+        assert_eq!(
+            pkg_failed_job_line(&json!({})),
+            "error: job failed (exit unknown): "
+        );
     }
 }
