@@ -195,6 +195,43 @@ fn run_command(cmd: impl AsRef<Path>, args: &[&str], slot: &CommandSlot) -> Resu
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
+// ───────────────────── hostname 写回 seam（TSI-2695） ─────────────────────
+//
+// 仅 hostname 写回路径可注入：`hostname_set`（HostnameSet 分派）与测试夹具
+// `HostnameGuard::restore` 的 hostnamectl 写回经此分派；其余 `run_command`
+// 调用点（journalctl/sysctl/mount/umount）保持直连真实 spawn（TSI-2695
+// 约束：seam 不扩散，`CommandSlot` 取消/pidfd 跟踪契约与 `validate_hostname`
+// 语义不变）。
+
+/// hostname 写回命令执行器（可注入 seam，供单测替换真实进程 spawn）。
+type HostnameCommandRunner = fn(&str, &[&str], &CommandSlot) -> Result<String, String>;
+
+/// 测试注入的 hostname 写回执行器；`None` = 使用默认真实执行器。
+///
+/// 测试中的写入必须持有 [`HOSTNAME_TEST_MUTEX`]（经 `set_hostname_command_runner`/
+/// `clear_hostname_command_runner` 的守护参数强制），与 [`JOB_RUNNER`] 同构——
+/// 进程级全局 seam，注入测试必须先取得独占闸，杜绝并行测试互相竞争。
+static HOSTNAME_COMMAND_RUNNER: Mutex<Option<HostnameCommandRunner>> = Mutex::new(None);
+
+/// 默认执行器：真实 spawn `hostnamectl`，复用 [`run_command`] 的取消/pidfd
+/// 跟踪语义（仅替换执行入口，不动 CommandSlot 契约）。
+fn default_hostname_command(
+    cmd: &str,
+    args: &[&str],
+    slot: &CommandSlot,
+) -> Result<String, String> {
+    run_command(cmd, args, slot)
+}
+
+/// 经注入 seam 执行 hostname 写回命令。
+fn run_hostname_command(cmd: &str, args: &[&str], slot: &CommandSlot) -> Result<String, String> {
+    let runner = HOSTNAME_COMMAND_RUNNER
+        .lock()
+        .expect("HOSTNAME_COMMAND_RUNNER mutex poisoned")
+        .unwrap_or(default_hostname_command);
+    runner(cmd, args, slot)
+}
+
 /// 为已 spawn 的 [`Child`](std::process::Child) 生成 pidfd。
 ///
 /// pidfd 引用进程本体而非 PID 数值，`pidfd_send_signal` 因此不受 PID 复用
@@ -312,6 +349,14 @@ pub(crate) static JOB_TEST_MUTEX: parking_lot::Mutex<()> = parking_lot::Mutex::n
 /// `sleep` 直接子进程会互相污染 `/proc` 扫描结果，必须独占。
 #[cfg(test)]
 pub(crate) static SPAWN_SLEEP_TEST_MUTEX: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
+/// 串行化所有会写入进程级全局 seam [`HOSTNAME_COMMAND_RUNNER`] 的测试。
+///
+/// 与 [`JOB_TEST_MUTEX`] 同构：注入 hostname 写回执行器的测试必须先取得
+/// 本锁（经 `set_hostname_command_runner`/`clear_hostname_command_runner` 的
+/// 守护参数强制），杜绝并行测试在 seam 上互相竞争。
+#[cfg(test)]
+pub(crate) static HOSTNAME_TEST_MUTEX: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
 /// 进程内 job 注册表（D-Bus 服务层轮询/订阅以发射信号）。
 static JOBS: Mutex<Option<HashMap<String, JobState>>> = Mutex::new(None);
@@ -1163,8 +1208,8 @@ fn hostname_set(args: &[Value], slot: &CommandSlot) -> RootResult {
         hostname,
         "hostname set requested (polkit action: com.agentshell.hostname.set)",
     );
-    // 实际执行：hostnamectl set-hostname
-    run_command("hostnamectl", &["set-hostname", hostname], slot)?;
+    // 实际执行：hostnamectl set-hostname（经可注入 seam，默认真实 spawn）。
+    run_hostname_command("hostnamectl", &["set-hostname", hostname], slot)?;
     Ok(json!({ "accepted": true, "hostname": hostname }))
 }
 
@@ -1971,6 +2016,7 @@ mod tests {
 
     #[test]
     fn hostname_validation() {
+        let _guard = HOSTNAME_TEST_MUTEX.lock();
         // 校验失败仍返回 Err（不触达 hostnamectl）
         assert!(dispatch("HostnameSet", &[json!("")]).is_err());
         assert!(dispatch("HostnameSet", &[json!("-bad")]).is_err());
@@ -1978,6 +2024,144 @@ mod tests {
         assert!(dispatch("HostnameSet", &[json!("host; rm -rf /")]).is_err());
         // 有效 hostname 通过校验——hostnamectl 在 CI 无权限/无 polkit → Err
         assert!(dispatch("HostnameSet", &[json!("myhost")]).is_err());
+    }
+
+    // ── hostname 写回 seam（TSI-2695） ──
+
+    /// 记录经 seam 分派的 hostname 写回调用（进程级全局，测试串行）。
+    static HOSTNAME_CALL_LOG: parking_lot::Mutex<Vec<(String, Vec<String>)>> =
+        parking_lot::Mutex::new(Vec::new());
+
+    fn clear_hostname_call_log() {
+        HOSTNAME_CALL_LOG.lock().clear();
+    }
+
+    fn recorded_hostname_calls() -> Vec<(String, Vec<String>)> {
+        HOSTNAME_CALL_LOG.lock().clone()
+    }
+
+    fn record_hostname_command(
+        cmd: &str,
+        args: &[&str],
+        _slot: &CommandSlot,
+    ) -> Result<String, String> {
+        HOSTNAME_CALL_LOG.lock().push((
+            cmd.to_string(),
+            args.iter().map(|s| s.to_string()).collect(),
+        ));
+        Ok(String::new())
+    }
+
+    fn hostname_failure_runner(
+        _cmd: &str,
+        _args: &[&str],
+        _slot: &CommandSlot,
+    ) -> Result<String, String> {
+        Err("mock hostname failure".to_string())
+    }
+
+    fn hostname_static_fails_runner(
+        _cmd: &str,
+        args: &[&str],
+        _slot: &CommandSlot,
+    ) -> Result<String, String> {
+        if args.contains(&"--static") {
+            Err("mock static restore failure".to_string())
+        } else {
+            Ok(String::new())
+        }
+    }
+
+    /// 注入 hostname 写回 runner。要求传入 [`HOSTNAME_TEST_MUTEX`] 的守护——
+    /// 从类型上保证任何触碰进程级全局 seam 的测试先持有测试串行闸。
+    fn set_hostname_command_runner(
+        _guard: &parking_lot::MutexGuard<'_, ()>,
+        r: HostnameCommandRunner,
+    ) {
+        *HOSTNAME_COMMAND_RUNNER
+            .lock()
+            .expect("HOSTNAME_COMMAND_RUNNER mutex poisoned") = Some(r);
+    }
+
+    /// 清除注入的 runner 并恢复默认真实执行器。要求持有 [`HOSTNAME_TEST_MUTEX`]。
+    fn clear_hostname_command_runner(_guard: &parking_lot::MutexGuard<'_, ()>) {
+        *HOSTNAME_COMMAND_RUNNER
+            .lock()
+            .expect("HOSTNAME_COMMAND_RUNNER mutex poisoned") = None;
+    }
+
+    #[test]
+    fn hostname_set_dispatches_through_seam() {
+        let _guard = HOSTNAME_TEST_MUTEX.lock();
+        clear_hostname_call_log();
+        set_hostname_command_runner(&_guard, record_hostname_command);
+        let r = dispatch("HostnameSet", &[json!("myhost")]);
+        clear_hostname_command_runner(&_guard);
+        assert!(r.is_ok(), "HostnameSet 失败: {r:?}");
+        let calls = recorded_hostname_calls();
+        assert_eq!(calls.len(), 1, "{calls:?}");
+        assert_eq!(calls[0].0, "hostnamectl");
+        assert_eq!(
+            calls[0].1,
+            vec!["set-hostname".to_string(), "myhost".to_string()]
+        );
+    }
+
+    #[test]
+    fn hostname_guard_restore_writes_static_and_transient() {
+        let _guard = HOSTNAME_TEST_MUTEX.lock();
+        clear_hostname_call_log();
+        let guard = HostnameGuard {
+            original: ("s.example".to_string(), "t.example".to_string()),
+        };
+        set_hostname_command_runner(&_guard, record_hostname_command);
+        guard.restore().expect("restore 失败");
+        clear_hostname_command_runner(&_guard);
+        let calls = recorded_hostname_calls();
+        assert_eq!(calls.len(), 2, "{calls:?}");
+        assert_eq!(
+            calls[0],
+            (
+                "hostnamectl".to_string(),
+                vec![
+                    "set-hostname".to_string(),
+                    "--static".to_string(),
+                    "s.example".to_string(),
+                ],
+            )
+        );
+        assert_eq!(
+            calls[1],
+            (
+                "hostnamectl".to_string(),
+                vec![
+                    "set-hostname".to_string(),
+                    "--transient".to_string(),
+                    "t.example".to_string(),
+                ],
+            )
+        );
+    }
+
+    #[test]
+    fn hostname_guard_restore_aggregates_partial_failure() {
+        let _guard = HOSTNAME_TEST_MUTEX.lock();
+        let guard = HostnameGuard {
+            original: ("s.example".to_string(), "t.example".to_string()),
+        };
+        set_hostname_command_runner(&_guard, hostname_static_fails_runner);
+        let err = guard.restore().expect_err("部分失败必须返回 Err");
+        clear_hostname_command_runner(&_guard);
+        assert!(err.contains("mock static restore failure"), "{err}");
+    }
+
+    #[test]
+    fn hostname_set_propagates_mock_failure() {
+        let _guard = HOSTNAME_TEST_MUTEX.lock();
+        set_hostname_command_runner(&_guard, hostname_failure_runner);
+        let r = dispatch("HostnameSet", &[json!("myhost")]);
+        clear_hostname_command_runner(&_guard);
+        assert!(r.is_err(), "mock 失败必须上抛");
     }
 
     // ── 主机名快照/恢复（TSI-2630：共享容器 /etc/hostname 漂移） ──
@@ -2028,7 +2212,7 @@ mod tests {
             let (static_, transient) = &self.original;
             let mut failures = Vec::new();
             for (flag, value) in [("--static", static_), ("--transient", transient)] {
-                if let Err(e) = run_command(
+                if let Err(e) = run_hostname_command(
                     "hostnamectl",
                     &["set-hostname", flag, value.as_str()],
                     &CommandSlot::new(),
@@ -2058,6 +2242,7 @@ mod tests {
     #[test]
     #[ignore = "requires root/hostnamed; live snapshot/restore fixture (TSI-2630)"]
     fn hostname_set_snapshot_and_restore_live() {
+        let _guard = HOSTNAME_TEST_MUTEX.lock();
         // 非 root 无法写回主机名：跳过而非假失败。真实验证需以 root 运行
         // （rootd 部署即 root），CI 默认忽略本测试。
         if unsafe { libc::geteuid() } != 0 {
