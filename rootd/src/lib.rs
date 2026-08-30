@@ -15,7 +15,7 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 /// 阻塞性系统命令的默认超时（秒）。
@@ -55,6 +55,94 @@ pub const MAX_JOURNAL_LINES: u64 = 10000;
 /// `JournalQuery` 默认时间上界（无 `since`/`until`/`boot` 时强制）。
 pub const DEFAULT_JOURNAL_SINCE: &str = "-24h";
 
+/// 单个阻塞分派的命令跟踪槽（TSI-2545）。
+///
+/// `dispatch_with_slot` 在阻塞线程内执行；`spawn_blocking` + `timeout` 超时后
+/// 该线程被 detach，异步包装层无法再接触其中的局部变量。本结构把取消意图
+/// 与子进程 pidfd 放进跨线程共享状态：包装层超时后置取消位并等待 kill 目标，
+/// 阻塞线程在 `Command::spawn` 前后各检查一次取消位——spawn 前检查跳过延迟
+/// 的 spawn，spawn 后检查在包装层来不及 kill 时自行清理并 reap。
+/// [`tokio::sync::Notify`] 让等待以「pidfd 可用」或「分派结束」为准，取代
+/// 固定 200ms 宽限启发式；异步等待不阻塞 tokio 工作线程（TSI-2504 事件
+/// 循环隔离的延续）。
+pub(crate) struct CommandSlot {
+    /// 包装层超时后置位；阻塞线程据此跳过 spawn 或 spawn 后自清理。
+    cancelled: AtomicBool,
+    /// 阻塞线程分派结束（正常或异常返回）后置位；`cancel` 也会置位以封住
+    /// 分派闭包尚未开始执行时的等待上界。等待方据此提前退出。
+    finished: AtomicBool,
+    /// 阻塞线程 spawn 成功后立即写入的 pidfd；包装层据此精确 kill。
+    pidfd: Mutex<Option<OwnedFd>>,
+    /// 在 pidfd 写入或分派结束（finished）时通知等待方。
+    state_changed: tokio::sync::Notify,
+}
+
+impl CommandSlot {
+    pub(crate) fn new() -> Self {
+        Self {
+            cancelled: AtomicBool::new(false),
+            finished: AtomicBool::new(false),
+            pidfd: Mutex::new(None),
+            state_changed: tokio::sync::Notify::new(),
+        }
+    }
+
+    pub(crate) fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+        // 与 `mark_finished`/`store_pidfd` 同理：置 finished 并 notify_one，
+        // 使 `wait_for_kill_target` 在分派闭包尚未开始执行（blocking 池饱和，
+        // 闭包仍在队列，`dispatch_with_slot` 无从走到 `mark_finished`）时立即
+        // 返回 None，包装层随即返回超时错误——封住无界等待（TSI-2545 C2）。
+        self.finished.store(true, Ordering::Release);
+        self.state_changed.notify_one();
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
+
+    fn store_pidfd(&self, fd: OwnedFd) {
+        *self.pidfd.lock().expect("pidfd slot poisoned") = Some(fd);
+        // `notify_one` 在无等待方时存储 permit，使「检查状态 → notified()」
+        // 的等待循环不会因写入与通知间的竞态错过唤醒；单等待方契约见
+        // `wait_for_kill_target`。
+        self.state_changed.notify_one();
+    }
+
+    fn take_pidfd(&self) -> Option<OwnedFd> {
+        self.pidfd.lock().expect("pidfd slot poisoned").take()
+    }
+
+    fn clear_pidfd(&self) {
+        *self.pidfd.lock().expect("pidfd slot poisoned") = None;
+    }
+
+    fn mark_finished(&self) {
+        self.finished.store(true, Ordering::Release);
+        // 与 `store_pidfd` 同理用 `notify_one`：无等待方时存储 permit，
+        // 使等待循环在「检查 finished → notified()」间不因竞态漏醒。
+        self.state_changed.notify_one();
+    }
+
+    /// 等待 kill 目标就绪：返回可精确 kill 子进程的 pidfd；分派在 spawn 前
+    /// 已结束（如取消在 spawn 前命中）则返回 `None`。不再依赖固定宽限时长。
+    ///
+    /// 「先检查状态、再 `notified()`、取回后复查」循环：`notify_one` 在无
+    /// 等待方时存储 permit，`notified()` 会立即消费该 permit 返回，因此写入
+    /// 与通知之间的任意交错都不会漏醒。单等待方契约（超时分支唯一调用方）。
+    pub(crate) async fn wait_for_kill_target(&self) -> Option<OwnedFd> {
+        loop {
+            if let Some(fd) = self.take_pidfd() {
+                return Some(fd);
+            }
+            if self.finished.load(Ordering::Acquire) {
+                return None;
+            }
+            self.state_changed.notified().await;
+        }
+    }
+}
+
 /// 执行系统命令（rootd 以 root 运行）。失败时返回错误描述。
 /// 薄代理职责：校验后的参数直接转发给系统工具，不做额外业务逻辑。
 ///
@@ -62,15 +150,16 @@ pub const DEFAULT_JOURNAL_SINCE: &str = "-24h";
 /// `tokio::time::timeout` 包装，本函数自身不含超时，便于单测。
 ///
 /// 子进程句柄经 [`Command`](std::process::Command) 的 `spawn()` 取得后立即
-/// 克隆为 pidfd 写入 `pid_slot`——超时后的 kill 据此以无 PID 复用竞态的
-/// 方式精确作用于本函数产生的进程（TSI-2504）。返回前清除 slot。
-fn run_command(
-    cmd: impl AsRef<Path>,
-    args: &[&str],
-    pid_slot: &Mutex<Option<OwnedFd>>,
-) -> Result<String, String> {
+/// 克隆为 pidfd 写入 `slot`——超时后的 kill 据此以无 PID 复用竞态的方式
+/// 精确作用于本函数产生的进程（TSI-2504/TSI-2545）。spawn 前后双重检查
+/// 取消位：spawn 前取消则跳过，spawn 后取消则自行 kill 并 reap。
+fn run_command(cmd: impl AsRef<Path>, args: &[&str], slot: &CommandSlot) -> Result<String, String> {
     let cmd_path = cmd.as_ref();
     let cmd_name = cmd_path.display().to_string();
+    // spawn 前检查：包装层已超时置取消位 → 直接跳过，不留孤儿（TSI-2545）。
+    if slot.is_cancelled() {
+        return Err(format!("{cmd_name} cancelled before spawn"));
+    }
     let mut child = std::process::Command::new(cmd_path)
         .args(args)
         .stdout(std::process::Stdio::piped())
@@ -78,16 +167,27 @@ fn run_command(
         .spawn()
         .map_err(|e| format!("{cmd_name} execution failed: {e}"))?;
     if let Ok(pidfd) = child_pidfd(&mut child) {
-        *pid_slot.lock().expect("pid_slot mutex poisoned") = Some(pidfd);
+        slot.store_pidfd(pidfd);
+    }
+    // spawn 后复查：取消若恰发生在 spawn 与复查之间，且包装层的轮询已耗尽，
+    // 本线程自行 kill 并 reap，杜绝延迟 spawn 孤儿（TSI-2545）。
+    if slot.is_cancelled() {
+        if let Some(pidfd) = slot.take_pidfd() {
+            kill_via_pidfd(&pidfd);
+        } else {
+            let _ = child.kill();
+        }
+        let _ = child.wait();
+        return Err(format!("{cmd_name} cancelled after spawn"));
     }
     let output = match child.wait_with_output() {
         Ok(out) => out,
         Err(e) => {
-            *pid_slot.lock().expect("pid_slot mutex poisoned") = None;
+            slot.clear_pidfd();
             return Err(format!("{cmd_name} wait failed: {e}"));
         }
     };
-    *pid_slot.lock().expect("pid_slot mutex poisoned") = None;
+    slot.clear_pidfd();
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(format!("{cmd_name} failed: {stderr}"));
@@ -206,6 +306,12 @@ pub struct JobState {
 /// runner 测试在进程级全局 seam 上互相竞争。
 #[cfg(test)]
 pub(crate) static JOB_TEST_MUTEX: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
+/// 串行化所有会真实 spawn `sleep` 子进程、并依赖 `/proc` 残留扫描的测试
+/// （dbus 层 B1/C0/C1 与 lib 层 CommandSlot pidfd 测试）——并行时各自的
+/// `sleep` 直接子进程会互相污染 `/proc` 扫描结果，必须独占。
+#[cfg(test)]
+pub(crate) static SPAWN_SLEEP_TEST_MUTEX: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
 /// 进程内 job 注册表（D-Bus 服务层轮询/订阅以发射信号）。
 static JOBS: Mutex<Option<HashMap<String, JobState>>> = Mutex::new(None);
@@ -365,25 +471,23 @@ pub fn job_snapshot() -> Vec<JobState> {
 /// `polkit_action_for` 获取 action id 并完成 polkit 授权校验。本函数
 /// 不重复 polkit 校验——它是薄代理的业务逻辑层，授权是传输层职责。
 pub fn dispatch(method: &str, args: &[Value]) -> RootResult {
-    dispatch_with_pid(method, args, &Mutex::new(None))
+    dispatch_with_slot(method, args, &CommandSlot::new())
 }
 
-/// 分派一个 rootd 方法调用，并允许跟踪产生的子进程（TSI-2504）。
+/// 分派一个 rootd 方法调用，并允许跟踪产生的子进程（TSI-2504/TSI-2545）。
 ///
 /// 与 [`dispatch`] 唯一区别：产生子进程的五个方法（journalctl/sysctl/
-/// hostnamectl/mount/umount）将子进程 pidfd 写入 `pid_slot`，供调用方在
-/// 超时后 kill。其余方法忽略 slot。非白名单方法一律拒绝——rootd 的安全
-/// 模型是「默认拒绝 + 显式白名单」。
+/// hostnamectl/mount/umount）将子进程 pidfd 写入 `slot`，供调用方在
+/// 超时后 kill。其余方法忽略 slot。分派结束（正常或异常）后置位
+/// `CommandSlot::finished`，使超时分支的 kill 目标等待可据此结束，不再
+/// 依赖固定宽限时长。非白名单方法一律拒绝——rootd 的安全模型是
+/// 「默认拒绝 + 显式白名单」。
 ///
 /// **polkit 前置**：调用方（D-Bus 服务层）必须在调用本函数**之前**经
 /// `polkit_action_for` 获取 action id 并完成 polkit 授权校验。本函数
 /// 不重复 polkit 校验——它是薄代理的业务逻辑层，授权是传输层职责。
-pub fn dispatch_with_pid(
-    method: &str,
-    args: &[Value],
-    pid_slot: &Mutex<Option<OwnedFd>>,
-) -> RootResult {
-    match method {
+pub(crate) fn dispatch_with_slot(method: &str, args: &[Value], slot: &CommandSlot) -> RootResult {
+    let result = match method {
         // 版本对账
         "Hello" => hello(),
         // 软件包（返回 job id）
@@ -396,16 +500,16 @@ pub fn dispatch_with_pid(
         | "ServiceReload" => service_control(method, args),
         "DaemonReload" => daemon_reload(),
         // 系统日志
-        "JournalQuery" => journal_query(args, pid_slot),
+        "JournalQuery" => journal_query(args, slot),
         // 系统配置
         "SysctlGet" => sysctl_get(args),
-        "SysctlSet" => sysctl_set(args, pid_slot),
-        "HostnameSet" => hostname_set(args, pid_slot),
+        "SysctlSet" => sysctl_set(args, slot),
+        "HostnameSet" => hostname_set(args, slot),
         // 进程（跨用户）
         "ProcessKill" => process_kill(args),
         // 挂载
-        "Mount" => mount(args, pid_slot),
-        "Unmount" => unmount(args, pid_slot),
+        "Mount" => mount(args, slot),
+        "Unmount" => unmount(args, slot),
         // job 状态查询（issue「job：status / progress 查询」）
         "JobStatus" => job_status_dispatch(args),
         // 会话 Token 管理（可选，无系统副作用）
@@ -420,11 +524,13 @@ pub fn dispatch_with_pid(
         }
         #[cfg(test)]
         "TestSpawnSleep" => {
-            run_command("sleep", &["30"], pid_slot)?;
+            run_command("sleep", &["30"], slot)?;
             Ok(json!({"spawned": true}))
         }
         _ => Err(format!("method not in whitelist: {method}")),
-    }
+    };
+    slot.mark_finished();
+    result
 }
 
 // ───────────────────── 版本对账 ─────────────────────
@@ -935,7 +1041,7 @@ fn build_journal_args(filter_obj: &serde_json::Map<String, Value>) -> Vec<String
     cmd_args
 }
 
-fn journal_query(args: &[Value], pid_slot: &Mutex<Option<OwnedFd>>) -> RootResult {
+fn journal_query(args: &[Value], slot: &CommandSlot) -> RootResult {
     let filter = str_arg(args, 0)?;
     // 过滤表达式必须是合法 JSON 对象（结构化查询，非自由文本拼接）。
     let parsed: Value = serde_json::from_str(filter)
@@ -962,7 +1068,7 @@ fn journal_query(args: &[Value], pid_slot: &Mutex<Option<OwnedFd>>) -> RootResul
     let mut cmd_args: Vec<String> = vec!["--output=json".into()];
     cmd_args.extend(build_journal_args(filter_obj));
     let refs: Vec<&str> = cmd_args.iter().map(|s| s.as_str()).collect();
-    let output = run_command("journalctl", &refs, pid_slot)?;
+    let output = run_command("journalctl", &refs, slot)?;
     Ok(json!({
         "output": output,
         "output_format": "json-stream",
@@ -979,7 +1085,7 @@ fn sysctl_get(args: &[Value]) -> RootResult {
     Ok(json!({ "key": key, "value": value.trim() }))
 }
 
-fn sysctl_set(args: &[Value], pid_slot: &Mutex<Option<OwnedFd>>) -> RootResult {
+fn sysctl_set(args: &[Value], slot: &CommandSlot) -> RootResult {
     let key = str_arg(args, 0)?;
     validate_sysctl_key(key)?;
     let value = args.get(1).ok_or("arg[1] (value) required")?;
@@ -1000,7 +1106,7 @@ fn sysctl_set(args: &[Value], pid_slot: &Mutex<Option<OwnedFd>>) -> RootResult {
     );
     // 实际执行：sysctl -w key=value
     let arg = format!("{key}={value_str}");
-    run_command("sysctl", &["-w", &arg], pid_slot)?;
+    run_command("sysctl", &["-w", &arg], slot)?;
     Ok(json!({ "accepted": true, "key": key }))
 }
 
@@ -1019,7 +1125,7 @@ fn validate_sysctl_key(key: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn hostname_set(args: &[Value], pid_slot: &Mutex<Option<OwnedFd>>) -> RootResult {
+fn hostname_set(args: &[Value], slot: &CommandSlot) -> RootResult {
     let hostname = str_arg(args, 0)?;
     validate_hostname(hostname)?;
     tracing::info!(
@@ -1027,7 +1133,7 @@ fn hostname_set(args: &[Value], pid_slot: &Mutex<Option<OwnedFd>>) -> RootResult
         "hostname set requested (polkit action: com.agentshell.hostname.set)",
     );
     // 实际执行：hostnamectl set-hostname
-    run_command("hostnamectl", &["set-hostname", hostname], pid_slot)?;
+    run_command("hostnamectl", &["set-hostname", hostname], slot)?;
     Ok(json!({ "accepted": true, "hostname": hostname }))
 }
 
@@ -1120,7 +1226,7 @@ fn mount_bin(name: &str) -> Result<&'static Path, String> {
     Ok(slot.get_or_init(|| path).as_path())
 }
 
-fn mount(args: &[Value], pid_slot: &Mutex<Option<OwnedFd>>) -> RootResult {
+fn mount(args: &[Value], slot: &CommandSlot) -> RootResult {
     let device = str_arg(args, 0)?;
     let target = str_arg(args, 1)?;
     let fstype = str_arg(args, 2)?;
@@ -1147,7 +1253,7 @@ fn mount(args: &[Value], pid_slot: &Mutex<Option<OwnedFd>>) -> RootResult {
     }
     mount_args.push(device);
     mount_args.push(target);
-    run_command(mount_bin("mount")?, &mount_args, pid_slot)?;
+    run_command(mount_bin("mount")?, &mount_args, slot)?;
     Ok(json!({
         "accepted": true,
         "device": device,
@@ -1157,7 +1263,7 @@ fn mount(args: &[Value], pid_slot: &Mutex<Option<OwnedFd>>) -> RootResult {
     }))
 }
 
-fn unmount(args: &[Value], pid_slot: &Mutex<Option<OwnedFd>>) -> RootResult {
+fn unmount(args: &[Value], slot: &CommandSlot) -> RootResult {
     let target = str_arg(args, 0)?;
     validate_mount_path(target, "target")?;
     tracing::info!(
@@ -1165,7 +1271,7 @@ fn unmount(args: &[Value], pid_slot: &Mutex<Option<OwnedFd>>) -> RootResult {
         "unmount requested (polkit action: com.agentshell.mount)",
     );
     // 实际执行：umount target
-    run_command(mount_bin("umount")?, &[target], pid_slot)?;
+    run_command(mount_bin("umount")?, &[target], slot)?;
     Ok(json!({ "accepted": true, "target": target }))
 }
 
@@ -1293,6 +1399,7 @@ pub fn is_whitelisted(method: &str) -> bool {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::sync::Arc;
 
     // ── 版本对账 ──
 
@@ -2066,7 +2173,80 @@ mod tests {
         assert!(dispatch("SetToken", &[json!("")]).is_err());
     }
 
-    // ── 白名单自省 ──
+    // ── CommandSlot 取消/等待语义（TSI-2545） ──
+
+    #[test]
+    fn run_command_skips_spawn_when_cancelled() {
+        // spawn 前取消位已置位 → run_command 必须直接返回错误，不产生子进程。
+        // 这是关闭「极端调度延迟下延迟 spawn 孤儿」窗口的关键路径。
+        let slot = CommandSlot::new();
+        slot.cancel();
+        let err = run_command("sleep", &["5"], &slot).unwrap_err();
+        assert!(err.contains("cancelled before spawn"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn command_slot_wait_returns_none_after_finished() {
+        // 分派在 spawn 前已结束（无 pidfd）→ 等待方必须立即返回 None 而非
+        // 无限阻塞。超时分支对不产生子进程或 spawn 前取消的方法依赖此路径。
+        let slot = CommandSlot::new();
+        slot.mark_finished();
+        assert!(slot.wait_for_kill_target().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn command_slot_wait_returns_none_after_cancel() {
+        // C2 回归：分派闭包尚未开始执行（blocking 池饱和，闭包仍在队列）时，
+        // 超时分支置 cancel 后必须立即拿到 None 而非无限等待——`cancel` 置
+        // finished 并 notify_one，与 `mark_finished` 同路径封住等待上界。
+        let slot = CommandSlot::new();
+        slot.cancel();
+        assert!(slot.wait_for_kill_target().await.is_none());
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn command_slot_wait_returns_stored_pidfd() {
+        let _guard = SPAWN_SLEEP_TEST_MUTEX.lock();
+        // pidfd 写入后等待方应立即拿到并取走（take），供超时分支精确 kill。
+        let slot = CommandSlot::new();
+        let mut child = std::process::Command::new("sleep")
+            .arg("1")
+            .spawn()
+            .expect("spawn sleep for pidfd");
+        let pidfd = child_pidfd(&mut child).expect("pidfd");
+        slot.store_pidfd(pidfd);
+        assert!(
+            slot.wait_for_kill_target().await.is_some(),
+            "pidfd must be retrievable after store"
+        );
+        let _ = child.wait();
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn command_slot_wait_wakes_on_late_store() {
+        let _guard = SPAWN_SLEEP_TEST_MUTEX.lock();
+        // 漏通知死等。这是 `wait_for_kill_target` 的核心契约（TSI-2545）。
+        let slot = Arc::new(CommandSlot::new());
+        let writer = Arc::clone(&slot);
+        let worker = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            let mut child = std::process::Command::new("sleep")
+                .arg("1")
+                .spawn()
+                .expect("spawn sleep for pidfd");
+            let pidfd = child_pidfd(&mut child).expect("pidfd");
+            writer.store_pidfd(pidfd);
+            let _ = child.wait();
+        });
+        let fd = slot
+            .wait_for_kill_target()
+            .await
+            .expect("late pidfd store must wake the waiter");
+        drop(fd);
+        worker.join().expect("writer thread");
+    }
 
     #[test]
     fn whitelist_matches_design_doc() {

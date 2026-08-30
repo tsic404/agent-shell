@@ -6,13 +6,13 @@
 //! - 非白名单方法由 lib `dispatch` 拒绝（默认拒绝）
 //! - `JobProgress`/`JobDone` 信号经 `job_snapshot`/`job_drain_done` 驱动
 use crate::{
-    dispatch, dispatch_with_pid, job_drain_done, job_snapshot, kill_via_pidfd, polkit_action_for,
-    JobState, COMMAND_TIMEOUT, JOURNAL_QUERY_TIMEOUT, MAX_CONCURRENT_BLOCKING_COMMANDS,
+    dispatch, dispatch_with_slot, job_drain_done, job_snapshot, kill_via_pidfd, polkit_action_for,
+    CommandSlot, JobState, COMMAND_TIMEOUT, JOURNAL_QUERY_TIMEOUT,
+    MAX_CONCURRENT_BLOCKING_COMMANDS,
 };
 use serde_json::Value;
 use std::os::fd::OwnedFd;
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::sync::Arc;
 use tokio::sync::Semaphore;
 use zbus::fdo;
 use zbus::message::Header;
@@ -200,11 +200,13 @@ async fn dispatch_with_timeout_tracked(
 ) -> (Result<Value, String>, Option<OwnedFd>) {
     let timeout = command_timeout_for(method);
     let method_name = method.to_string();
-    let pidfd_slot: Arc<Mutex<Option<OwnedFd>>> = Arc::new(Mutex::new(None));
-    let slot = Arc::clone(&pidfd_slot);
+    let slot: Arc<CommandSlot> = Arc::new(CommandSlot::new());
+    let worker_slot = Arc::clone(&slot);
     let result = tokio::time::timeout(
         timeout,
-        tokio::task::spawn_blocking(move || dispatch_with_pid(&method_name, &args, &slot)),
+        tokio::task::spawn_blocking(move || {
+            dispatch_with_slot(&method_name, &args, worker_slot.as_ref())
+        }),
     )
     .await;
     match result {
@@ -212,11 +214,19 @@ async fn dispatch_with_timeout_tracked(
         Ok(Ok(dispatch_result)) => (dispatch_result, None),
         // spawn_blocking join 失败（blocking 线程 panic/中止）。
         Ok(Err(join_err)) => (Err(format!("{method} task join failed: {join_err}")), None),
-        // 超时：短暂等待阻塞线程把子进程 pidfd 写入 slot 后 kill（TSI-2504）。
+        // 超时：置取消位后等待 kill 目标就绪——pidfd 可用或分派已结束，
+        // 取代固定 200ms 宽限（TSI-2545）。不产生子进程的方法不等待。
         Err(_) => {
-            let killed = wait_for_pidfd(&pidfd_slot, Duration::from_millis(200))
-                .await
-                .inspect(kill_via_pidfd);
+            slot.cancel();
+            let killed = if method_spawns_child(method) {
+                let fd = slot.wait_for_kill_target().await;
+                if let Some(fd) = &fd {
+                    kill_via_pidfd(fd);
+                }
+                fd
+            } else {
+                None
+            };
             (Err(format!("{method} timed out after {timeout:?}")), killed)
         }
     }
@@ -238,21 +248,13 @@ async fn dispatch_with_semaphore(
     dispatch_with_timeout(method, args).await
 }
 
-/// 轮询等待 pidfd 写入（阻塞线程已 spawn 子进程），最多 `grace` 时长。
-///
-/// Semaphore 许可先于 `spawn_blocking` 取得，16 上限远小于 blocking 线程池
-/// 512 容量，spawn 应在毫秒内发生；200ms 宽限覆盖调度抖动，避免 kill 落空。
-async fn wait_for_pidfd(slot: &Arc<Mutex<Option<OwnedFd>>>, grace: Duration) -> Option<OwnedFd> {
-    let deadline = std::time::Instant::now() + grace;
-    loop {
-        if let Some(fd) = slot.lock().expect("pidfd slot poisoned").take() {
-            return Some(fd);
-        }
-        if std::time::Instant::now() >= deadline {
-            return None;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+/// 方法是否会产生可被 kill 的子进程（TSI-2545 超时分支等待 kill 目标的
+/// 唯一白名单）。不产生子进程的方法超时后无需等待即可返回。
+fn method_spawns_child(method: &str) -> bool {
+    matches!(
+        method,
+        "JournalQuery" | "SysctlSet" | "HostnameSet" | "Mount" | "Unmount" | "TestSpawnSleep"
+    )
 }
 
 /// 方法对应的命令超时：`JournalQuery` 走专项超时（60s），其余走默认（30s）。
@@ -660,16 +662,17 @@ pub async fn drive_signals(
 mod tests {
     use super::{
         command_timeout_for, dispatch_with_semaphore, dispatch_with_timeout,
-        dispatch_with_timeout_tracked, process_start_time,
+        dispatch_with_timeout_tracked, method_spawns_child, process_start_time,
     };
-    use crate::{COMMAND_TIMEOUT, JOURNAL_QUERY_TIMEOUT};
-    use std::os::fd::AsRawFd;
+    use crate::{whitelist_methods, COMMAND_TIMEOUT, JOURNAL_QUERY_TIMEOUT};
+    use std::os::fd::{AsRawFd, OwnedFd};
 
     // ── drive_signals 信号循环 ──
 
     use super::{drive_signals, RootdInterface};
     use crate::{
         completed_jobs_lock, job_create, job_done_with, job_progress, job_status, JOB_TEST_MUTEX,
+        SPAWN_SLEEP_TEST_MUTEX,
     };
     use futures_util::StreamExt;
     use std::io::Read as _;
@@ -916,6 +919,41 @@ mod tests {
         assert_eq!(command_timeout_for("PackageInstall"), COMMAND_TIMEOUT);
     }
 
+    /// `method_spawns_child` 是超时分支等待 kill 目标的唯一白名单，必须与
+    /// dispatch 中实际经 `run_command(…, slot)` 产生子进程的方法保持 1:1。
+    /// 两侧独立来源：`SPAWN_CALLERS` 硬编码 dispatch 的 spawn 分支（与
+    /// `dispatch_with_slot` 手工同步），候选全集 `callers` = D-Bus 白名单 ∪
+    /// dispatch。`method_spawns_child` 只作为被比较的分类结果，不参与任何
+    /// 一侧的推导——漏加 spawn 方法时该方法仍留在硬编码列表中，断言即红。
+    #[test]
+    fn method_spawns_child_matches_run_command_callers() {
+        const SPAWN_CALLERS: &[&str] = &[
+            "JournalQuery",
+            "SysctlSet",
+            "HostnameSet",
+            "Mount",
+            "Unmount",
+            "TestSpawnSleep",
+        ];
+
+        // 候选全集：D-Bus 白名单 ∪ dispatch spawn 分支。TestSpawnSleep 是
+        // cfg(test) 专用方法，不在白名单内，须显式并入。
+        let mut callers: Vec<&str> = whitelist_methods().to_vec();
+        for method in SPAWN_CALLERS.iter().copied() {
+            if !callers.contains(&method) {
+                callers.push(method);
+            }
+        }
+
+        for method in callers {
+            assert_eq!(
+                method_spawns_child(method),
+                SPAWN_CALLERS.contains(&method),
+                "method_spawns_child({method:?}) 与 dispatch spawn 分支不一致",
+            );
+        }
+    }
+
     #[test]
     fn slow_test_method_uses_short_timeout() {
         // 测试专用慢方法映射到亚秒超时，保证超时测试在 CI 快速完成。
@@ -955,10 +993,13 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn timeout_kills_spawned_child() {
+        let _guard = SPAWN_SLEEP_TEST_MUTEX.lock();
         // TestSpawnSleep spawn `sleep 30` 后阻塞等待；100ms 超时后必须
-        // kill 子进程，不留孤儿。被 kill 的 pidfd 由包装函数返回，避免
-        // 全局状态在多测试并行下互相覆盖；pidfd 探测与 PID 无关，不惧复用。
+        // kill 子进程，不留孤儿。kill 目标等待以 pidfd 可用为条件（不再
+        // 依赖 200ms 宽限），被 kill 的 pidfd 由包装函数返回，避免全局状态
+        // 在多测试并行下互相覆盖；pidfd 探测与 PID 无关，不惧复用。
         let (r, killed) = dispatch_with_timeout_tracked("TestSpawnSleep", vec![]).await;
         let err = r.expect_err("spawning slow command must time out");
         assert!(err.contains("timed out"), "{err}");
@@ -988,6 +1029,221 @@ mod tests {
             );
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
+    }
+
+    #[test]
+    fn timeout_returns_when_blocking_pool_saturated() {
+        // C2 回归：blocking 池饱和时 spawn_blocking 闭包仍在队列、尚未执行，
+        // `dispatch_with_slot` 无从走到 `mark_finished`，pidfd 也永不写入——
+        // 超时分支必须仍在 `timeout + 小常数` 内返回，而非无限等待（TSI-2545）。
+        // 用小 blocking 池（4 槽）确定性重现：占满后新分派必然排队到超时之后。
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .max_blocking_threads(4)
+            .enable_all()
+            .build()
+            .expect("build tokio runtime with tiny blocking pool");
+        runtime.block_on(async {
+            let (started_tx, started_rx) = std::sync::mpsc::channel();
+            let blockers: Vec<_> = (0..4)
+                .map(|_| {
+                    let started_tx = started_tx.clone();
+                    tokio::task::spawn_blocking(move || {
+                        started_tx.send(()).expect("blocker start signal");
+                        std::thread::sleep(std::time::Duration::from_secs(1));
+                    })
+                })
+                .collect();
+            // 4 槽全部开始执行后才分派，确保后续 spawn_blocking 必然排队。
+            for _ in 0..4 {
+                started_rx.recv().expect("all blockers must start");
+            }
+
+            let start = std::time::Instant::now();
+            let (r, killed) = dispatch_with_timeout_tracked("TestSpawnSleep", vec![]).await;
+            let elapsed = start.elapsed();
+
+            let err = r.expect_err("spawning slow command must time out");
+            assert!(err.contains("timed out"), "{err}");
+            // 闭包从未运行，不可能产生子进程；取消须直接封住等待上界。
+            assert!(killed.is_none(), "queued closure must not have spawned");
+            assert!(
+                elapsed < std::time::Duration::from_secs(1),
+                "dispatch hung for {elapsed:?} under saturated blocking pool",
+            );
+
+            for b in blockers {
+                b.await.expect("blocker task");
+            }
+        });
+    }
+
+    /// 用 pidfd 探针确认目标进程已被 reap：`pidfd_send_signal(fd, 0)` 对
+    /// 仍存在（含僵尸 Z）的进程返回 0，仅在被 reap、进程彻底消失后才返回
+    /// -1/ESRCH。与 PID 无关，不惧 PID 复用（TSI-2545 C0/C1 独立证据）。
+    fn pidfd_probe_esrch(fd: &OwnedFd) -> bool {
+        let rc = unsafe {
+            libc::syscall(
+                libc::SYS_pidfd_send_signal,
+                fd.as_raw_fd(),
+                0,
+                std::ptr::null::<libc::siginfo_t>(),
+                0u32,
+            )
+        };
+        rc != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+    }
+
+    /// 阻塞至 pidfd 指向的进程被 reap（ESRCH），超时 2s 即失败。
+    fn assert_pidfd_reaped(fd: &OwnedFd) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if pidfd_probe_esrch(fd) {
+                return;
+            }
+            assert!(Instant::now() < deadline, "child not killed within 2s");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// 扫描当前进程（tgid 主线程）的直接子进程，返回其中 `comm == "sleep"`
+    /// 的描述列表（含僵尸 Z——其 `/proc/<pid>/comm` 仍可读）。这是与代码
+    /// 返回的 pidfd 无关的独立残留证据，防止「返回 Some(pidfd) 但未真正
+    /// 清理」的假通过（TSI-2545 B1/C0/C1）。
+    fn sleep_residue_descs() -> Vec<String> {
+        let tgid = std::process::id();
+        let children_path = format!("/proc/{tgid}/task/{tgid}/children");
+        let Ok(raw) = std::fs::read_to_string(&children_path) else {
+            return Vec::new();
+        };
+        let mut descs = Vec::new();
+        for tok in raw.split_whitespace() {
+            let Ok(pid) = tok.parse::<u32>() else {
+                continue;
+            };
+            let comm_path = format!("/proc/{pid}/comm");
+            let Ok(comm) = std::fs::read_to_string(&comm_path) else {
+                continue;
+            };
+            if comm.trim() != "sleep" {
+                continue;
+            }
+            let state = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                .ok()
+                .and_then(|stat| {
+                    stat.rsplit_once(')')
+                        .and_then(|(_, rest)| rest.split_whitespace().next().map(str::to_string))
+                })
+                .unwrap_or_default();
+            descs.push(format!("comm=sleep pid={pid} state={state}"));
+        }
+        descs
+    }
+
+    /// C0：单次无争用分派必须真实 spawn 子进程、超时后 kill 并 reap，且
+    /// `/proc` 进程树无残留。pidfd 探针 + 进程树扫描双路独立证据，防止
+    /// 「闭包从未 spawn」的假通过。
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn timeout_spawns_then_kills_child() {
+        let _guard = SPAWN_SLEEP_TEST_MUTEX.lock();
+        let (r, killed) = dispatch_with_timeout_tracked("TestSpawnSleep", vec![]).await;
+        let err = r.expect_err("spawning slow command must time out");
+        assert!(err.contains("timed out"), "{err}");
+        let pidfd = killed.expect("child must have spawned then been killed");
+        assert_pidfd_reaped(&pidfd);
+        assert_eq!(
+            sleep_residue_descs(),
+            Vec::<String>::new(),
+            "sleep residue must be empty after kill + reap",
+        );
+    }
+
+    /// B1：多轮（20）重复「spawn → 超时 kill → reap」后，`/proc` 树始终无
+    /// `sleep` 残留（含僵尸 Z）——验证清理不是偶发单次成功。
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn timeout_spawn_sleep_leaves_no_residue_across_rounds() {
+        let _guard = SPAWN_SLEEP_TEST_MUTEX.lock();
+        for round in 0..20 {
+            let (r, killed) = dispatch_with_timeout_tracked("TestSpawnSleep", vec![]).await;
+            let err = r.expect_err("spawning slow command must time out");
+            assert!(err.contains("timed out"), "round {round}: {err}");
+            let pidfd = killed.expect("child must have spawned then been killed");
+            assert_pidfd_reaped(&pidfd);
+            assert_eq!(
+                sleep_residue_descs(),
+                Vec::<String>::new(),
+                "round {round}: sleep residue must be empty",
+            );
+        }
+    }
+
+    /// C1：blocking 池饱和时，排队的闭包在超时窗口内获得释放出的槽后真实
+    /// spawn，超时分支仍须 kill 并 reap，`/proc` 树无残留。验证「延迟 spawn」
+    /// 路径（而非闭包从未运行）在饱和池下同样收敛（TSI-2545）。
+    #[test]
+    fn timeout_kills_spawned_child_under_saturated_blocking_pool() {
+        let _guard = SPAWN_SLEEP_TEST_MUTEX.lock();
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .max_blocking_threads(8)
+            .enable_all()
+            .build()
+            .expect("build tokio runtime with small blocking pool");
+        runtime.block_on(async {
+            // 8 槽全部占满。0 号 blocker 等待释放信号后立刻退出让槽，其余
+            // 保持占位，保证分派闭包先排队、后借释放出的槽真正执行 spawn。
+            let (started_tx, started_rx) = std::sync::mpsc::channel::<()>();
+            let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+            let mut blockers = Vec::new();
+            // 0 号 blocker 占位后等待释放信号，立刻退出让出槽位。
+            {
+                let started_tx = started_tx.clone();
+                blockers.push(tokio::task::spawn_blocking(move || {
+                    started_tx.send(()).expect("blocker start signal");
+                    release_rx.recv().expect("release signal");
+                }));
+            }
+            // 其余 7 个 blocker 保持占位 1s。
+            for _ in 0..7 {
+                let started_tx = started_tx.clone();
+                blockers.push(tokio::task::spawn_blocking(move || {
+                    started_tx.send(()).expect("blocker start signal");
+                    std::thread::sleep(Duration::from_secs(1));
+                }));
+            }
+            for _ in 0..8 {
+                started_rx.recv().expect("all blockers must start");
+            }
+
+            let start = Instant::now();
+            let dispatch = tokio::spawn(dispatch_with_timeout_tracked("TestSpawnSleep", vec![]));
+            // 确保分派闭包已提交并进入排队状态，再释放一个槽。
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            release_tx.send(()).expect("release one blocker");
+            let (r, killed) = dispatch.await.expect("dispatch task join");
+            let elapsed = start.elapsed();
+
+            let err = r.expect_err("spawning slow command must time out");
+            assert!(err.contains("timed out"), "{err}");
+            // C1 核心：池饱和下闭包仍被调度执行并真实 spawn，随后被 kill。
+            let pidfd = killed.expect("child must have spawned then been killed");
+            assert_pidfd_reaped(&pidfd);
+            assert_eq!(
+                sleep_residue_descs(),
+                Vec::<String>::new(),
+                "sleep residue must be empty under saturated blocking pool",
+            );
+            assert!(
+                elapsed < Duration::from_secs(1),
+                "dispatch hung for {elapsed:?} under saturated blocking pool",
+            );
+
+            for b in blockers {
+                b.await.expect("blocker task");
+            }
+        });
     }
 
     #[test]
