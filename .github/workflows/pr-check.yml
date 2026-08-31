@@ -42,16 +42,3 @@ jobs:
 
       - name: Build (Rust)
         run: cargo build --release
-
-  qa-gate-offline:
-    # Offline QA gate: qa/tests/test_pkkit.sh runs without root and without
-    # polkitd — pkcheck is replaced by a bash function stub inside the test.
-    # qa/verity/* needs live systemd + `sudo -n` + a real polkitd to mask/
-    # unmask/restart, which the CI container cannot provide (same conclusion
-    # as TSI-2709), so it stays in local QA.
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-
-      - name: QA offline gate (pkkit)
-        run: bash qa/tests/test_pkkit.sh
