@@ -122,6 +122,8 @@ pub async fn dispatch(daemon: &mut Daemon, req: &Request) -> Response {
         method::HOSTNAME_SET => hostname_set(daemon, req).await,
         method::MOUNT => mount(daemon, req).await,
         method::UNMOUNT => unmount(daemon, req).await,
+        method::SYSCTL_GET => sysctl_get(daemon, req).await,
+        method::SYSCTL_SET => sysctl_set(daemon, req).await,
         other => {
             return Response::err(
                 req.id,
@@ -221,6 +223,8 @@ fn operation_for(method_name: &str, params: &Option<Value>) -> Option<Operation>
         (method::HOSTNAME_SET, L3),
         (method::MOUNT, L4),
         (method::UNMOUNT, L4),
+        (method::SYSCTL_GET, L0),
+        (method::SYSCTL_SET, L3),
     ];
     OPS.iter()
         .find(|(m, _)| *m == method_name)
@@ -874,6 +878,101 @@ async fn system_log_view(_d: &mut Daemon, req: &Request) -> RpcResult {
         .await
         .map_err(|e| (RpcErrorCode::BackendError, format!("rootd: {e}")))?;
     Ok(json!({ "result": result }))
+}
+
+/// 读取内核参数（rootd SysctlGet，§23.4）。
+///
+/// 参数：{ "key": "kernel.hostname" }；返回 rootd 的 value 裸字符串。
+/// rootd 未安装时返回降级错误。
+async fn sysctl_get(_d: &mut Daemon, req: &Request) -> RpcResult {
+    let params = params_of(req)?;
+    let key = params
+        .get("key")
+        .and_then(|v| v.as_str())
+        .ok_or((RpcErrorCode::InvalidParams, "missing key".into()))?;
+
+    let proxy = crate::rootd_client::connect().await.ok_or((
+        RpcErrorCode::BackendUnavailable,
+        "rootd not installed — privileged operation unavailable".into(),
+    ))?;
+
+    let value = proxy
+        .sysctl_get(key)
+        .await
+        .map_err(|e| map_rootd_error("com.agentshell.sysctl.get", e))?;
+    Ok(Value::String(value))
+}
+
+/// 特权链路错误映射：polkit 拒绝/不可用映射为专用认证错误码，其余保持
+/// `BackendError`（CLI 侧据码区分退出码 2 与 1）。
+fn map_rootd_error(action_id: &str, e: zbus::Error) -> (RpcErrorCode, String) {
+    if is_auth_failed(&e) {
+        (
+            RpcErrorCode::AuthenticationRequired,
+            format!("authentication required: {action_id}"),
+        )
+    } else {
+        (RpcErrorCode::BackendError, format!("rootd: {e}"))
+    }
+}
+
+/// 判断 zbus 错误是否为 D-Bus 方法错误且错误名为 AuthFailed。
+///
+/// rootd 的 polkit 拒绝（`check_polkit`）以 `fdo::Error::AuthFailed` 返回，
+/// 经 zbus 序列化为名为 `org.freedesktop.DBus.Error.AuthFailed` 的方法错误；
+/// 按错误名匹配而非 `to_string()` 子串，避免消息文本恰好含该词时的误判。
+fn is_auth_failed(e: &zbus::Error) -> bool {
+    matches!(e, zbus::Error::MethodError(name, _, _) if name.as_str() == "org.freedesktop.DBus.Error.AuthFailed")
+}
+
+/// 设置内核参数（rootd SysctlSet，§23.4）。
+///
+/// 参数：{ "key": "net.ipv4.ip_forward", "value": "1" }，value 支持
+/// string/number/bool。rootd 未安装时返回降级错误。
+async fn sysctl_set(_d: &mut Daemon, req: &Request) -> RpcResult {
+    let params = params_of(req)?;
+    let key = params
+        .get("key")
+        .and_then(|v| v.as_str())
+        .ok_or((RpcErrorCode::InvalidParams, "missing key".into()))?;
+    let value = params
+        .get("value")
+        .ok_or((RpcErrorCode::InvalidParams, "missing value".into()))?;
+    let zv = json_to_zvariant(value).ok_or((
+        RpcErrorCode::InvalidParams,
+        "value must be string/number/bool".into(),
+    ))?;
+
+    let proxy = crate::rootd_client::connect().await.ok_or((
+        RpcErrorCode::BackendUnavailable,
+        "rootd not installed — privileged operation unavailable".into(),
+    ))?;
+
+    proxy
+        .sysctl_set(key, zv)
+        .await
+        .map_err(|e| map_rootd_error("com.agentshell.sysctl.set", e))?;
+    Ok(json!({ "accepted": true, "key": key }))
+}
+
+/// serde_json `value` → `zvariant::Value`（仅 string/number/bool；其余 None）。
+fn json_to_zvariant(value: &Value) -> Option<zbus::zvariant::Value<'_>> {
+    match value {
+        Value::String(s) => Some(zbus::zvariant::Value::Str(zbus::zvariant::Str::from(
+            s.as_str(),
+        ))),
+        Value::Bool(b) => Some(zbus::zvariant::Value::Bool(*b)),
+        Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                Some(zbus::zvariant::Value::I64(i))
+            } else if let Some(u) = n.as_u64() {
+                Some(zbus::zvariant::Value::U64(u))
+            } else {
+                n.as_f64().map(zbus::zvariant::Value::F64)
+            }
+        }
+        _ => None,
+    }
 }
 
 /// 设置系统主机名（rootd HostnameSet，§23.4）。
@@ -1961,7 +2060,6 @@ mod tests {
             RpcErrorCode::InvalidParams as i32
         );
     }
-
     #[tokio::test]
     async fn package_install_default_config_returns_confirmation_required() {
         // package.install（L3）与 service.control/process.kill 同级：
@@ -2023,6 +2121,143 @@ mod tests {
             .allow
             .insert("trusted".into(), vec![PermissionLevel::L4]);
         let resp = dispatch(&mut d, &req(method::PACKAGE_REFRESH, Some(json!({})))).await;
+        assert_eq!(
+            resp.error.expect("error").code,
+            RpcErrorCode::BackendUnavailable as i32
+        );
+    }
+
+    #[test]
+    fn json_to_zvariant_maps_scalars() {
+        assert!(matches!(
+            json_to_zvariant(&json!("hello")),
+            Some(zbus::zvariant::Value::Str(_))
+        ));
+        assert!(matches!(
+            json_to_zvariant(&json!(true)),
+            Some(zbus::zvariant::Value::Bool(true))
+        ));
+        assert!(matches!(
+            json_to_zvariant(&json!(u64::MAX)),
+            Some(zbus::zvariant::Value::U64(u)) if u == u64::MAX
+        ));
+        assert!(matches!(
+            json_to_zvariant(&json!(1.5)),
+            Some(zbus::zvariant::Value::F64(f)) if (f - 1.5).abs() < f64::EPSILON
+        ));
+    }
+    #[test]
+    fn json_to_zvariant_rejects_non_scalars() {
+        assert!(json_to_zvariant(&json!(null)).is_none());
+        assert!(json_to_zvariant(&json!([1, 2])).is_none());
+        assert!(json_to_zvariant(&json!({"a": 1})).is_none());
+    }
+    #[test]
+    fn auth_failed_maps_to_authentication_required() {
+        let name =
+            zbus::names::OwnedErrorName::try_from("org.freedesktop.DBus.Error.AuthFailed").unwrap();
+        let msg = zbus::Message::method_call("/org/agentshell/Rootd", "SysctlGet")
+            .unwrap()
+            .build(&())
+            .unwrap();
+        let (code, message) = map_rootd_error(
+            "com.agentshell.sysctl.get",
+            zbus::Error::MethodError(name, Some("polkit denied".into()), msg),
+        );
+        assert_eq!(code, RpcErrorCode::AuthenticationRequired);
+        assert_eq!(
+            message,
+            "authentication required: com.agentshell.sysctl.get"
+        );
+    }
+    #[test]
+    fn non_auth_error_stays_backend_error() {
+        let (code, message) = map_rootd_error(
+            "com.agentshell.sysctl.get",
+            zbus::Error::Failure("boom".into()),
+        );
+        assert_eq!(code, RpcErrorCode::BackendError);
+        assert!(message.starts_with("rootd: "), "{message}");
+    }
+    #[tokio::test]
+    async fn sysctl_get_missing_key_returns_invalid_params() {
+        let mut d = Daemon::connect(Duration::from_secs(1)).await;
+        let resp = dispatch(&mut d, &req(method::SYSCTL_GET, Some(json!({})))).await;
+        assert_eq!(
+            resp.error.expect("error").code,
+            RpcErrorCode::InvalidParams as i32
+        );
+    }
+    #[tokio::test]
+    async fn sysctl_get_valid_key_without_rootd_returns_backend_unavailable() {
+        let mut d = Daemon::connect(Duration::from_secs(1)).await;
+        let resp = dispatch(
+            &mut d,
+            &req(method::SYSCTL_GET, Some(json!({"key": "kernel.hostname"}))),
+        )
+        .await;
+        assert_eq!(
+            resp.error.expect("error").code,
+            RpcErrorCode::BackendUnavailable as i32
+        );
+    }
+    #[tokio::test]
+    async fn sysctl_set_above_level_requires_confirmation() {
+        // SYSCTL_SET 是 L3；默认 `"*"` 无白名单 → 确认而非直达 handler。
+        let mut d = Daemon::connect(Duration::from_secs(1)).await;
+        let resp = dispatch(
+            &mut d,
+            &req(
+                method::SYSCTL_SET,
+                Some(json!({"key": "net.ipv4.ip_forward", "value": "1"})),
+            ),
+        )
+        .await;
+        assert_eq!(
+            resp.error.expect("error").code,
+            RpcErrorCode::ConfirmationRequired as i32
+        );
+    }
+    #[tokio::test]
+    async fn sysctl_set_missing_value_returns_invalid_params() {
+        // 授权 L4 绕过 gate → 到达 handler，缺 value 由 handler 报 InvalidParams。
+        let mut d = Daemon::connect(Duration::from_secs(1)).await;
+        d.caller_id = "trusted".into();
+        d.security
+            .config
+            .permissions
+            .allow
+            .insert("trusted".into(), vec![PermissionLevel::L4]);
+        let resp = dispatch(
+            &mut d,
+            &req(
+                method::SYSCTL_SET,
+                Some(json!({"key": "net.ipv4.ip_forward"})),
+            ),
+        )
+        .await;
+        assert_eq!(
+            resp.error.expect("error").code,
+            RpcErrorCode::InvalidParams as i32
+        );
+    }
+    #[tokio::test]
+    async fn sysctl_set_valid_params_without_rootd_returns_backend_unavailable() {
+        let mut d = Daemon::connect(Duration::from_secs(1)).await;
+        d.caller_id = "trusted".into();
+        d.security
+            .config
+            .permissions
+            .allow
+            .insert("trusted".into(), vec![PermissionLevel::L4]);
+        let resp = dispatch(
+            &mut d,
+            &req(
+                method::SYSCTL_SET,
+                Some(json!({"key": "net.ipv4.ip_forward", "value": "1"})),
+            ),
+        )
+        .await;
         assert_eq!(
             resp.error.expect("error").code,
             RpcErrorCode::BackendUnavailable as i32

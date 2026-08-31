@@ -9,7 +9,7 @@ mod client;
 mod format;
 mod repl;
 
-use agent_shell_rpc::{method, WindowOpKind, MOUNT_POLKIT_ACTION};
+use agent_shell_rpc::{method, RpcErrorCode, WindowOpKind, MOUNT_POLKIT_ACTION};
 use clap::Parser;
 use cli::{Cli, Command, OutputFormat};
 use client::{CallError, DaemonClient};
@@ -75,6 +75,7 @@ async fn dispatch_command(command: Command, out: OutputFormat) -> CmdResult {
         Command::Kill { pid, signal } => kill_cmd(&mut c, pid, signal).await,
         Command::Job(cmd) => job_cmd(&mut c, cmd).await,
         Command::Pkg(cmd) => pkg_cmd(&mut c, cmd).await,
+        Command::Sysctl(cmd) => sysctl_cmd(&mut c, cmd).await,
     }
 }
 
@@ -1029,14 +1030,74 @@ fn process_rootd_error(e: &str) -> Option<(i32, String)> {
     Some((1, detail.to_string()))
 }
 
+/// `sysctl set` 成功输出行（CLI 打印与回归单测共用）。
+fn sysctl_set_accepted_line(key: &str, value: &str) -> String {
+    format!("sysctl set {key}={value}: accepted")
+}
+
+/// `sysctl` 命令（rootd SysctlGet/Set，§23.4）。
+///
+/// daemon 侧已把 polkit 拒绝映射为专用认证错误码 1007，故 CLI 侧按码分派：
+/// 1007 → exit 2；其余错误保留 `rpc error N: …` 形态交 `run` 统一打印（exit 1）。
+async fn sysctl_cmd(c: &mut DaemonClient, cmd: cli::SysctlCommand) -> CmdResult {
+    match cmd {
+        cli::SysctlCommand::Get { key } => {
+            let r = c.call_rpc(method::SYSCTL_GET, json!({ "key": key })).await;
+            match r {
+                Ok(v) => {
+                    let s = v
+                        .as_str()
+                        .ok_or_else(|| "sysctl.get: malformed response".to_string())?;
+                    println!("{s}");
+                    Ok(0)
+                }
+                Err(e) => sysctl_rpc_error(e),
+            }
+        }
+        cli::SysctlCommand::Set { key, value } => {
+            let r = c
+                .call_rpc(method::SYSCTL_SET, json!({ "key": key, "value": value }))
+                .await;
+            match r {
+                Ok(_) => {
+                    println!("{}", sysctl_set_accepted_line(&key, &value));
+                    Ok(0)
+                }
+                Err(e) => sysctl_rpc_error(e),
+            }
+        }
+    }
+}
+
+/// sysctl RPC 错误 → `CmdResult`：认证要求（1007）→ exit 2；其余交
+/// `process_rootd_error` 剥 RPC/rootd 前缀后打印（exit 1）；非本链路错误
+/// 保留 `rpc error N: …` 形态交 `run` 统一打印（exit 1）。
+fn sysctl_rpc_error(e: CallError) -> CmdResult {
+    if let CallError::Rpc { code, message } = &e {
+        if *code == RpcErrorCode::AuthenticationRequired as i32 {
+            eprintln!("error: {message}");
+            return Ok(2);
+        }
+    }
+    match process_rootd_error(&e.to_string()) {
+        Some((code, msg)) => {
+            eprintln!("error: {msg}");
+            Ok(code)
+        }
+        None => Err(e.to_string()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         is_auth_required, job_status_outcome, log_query_timeout_error, parse_log_filter,
         pkg_failed_job_line, process_rootd_error, security_audit_params, security_request,
-        wait_for_job_impl, JobStatusSource, LOG_QUERY_TIMEOUT,
+        sysctl_rpc_error, sysctl_set_accepted_line, wait_for_job_impl, JobStatusSource,
+        LOG_QUERY_TIMEOUT,
     };
-
+    use crate::client::CallError;
+    use crate::RpcErrorCode;
     use serde_json::{json, Value};
     use std::collections::VecDeque;
     use std::time::Duration;
@@ -1391,5 +1452,31 @@ mod tests {
             p,
             json!({ "agent_id": "alice", "decision": "deny", "result": false })
         );
+    }
+
+    #[test]
+    fn sysctl_rpc_error_maps_auth_required_to_two() {
+        let e = CallError::Rpc {
+            code: RpcErrorCode::AuthenticationRequired as i32,
+            message: "authentication required: com.agentshell.sysctl.get".into(),
+        };
+        assert_eq!(sysctl_rpc_error(e), Ok(2));
+    }
+
+    #[test]
+    fn sysctl_set_accepted_line_includes_value() {
+        assert_eq!(
+            sysctl_set_accepted_line("net.ipv4.ip_forward", "1"),
+            "sysctl set net.ipv4.ip_forward=1: accepted"
+        );
+    }
+
+    #[test]
+    fn sysctl_rpc_error_maps_rootd_backend_to_one() {
+        let e = CallError::Rpc {
+            code: RpcErrorCode::BackendError as i32,
+            message: "rootd: boom".into(),
+        };
+        assert_eq!(sysctl_rpc_error(e), Ok(1));
     }
 }

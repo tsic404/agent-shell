@@ -114,6 +114,9 @@ pub enum Command {
     /// 系统包管理（rootd 特权链路，§23.4）
     #[command(subcommand)]
     Pkg(PkgCommand),
+    /// 内核参数管理（rootd 特权链路，§23.4）
+    #[command(subcommand)]
+    Sysctl(SysctlCommand),
 }
 
 // ───────────────────────── windows ─────────────────────────
@@ -543,6 +546,19 @@ pub enum PkgCommand {
         wait: bool,
     },
 }
+
+// ───────────────────────── sysctl（rootd 特权链路） ─────────────────────────
+
+/// 内核参数读写命令（rootd SysctlGet/SysctlSet，§23.4）。
+#[derive(Subcommand, Debug)]
+pub enum SysctlCommand {
+    /// 读取内核参数
+    Get { key: String },
+    /// 设置内核参数
+    Set { key: String, value: String },
+}
+
+// ───────────────────────── 解析辅助 ─────────────────────────
 
 /// 解析 "ctrl+c" / "meta+t" 形式的按键组合。
 ///

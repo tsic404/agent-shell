@@ -204,6 +204,10 @@ pub mod method {
     pub const PACKAGE_UPDATE: &str = "package.update";
     /// 刷新包元数据缓存（rootd PackageRefresh）。
     pub const PACKAGE_REFRESH: &str = "package.refresh";
+    /// 读取内核参数（rootd SysctlGet）。
+    pub const SYSCTL_GET: &str = "sysctl.get";
+    /// 设置内核参数（rootd SysctlSet）。
+    pub const SYSCTL_SET: &str = "sysctl.set";
 }
 
 /// Mount/Unmount 共用的 polkit action id（§23.4.2）。
@@ -360,6 +364,8 @@ pub enum RpcErrorCode {
     BackendError = 1005,
     /// 需要用户确认（安全判定为 Confirm，纯后端无 UI 时短路返回）。
     ConfirmationRequired = 1006,
+    /// 特权操作授权失败（polkit 拒绝/不可用）。
+    AuthenticationRequired = 1007,
 }
 
 // ───────────────────────── 载荷定义 ─────────────────────────
