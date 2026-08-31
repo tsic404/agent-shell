@@ -1795,6 +1795,9 @@ mod tests {
         // 非法 level 由 handler 报 InvalidParams——合法 grant 会写盘污染真实配置，
         // 故用 InvalidParams 断言门禁放行；成功 grant 路径由 core security 测试覆盖。
         let mut d = Daemon::connect(Duration::from_secs(1)).await;
+        // 隔离 ambient env：`Daemon::connect` 从 `AGENT_SHELL_AGENT_ID` 读 caller_id，
+        // 已设置时成为具名管理面身份，经 caller 门禁拒绝（1004）。显式回落 `"*"`。
+        d.caller_id = "*".into();
         let resp = dispatch(
             &mut d,
             &req(
