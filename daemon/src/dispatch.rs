@@ -1171,9 +1171,19 @@ mod tests {
         crate::rootd_client::connect().await.is_some()
     }
 
+    /// 测试基座：隔离 ambient env/config——`caller_id` 回落 `"*"`、security 用
+    /// 默认配置（不读磁盘/env 的持久化 grant/deny）。需要具名 caller 或自定义
+    /// 审计路径的测试在基座返回值上显式覆盖。
+    async fn test_daemon() -> Daemon {
+        let mut d = Daemon::connect(Duration::from_secs(1)).await;
+        d.caller_id = "*".into();
+        d.security = SecurityManager::with_config(AgentShellConfig::default());
+        d
+    }
+
     #[tokio::test]
     async fn unknown_method_returns_method_not_found() {
-        let mut d = Daemon::connect(Duration::from_secs(1)).await;
+        let mut d = test_daemon().await;
         let resp = dispatch(&mut d, &req("bogus.method", None)).await;
         let err = resp.error.expect("error");
         assert_eq!(err.code, RpcErrorCode::MethodNotFound as i32);
@@ -1183,7 +1193,7 @@ mod tests {
     #[tokio::test]
     async fn doctor_always_responds_even_without_compositor() {
         // daemon 契约：装配失败不 panic，doctor 逐项如实报告。
-        let mut d = Daemon::connect(Duration::from_secs(1)).await;
+        let mut d = test_daemon().await;
         let resp = dispatch(&mut d, &req(method::DOCTOR, None)).await;
         let v = resp.result.expect("ok");
         let r: DoctorResult = serde_json::from_value(v).expect("DoctorResult");
@@ -1193,7 +1203,7 @@ mod tests {
 
     #[tokio::test]
     async fn info_reports_capabilities_from_compositor_truth() {
-        let mut d = Daemon::connect(Duration::from_secs(1)).await;
+        let mut d = test_daemon().await;
         let resp = dispatch(&mut d, &req(method::INFO, None)).await;
         let v = resp.result.expect("ok");
         let r: InfoResult = serde_json::from_value(v).expect("InfoResult");
@@ -1248,7 +1258,7 @@ mod tests {
 
     #[tokio::test]
     async fn missing_params_is_invalid_params_not_panic() {
-        let mut d = Daemon::connect(Duration::from_secs(1)).await;
+        let mut d = test_daemon().await;
         for m in [method::WINDOW_INFO, method::WINDOW_OP] {
             let resp = dispatch(&mut d, &req(m, None)).await;
             assert_eq!(
@@ -1261,7 +1271,7 @@ mod tests {
 
     #[tokio::test]
     async fn input_bad_payload_is_invalid_params() {
-        let mut d = Daemon::connect(Duration::from_secs(1)).await;
+        let mut d = test_daemon().await;
         let resp = dispatch(
             &mut d,
             &req(
@@ -1280,7 +1290,7 @@ mod tests {
     async fn screenshot_negative_area_rejected_gracefully() {
         // 审查项 #1 回归锚定：负坐标走 RPC error 而非 panic。
         // （无 DISPLAY 环境 → BackendUnavailable 先于裁剪；两条路径都必须是 error。）
-        let mut d = Daemon::connect(Duration::from_secs(1)).await;
+        let mut d = test_daemon().await;
         let params = json!({
             "area": [-5, -3, 100, 100],
             "output_path": "/tmp/never-written.ppm",
@@ -1295,7 +1305,7 @@ mod tests {
         // handler 失败时，执行结果审计必须落 result=false，绝不能再出现
         // allow+result=true 的失真实记录。`d.capture = None` 在连接后确定性
         // 触发 BackendUnavailable，不依赖宿主是否可达 portal/X11 后端。
-        let mut d = Daemon::connect(Duration::from_secs(1)).await;
+        let mut d = test_daemon().await;
         // 隔离 ambient config：独立审计路径 + 默认权限（`"*"` 自动放行 L2）。
         let audit_path = std::env::temp_dir().join(format!(
             "agent-shell-dispatch-tsi2659-{}.jsonl",
@@ -1305,7 +1315,6 @@ mod tests {
         let mut cfg = AgentShellConfig::default();
         cfg.security.audit_log_path = Some(audit_path.to_string_lossy().into_owned());
         d.security = SecurityManager::with_config(cfg);
-        d.caller_id = "*".into();
         d.capture = None;
 
         let resp = dispatch(
@@ -1337,7 +1346,7 @@ mod tests {
     async fn security_audit_filters_by_result() {
         // TSI-2659：`security.audit` 新增 `result` 过滤键——同一 allow 操作
         // 现在双记录（门禁 false + 执行结果），按执行态区分只读已执行/未执行。
-        let mut d = Daemon::connect(Duration::from_secs(1)).await;
+        let mut d = test_daemon().await;
         let audit_path = std::env::temp_dir().join(format!(
             "agent-shell-dispatch-audit-result-{}.jsonl",
             std::process::id()
@@ -1383,7 +1392,7 @@ mod tests {
     async fn a11y_query_non_string_role_name_is_invalid_params() {
         // TSI-2480 QA 回归锚定：类型校验先于后端可用性判定，
         // headless（无 AT-SPI bus）环境也须返回 InvalidParams。
-        let mut d = Daemon::connect(Duration::from_secs(1)).await;
+        let mut d = test_daemon().await;
         for params in [json!({"role": 123}), json!({"name": true})] {
             let resp = dispatch(&mut d, &req(method::A11Y_QUERY, Some(params))).await;
             assert_eq!(
@@ -1398,7 +1407,7 @@ mod tests {
         // `null` 与缺省等价：单条件仍有效，绝不可判 InvalidParams。
         // 有 AT-SPI bus 时返回结果（含 count），headless 时退化
         // BackendUnavailable——两条路径都证明 null 未触发类型/缺参误拒。
-        let mut d = Daemon::connect(Duration::from_secs(1)).await;
+        let mut d = test_daemon().await;
         let resp = dispatch(
             &mut d,
             &req(
@@ -1426,7 +1435,7 @@ mod tests {
 
     #[tokio::test]
     async fn events_subscribe_returns_subscriber_id() {
-        let mut d = Daemon::connect(Duration::from_secs(1)).await;
+        let mut d = test_daemon().await;
         let resp = dispatch(&mut d, &req(method::EVENTS_SUBSCRIBE, None)).await;
         let v = resp.result.expect("subscribe ok");
         let id = v.get("subscriber_id").and_then(|v| v.as_str()).expect("id");
@@ -1437,7 +1446,7 @@ mod tests {
 
     #[tokio::test]
     async fn events_subscribe_unknown_filter_is_invalid_params() {
-        let mut d = Daemon::connect(Duration::from_secs(1)).await;
+        let mut d = test_daemon().await;
         let resp = dispatch(
             &mut d,
             &req(method::EVENTS_SUBSCRIBE, Some(json!({"filter": "bogus"}))),
@@ -1451,7 +1460,7 @@ mod tests {
 
     #[tokio::test]
     async fn events_unsubscribe_invalid_id_is_invalid_params() {
-        let mut d = Daemon::connect(Duration::from_secs(1)).await;
+        let mut d = test_daemon().await;
         for params in [json!({}), json!({"subscriber_id": "not-a-uuid"})] {
             let resp = dispatch(&mut d, &req(method::EVENTS_UNSUBSCRIBE, Some(params))).await;
             assert_eq!(
@@ -1463,7 +1472,7 @@ mod tests {
 
     #[tokio::test]
     async fn events_unsubscribe_is_idempotent() {
-        let mut d = Daemon::connect(Duration::from_secs(1)).await;
+        let mut d = test_daemon().await;
         let resp = dispatch(&mut d, &req(method::EVENTS_UNSUBSCRIBE, None)).await;
         assert_eq!(
             resp.error.expect("error").code,
@@ -1486,7 +1495,7 @@ mod tests {
     #[tokio::test]
     async fn events_replay_returns_ring_contents() {
         // events --replay 数据源：push 一个真实 DesktopEvent 后 count=1。
-        let mut d = Daemon::connect(Duration::from_secs(1)).await;
+        let mut d = test_daemon().await;
         d.ring.push(event::DesktopEvent::WindowClosed {
             id: test_window_id(),
             source: event::EventSource::KWinWayland,
@@ -1504,7 +1513,7 @@ mod tests {
     async fn events_replay_honors_filter() {
         // 阻塞 3 回归锚定：`filter` 参数必须被 events_replay 应用，
         // 未匹配类别（含 Noop）被过滤。
-        let mut d = Daemon::connect(Duration::from_secs(1)).await;
+        let mut d = test_daemon().await;
         d.ring.push(event::DesktopEvent::WindowClosed {
             id: test_window_id(),
             source: event::EventSource::KWinWayland,
@@ -1538,7 +1547,7 @@ mod tests {
 
     #[tokio::test]
     async fn deny_short_circuits_before_handler() {
-        let mut d = Daemon::connect(Duration::from_secs(1)).await;
+        let mut d = test_daemon().await;
         d.security
             .config
             .permissions
@@ -1551,10 +1560,7 @@ mod tests {
     #[tokio::test]
     async fn above_level_without_whitelist_returns_confirmation_required() {
         // 默认配置：`"*"` 无白名单 → service.control（L3）需确认。
-        let mut d = Daemon::connect(Duration::from_secs(1)).await;
-        // 隔离 ambient config：清除 connect 从磁盘/env 读到的持久化 grant/deny。
-        d.security = SecurityManager::with_config(AgentShellConfig::default());
-        d.caller_id = "*".into();
+        let mut d = test_daemon().await;
         let resp = dispatch(&mut d, &req(method::SERVICE_CONTROL, Some(json!({})))).await;
         assert_eq!(
             resp.error.expect("error").code,
@@ -1566,7 +1572,7 @@ mod tests {
     async fn daemon_reload_default_config_returns_confirmation_required() {
         // daemon.reload（L3）与 service.control 同级：默认配置需确认，
         // 在 handler 之前短路——不触碰 rootd。
-        let mut d = Daemon::connect(Duration::from_secs(1)).await;
+        let mut d = test_daemon().await;
         let resp = dispatch(&mut d, &req(method::DAEMON_RELOAD, None)).await;
         assert_eq!(
             resp.error.expect("error").code,
@@ -1583,7 +1589,7 @@ mod tests {
             eprintln!("SKIP: rootd 在线 → 非降级路径（环境性跳过）");
             return;
         }
-        let mut d = Daemon::connect(Duration::from_secs(1)).await;
+        let mut d = test_daemon().await;
         d.caller_id = "trusted".into();
         d.security
             .config
@@ -1615,7 +1621,7 @@ mod tests {
             eprintln!("SKIP: rootd 在线 → 非降级路径（环境性跳过）");
             return;
         }
-        let mut d = Daemon::connect(Duration::from_secs(1)).await;
+        let mut d = test_daemon().await;
         d.caller_id = "trusted".into();
         d.security
             .config
@@ -1633,10 +1639,7 @@ mod tests {
     async fn process_kill_default_config_returns_confirmation_required() {
         // process.kill（L3）与 service.control 同级：默认配置需确认，
         // 在 handler 之前短路——不触碰 rootd。
-        let mut d = Daemon::connect(Duration::from_secs(1)).await;
-        // 隔离 ambient config：清除 connect 从磁盘/env 读到的持久化 grant/deny。
-        d.security = SecurityManager::with_config(AgentShellConfig::default());
-        d.caller_id = "*".into();
+        let mut d = test_daemon().await;
         let resp = dispatch(
             &mut d,
             &req(
@@ -1655,7 +1658,7 @@ mod tests {
     async fn process_kill_gate_pass_reaches_handler() {
         // L4 白名单放行后进入 handler：缺失 pid 必须报 InvalidParams
         //（证明门禁放行且 handler 已执行，而非 Denied 短路）。
-        let mut d = Daemon::connect(Duration::from_secs(1)).await;
+        let mut d = test_daemon().await;
         d.caller_id = "trusted".into();
         d.security
             .config
@@ -1675,7 +1678,7 @@ mod tests {
     async fn process_kill_rejects_pid_out_of_i32_range() {
         // L4 放行后进入 handler：`pid > i32::MAX` 与回绕值（2³²+1234 → 1234）
         // 必须在 daemon 侧拒绝，否则 rootd 只见截断后的合法正数、对无关进程发信号。
-        let mut d = Daemon::connect(Duration::from_secs(1)).await;
+        let mut d = test_daemon().await;
         d.caller_id = "trusted".into();
         d.security
             .config
@@ -1699,7 +1702,7 @@ mod tests {
 
     #[tokio::test]
     async fn allow_passes_gate_and_reaches_handler() {
-        let mut d = Daemon::connect(Duration::from_secs(1)).await;
+        let mut d = test_daemon().await;
         d.caller_id = "trusted".into();
         d.security
             .config
@@ -1725,7 +1728,7 @@ mod tests {
     async fn screenshot_capture_requires_confirmation_when_whitelist_below_l2() {
         // F1：截图含屏幕内容，L2；`"*"` 白名单只有 L1 时必须确认（L0 只读
         // 不会触发确认，故该断言同时证明截图不再是 L0 只读映射）。
-        let mut d = Daemon::connect(Duration::from_secs(1)).await;
+        let mut d = test_daemon().await;
         d.security
             .config
             .permissions
@@ -1741,9 +1744,8 @@ mod tests {
     #[tokio::test]
     async fn grant_revoked_for_named_agent() {
         // F2：具名 caller 不可自我提权——grant/revoke 必须经 `"*"`。
-        let mut d = Daemon::connect(Duration::from_secs(1)).await;
+        let mut d = test_daemon().await;
         d.caller_id = "agent-x".into();
-        d.security = SecurityManager::with_config(AgentShellConfig::default());
         let resp = dispatch(
             &mut d,
             &req(
@@ -1761,7 +1763,7 @@ mod tests {
     async fn management_deny_is_audited() {
         // TSI-2513 回归锚定：具名 caller 越权调用 security.grant/revoke 被拒后，
         // audit.jsonl 必须至少 1 行 deny（此前管理面拒绝完全无痕）。
-        let mut d = Daemon::connect(Duration::from_secs(1)).await;
+        let mut d = test_daemon().await;
         d.caller_id = "agent-x".into();
         let audit_path = std::env::temp_dir().join(format!(
             "agent-shell-dispatch-audit-{}.jsonl",
@@ -1794,10 +1796,7 @@ mod tests {
         // F2 反例：`"*"`（本地 CLI/MCP，未注入 agent id）通过门禁、可达 handler。
         // 非法 level 由 handler 报 InvalidParams——合法 grant 会写盘污染真实配置，
         // 故用 InvalidParams 断言门禁放行；成功 grant 路径由 core security 测试覆盖。
-        let mut d = Daemon::connect(Duration::from_secs(1)).await;
-        // 隔离 ambient env：`Daemon::connect` 从 `AGENT_SHELL_AGENT_ID` 读 caller_id，
-        // 已设置时成为具名管理面身份，经 caller 门禁拒绝（1004）。显式回落 `"*"`。
-        d.caller_id = "*".into();
+        let mut d = test_daemon().await;
         let resp = dispatch(
             &mut d,
             &req(
@@ -1815,10 +1814,7 @@ mod tests {
     async fn hostname_set_default_config_returns_confirmation_required() {
         // hostname.set（L3）与 service.control/process.kill 同级：
         // 默认配置需确认，在 handler 之前短路——不触碰 rootd。
-        let mut d = Daemon::connect(Duration::from_secs(1)).await;
-        // 隔离 ambient config：清除 connect 从磁盘/env 读到的持久化 grant/deny。
-        d.security = SecurityManager::with_config(AgentShellConfig::default());
-        d.caller_id = "*".into();
+        let mut d = test_daemon().await;
         let resp = dispatch(
             &mut d,
             &req(
@@ -1836,7 +1832,7 @@ mod tests {
     #[tokio::test]
     async fn job_status_missing_job_id_is_invalid_params() {
         // headless 环境：job_id 缺省先于 rootd 可用性判定报 InvalidParams。
-        let mut d = Daemon::connect(Duration::from_secs(1)).await;
+        let mut d = test_daemon().await;
         let resp = dispatch(&mut d, &req(method::JOB_STATUS, Some(json!({})))).await;
         assert_eq!(
             resp.error.expect("error").code,
@@ -1848,10 +1844,7 @@ mod tests {
     async fn mount_requires_confirmation_without_whitelist() {
         // 默认配置无白名单 → mount（L4）需确认，且在 handler 之前短路
         // （rootd 未安装时不会走到 BackendUnavailable）。
-        let mut d = Daemon::connect(Duration::from_secs(1)).await;
-        // 隔离 ambient config：清除 connect 从磁盘/env 读到的持久化 grant/deny。
-        d.security = SecurityManager::with_config(AgentShellConfig::default());
-        d.caller_id = "*".into();
+        let mut d = test_daemon().await;
         let resp = dispatch(&mut d, &req(method::MOUNT, Some(json!({})))).await;
         assert_eq!(
             resp.error.expect("error").code,
@@ -1863,7 +1856,7 @@ mod tests {
     async fn hostname_set_gate_pass_reaches_handler() {
         // L4 白名单放行后进入 handler：缺失/非字符串 hostname 必须报
         // InvalidParams（证明门禁放行且 handler 已执行，而非 Denied 短路）。
-        let mut d = Daemon::connect(Duration::from_secs(1)).await;
+        let mut d = test_daemon().await;
         d.caller_id = "trusted".into();
         d.security
             .config
@@ -1885,7 +1878,7 @@ mod tests {
 
     #[tokio::test]
     async fn mount_validates_params_after_gate_passes() {
-        let mut d = Daemon::connect(Duration::from_secs(1)).await;
+        let mut d = test_daemon().await;
         d.caller_id = "trusted".into();
         d.security
             .config
@@ -1907,9 +1900,7 @@ mod tests {
             eprintln!("SKIP: rootd 在线 → 非降级路径（环境性跳过）");
             return;
         }
-        let mut d = Daemon::connect(Duration::from_secs(1)).await;
-        // 隔离 ambient config：清除 connect 从磁盘/env 读到的持久化 grant/deny。
-        d.security = SecurityManager::with_config(AgentShellConfig::default());
+        let mut d = test_daemon().await;
         d.caller_id = "trusted".into();
         d.security
             .config
@@ -1932,7 +1923,7 @@ mod tests {
 
     #[tokio::test]
     async fn unmount_validates_target_after_gate_passes() {
-        let mut d = Daemon::connect(Duration::from_secs(1)).await;
+        let mut d = test_daemon().await;
         d.caller_id = "trusted".into();
         d.security
             .config
@@ -1963,7 +1954,7 @@ mod tests {
 
     #[tokio::test]
     async fn job_status_requires_params() {
-        let mut d = Daemon::connect(Duration::from_secs(1)).await;
+        let mut d = test_daemon().await;
         let resp = dispatch(&mut d, &req(method::JOB_STATUS, None)).await;
         assert_eq!(
             resp.error.expect("error").code,
@@ -1975,7 +1966,7 @@ mod tests {
     async fn package_install_default_config_returns_confirmation_required() {
         // package.install（L3）与 service.control/process.kill 同级：
         // 默认配置需确认，在 handler 之前短路——不触碰 rootd。
-        let mut d = Daemon::connect(Duration::from_secs(1)).await;
+        let mut d = test_daemon().await;
         let resp = dispatch(
             &mut d,
             &req(
@@ -1994,7 +1985,7 @@ mod tests {
     async fn package_install_bad_params_after_gate_pass_is_invalid_params() {
         // L4 白名单放行后进入 handler：缺失/非数组/非字符串元素必须报
         // InvalidParams（证明门禁放行且 handler 已执行，而非 Denied 短路）。
-        let mut d = Daemon::connect(Duration::from_secs(1)).await;
+        let mut d = test_daemon().await;
         d.caller_id = "trusted".into();
         d.security
             .config
@@ -2024,7 +2015,7 @@ mod tests {
             eprintln!("SKIP: rootd 在线 → 非降级路径（环境性跳过）");
             return;
         }
-        let mut d = Daemon::connect(Duration::from_secs(1)).await;
+        let mut d = test_daemon().await;
         d.caller_id = "trusted".into();
         d.security
             .config
