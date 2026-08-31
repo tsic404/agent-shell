@@ -14,14 +14,29 @@ use async_trait::async_trait;
 use std::fmt::Display;
 use zbus::zvariant::{ObjectPath, OwnedObjectPath};
 
-/// D-Bus 错误归一化：`org.freedesktop.DBus.Error.AccessDenied` → [`AgentShellError::Permission`]，
+/// D-Bus 错误归一化：权限类错误名 → [`AgentShellError::Permission`]，
 /// 其余错误 → [`AgentShellError::DBus`]。
 ///
 /// 权限类错误单独归一是降级链/测试判断的依据：缺 polkit 授权是环境状态，
 /// 而非调用失败或组件缺陷。
+///
+/// 错误名取自消息 `:` 分隔段——zbus 的 [`std::fmt::Display`] 渲染为
+/// `<错误名>: <描述>`，调用点可能再加 `CanReboot:` 这类上下文前缀，
+/// 故遍历全部 `:` 段与集合比对。
+const PERMISSION_ERROR_NAMES: &[&str] = &[
+    "org.freedesktop.DBus.Error.AccessDenied",
+    "org.freedesktop.DBus.Error.InteractiveAuthorizationRequired",
+    "org.freedesktop.DBus.Error.AuthenticationRequisite",
+    "org.freedesktop.DBus.Error.UnixFD.AccessDenied",
+];
+
 fn dbus_err<E: Display>(e: E) -> AgentShellError {
     let msg = e.to_string();
-    if msg.contains("org.freedesktop.DBus.Error.AccessDenied") {
+    let denied = msg
+        .split(':')
+        .map(str::trim)
+        .any(|segment| PERMISSION_ERROR_NAMES.contains(&segment));
+    if denied {
         AgentShellError::Permission(msg)
     } else {
         AgentShellError::DBus(msg)
@@ -279,14 +294,32 @@ mod tests {
     use super::*;
 
     #[test]
-    fn access_denied_maps_to_permission() {
-        let e = dbus_err("CanReboot: org.freedesktop.DBus.Error.AccessDenied: Permission denied");
-        assert!(matches!(e, AgentShellError::Permission(_)));
+    fn permission_error_names_map_to_permission() {
+        for msg in [
+            "CanReboot: org.freedesktop.DBus.Error.AccessDenied: Permission denied",
+            "org.freedesktop.DBus.Error.InteractiveAuthorizationRequired: Access denied as the requested operation requires interactive authentication",
+            "CanPowerOff: org.freedesktop.DBus.Error.AuthenticationRequisite: Authentication is required",
+            "org.freedesktop.DBus.Error.UnixFD.AccessDenied: fd passing denied",
+        ] {
+            assert!(
+                matches!(dbus_err(msg), AgentShellError::Permission(_)),
+                "expected Permission for {msg:?}"
+            );
+        }
     }
 
     #[test]
-    fn other_errors_map_to_dbus() {
-        let e = dbus_err("list sessions failed");
-        assert!(matches!(e, AgentShellError::DBus(_)));
+    fn unscoped_or_unmatched_names_map_to_dbus() {
+        for msg in [
+            "list sessions failed",
+            // 无命名空间的 "Access denied" 描述不能匹配——原 bug 的复现路径。
+            "CanReboot: Access denied as the requested operation requires interactive authentication",
+            "CanReboot: org.freedesktop.DBus.Error.AccessDeniedEvil: Permission denied",
+        ] {
+            assert!(
+                matches!(dbus_err(msg), AgentShellError::DBus(_)),
+                "expected DBus for {msg:?}"
+            );
+        }
     }
 }
