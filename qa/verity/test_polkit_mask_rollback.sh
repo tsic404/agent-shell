@@ -1,9 +1,18 @@
 #!/bin/bash
 # Integration test for the polkit mask rollback path (TSI-2615).
 #
-# Requires passwordless root (`sudo -n`) and a live systemd. Every step masks
-# and then un-masks the real polkit units, so the host is left as it was.
-# All assertions are about observable host state, not source text.
+# Requires passwordless root (`sudo -n`) and a live systemd.
+#
+# IT1-IT3 and IT5 exercise the destructive mask/unmask path against a scratch
+# directory (via a retargeted `verity_maskdirs`), so they never create or remove
+# real /run/systemd/system or /etc/systemd/system unit entries. IT4 alone still
+# needs a real polkitd teardown/restart: it hides the D-Bus activation file,
+# stops polkit, kills polkitd, and asserts the helper brings it back — that
+# observable is a live daemon and cannot be decoupled without faking the very
+# state the helper must restore. A suite-entry snapshot of
+# /etc/polkit-1/rules.d and the mask dirs is compared at exit; if a third party
+# changed them mid-run the suite reports BLOCKED instead of PASS/FAIL.
+# All assertions are about observable state, not source text.
 set -u
 # Resolve the helper by the script's real location, not the caller's cwd.
 # `basename %/*` yields "" for a bare-name invocation ("bash
@@ -20,6 +29,17 @@ PASS=0; FAIL=0
 ok()  { echo "  ok: $1"; PASS=$((PASS+1)); }
 bad() { echo "  FAIL: $1"; FAIL=$((FAIL+1)); }
 info() { echo "  info: $1"; }
+
+# Retarget `verity_maskdirs` before any test runs: with MASKDIR_PATCH set every
+# mask helper addresses the scratch dir; without it, the original real dirs.
+# The restore helper still calls `systemctl unmask`/`daemon-reload` on the real
+# units — that is the existing IT5-accepted behavior, not mask/stop/pkill.
+eval 'verity_maskdirs_orig() { '"$(declare -f verity_maskdirs | tail -n +2)"' }'
+mk_maskdirs_patch() {
+  eval 'verity_maskdirs() { if [ -n "${MASKDIR_PATCH:-}" ]; then printf "%s\\n" "$MASKDIR_PATCH"; else verity_maskdirs_orig; fi; }'
+}
+mk_maskdirs_patch
+
 # Count only real mask links: a symlink resolving to /dev/null. A plain
 # `ls | wc -l` over a mask dir counts unrelated entries and is a lie.
 nmasklinks() {
@@ -31,27 +51,79 @@ nmasklinks() {
   done
   printf '%s' "$n"
 }
-mask3() { sudo systemctl mask --runtime $UNITS >/dev/null 2>&1; }
+# Scratch-only counterpart of `systemctl mask --runtime $UNITS`: creates the
+# same three /dev/null mask symlinks, but inside $MASKDIR_PATCH.
+mask3() {
+  local u
+  for u in $UNITS; do
+    ln -s /dev/null "$MASKDIR_PATCH/$u"
+  done
+}
+
+# Suite-entry snapshot of the real shared-host polkit state this suite must
+# leave untouched, so a third-party change mid-run is detected rather than
+# reported as our own PASS/FAIL.
+snapshot_polkit_state() {
+  sudo -n find /etc/polkit-1/rules.d -maxdepth 1 \( -type f -o -type l \) \
+      -printf '%f|%l\n' 2>/dev/null | sort
+  local d u p
+  for d in /run/systemd/system /etc/systemd/system; do
+    for u in $UNITS; do
+      p="$d/$u"
+      if [ -L "$p" ]; then
+        printf '%s|L|%s\n' "$p" "$(readlink "$p" 2>/dev/null)"
+      elif [ -e "$p" ]; then
+        printf '%s|F\n' "$p"
+      else
+        printf '%s|A\n' "$p"
+      fi
+    done
+  done
+}
+
+SNAP_BEFORE=$(mktemp)
+SNAP_AFTER=$(mktemp)
+snapshot_polkit_state > "$SNAP_BEFORE"
+
 cleanup() {
+  # The final restore must always address the real units, not a scratch dir
+  # left behind by a mid-run crash.
+  MASKDIR_PATCH=""
   echo
   echo "### cleanup: restore polkit regardless of how the test exited"
   verity_restore_polkit >/dev/null 2>&1 \
     || echo "  WARNING: final restore failed, polkit may be left masked" >&2
+  snapshot_polkit_state > "$SNAP_AFTER"
+  if cmp -s "$SNAP_BEFORE" "$SNAP_AFTER"; then
+    rm -f -- "$SNAP_BEFORE" "$SNAP_AFTER"
+  else
+    echo "  BLOCKED: shared-host polkit state (rules.d / mask dirs) changed during"
+    echo "           the run; a sibling QA task may be active. Diff (before -> after):"
+    diff "$SNAP_BEFORE" "$SNAP_AFTER" | sed 's/^/    /'
+    rm -f -- "$SNAP_BEFORE" "$SNAP_AFTER"
+    echo "RESULT: BLOCKED"
+    exit 3
+  fi
 }
 trap cleanup EXIT
 
 echo "### IT1: harness clean-slate restore when nothing is masked"
+TMP=$(mktemp -d)
+MASKDIR_PATCH="$TMP"
 verity_restore_polkit >/dev/null 2>&1 && ok "idempotent restore, rc=0" || bad "restore rc!=0"
-verity_is_masked polkit.service && bad "polkit.service reports masked" || ok "polkit.service unmasked"
+verity_path_is_mask "$TMP/polkit.service" && bad "polkit.service reports masked" || ok "polkit.service unmasked"
+rm -rf -- "$TMP"; MASKDIR_PATCH=""
 
 echo "### IT2: harness masks 3 names; rollback must clear all 3"
+TMP=$(mktemp -d)
+MASKDIR_PATCH="$TMP"
 mask3
 info "mask links present after mask: $(nmasklinks)"
-# One assertion per unit, on the path `--runtime` actually writes.
+# One assertion per unit, on the path the scratch mask actually writes.
 for u in $UNITS; do
-  [ -L "/run/systemd/system/$u" ] \
-    && ok "mask symlink present: /run/systemd/system/$u" \
-    || bad "expected mask symlink for $u under /run/systemd/system"
+  [ -L "$TMP/$u" ] \
+    && ok "mask symlink present: $TMP/$u" \
+    || bad "expected mask symlink for $u under scratch dir"
 done
 out=$(verity_restore_polkit) && ok "restore rc=0" || bad "restore rc!=0"
 case "$out" in
@@ -59,26 +131,34 @@ case "$out" in
   *) bad "report missing 'removed 3 mask symlink(s)': ${out:-<empty>}" ;;
 esac
 for u in $UNITS; do
-  verity_is_masked "$u" && bad "$u still masked" || ok "$u unmasked"
+  verity_path_is_mask "$TMP/$u" && bad "$u still masked" || ok "$u unmasked"
 done
+rm -rf -- "$TMP"; MASKDIR_PATCH=""
 
 echo "### IT3: the TSI-2615 trap — unmask only the first name, then restore"
+TMP=$(mktemp -d)
+MASKDIR_PATCH="$TMP"
 mask3
-sudo systemctl unmask polkit.service >/dev/null 2>&1
-if verity_is_masked polkit.service; then
-  info "TSI-2615 trap reproduced: unmask returned rc=0 but polkit.service is still masked"
-else
-  info "unmask worked on this host; the TSI-2615 regression is absent here"
-fi
-# Reporting whether the bug exists is informational: the assertion that matters
-# is that the helper restores polkit either way. Failing a healthy host whose
-# unmask works inverts the goal of this test.
+# Simulate the buggy unmask that removes only the first name: drop just
+# polkit.service, leaving polkitd.service and org.freedesktop.PolicyKit1.service
+# masked — the exact trap state `systemctl unmask polkit.service` leaves on
+# affected hosts. The regression the helper guards is restoring the rest.
+rm -f -- "$TMP/polkit.service"
+info "first name unmasked, remaining mask links: $(nmasklinks)"
+# The assertion that matters is that the helper restores polkit either way.
 verity_restore_polkit >/dev/null 2>&1 && ok "restore cleared the trap state" || bad "restore failed on trap state"
 for u in $UNITS; do
-  verity_is_masked "$u" && bad "$u masked after restore" || ok "$u unmasked after restore"
+  verity_path_is_mask "$TMP/$u" && bad "$u masked after restore" || ok "$u unmasked after restore"
 done
+rm -rf -- "$TMP"; MASKDIR_PATCH=""
 
 echo "### IT4: unreachable-mode teardown then restore (the s20/s21 harness path)"
+# Cannot decouple: this IT must observe a real polkitd teardown and the helper's
+# live restart. It still hides the activation file, stops polkit, and kills
+# polkitd on this host; only the mask creation is scratch (IT2/IT3 already prove
+# the mask-clear branch, so no real mask is needed here).
+TMP=$(mktemp -d)
+MASKDIR_PATCH="$TMP"
 mask3
 sudo mv -f "$PKACT" "$PKACT.verity-hidden" 2>/dev/null
 sudo systemctl stop polkit.service >/dev/null 2>&1
@@ -90,16 +170,12 @@ sleep 1
 pgrep -x polkitd >/dev/null && ok "polkitd back up" || bad "polkitd did not restart"
 [ -f "$PKACT" ] && ok "D-Bus activation file restored" || bad "activation file missing"
 verity_is_masked polkitd.service && bad "polkitd.service masked" || ok "polkitd.service clean"
+rm -rf -- "$TMP"; MASKDIR_PATCH=""
 
 echo "### IT5: restore must not delete non-mask paths (review: data loss)"
 # The mask dirs are a function, so a test can retarget them to a scratch
 # directory: the destructive path is then exercised without touching any real
 # unit file. Without this IT5 does not test the actual code.
-eval 'verity_maskdirs_orig() { '"$(declare -f verity_maskdirs | tail -n +2)"' }'
-mk_maskdirs_patch() {
-  eval 'verity_maskdirs() { if [ -n "${MASKDIR_PATCH:-}" ]; then printf "%s\\n" "$MASKDIR_PATCH"; else verity_maskdirs_orig; fi; }'
-}
-mk_maskdirs_patch
 
 TMP=$(mktemp -d)
 for u in $UNITS; do
