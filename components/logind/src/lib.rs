@@ -14,33 +14,10 @@ use async_trait::async_trait;
 use std::fmt::Display;
 use zbus::zvariant::{ObjectPath, OwnedObjectPath};
 
-/// D-Bus 错误归一化：权限类错误名 → [`AgentShellError::Permission`]，
-/// 其余错误 → [`AgentShellError::DBus`]。
-///
-/// 权限类错误单独归一是降级链/测试判断的依据：缺 polkit 授权是环境状态，
-/// 而非调用失败或组件缺陷。
-///
-/// 错误名取自消息 `:` 分隔段——zbus 的 [`std::fmt::Display`] 渲染为
-/// `<错误名>: <描述>`，调用点可能再加 `CanReboot:` 这类上下文前缀，
-/// 故遍历全部 `:` 段与集合比对。
-const PERMISSION_ERROR_NAMES: &[&str] = &[
-    "org.freedesktop.DBus.Error.AccessDenied",
-    "org.freedesktop.DBus.Error.InteractiveAuthorizationRequired",
-    "org.freedesktop.DBus.Error.AuthenticationRequisite",
-    "org.freedesktop.DBus.Error.UnixFD.AccessDenied",
-];
-
+/// D-Bus 错误归一化：委托共享 helper [`agent_shell_core::error::dbus_error`]，
+/// 权限类错误名 → [`AgentShellError::Permission`]，其余 → [`AgentShellError::DBus`]。
 fn dbus_err<E: Display>(e: E) -> AgentShellError {
-    let msg = e.to_string();
-    let denied = msg
-        .split(':')
-        .map(str::trim)
-        .any(|segment| PERMISSION_ERROR_NAMES.contains(&segment));
-    if denied {
-        AgentShellError::Permission(msg)
-    } else {
-        AgentShellError::DBus(msg)
-    }
+    agent_shell_core::error::dbus_error(e)
 }
 
 /// `org.freedesktop.login1.Manager` 的 zbus proxy。

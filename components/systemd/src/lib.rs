@@ -4,8 +4,9 @@
 //! 接口，实现 core 的 [`SystemComponent`] 与 [`DesktopComponent`]。
 //! 不依赖 DE——TTY 后端装配时的必选组件之一。
 //!
-//! zbus system-bus 连接在构造时建立并持有；所有 D-Bus 错误归一化为
-//! [`AgentShellError::DBus`]（design/11 §19）。
+//! zbus system-bus 连接在构造时建立并持有；D-Bus 错误经共享 helper
+//! [`agent_shell_core::error::dbus_error`] 归一化（design/11 §19）：权限类
+//! 错误名 → [`AgentShellError::Permission`]，其余 → [`AgentShellError::DBus`]。
 
 use agent_shell_core::component::{
     ComponentHealth, ComponentType, DesktopComponent, SystemComponent,
@@ -18,9 +19,10 @@ use std::fmt::Display;
 use tracing::debug;
 use zbus::zvariant::OwnedObjectPath;
 
-/// D-Bus 错误归一化：任何传输层错误 → [`AgentShellError::DBus`]。
+/// D-Bus 错误归一化：委托共享 helper [`agent_shell_core::error::dbus_error`]，
+/// 权限类错误名 → [`AgentShellError::Permission`]，其余 → [`AgentShellError::DBus`]。
 fn dbus_err<E: Display>(e: E) -> AgentShellError {
-    AgentShellError::DBus(e.to_string())
+    agent_shell_core::error::dbus_error(e)
 }
 
 /// `org.freedesktop.systemd1.Manager` 的 zbus proxy。
@@ -194,7 +196,7 @@ impl SystemComponent for SystemdComponent {
             .map_err(dbus_err)?
             .reload()
             .await
-            .map_err(|e| AgentShellError::DBus(format!("Reload: {e}")))
+            .map_err(|e| dbus_err(format!("Reload: {e}")))
     }
 
     async fn list_units(&self) -> Result<Vec<SystemdUnit>> {
@@ -204,7 +206,7 @@ impl SystemComponent for SystemdComponent {
             .map_err(dbus_err)?
             .list_units()
             .await
-            .map_err(|e| AgentShellError::DBus(format!("ListUnits: {e}")))?;
+            .map_err(|e| dbus_err(format!("ListUnits: {e}")))?;
         Ok(units.into_iter().map(Self::parse_unit).collect())
     }
 
@@ -216,7 +218,7 @@ impl SystemComponent for SystemdComponent {
             .start_unit(name, "replace")
             .await
             .map(|_| ())
-            .map_err(|e| AgentShellError::DBus(format!("StartUnit({name}): {e}")))
+            .map_err(|e| dbus_err(format!("StartUnit({name}): {e}")))
     }
 
     async fn stop_unit(&self, name: &str) -> Result<()> {
@@ -226,7 +228,7 @@ impl SystemComponent for SystemdComponent {
             .stop_unit(name, "replace")
             .await
             .map(|_| ())
-            .map_err(|e| AgentShellError::DBus(format!("StopUnit({name}): {e}")))
+            .map_err(|e| dbus_err(format!("StopUnit({name}): {e}")))
     }
 
     async fn enable_unit(&self, name: &str) -> Result<()> {
@@ -236,7 +238,7 @@ impl SystemComponent for SystemdComponent {
             .enable_unit_files(&[name], false, false)
             .await
             .map(|_| ())
-            .map_err(|e| AgentShellError::DBus(format!("EnableUnitFiles({name}): {e}")))
+            .map_err(|e| dbus_err(format!("EnableUnitFiles({name}): {e}")))
     }
 
     async fn disable_unit(&self, name: &str) -> Result<()> {
@@ -246,7 +248,7 @@ impl SystemComponent for SystemdComponent {
             .disable_unit_files(&[name], false)
             .await
             .map(|_| ())
-            .map_err(|e| AgentShellError::DBus(format!("DisableUnitFiles({name}): {e}")))
+            .map_err(|e| dbus_err(format!("DisableUnitFiles({name}): {e}")))
     }
 
     async fn unit_status(&self, name: &str) -> Result<UnitStatus> {
@@ -283,4 +285,37 @@ pub async fn assemble_system_services() -> (
         }
     };
     (init_system, session_manager)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dbus_err_maps_permission_error_names() {
+        for msg in [
+            "Reload: org.freedesktop.DBus.Error.AccessDenied: Permission denied",
+            "StartUnit(x): org.freedesktop.DBus.Error.InteractiveAuthorizationRequired: interactive auth required",
+            "org.freedesktop.DBus.Error.AuthenticationRequisite: Authentication is required",
+            "org.freedesktop.DBus.Error.UnixFD.AccessDenied: fd passing denied",
+        ] {
+            assert!(
+                matches!(dbus_err(msg), AgentShellError::Permission(_)),
+                "expected Permission for {msg:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn dbus_err_keeps_other_errors_as_dbus() {
+        for msg in [
+            "Reload: failed",
+            "StartUnit(x): Access denied as the requested operation requires interactive authentication",
+        ] {
+            assert!(
+                matches!(dbus_err(msg), AgentShellError::DBus(_)),
+                "expected DBus for {msg:?}"
+            );
+        }
+    }
 }

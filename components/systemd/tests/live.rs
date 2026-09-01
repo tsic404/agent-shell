@@ -83,9 +83,14 @@ async fn live_systemd_start_stop_unit_status_transitions() {
 #[tokio::test]
 async fn live_systemd_daemon_reload_succeeds() {
     let c = SystemdComponent::connect().await.unwrap();
-    if let Err(e) = c.daemon_reload().await {
-        skip_environment(&format!("environment disallows daemon-reload: {e}"));
-        return;
+    // 无 polkit 授权时 Reload 回 InteractiveAuthorizationRequired；归一为
+    // Permission 后按环境跳过，其余错误视为组件缺陷。
+    match c.daemon_reload().await {
+        Ok(()) => {}
+        Err(AgentShellError::Permission(reason)) => {
+            skip_environment(&format!("daemon-reload 缺 polkit 授权: {reason}"));
+        }
+        Err(e) => panic!("daemon-reload failed: {e}"),
     }
 }
 
