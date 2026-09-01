@@ -5,7 +5,9 @@
 //!
 //! 纯映射单元测试无环境依赖；`*_live` 测试需要 system bus。
 
-use agent_shell_core::component::{SessionManagerComponent, SystemComponent};
+use agent_shell_core::component::{
+    ComponentHealth, DesktopComponent, SessionManagerComponent, SystemComponent,
+};
 use agent_shell_core::error::AgentShellError;
 use agent_shell_core::types::UnitStatus;
 use agent_shell_logind::LogindComponent;
@@ -13,6 +15,33 @@ use agent_shell_systemd::SystemdComponent;
 
 mod common;
 use common::{skip, skip_environment};
+
+/// 连接 logind 并预检 manager 接口可达性。
+///
+/// logind 的 D-Bus 方法（ListSessions/CanReboot）在本机/CI 环境可能超时
+/// （`org.freedesktop.login1` 不可达）——这是环境状态而非组件缺陷，与
+/// systemd 侧的 polkit 跳过同理：按环境性跳过，避免污染非 systemd PR 门禁。
+/// 仅当 `health()` 判定 Healthy 时返回组件，其余情况输出 SKIP 并返回 None。
+async fn logind_or_skip() -> Option<LogindComponent> {
+    let component = match LogindComponent::connect().await {
+        Ok(component) => component,
+        Err(e) => {
+            skip_environment(&format!("logind system bus connect failed: {e}"));
+            return None;
+        }
+    };
+    match component.health().await {
+        ComponentHealth::Healthy => Some(component),
+        ComponentHealth::Degraded(reason) => {
+            skip_environment(&format!("org.freedesktop.login1 unreachable: {reason}"));
+            None
+        }
+        ComponentHealth::Unavailable => {
+            skip_environment("org.freedesktop.login1 unavailable");
+            None
+        }
+    }
+}
 
 #[test]
 fn active_state_mapping() {
@@ -96,7 +125,9 @@ async fn live_systemd_daemon_reload_succeeds() {
 
 #[tokio::test]
 async fn live_logind_list_sessions_returns_current() {
-    let c = LogindComponent::connect().await.unwrap();
+    let Some(c) = logind_or_skip().await else {
+        return;
+    };
     let sessions = c.list_sessions().await.unwrap();
     if sessions.is_empty() {
         // CI runner / 无头容器可达 logind 但无任何 session（无人登录）——
@@ -123,7 +154,9 @@ async fn live_logind_list_sessions_returns_current() {
 
 #[tokio::test]
 async fn live_logind_can_reboot_can_poweroff_booleans() {
-    let c = LogindComponent::connect().await.unwrap();
+    let Some(c) = logind_or_skip().await else {
+        return;
+    };
     // 只查询能力位，绝不触发实际关机/重启。
     let reboot = match c.can_reboot().await {
         Ok(v) => v,
