@@ -1,7 +1,7 @@
 //! 执行引擎（design/07 §15.2）。
 //!
 //! ⚠️ 测试用实现：本模块无任何生产调用点。全仓 `Executor::new` 仅命中
-//! `router/src/executor/tests.rs`（7 处）；daemon 的 `windows.list` /
+//! `router/src/executor/tests.rs`；daemon 的 `windows.list` /
 //! `screenshot.capture` 及其余命令 handler 均直调 `Daemon` / `CaptureDispatcher`
 //! 与合成器后端，不经 [`Executor::execute`]。
 //!
@@ -9,6 +9,13 @@
 //! 审计入口；不得以「router 统一安全检查（D6）」为由省略 daemon 侧 gate
 //! 或审计。若日后 router 演变为真实分派层（daemon handler 改走
 //! `Executor::execute`），移除本标注并同步接线与审计契约。
+//!
+//! # caller 注入点（TSI-2515）
+//! router 层不自知会话身份：安全判定的 `caller_id` 由装配方经
+//! [`Executor::new`] 末位参数注入，存于 [`Executor::caller_id`]。当前无
+//! 生产调用点，恒注入 `"*"`（走默认策略）；演进为真实分派层时把 daemon
+//! 的 `caller_id`（`daemon/src/state.rs` 经 `AGENT_SHELL_AGENT_ID` 解析）
+//! 传到该注入点，勿再改回字面量。
 //!
 //! [`Executor`] 持有合成器后端与四个能力 dispatcher；`execute` 把
 //! [`Command`] 翻译为具体调用。带 `SemanticTarget` 的窗口类命令一律先过
@@ -34,6 +41,11 @@ pub struct Executor {
     a11y: Arc<dyn ElementActions>,
     /// 安全判定入口（§22.7 D6）：`execute()` 在分派前统一调用。
     security: Arc<SecurityManager>,
+    /// 会话身份（app_id/executable）——本层不自知 caller，由装配方经
+    /// [`Executor::new`] 注入（TSI-2515 注入点）。router 无生产调用点时
+    /// 恒为 `"*"`（走默认策略）；演进为真实分派层时在此接线 daemon 的
+    /// `caller_id`。
+    caller_id: String,
 }
 
 impl Executor {
@@ -43,6 +55,7 @@ impl Executor {
         capture: Arc<dyn CaptureDispatcher>,
         a11y: Arc<dyn ElementActions>,
         security: Arc<SecurityManager>,
+        caller_id: String,
     ) -> Self {
         Self {
             backend,
@@ -50,14 +63,17 @@ impl Executor {
             capture,
             a11y,
             security,
+            caller_id,
         }
     }
     pub async fn execute(&self, cmd: Command) -> Result<CommandResult> {
-        // §22.7 D6：SecurityManager 是唯一入口，全部命令必经。agent_id
-        // 本层不可知（无 caller 上下文），以 `"*"` 走默认策略——daemon
-        // 层持有真实 agent 身份时在调用前以显式 id 复核。
+        // §22.7 D6：SecurityManager 是唯一入口，全部命令必经。caller_id
+        // 由装配方经 `Executor::new` 注入（见 `Executor::caller_id` 字段与
+        // 模块头「TSI-2515 注入点」标注）；本层不自知 caller，router 无
+        // 生产调用点时恒为 `"*"` 走默认策略——daemon 层持有真实 agent
+        // 身份时在调用前以显式 id 复核。
         let op = cmd.operation();
-        match self.security.check_permission("*", &op) {
+        match self.security.check_permission(&self.caller_id, &op) {
             PermissionDecision::Allow => {}
             PermissionDecision::Deny(reason) => return Err(AgentShellError::Permission(reason)),
             PermissionDecision::Confirm(mode) => {
@@ -70,7 +86,8 @@ impl Executor {
         // 都会流出到此处回写执行态（TSI-2659 复审：失败路径同样落 2 条记录，
         // 与 daemon 侧契约一致）。
         let result = self.run(cmd).await;
-        self.security.record_execution("*", &op, result.is_ok());
+        self.security
+            .record_execution(&self.caller_id, &op, result.is_ok());
         result
     }
 

@@ -316,6 +316,7 @@ fn make_executor(
         Arc::new(MockCapture),
         Arc::new(FailingSetTextA11y),
         default_security(),
+        "*".into(),
     );
     (ex, focused, input)
 }
@@ -581,6 +582,7 @@ async fn wait_for_window_succeeds_once_window_appears() {
         Arc::new(MockCapture),
         Arc::new(FailingSetTextA11y),
         default_security(),
+        "*".into(),
     );
 
     let res = ex
@@ -606,6 +608,7 @@ async fn type_text_falls_back_to_input_when_a11y_set_text_fails() {
         Arc::new(MockCapture),
         Arc::new(FailingSetTextA11y),
         default_security(),
+        "*".into(),
     );
 
     let res = ex
@@ -635,6 +638,7 @@ async fn denied_command_short_circuits_before_execution() {
         Arc::new(MockCapture),
         Arc::new(FailingSetTextA11y),
         security,
+        "*".into(),
     );
 
     let err = ex
@@ -667,6 +671,7 @@ async fn confirm_override_returns_confirmation_required() {
         Arc::new(MockCapture),
         Arc::new(FailingSetTextA11y),
         security,
+        "*".into(),
     );
 
     let err = ex
@@ -700,6 +705,7 @@ async fn allow_command_records_execution_outcome() {
         Arc::new(MockCapture),
         Arc::new(FailingSetTextA11y),
         security.clone(),
+        "*".into(),
     );
 
     ex.execute(Command::GetDesktopInfo)
@@ -747,6 +753,7 @@ async fn allow_command_failure_still_records_execution_outcome() {
         Arc::new(MockCapture),
         Arc::new(FailingSetTextA11y),
         security.clone(),
+        "*".into(),
     );
 
     let err = ex
@@ -769,6 +776,51 @@ async fn allow_command_failure_still_records_execution_outcome() {
     assert!(
         op_entries.iter().all(|e| !e.result),
         "both records must be result=false on failure: {op_entries:?}"
+    );
+    let _ = std::fs::remove_file(&audit_path);
+}
+
+#[tokio::test]
+async fn injected_caller_id_propagates_to_security_gate_and_audit() {
+    // TSI-2515 回归锚定：caller_id 经 `Executor::new` 注入后，门禁判定与执行
+    // 审计均携带该身份而非硬编码 `"*"`——router 未来持真实会话身份时，
+    // 白名单按 agent 匹配而非 `"*"` 通配兜底。
+    let audit_path = std::env::temp_dir().join(format!(
+        "agent-shell-router-audit-caller-{}.jsonl",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&audit_path);
+    let mut cfg = AgentShellConfig::default();
+    cfg.security.audit_log_path = Some(audit_path.to_string_lossy().into_owned());
+    let security = Arc::new(SecurityManager::with_config(cfg));
+
+    let ex = Executor::new(
+        Box::new(MockCompositor::new(vec![])),
+        Arc::new(MockInput::default()),
+        Arc::new(MockCapture),
+        Arc::new(FailingSetTextA11y),
+        security.clone(),
+        "agent-x".into(),
+    );
+
+    ex.execute(Command::GetDesktopInfo)
+        .await
+        .expect("system.desktop_info must succeed");
+
+    let op_entries: Vec<_> = security
+        .audit
+        .read_all()
+        .into_iter()
+        .filter(|e| e.op == "system.desktop_info")
+        .collect();
+    assert_eq!(
+        op_entries.len(),
+        2,
+        "gate + execution outcome: {op_entries:?}"
+    );
+    assert!(
+        op_entries.iter().all(|e| e.agent_id == "agent-x"),
+        "both audit records must carry injected caller_id: {op_entries:?}"
     );
     let _ = std::fs::remove_file(&audit_path);
 }
