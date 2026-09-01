@@ -2340,8 +2340,9 @@ mod tests {
         // 信号校验失败仍返回 Err（不触达 kill）
         assert!(dispatch("ProcessKill", &[json!(1234), json!(0)]).is_err());
         assert!(dispatch("ProcessKill", &[json!(1234), json!(32)]).is_err());
-        // 有效输入通过校验——kill(1234,9) 在 CI 无 PID 1234 → Err
-        assert!(dispatch("ProcessKill", &[json!(1234), json!(9)]).is_err());
+        // 有效输入通过校验并触达 kill(2)——用必不存在的 PID（i32::MAX 远超
+        // Linux pid_max 上限 2^22）确保 kill 恒返回 ESRCH，不依赖 CI 恰好无 PID 1234。
+        assert!(dispatch("ProcessKill", &[json!(i32::MAX), json!(9)]).is_err());
     }
     #[test]
     fn process_kill_rejects_pid_out_of_i32_range() {

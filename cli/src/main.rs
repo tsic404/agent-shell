@@ -771,14 +771,17 @@ fn pkg_failed_job_line(v: &Value) -> String {
     format!("error: job failed (exit {code}): {stderr}")
 }
 
-/// `log` 查询的 CLI 侧超时（秒）：大于 daemon→rootd 链路最长 90s 的容错余量，
-/// 到点主动失败并给明确提示（TSI-2493），而非静默挂起。
-const LOG_QUERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
+/// `log` 查询的 CLI 侧超时（秒）：作为最外层兜底，防止 daemon 本身无响应
+/// 时 CLI 进程永久挂起。必须严格大于 daemon→rootd 的 zbus `method_timeout`
+/// （`daemon/src/rootd_client.rs`，90s）——rootd `JOURNAL_QUERY_TIMEOUT` 60s
+/// 最先触发，其次 daemon zbus 90s 错误会先传播回 CLI，本常量仅覆盖 daemon
+/// 进程自身卡死的罕见情况，不会抢在 daemon 的超时错误之前误报。
+const LOG_QUERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(91);
 
-/// `log` 查询超时后的用户可读错误信息。
+/// `log` 查询 CLI 侧超时后的用户可读错误信息。
 fn log_query_timeout_error() -> String {
     format!(
-        "journal query timed out after {}s (rootd may be scanning an oversized journal)",
+        "call to daemon timed out after {}s (daemon may be unresponsive)",
         LOG_QUERY_TIMEOUT.as_secs()
     )
 }
@@ -1315,10 +1318,10 @@ mod tests {
 
     #[test]
     fn log_timeout_is_positive_and_explicit() {
-        assert_eq!(LOG_QUERY_TIMEOUT.as_secs(), 90);
+        assert_eq!(LOG_QUERY_TIMEOUT.as_secs(), 91);
         let msg = log_query_timeout_error();
         assert!(msg.contains("timed out"), "{msg}");
-        assert!(msg.contains("90"), "{msg}");
+        assert!(msg.contains("91"), "{msg}");
     }
 
     #[test]
