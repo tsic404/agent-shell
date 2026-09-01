@@ -16,5 +16,5 @@ pub fn skip(reason: &str) {
 /// 「缺 polkit 授权（环境性跳过）」共用同一 grep 关键字，
 /// 便于 CI 区分环境跳过与授权回归误报。
 pub fn skip_environment(reason: &str) {
-    eprintln!("SKIP: {reason}（环境性跳过）");
+    skip(&format!("{reason}（环境性跳过）"));
 }

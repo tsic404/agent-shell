@@ -14,7 +14,7 @@ use agent_shell_logind::LogindComponent;
 use agent_shell_systemd::SystemdComponent;
 
 mod common;
-use common::{skip, skip_environment};
+use common::skip_environment;
 
 /// 连接 logind 并预检 manager 接口可达性。
 ///
@@ -132,7 +132,7 @@ async fn live_logind_list_sessions_returns_current() {
     if sessions.is_empty() {
         // CI runner / 无头容器可达 logind 但无任何 session（无人登录）——
         // ListSessions 空是合法环境状态而非组件缺陷，按本文件 skip 约定放行。
-        skip("no logind sessions on this host (headless/CI)");
+        skip_environment("no logind sessions on this host (headless/CI)");
         return;
     }
     for s in &sessions {
