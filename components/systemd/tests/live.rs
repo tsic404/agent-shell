@@ -122,8 +122,12 @@ async fn live_logind_can_reboot_can_poweroff_booleans() {
     // 只查询能力位，绝不触发实际关机/重启。
     let reboot = match c.can_reboot().await {
         Ok(v) => v,
-        // CI runner 无 polkit 授权时 CanReboot/CanPowerOff 恒回 AccessDenied；
-        // 这是环境权限不足，非组件缺陷——按本文件 skip 约定放行。
+        // CanReboot/CanPowerOff 返回 "yes"/"no"/"challenge" 字符串——合法
+        // D-Bus 回复而非错误；can_bool 仅把 "yes" 归 true，其余（含无
+        // polkit 授权时返回的 "challenge"）归 false。因此真实主机无授权时
+        // 通常走 Ok(false) 而非这里的分支；Err(Permission)/panic 两支只在
+        // logind 真回方法错误（AccessDenied 等）时触发，由 agent-shell-logind
+        // 的 mock D-Bus 测试覆盖。
         Err(AgentShellError::Permission(reason)) => {
             skip_environment(&format!("CanReboot 缺 polkit 授权: {reason}"));
             return;

@@ -472,6 +472,7 @@ version = "0.1.0"
 dependencies = [
  "agent-shell-core",
  "async-trait",
+ "parking_lot",
  "tokio",
  "tracing",
  "zbus",

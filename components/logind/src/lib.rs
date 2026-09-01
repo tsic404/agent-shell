@@ -292,6 +292,20 @@ impl SessionManagerComponent for LogindComponent {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use parking_lot::Mutex;
+    use std::io::Read as _;
+    use std::process::{ChildStdout, Stdio};
+    use std::sync::Arc;
+    use zbus::names::WellKnownName;
+
+    #[test]
+    fn can_bool_only_yes_is_true() {
+        assert!(can_bool("yes"));
+        assert!(!can_bool("no"));
+        assert!(!can_bool("challenge"));
+        assert!(!can_bool("YES"));
+        assert!(!can_bool(""));
+    }
 
     #[test]
     fn permission_error_names_map_to_permission() {
@@ -321,5 +335,203 @@ mod tests {
                 "expected DBus for {msg:?}"
             );
         }
+    }
+
+    // ── mock D-Bus 验证 ────────────────────────────────────────────────
+    // 真实 logind 无 polkit 授权时，CanReboot/CanPowerOff 返回 "challenge"
+    // 字符串（合法回复）而非 AccessDenied 错误；live.rs 的 Err(Permission)
+    // 与 panic 分支在真机/CI 上对这两个方法永不触发。以下测试用私有
+    // session bus 上的 mock login1 服务逐一覆盖这两条错误路径与字符串
+    // 归一化路径，避免依赖真机 polkit 状态。
+
+    /// CanReboot/CanPowerOff 的 mock 回复。
+    #[derive(Clone, Copy)]
+    enum PowerReply {
+        Yes,
+        No,
+        Challenge,
+        Denied,
+        Failed,
+    }
+
+    struct MockLogin1 {
+        reboot: Arc<Mutex<PowerReply>>,
+        poweroff: Arc<Mutex<PowerReply>>,
+    }
+
+    #[zbus::interface(name = "org.freedesktop.login1.Manager")]
+    impl MockLogin1 {
+        fn can_reboot(&self) -> zbus::fdo::Result<String> {
+            match *self.reboot.lock() {
+                PowerReply::Yes => Ok("yes".to_string()),
+                PowerReply::No => Ok("no".to_string()),
+                PowerReply::Challenge => Ok("challenge".to_string()),
+                PowerReply::Denied => Err(zbus::fdo::Error::AccessDenied(
+                    "mock polkit denial".to_string(),
+                )),
+                PowerReply::Failed => Err(zbus::fdo::Error::Failed("mock failure".to_string())),
+            }
+        }
+
+        fn can_power_off(&self) -> zbus::fdo::Result<String> {
+            match *self.poweroff.lock() {
+                PowerReply::Yes => Ok("yes".to_string()),
+                PowerReply::No => Ok("no".to_string()),
+                PowerReply::Challenge => Ok("challenge".to_string()),
+                PowerReply::Denied => Err(zbus::fdo::Error::AccessDenied(
+                    "mock polkit denial".to_string(),
+                )),
+                PowerReply::Failed => Err(zbus::fdo::Error::Failed("mock failure".to_string())),
+            }
+        }
+    }
+
+    /// 独立私有 session bus（避免与真机/并行测试竞争 system bus 或
+    /// `Connection::session()` 环境变量）。mock 服务与客户端共享同一地址。
+    struct TestBus {
+        addr: String,
+        _child: std::process::Child,
+    }
+
+    impl TestBus {
+        async fn start() -> Self {
+            let mut child = std::process::Command::new("dbus-daemon")
+                .args(["--session", "--nofork", "--print-address=1"])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("dbus-daemon must be installed for logind mock tests");
+            let stdout = child.stdout.take().expect("piped stdout");
+            let addr = read_address_line(stdout);
+            assert!(
+                addr.starts_with("unix:"),
+                "dbus-daemon printed unexpected address: {addr:?}"
+            );
+            Self {
+                addr,
+                _child: child,
+            }
+        }
+
+        async fn connect(&self) -> zbus::Connection {
+            zbus::connection::Builder::address(self.addr.as_str())
+                .expect("dbus-daemon address must parse")
+                .build()
+                .await
+                .expect("connect to private session bus")
+        }
+    }
+
+    impl Drop for TestBus {
+        fn drop(&mut self) {
+            let _ = self._child.kill();
+            let _ = self._child.wait();
+        }
+    }
+
+    /// 逐字节读地址行：`dbus-daemon --print-address=1` 恰好一行。
+    fn read_address_line(stdout: ChildStdout) -> String {
+        let mut reader = std::io::BufReader::new(stdout);
+        let mut bytes = Vec::new();
+        loop {
+            let mut buf = [0u8; 1];
+            match reader.read_exact(&mut buf) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                Err(e) => panic!("read dbus-daemon address: {e}"),
+            }
+            bytes.push(buf[0]);
+            if buf[0] == b'\n' {
+                break;
+            }
+        }
+        let line = String::from_utf8(bytes).expect("dbus-daemon address must be UTF-8");
+        assert!(!line.is_empty(), "dbus-daemon printed no address line");
+        line.trim_end_matches('\n').to_string()
+    }
+
+    /// 启动 mock login1 服务，返回：服务连接（保持存活）、两个回复槽、以及
+    /// 连接同一私有 bus 的 `LogindComponent`（绕过 `connect()` 的 system bus）。
+    async fn spawn_mock_login1(
+        bus: &TestBus,
+    ) -> (
+        zbus::Connection,
+        Arc<Mutex<PowerReply>>,
+        Arc<Mutex<PowerReply>>,
+        LogindComponent,
+    ) {
+        let reboot = Arc::new(Mutex::new(PowerReply::Challenge));
+        let poweroff = Arc::new(Mutex::new(PowerReply::Challenge));
+        let mock = MockLogin1 {
+            reboot: Arc::clone(&reboot),
+            poweroff: Arc::clone(&poweroff),
+        };
+        let server = bus.connect().await;
+        server
+            .object_server()
+            .at("/org/freedesktop/login1", mock)
+            .await
+            .expect("register mock login1 manager");
+        let name =
+            WellKnownName::try_from("org.freedesktop.login1".to_string()).expect("valid bus name");
+        server
+            .request_name(name)
+            .await
+            .expect("claim org.freedesktop.login1");
+        let comp = LogindComponent {
+            conn: bus.connect().await,
+        };
+        (server, reboot, poweroff, comp)
+    }
+
+    #[tokio::test]
+    async fn can_reboot_poweroff_yes_true_no_false() {
+        let bus = TestBus::start().await;
+        let (_server, reboot, poweroff, comp) = spawn_mock_login1(&bus).await;
+        *reboot.lock() = PowerReply::Yes;
+        *poweroff.lock() = PowerReply::No;
+        assert!(comp.can_reboot().await.unwrap(), "yes 应归 true");
+        assert!(!comp.can_poweroff().await.unwrap(), "no 应归 false");
+    }
+
+    #[tokio::test]
+    async fn can_reboot_poweroff_challenge_normalizes_to_false() {
+        let bus = TestBus::start().await;
+        // spawn_mock_login1 默认 Challenge——真机无 polkit 授权的实际回复。
+        let (_server, _reboot, _poweroff, comp) = spawn_mock_login1(&bus).await;
+        assert!(!comp.can_reboot().await.unwrap(), "challenge 应归 false");
+        assert!(!comp.can_poweroff().await.unwrap(), "challenge 应归 false");
+    }
+
+    #[tokio::test]
+    async fn can_reboot_poweroff_access_denied_maps_to_permission() {
+        let bus = TestBus::start().await;
+        let (_server, reboot, poweroff, comp) = spawn_mock_login1(&bus).await;
+        *reboot.lock() = PowerReply::Denied;
+        *poweroff.lock() = PowerReply::Denied;
+        assert!(matches!(
+            comp.can_reboot().await,
+            Err(AgentShellError::Permission(_))
+        ));
+        assert!(matches!(
+            comp.can_poweroff().await,
+            Err(AgentShellError::Permission(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn can_reboot_poweroff_unmatched_error_maps_to_dbus() {
+        let bus = TestBus::start().await;
+        let (_server, reboot, poweroff, comp) = spawn_mock_login1(&bus).await;
+        *reboot.lock() = PowerReply::Failed;
+        *poweroff.lock() = PowerReply::Failed;
+        assert!(matches!(
+            comp.can_reboot().await,
+            Err(AgentShellError::DBus(_))
+        ));
+        assert!(matches!(
+            comp.can_poweroff().await,
+            Err(AgentShellError::DBus(_))
+        ));
     }
 }
