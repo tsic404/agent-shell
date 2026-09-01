@@ -2291,8 +2291,9 @@ mod tests {
         }
     }
 
-    /// 实况夹具入口见 `scripts/hostname-fixture.sh`：root 下跑 ignored 测试，
-    /// 前后抓取主机名断言无漂移。托管 CI 无 systemd-hostnamed，不能跑。
+    /// 实况回归由 agent 在真实 root + systemd-hostnamed 环境执行：运行本
+    /// ignored 测试，前后抓取主机名断言无漂移。托管 CI 无 systemd-hostnamed，
+    /// 默认忽略本测试，仅保留单元测试。
     #[test]
     #[ignore = "requires root/hostnamed; live snapshot/restore fixture (TSI-2630)"]
     fn hostname_set_snapshot_and_restore_live() {
