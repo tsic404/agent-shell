@@ -232,8 +232,8 @@ async fn a11y(c: &mut DaemonClient, cmd: cli::A11yCommand) -> CmdResult {
             println!("{}", r.detail);
             Ok(if r.available { 0 } else { 2 })
         }
-        cli::A11yCommand::Query { role, name } => {
-            let r = c.a11y_query(role, name).await?;
+        cli::A11yCommand::Query { role, name, all } => {
+            let r = c.a11y_query(role, name, all).await?;
             println!("{}", serde_json::to_string_pretty(&r).expect("json"));
             Ok(if r.count > 0 { 0 } else { 2 })
         }

@@ -454,10 +454,16 @@ async fn a11y_status() -> RpcResult {
 }
 
 /// 语义查询（§14.3）：AT-SPI 树按 (role, name) 定位元素，投影为协议载荷。
+///
+/// `all=true` 仅放开「必须有 role 或 name」的 gate：无 role/name 时查询全树
+/// （locator 以 `(None, None)` 遍历）；同时提供 role/name 时仍作为过滤条件，
+/// `all` 不覆盖它们。
 async fn a11y_query(d: &Daemon, req: &Request) -> RpcResult {
     // 参数校验先于后端可用性判定：无效请求恒返回 InvalidParams，
     // 与 AT-SPI 是否可达无关（不信任客户端输入）。`role`/`name` 键
     // 缺省或值为 `null` 均视为未提供；存在且非字符串 → InvalidParams。
+    // `all` 键同样独立校验：缺省/`null` 视为 false，存在且非 bool →
+    // InvalidParams。
     let params = params_of(req)?;
     let role = match params.get("role") {
         None | Some(Value::Null) => None,
@@ -479,7 +485,17 @@ async fn a11y_query(d: &Daemon, req: &Request) -> RpcResult {
             ))
         }
     };
-    if role.is_none() && name.is_none() {
+    let all = match params.get("all") {
+        None | Some(Value::Null) => false,
+        Some(Value::Bool(b)) => *b,
+        Some(_) => {
+            return Err((
+                RpcErrorCode::InvalidParams,
+                "a11y.query all must be a boolean".to_string(),
+            ))
+        }
+    };
+    if !all && role.is_none() && name.is_none() {
         return Err((
             RpcErrorCode::InvalidParams,
             "a11y.query requires `role` and/or `name`".to_string(),
@@ -1528,6 +1544,64 @@ mod tests {
             None => {
                 let v = resp.result.expect("query ok");
                 assert!(v.get("count").is_some(), "result must carry count: {v}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a11y_query_all_flag_bypasses_empty_filter_gate() {
+        // TSI-2525：`all=true` 是通配查询，不应命中 "requires role and/or
+        // name" 的 InvalidParams gate；headless 环境应进入 locator 路径并
+        // 返回 BackendUnavailable（非 InvalidParams）。
+        let mut d = test_daemon().await;
+        let resp = dispatch(&mut d, &req(method::A11Y_QUERY, Some(json!({"all": true})))).await;
+        match resp.error {
+            Some(err) => assert_ne!(
+                err.code,
+                RpcErrorCode::InvalidParams as i32,
+                "all=true must bypass the empty-filter gate"
+            ),
+            None => {
+                let v = resp.result.expect("query ok");
+                assert!(v.get("count").is_some(), "result must carry count: {v}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a11y_query_non_bool_all_is_invalid_params() {
+        // `all` 非 bool 是类型错误，独立校验分支先行于 gate/后端判定。
+        let mut d = test_daemon().await;
+        for params in [json!({"all": "yes"}), json!({"all": 1})] {
+            let resp = dispatch(&mut d, &req(method::A11Y_QUERY, Some(params))).await;
+            assert_eq!(
+                resp.error.expect("error").code,
+                RpcErrorCode::InvalidParams as i32
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a11y_query_all_with_role_name_is_not_invalid_params() {
+        // TSI-2525：all=true 不再覆盖 role/name——同时提供时仍是合法请求，
+        // headless 环境应进入 locator 路径返回 BackendUnavailable（非
+        // InvalidParams）；role/name 过滤由 locator 层单测锚定。
+        let mut d = test_daemon().await;
+        for params in [
+            json!({"all": true, "role": "pushButton"}),
+            json!({"all": true, "name": "OK"}),
+        ] {
+            let resp = dispatch(&mut d, &req(method::A11Y_QUERY, Some(params))).await;
+            match resp.error {
+                Some(err) => assert_ne!(
+                    err.code,
+                    RpcErrorCode::InvalidParams as i32,
+                    "all=true with role/name must not be InvalidParams"
+                ),
+                None => {
+                    let v = resp.result.expect("query ok");
+                    assert!(v.get("count").is_some(), "result must carry count: {v}");
+                }
             }
         }
     }

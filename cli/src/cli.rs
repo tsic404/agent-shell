@@ -210,12 +210,15 @@ pub struct ScreenshotCommand {
 pub enum A11yCommand {
     /// a11y bus 与 AT-SPI Registry 可达性报告
     Status,
-    /// 语义查询（role/name 过滤）
+    /// 语义查询（role/name 过滤；--all 允许省略过滤查询全树）
     Query {
         #[arg(long)]
         role: Option<String>,
         #[arg(long)]
         name: Option<String>,
+        /// 通配匹配：允许省略 role/name 查询全树；提供时仍作为过滤条件
+        #[arg(long, default_value_t = false)]
+        all: bool,
     },
 }
 

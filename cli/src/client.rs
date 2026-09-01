@@ -351,28 +351,33 @@ impl DaemonClient {
         &mut self,
         role: Option<String>,
         name: Option<String>,
+        all: bool,
     ) -> Result<agent_shell_rpc::A11yQueryResult, String> {
         let v = self
             .call(
                 method::A11Y_QUERY,
-                a11y_query_params(role.as_deref(), name.as_deref()),
+                a11y_query_params(role.as_deref(), name.as_deref(), all),
             )
             .await?;
         serde_json::from_value(v).map_err(|e| e.to_string())
     }
 }
 
-/// `a11y.query` 参数构造：`None` 条件省略该键，而非序列化为 JSON `null`。
+/// `a11y.query` 参数构造：`None` 条件省略该键，而非序列化为 JSON `null`；
+/// `all=true` 显式插入 `"all": true`，`all=false` 保持省略键约定。
 ///
 /// daemon 侧把缺省键与 `null` 值均视为「未提供」，但 CLI 省略键更忠实于
 /// 「单条件查询」语义，且不依赖双方对 null 解释的一致性。
-fn a11y_query_params(role: Option<&str>, name: Option<&str>) -> Value {
+fn a11y_query_params(role: Option<&str>, name: Option<&str>, all: bool) -> Value {
     let mut params = serde_json::Map::new();
     if let Some(r) = role {
         params.insert("role".into(), json!(r));
     }
     if let Some(n) = name {
         params.insert("name".into(), json!(n));
+    }
+    if all {
+        params.insert("all".into(), json!(true));
     }
     Value::Object(params)
 }
@@ -409,14 +414,26 @@ mod tests {
     /// 而非序列化为 JSON `null`（TSI-2480 QA 回归锚定）。
     #[test]
     fn a11y_query_params_omits_none_keys() {
-        let v = a11y_query_params(Some("pushButton"), None);
+        let v = a11y_query_params(Some("pushButton"), None, false);
         let obj = v.as_object().expect("params must be object");
         assert_eq!(obj.get("role").and_then(|v| v.as_str()), Some("pushButton"));
         assert!(!obj.contains_key("name"), "None name must be omitted");
 
-        let v = a11y_query_params(None, Some("foo"));
+        let v = a11y_query_params(None, Some("foo"), false);
         let obj = v.as_object().expect("params must be object");
         assert_eq!(obj.get("name").and_then(|v| v.as_str()), Some("foo"));
         assert!(!obj.contains_key("role"), "None role must be omitted");
+    }
+
+    /// `all=true` 显式插入 `"all": true`；`all=false` 保持省略键约定。
+    #[test]
+    fn a11y_query_params_all_includes_flag() {
+        let v = a11y_query_params(None, None, true);
+        let obj = v.as_object().expect("params must be object");
+        assert_eq!(obj.get("all").and_then(|v| v.as_bool()), Some(true));
+
+        let v = a11y_query_params(None, None, false);
+        let obj = v.as_object().expect("params must be object");
+        assert!(!obj.contains_key("all"), "all=false must be omitted");
     }
 }
