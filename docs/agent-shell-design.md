@@ -3554,7 +3554,9 @@ impl<T> FallbackChain<T> {
 ```toml
 [workspace]
 members = [
+    "core",
     "components/input",
+    "components/audio",
     "components/displayserver/wayland",
     "components/displayserver/x11",
     "components/compositor/wayland-core",
@@ -3566,6 +3568,7 @@ members = [
     "components/compositor/x11",
     "components/systemd",
     "components/logind",
+    "components/power",
     "components/notification",
     "components/appearance",
     "components/launcher",
@@ -3589,9 +3592,6 @@ members = [
     "mcp",
     "event",
 ]
-
-> `core` / `components/audio` / `components/power` 仅在 `[workspace.dependencies]`
-> 以 path 出现，**不是** workspace members。
 
 [workspace.dependencies]
 zbus = "5"

@@ -1,7 +1,9 @@
 [workspace]
 resolver = "2"
 members = [
+    "core",
     "components/input",
+    "components/audio",
     "components/displayserver/wayland",
     "components/displayserver/x11",
     "components/compositor/wayland-core",
@@ -13,6 +15,7 @@ members = [
     "components/compositor/x11",
     "components/systemd",
     "components/logind",
+    "components/power",
     "components/notification",
     "components/appearance",
     "components/launcher",
