@@ -2593,29 +2593,58 @@ impl SemanticLocator {
 
 ### 14.4 元素操作
 
+> 体例：本节为「示意伪代码」——`pub` 签名与 `components/a11y/src/action.rs` 逐字一致，函数体以示意为主。`click()`/`get_text()`/`set_text()` 三处已按真实实现对齐（`NActions` 属性 + D-Bus 错误映射、`CharacterCount` 上界、`is_editable` 前置校验），`focus()` 仍为简化示意。
+
 ```rust
 // components/a11y/src/action.rs
 
 pub struct ElementActions {
     bridge: AtspiBridge,
-    input: Arc<dyn PointerInput>,
+    input: std::sync::Arc<dyn PointerInput>,
 }
 
 impl ElementActions {
     pub fn new(bridge: AtspiBridge) -> Self { ... }
-    pub fn with_input(mut self, input: Arc<dyn PointerInput>) -> Self { ... }
+    pub fn with_input(mut self, input: std::sync::Arc<dyn PointerInput>) -> Self { ... }
     pub fn bridge(&self) -> &AtspiBridge { ... }
     /// 点击元素：优先 AT-SPI Action 接口，降级坐标点击
     pub async fn click(&self, element: &ElementNode) -> Result<()> {
-        let action = element.get_action_interface().await?;
-        if action.get_n_actions() > 0 {
-            action.do_action(0).await?;  // 0 = "click"
-            return Ok(());
+        if self.has_action_interface(element).await {
+            let p = self
+                .bridge
+                .proxy_for(
+                    element.bus_name.as_str(),
+                    element.path.as_str(),
+                    "org.a11y.atspi.Action",
+                )
+                .await?;
+            let n_actions: i32 = p
+                .get_property("NActions")
+                .await
+                .map_err(|e| AgentShellError::DBus(format!("Action.NActions: {e}")))?;
+            if n_actions > 0 {
+                let ok: bool = AtspiBridge::call_checked(
+                    &p,
+                    "DoAction",
+                    &(0,), // index 0 = 主动作（GTK "Click" / Qt "press"）
+                    "Action.DoAction",
+                )
+                .await?;
+                if ok {
+                    return Ok(());
+                }
+                tracing::warn!(
+                    path = %element.path,
+                    "DoAction returned false; falling back to coordinate click"
+                );
+            }
         }
-        // 降级：获取元素中心坐标 → 鼠标移动 + 点击
-        let rect = element.get_rect().await?;
-        let cx = rect.x + rect.width / 2;
-        let cy = rect.y + rect.height / 2;
+        // 降级：中心坐标 → 移动 + 左键点击
+        let rect = self
+            .bridge
+            .get_extents(&element.bus_name, &element.path)
+            .await?;
+        let (cx, cy) = ElementNode::center_of(rect);
         self.input.mouse_move(cx, cy).await?;
         self.input.mouse_click(MouseButton::Left).await
     }
