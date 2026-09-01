@@ -2044,8 +2044,23 @@ mod tests {
         // 结尾点：由既有前后缀检查拒绝，回归断言固定该行为
         let e = dispatch("HostnameSet", &[json!("b.")]).unwrap_err();
         assert!(e.contains("end with '-' or '.'"), "{e}");
-        // 有效 hostname 通过校验——hostnamectl 在 CI 无权限/无 polkit → Err
-        assert!(dispatch("HostnameSet", &[json!("myhost")]).is_err());
+        // 有效 hostname（无点）必须通过校验并触达写回 seam——不直接调用真实
+        // hostnamectl：root 下会真实写回主机名并残留副作用，非 root 下又因
+        // polkit/hostnamed 环境差异不稳定。注入 recorder 证明未被校验拦截。
+        clear_hostname_call_log();
+        set_hostname_command_runner(&_guard, record_hostname_command);
+        let r = dispatch("HostnameSet", &[json!("myhost")]);
+        clear_hostname_command_runner(&_guard);
+        assert!(r.is_ok(), "myhost 应通过校验并走 seam: {r:?}");
+        let calls = recorded_hostname_calls();
+        assert_eq!(calls.len(), 1, "{calls:?}");
+        assert_eq!(
+            calls[0],
+            (
+                "hostnamectl".to_string(),
+                vec!["set-hostname".to_string(), "myhost".to_string()],
+            )
+        );
         // 合法带点 hostname `a.b` 必须通过校验并触达写回 seam：注入 recorder，
         // 断言 seam 收到 `hostnamectl set-hostname a.b`，证明未被校验拦截——
         // 仅 `is_err()` 无法区分「校验拒绝」与「CI 无 hostnamectl 的 spawn 失败」。
