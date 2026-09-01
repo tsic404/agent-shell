@@ -232,11 +232,30 @@ async fn a11y(c: &mut DaemonClient, cmd: cli::A11yCommand) -> CmdResult {
             println!("{}", r.detail);
             Ok(if r.available { 0 } else { 2 })
         }
-        cli::A11yCommand::Query { role, name, all } => {
+        cli::A11yCommand::Query {
+            role,
+            name,
+            all,
+            fail_on_empty,
+        } => {
             let r = c.a11y_query(role, name, all).await?;
             println!("{}", serde_json::to_string_pretty(&r).expect("json"));
-            Ok(if r.count > 0 { 0 } else { 2 })
+            Ok(a11y_query_exit_code(r.count, fail_on_empty))
         }
+    }
+}
+
+/// `a11y query` 的退出码决策：零命中不再是错误——RPC 成功即 exit 0，
+/// 空结果照常打印；仅当调用方显式传入 `--fail-on-empty` 时才把零命中
+/// 视为失败（exit 2）。这样脚本可通过退出码区分「无匹配」与「命令出错」
+/// （后者走 `run()` 的 `Err` 路径，exit 1）。
+fn a11y_query_exit_code(count: usize, fail_on_empty: bool) -> i32 {
+    if count > 0 {
+        0
+    } else if fail_on_empty {
+        2
+    } else {
+        0
     }
 }
 
@@ -1094,10 +1113,10 @@ fn sysctl_rpc_error(e: CallError) -> CmdResult {
 #[cfg(test)]
 mod tests {
     use super::{
-        is_auth_required, job_status_outcome, log_query_timeout_error, parse_log_filter,
-        pkg_failed_job_line, process_rootd_error, security_audit_params, security_request,
-        sysctl_rpc_error, sysctl_set_accepted_line, wait_for_job_impl, JobStatusSource,
-        LOG_QUERY_TIMEOUT,
+        a11y_query_exit_code, is_auth_required, job_status_outcome, log_query_timeout_error,
+        parse_log_filter, pkg_failed_job_line, process_rootd_error, security_audit_params,
+        security_request, sysctl_rpc_error, sysctl_set_accepted_line, wait_for_job_impl,
+        JobStatusSource, LOG_QUERY_TIMEOUT,
     };
     use crate::client::CallError;
     use crate::RpcErrorCode;
@@ -1481,5 +1500,21 @@ mod tests {
             message: "rootd: boom".into(),
         };
         assert_eq!(sysctl_rpc_error(e), Ok(1));
+    }
+
+    #[test]
+    fn a11y_query_hit_exits_zero() {
+        assert_eq!(a11y_query_exit_code(1, false), 0);
+        assert_eq!(a11y_query_exit_code(1, true), 0);
+    }
+
+    #[test]
+    fn a11y_query_zero_hit_exits_zero_by_default() {
+        assert_eq!(a11y_query_exit_code(0, false), 0);
+    }
+
+    #[test]
+    fn a11y_query_zero_hit_with_fail_on_empty_exits_two() {
+        assert_eq!(a11y_query_exit_code(0, true), 2);
     }
 }

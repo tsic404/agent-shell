@@ -219,6 +219,9 @@ pub enum A11yCommand {
         /// 通配匹配：允许省略 role/name 查询全树；提供时仍作为过滤条件
         #[arg(long, default_value_t = false)]
         all: bool,
+        /// 零命中时按失败处理（exit 2），供需要区分空结果的脚本调用方使用
+        #[arg(short = 'c', long = "fail-on-empty", default_value_t = false)]
+        fail_on_empty: bool,
     },
 }
 
