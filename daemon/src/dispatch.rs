@@ -2278,7 +2278,7 @@ mod tests {
     #[tokio::test]
     async fn sysctl_set_above_level_requires_confirmation() {
         // SYSCTL_SET 是 L3；默认 `"*"` 无白名单 → 确认而非直达 handler。
-        let mut d = Daemon::connect(Duration::from_secs(1)).await;
+        let mut d = test_daemon().await;
         let resp = dispatch(
             &mut d,
             &req(
