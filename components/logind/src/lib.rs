@@ -19,6 +19,18 @@ use zbus::zvariant::{ObjectPath, OwnedObjectPath};
 fn dbus_err<E: Display>(e: E) -> AgentShellError {
     agent_shell_core::error::dbus_error(e)
 }
+/// zbus 方法调用错误归一化：D-Bus 调用超时（zbus `method_timeout` 触发，
+/// 呈现为 `I/O error: timed out`）是环境状态而非组件缺陷，归一为
+/// [`AgentShellError::Timeout`]，供 live 测试与 `Permission` 分支并列跳过；
+/// 其余错误委托 [`dbus_err`] 共享归一化。
+fn method_err(context: &str, e: zbus::Error) -> AgentShellError {
+    if let zbus::Error::InputOutput(io) = &e {
+        if io.kind() == std::io::ErrorKind::TimedOut {
+            return AgentShellError::Timeout(format!("{context}: {e}"));
+        }
+    }
+    dbus_err(format!("{context}: {e}"))
+}
 
 /// `org.freedesktop.login1.Manager` 的 zbus proxy。
 #[zbus::proxy(
@@ -232,7 +244,7 @@ impl SessionManagerComponent for LogindComponent {
             .map_err(dbus_err)?
             .can_reboot()
             .await
-            .map_err(|e| dbus_err(format!("CanReboot: {e}")))?;
+            .map_err(|e| method_err("CanReboot", e))?;
         Ok(can_bool(&answer))
     }
 
@@ -253,7 +265,7 @@ impl SessionManagerComponent for LogindComponent {
             .map_err(dbus_err)?
             .can_power_off()
             .await
-            .map_err(|e| dbus_err(format!("CanPowerOff: {e}")))?;
+            .map_err(|e| method_err("CanPowerOff", e))?;
         Ok(can_bool(&answer))
     }
 
@@ -312,6 +324,30 @@ mod tests {
                 "expected DBus for {msg:?}"
             );
         }
+    }
+
+    #[test]
+    fn io_timeout_maps_to_timeout() {
+        let e = zbus::Error::from(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "timed out",
+        ));
+        assert!(matches!(
+            method_err("CanReboot", e),
+            AgentShellError::Timeout(_)
+        ));
+    }
+
+    #[test]
+    fn non_timeout_io_error_maps_to_dbus() {
+        let e = zbus::Error::from(std::io::Error::new(
+            std::io::ErrorKind::ConnectionReset,
+            "connection reset",
+        ));
+        assert!(matches!(
+            method_err("CanReboot", e),
+            AgentShellError::DBus(_)
+        ));
     }
 
     // ── mock D-Bus 验证 ────────────────────────────────────────────────

@@ -163,11 +163,16 @@ async fn live_logind_can_reboot_can_poweroff_booleans() {
         // CanReboot/CanPowerOff 返回 "yes"/"no"/"challenge" 字符串——合法
         // D-Bus 回复而非错误；can_bool 仅把 "yes" 归 true，其余（含无
         // polkit 授权时返回的 "challenge"）归 false。因此真实主机无授权时
-        // 通常走 Ok(false) 而非这里的分支；Err(Permission)/panic 两支只在
-        // logind 真回方法错误（AccessDenied 等）时触发，由 agent-shell-logind
+        // 通常走 Ok(false) 而非这里的分支；Err(Permission)/Err(Timeout)/
+        // panic 三支只在 logind 真回方法错误（AccessDenied 等）或 D-Bus
+        // 调用超时（method_err 归一为 Timeout）时触发，由 agent-shell-logind
         // 的 mock D-Bus 测试覆盖。
         Err(AgentShellError::Permission(reason)) => {
             skip_environment(&format!("CanReboot 缺 polkit 授权: {reason}"));
+            return;
+        }
+        Err(AgentShellError::Timeout(reason)) => {
+            skip_environment(&format!("CanReboot D-Bus 调用超时: {reason}"));
             return;
         }
         Err(e) => panic!("CanReboot failed: {e}"),
@@ -176,6 +181,10 @@ async fn live_logind_can_reboot_can_poweroff_booleans() {
         Ok(v) => v,
         Err(AgentShellError::Permission(reason)) => {
             skip_environment(&format!("CanPowerOff 缺 polkit 授权: {reason}"));
+            return;
+        }
+        Err(AgentShellError::Timeout(reason)) => {
+            skip_environment(&format!("CanPowerOff D-Bus 调用超时: {reason}"));
             return;
         }
         Err(e) => panic!("CanPowerOff failed: {e}"),
