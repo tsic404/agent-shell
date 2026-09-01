@@ -76,21 +76,19 @@ fn dde_event_source(kind: CompositorKind) -> event::EventSource {
     match kind {
         CompositorKind::DeepinKwin => event::EventSource::KWinWayland,
         CompositorKind::Treeland => event::EventSource::Treeland,
-        CompositorKind::X11 | CompositorKind::Unknown => event::EventSource::X11Generic,
+        CompositorKind::X11 => event::EventSource::X11Generic,
     }
 }
 
 /// DDE 合成器形态 → `WindowId` 环境标签。deepin-kwin 与 X11 分支都复用
 /// KWin 实现（org_kde_* 协议 / EWMH-ICCCM + D-Bus 桥），内部 ID 一律打
-/// KDE 标签（同会话自洽）；Treeland 与 Unknown 标 DDE。
+/// KDE 标签（同会话自洽）；Treeland 标 DDE。
 fn dde_de_type(kind: CompositorKind) -> agent_shell_core::types::DesktopEnvironment {
     match kind {
         CompositorKind::DeepinKwin | CompositorKind::X11 => {
             agent_shell_core::types::DesktopEnvironment::KDE
         }
-        CompositorKind::Treeland | CompositorKind::Unknown => {
-            agent_shell_core::types::DesktopEnvironment::DDE
-        }
+        CompositorKind::Treeland => agent_shell_core::types::DesktopEnvironment::DDE,
     }
 }
 
@@ -449,7 +447,6 @@ mod tests {
         );
         assert_eq!(dde_event_source(K::Treeland), event::EventSource::Treeland);
         assert_eq!(dde_event_source(K::X11), event::EventSource::X11Generic);
-        assert_eq!(dde_event_source(K::Unknown), event::EventSource::X11Generic);
     }
 
     #[test]
@@ -459,7 +456,6 @@ mod tests {
         assert_eq!(dde_de_type(K::DeepinKwin), DE::KDE);
         assert_eq!(dde_de_type(K::X11), DE::KDE);
         assert_eq!(dde_de_type(K::Treeland), DE::DDE);
-        assert_eq!(dde_de_type(K::Unknown), DE::DDE);
     }
 
     #[test]

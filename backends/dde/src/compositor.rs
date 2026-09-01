@@ -24,7 +24,7 @@ pub const TREELAND_FOREIGN_TOPLEVEL: &str = "treeland_foreign_toplevel_manager_v
 pub const TREELAND_WINDOW_MANAGEMENT: &str = "treeland_window_management_v1";
 
 /// DDE 合成器形态（§10.4 复合装配的分支键）。
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CompositorKind {
     /// Treeland（wlroots 系新一代，treeland_* 私有协议）。
     Treeland,
@@ -32,9 +32,6 @@ pub enum CompositorKind {
     DeepinKwin,
     /// X11 会话（EWMH/ICCCM 基础通道）。
     X11,
-    /// 无法确定（无显示服务器连接）。
-    #[default]
-    Unknown,
 }
 
 impl CompositorKind {
@@ -44,38 +41,38 @@ impl CompositorKind {
             Self::Treeland => "Treeland (Wayland)",
             Self::DeepinKwin => "deepin-kwin (Wayland)",
             Self::X11 => "X11",
-            Self::Unknown => "unknown",
         }
     }
 }
 
 /// 纯函数版形态判定：给定 registry 中已公布的接口集合与是否为 Wayland
-/// 连接，返回合成器形态。注入式设计使检测逻辑可离线单测。
+/// 连接，返回合成器形态；无法判定时返回 `None`。注入式设计使检测逻辑
+/// 可离线单测。
 ///
 /// deepin-kwin 与 Treeland 同时公布时优先 Treeland（设计决策 D9：
 /// 优先 Treeland Wayland 协议，其次 deepin-kwin）。
-pub fn classify(wl_connected: bool, interfaces: &[&str]) -> CompositorKind {
+pub fn classify(wl_connected: bool, interfaces: &[&str]) -> Option<CompositorKind> {
     if !wl_connected {
         // 非 Wayland：有 X11 形态由调用方按 DISPLAY 判定，这里只认显式传入。
-        return CompositorKind::Unknown;
+        return None;
     }
     if interfaces.contains(&TREELAND_FOREIGN_TOPLEVEL)
         || interfaces.contains(&TREELAND_WINDOW_MANAGEMENT)
     {
-        return CompositorKind::Treeland;
+        return Some(CompositorKind::Treeland);
     }
     if interfaces.contains(&ORG_KDE_WINDOW_MANAGEMENT) {
-        return CompositorKind::DeepinKwin;
+        return Some(CompositorKind::DeepinKwin);
     }
-    CompositorKind::Unknown
+    None
 }
 
 /// 连接真实显示环境并检测合成器形态。
 ///
 /// 先试 Wayland（`$WAYLAND_DISPLAY`），成功后读 registry globals 分类；
-/// Wayland 不可用且 `DISPLAY` 存在 → X11。两者皆缺 → Unknown（错误不抛，
+/// Wayland 不可用且 `DISPLAY` 存在 → X11。两者皆缺 → `None`（错误不抛，
 /// 由装配方决定降级链——DdeCompositor 构造时才需要硬失败）。
-pub async fn detect_compositor() -> CompositorKind {
+pub async fn detect_compositor() -> Option<CompositorKind> {
     // 同步 wayland-client 调用包进阻塞安全上下文（连接含 roundtrip IO）。
     let wl = tokio::task::spawn_blocking(WaylandDisplayServer::connect);
     let wl = match wl.await {
@@ -99,9 +96,9 @@ pub async fn detect_compositor() -> CompositorKind {
         return classify(true, &interfaces);
     }
     if std::env::var_os("DISPLAY").is_some_and(|d| !d.is_empty()) {
-        return CompositorKind::X11;
+        return Some(CompositorKind::X11);
     }
-    CompositorKind::Unknown
+    None
 }
 
 #[cfg(test)]
@@ -112,22 +109,19 @@ mod tests {
     fn treeland_wins_over_deepin_kwin() {
         // D9：优先 Treeland 协议通道。
         let kwin_only = vec![ORG_KDE_WINDOW_MANAGEMENT];
-        assert_eq!(classify(true, &kwin_only), CompositorKind::DeepinKwin);
+        assert_eq!(classify(true, &kwin_only), Some(CompositorKind::DeepinKwin));
 
         let both = vec![ORG_KDE_WINDOW_MANAGEMENT, TREELAND_FOREIGN_TOPLEVEL];
-        assert_eq!(classify(true, &both), CompositorKind::Treeland);
+        assert_eq!(classify(true, &both), Some(CompositorKind::Treeland));
 
         let wm_variant = vec![TREELAND_WINDOW_MANAGEMENT];
-        assert_eq!(classify(true, &wm_variant), CompositorKind::Treeland);
+        assert_eq!(classify(true, &wm_variant), Some(CompositorKind::Treeland));
     }
 
     #[test]
-    fn no_wayland_means_unknown_here() {
-        assert_eq!(
-            classify(false, &[ORG_KDE_WINDOW_MANAGEMENT]),
-            CompositorKind::Unknown
-        );
-        assert_eq!(classify(true, &[]), CompositorKind::Unknown);
+    fn no_detected_compositor_is_none() {
+        assert_eq!(classify(false, &[ORG_KDE_WINDOW_MANAGEMENT]), None);
+        assert_eq!(classify(true, &[]), None);
     }
 
     #[test]

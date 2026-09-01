@@ -17,7 +17,9 @@
 //!
 //! 检测顺序由 core::de_detection 保证「先判 DDE 再判 KDE」（deepin-kwin
 //! 注册 org.kde.KWin 但 XDG_CURRENT_DESKTOP=Deepin）；本组件只在已确认
-//! DDE 后装配，`name()` 按 §10.2 返回 "DDE (Wayland, deepin-kwin)"。
+//! DDE 后装配，`name()` 返回静态标识 `"dde-compositor"`——具体分支细节
+//! （deepin-kwin / Treeland / X11）由 [`DdeCompositor::doctor_lines_async`]
+//! 呈现。
 
 use std::sync::Arc;
 
@@ -96,7 +98,11 @@ impl DdeCompositor {
     /// 不可用才报 BackendUnavailable。DdeApi 服务族探测失败只记入
     /// [`DdeVersion`]（health 表达），不让系统服务缺席拖垮窗口管理。
     pub async fn connect() -> Result<Self> {
-        let kind = detect_compositor().await;
+        let kind = detect_compositor().await.ok_or_else(|| {
+            AgentShellError::BackendUnavailable(
+                "no usable DDE compositor channel detected".to_string(),
+            )
+        })?;
         let compositor = match kind {
             CompositorKind::DeepinKwin => {
                 Compositor::DeepinKwin(Box::new(KWinCompositor::new_wayland().await?))
@@ -114,11 +120,6 @@ impl DdeCompositor {
                 }
             }
             CompositorKind::X11 => Compositor::X11(Box::new(KWinCompositor::new_x11().await?)),
-            CompositorKind::Unknown => {
-                return Err(AgentShellError::BackendUnavailable(format!(
-                    "no usable DDE compositor channel detected (kind={kind:?})"
-                )));
-            }
         };
         let version = probe_service_families().await;
         Ok(Self {
@@ -451,7 +452,7 @@ mod tests {
         // treeland_* 出现则优先 Treeland（D9）。
         assert_eq!(
             classify(true, &["org_kde_plasma_window_management"]),
-            CompositorKind::DeepinKwin
+            Some(CompositorKind::DeepinKwin)
         );
         assert_eq!(
             classify(
@@ -461,7 +462,7 @@ mod tests {
                     "treeland_foreign_toplevel_manager_v1"
                 ]
             ),
-            CompositorKind::Treeland
+            Some(CompositorKind::Treeland)
         );
     }
 

@@ -2025,8 +2025,6 @@ pub enum CompositorKind {
     Treeland,
     DeepinKwin,
     X11,
-    #[default]
-    Unknown,
 }
 
 pub enum Compositor {
@@ -2045,16 +2043,16 @@ pub struct DdeCompositor {
 
 **Compositor 检测**（`backends/dde/src/compositor.rs`）：
 ```rust
-pub fn classify(wl_connected: bool, interfaces: &[&str]) -> CompositorKind {
+pub fn classify(wl_connected: bool, interfaces: &[&str]) -> Option<CompositorKind> {
     // treeland_foreign_toplevel_manager_v1 或 treeland_window_management_v1 → Treeland
     // org_kde_plasma_window_management → DeepinKwin
-    // 否则 Unknown
+    // 否则 None
 }
 
-pub async fn detect_compositor() -> CompositorKind {
+pub async fn detect_compositor() -> Option<CompositorKind> {
     // 1. 连接 $WAYLAND_DISPLAY，读 registry globals → classify(true, interfaces)
     // 2. Wayland 不可用且 DISPLAY 存在 → X11
-    // 3. 两者皆缺 → Unknown
+    // 3. 两者皆缺 → None
 }
 ```
 
