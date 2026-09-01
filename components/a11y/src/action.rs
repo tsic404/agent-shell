@@ -183,9 +183,9 @@ impl ElementActions {
         )))
     }
 
-    /// 获取元素文本：`GetText(0, i32::MAX)` 取全文（设计 §14.4 用 -1 表
-    /// 全文，但 Qt atspi 实现按字面区间处理负值会出错——实测以
-    /// CharacterCount 上界替代）。
+    /// 获取元素文本：`GetText(0, CharacterCount)` 取全文——CharacterCount
+    /// 语义等价全文；Qt atspi 对负值区间按字面处理实测不可靠，故不用
+    /// -1 作终点。
     pub async fn get_text(&self, element: &ElementNode) -> Result<String> {
         let text = self
             .bridge
@@ -195,9 +195,7 @@ impl ElementActions {
                 "org.a11y.atspi.Text",
             )
             .await?;
-        // 终点偏移：设计 §14.4 原文是 -1（AT-SPI 惯例表「取到结尾」），
-        // 但 Qt atspi 实现按字面区间处理负值会返回空/出错（实测），
-        // 故改用 CharacterCount 作为终点——语义等价（全文），跨实现安全。
+        // 终点偏移用 CharacterCount 而非 -1：Qt atspi 按字面区间处理负值会出错
         let count: i32 = text
             .get_property("CharacterCount")
             .await
