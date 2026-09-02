@@ -5,6 +5,8 @@
 //! 默认 keymap（PC/AT evdev+8）。构造失败（无 DISPLAY / 连接拒绝 /
 //! 扩展不可用）由 dispatcher 跳过该候选。
 
+use std::sync::Arc;
+
 use x11rb::connection::Connection as _;
 
 use agent_shell_core::error::{AgentShellError, Result};
@@ -19,7 +21,7 @@ use super::dispatcher::InputService;
 
 /// XTest 注入后端：持有独立 X11 连接。
 pub struct XTestInput {
-    conn: RustConnection,
+    conn: Arc<RustConnection>,
     root: Window,
     /// 扩展版本协商结果（构造时探测）。
     available: bool,
@@ -50,7 +52,7 @@ impl XTestInput {
             ));
         }
         Ok(Self {
-            conn,
+            conn: Arc::new(conn),
             root,
             available,
             inject_lock: Mutex::new(()),
@@ -67,16 +69,32 @@ impl XTestInput {
         }
     }
 
+    /// 在阻塞线程池上执行同步 x11rb I/O，避免长 `type_text` 饿死 tokio
+    /// worker（事件订阅等并发任务）——见 §19 审查项：XTest 是同步协议。
+    async fn with_conn<F, T>(&self, f: F) -> Result<T>
+    where
+        F: FnOnce(&RustConnection) -> Result<T> + Send + 'static,
+        T: Send + 'static,
+    {
+        let conn = Arc::clone(&self.conn);
+        tokio::task::spawn_blocking(move || f(&conn))
+            .await
+            .map_err(|e| AgentShellError::Input(format!("x11 blocking task join: {e}")))?
+    }
+
     async fn fake_key(&self, keycode: u8, is_press: bool) -> Result<()> {
         let type_ = if is_press {
             KEY_PRESS_EVENT
         } else {
             KEY_RELEASE_EVENT
         };
-        self.conn
-            .xtest_fake_input(type_, keycode, x11rb::CURRENT_TIME, self.root, 0, 0, 0)
-            .map_err(xerr)?;
-        self.conn.flush().map_err(xerr)
+        let root = self.root;
+        self.with_conn(move |conn| {
+            conn.xtest_fake_input(type_, keycode, x11rb::CURRENT_TIME, root, 0, 0, 0)
+                .map_err(xerr)?;
+            conn.flush().map_err(xerr)
+        })
+        .await
     }
 
     async fn fake_button(&self, button: u8, is_press: bool) -> Result<()> {
@@ -85,10 +103,13 @@ impl XTestInput {
         } else {
             BUTTON_RELEASE_EVENT
         };
-        self.conn
-            .xtest_fake_input(type_, button, x11rb::CURRENT_TIME, self.root, 0, 0, 0)
-            .map_err(xerr)?;
-        self.conn.flush().map_err(xerr)
+        let root = self.root;
+        self.with_conn(move |conn| {
+            conn.xtest_fake_input(type_, button, x11rb::CURRENT_TIME, root, 0, 0, 0)
+                .map_err(xerr)?;
+            conn.flush().map_err(xerr)
+        })
+        .await
     }
 
     /// 键码序列注入：修饰键 → 实体键按下，整体逆序释放；临时 shift 补齐。
@@ -312,7 +333,7 @@ impl InputService for XTestInput {
                 tokio::time::sleep(std::time::Duration::from_millis(delay_ms as u64)).await;
             }
         }
-        self.conn.flush().map_err(xerr)
+        self.with_conn(|conn| conn.flush().map_err(xerr)).await
     }
 
     async fn mouse_move(&self, x: i32, y: i32) -> Result<()> {
@@ -327,18 +348,13 @@ impl InputService for XTestInput {
                 )))
             }
         };
-        self.conn
-            .xtest_fake_input(
-                MOTION_NOTIFY_EVENT,
-                0,
-                x11rb::CURRENT_TIME,
-                self.root,
-                x,
-                y,
-                0,
-            )
-            .map_err(xerr)?;
-        self.conn.flush().map_err(xerr)
+        let root = self.root;
+        self.with_conn(move |conn| {
+            conn.xtest_fake_input(MOTION_NOTIFY_EVENT, 0, x11rb::CURRENT_TIME, root, x, y, 0)
+                .map_err(xerr)?;
+            conn.flush().map_err(xerr)
+        })
+        .await
     }
 
     async fn mouse_click(&self, button: MouseButton) -> Result<()> {

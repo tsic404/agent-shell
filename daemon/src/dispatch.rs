@@ -63,7 +63,7 @@ pub async fn dispatch(daemon: &mut Daemon, req: &Request) -> Response {
         method::WINDOW_OP => window_op(daemon, req).await,
         method::WORKSPACES_LIST => workspaces_list(daemon).await,
         method::WORKSPACE_SWITCH => workspace_switch(daemon, req).await,
-        method::INPUT_SEND => blocking_input_send(req).await,
+        method::INPUT_SEND => input_send(daemon, req).await,
         method::SCREENSHOT_CAPTURE => screenshot_capture(daemon, req).await,
         method::A11Y_STATUS => a11y_status().await,
         method::A11Y_QUERY => a11y_query(daemon, req).await,
@@ -285,9 +285,27 @@ async fn doctor(d: &mut Daemon) -> RpcResult {
     lines.push(crate::a11y::atspi_line());
     // 4. capture 组件（三级降级链状态，§13）。
     lines.push(agent_shell_capture::doctor_line(d.capture.as_ref()).await);
+    // 5. input 组件（libei → ydotool → XTest 降级链，§12）。
+    lines.push(input_doctor_line(d));
     let healthy = !lines.iter().any(|l| l.starts_with('✗'));
     let r = DoctorResult { lines, healthy };
     Ok(serde_json::to_value(r).expect("DoctorResult serializable"))
+}
+
+/// input 组件 doctor 行（§12 降级链状态；None = TTY/全后端探测失败）。
+fn input_doctor_line(d: &Daemon) -> String {
+    const LABEL: &str = "输入后端";
+    match d.input.as_ref() {
+        None => format!("✗ {LABEL:<12}: 不可用（TTY 或无注入后端）"),
+        Some(handle) => {
+            let chain = handle.dispatcher().backend_names().join(" → ");
+            // detect 仅在选出 active 后端时返回 Ok，故 backend_name 恒 Some。
+            let name = handle
+                .backend_name()
+                .expect("detect guarantees an active backend");
+            format!("✓ {LABEL:<12}: {chain}（选中 {name}）")
+        }
+    }
 }
 
 async fn compositor_doctor_lines(d: &Daemon) -> Vec<String> {
@@ -407,16 +425,20 @@ async fn workspace_switch(d: &Daemon, req: &Request) -> RpcResult {
 
 // ───────────────────────── input ─────────────────────────
 
-/// 输入注入：daemon 经其持久化 X11/XTest 通道执行。
-///
-/// XTest 是同步 I/O——经 `spawn_blocking` 执行，不阻塞 tokio worker
-/// 线程（与 a11y_status 同口径）。
-async fn blocking_input_send(req: &Request) -> RpcResult {
+/// 输入注入：daemon 经 `InputComponentHandle` 降级链（libei → ydotool →
+/// XTest → xdotool）执行。参数校验先于后端探测——坏载荷返回 InvalidParams，
+/// 不被 BackendUnavailable 掩盖（CI 无显示服务器环境回归锚定）。
+async fn input_send(d: &mut Daemon, req: &Request) -> RpcResult {
     let p: InputParams = serde_json::from_value(params_of(req)?.clone())
         .map_err(|e| (RpcErrorCode::InvalidParams, format!("bad params: {e}")))?;
-    tokio::task::spawn_blocking(move || crate::input::execute(p.kind, &p.payload))
-        .await
-        .map_err(|e| (RpcErrorCode::InternalError, e.to_string()))??;
+    let op = crate::input::prepare(p.kind, &p.payload)?;
+    let input = d.input.as_ref().ok_or_else(|| {
+        (
+            RpcErrorCode::BackendUnavailable,
+            "input unavailable in this session".into(),
+        )
+    })?;
+    crate::input::execute(input.dispatcher(), op).await?;
     Ok(json!({ "ok": true }))
 }
 

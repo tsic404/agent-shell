@@ -390,8 +390,8 @@ dependencies = [
  "agent-shell-capture",
  "agent-shell-compositor-kwin",
  "agent-shell-core",
- "agent-shell-displayserver-x11",
  "agent-shell-event",
+ "agent-shell-input",
  "agent-shell-rpc",
  "dirs",
  "libc",
@@ -402,7 +402,6 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
- "x11rb",
  "zbus",
 ]
 

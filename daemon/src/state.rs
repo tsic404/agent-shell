@@ -104,6 +104,8 @@ pub struct Daemon {
     pub idle_timeout: Duration,
     /// capture 组件（三级降级链；None = 全后端探测失败，TTY 场景）。
     pub capture: Option<CaptureDispatcher>,
+    /// input 组件（libei → ydotool → XTest 降级链；None = 全后端探测失败，TTY 场景）。
+    pub input: Option<agent_shell_input::InputComponentHandle>,
     /// Portal 会话管理器（§22.6 D5）。
     pub portal_sessions: std::sync::Arc<crate::portal_sessions::PortalSessionManager>,
     /// IME 会话（§22.8 D7）。
@@ -147,6 +149,11 @@ impl Daemon {
                 None
             }
         };
+        // 输入降级链（libei → ydotool → XTest）：与 compositor 独立装配，
+        // TTY/无后端会话探测失败返回 None，input.send 报 BackendUnavailable。
+        let de_type = agent_shell_core::de_detection::detect_desktop_environment();
+        let input = agent_shell_input::detect(de_type).await.ok();
+
         // PortalSessionManager 先建——注入 CaptureDispatcher 作 TokenStore，
         // 使 ScreenCast 能 restore_token 静默恢复（§22.7 D5）。
         let portal_sessions = std::sync::Arc::new(
@@ -165,6 +172,7 @@ impl Daemon {
         Self {
             compositor,
             capture: CaptureDispatcher::with_token_store(Some(token_store)).await,
+            input,
             cache: Vec::new(),
             cached_at: None,
             idle_timeout,
@@ -469,6 +477,7 @@ mod tests {
             cached_at: None,
             idle_timeout: Duration::from_secs(1),
             capture: None,
+            input: None,
             portal_sessions: std::sync::Arc::new(
                 crate::portal_sessions::PortalSessionManager::new(
                     crate::single_instance::state_dir(),
