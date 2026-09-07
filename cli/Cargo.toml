@@ -10,6 +10,12 @@ description = "agent-shell CLI entry point — pure JSON-RPC client to daemon (�
 name = "agent-shell"
 path = "src/main.rs"
 
+# 测试夹具：模拟 pre-21c7267 旧 daemon 的 info.show 线格式（TSI-2873）。
+# 仅被 cli/tests/mixed_version_e2e.rs 以子进程方式拉起，不参与生产安装。
+[[bin]]
+name = "agent-shell-legacy-daemon"
+path = "src/bin/legacy_daemon.rs"
+
 [dependencies]
 # CLI 不直连任何系统服务：仅依赖 rpc 协议 crate（+ clap/tokio 传输）。
 agent-shell-rpc.workspace = true
