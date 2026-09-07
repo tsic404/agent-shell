@@ -247,7 +247,8 @@ impl KWinCompositor {
         lines.push(if event_loaded {
             "✓ 事件脚本    : loaded (workspace.windowAdded OK)".to_string()
         } else {
-            "⚠ 事件脚本    : not started (lazy; starts on first subscribe)".to_string()
+            "⚠ 事件脚本    : not started (lazy; daemon 事件归一化管线未装配，subscribe 未接线)"
+                .to_string()
         });
         lines
     }
