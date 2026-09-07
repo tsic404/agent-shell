@@ -679,13 +679,26 @@ where
         .join(", ")
 }
 
+/// `--at` 的统一格式提示：clap 解析误用（[`at_syntax_hint`]）与运行时
+/// 坐标解析失败（[`parse_xy_json`]）共用，保证两条失败路径给同一写法示例。
+const AT_SYNTAX_HINT: &str = "`--at` 需要单个 \"X,Y\" 坐标（如 `--at 100,200`）";
+
 /// 点击坐标 "X,Y" → JSON 数组 [x, y]（经 RPC 载荷传递）。
+///
+/// 解析失败的错误串附带 [`AT_SYNTAX_HINT`]，与 clap 层的 [`at_syntax_hint`]
+/// 同文案（运行时 `--at 100,abc` 此前缺少 X,Y 格式提示）。
 pub fn parse_xy_json(s: &str) -> Result<serde_json::Value, String> {
     let (a, b) = s
         .split_once(',')
-        .ok_or_else(|| format!("expected X,Y, got {s:?}"))?;
-    let x: i64 = a.trim().parse().map_err(|_| format!("bad X in {s:?}"))?;
-    let y: i64 = b.trim().parse().map_err(|_| format!("bad Y in {s:?}"))?;
+        .ok_or_else(|| format!("expected X,Y, got {s:?}；{AT_SYNTAX_HINT}"))?;
+    let x: i64 = a
+        .trim()
+        .parse()
+        .map_err(|_| format!("bad X in {s:?}；{AT_SYNTAX_HINT}"))?;
+    let y: i64 = b
+        .trim()
+        .parse()
+        .map_err(|_| format!("bad Y in {s:?}；{AT_SYNTAX_HINT}"))?;
     Ok(serde_json::json!([x, y]))
 }
 
@@ -710,10 +723,7 @@ pub fn at_syntax_hint(args: &[std::ffi::OsString], err: &clap::Error) -> Option<
         }
         _ => false,
     };
-    at_misuse.then(|| {
-        "`--at` 需要单个 \"X,Y\" 坐标（如 `--at 100,200`）；`--at 100 100` 或 `--at 100 --at 200` 均不可用"
-            .to_string()
-    })
+    at_misuse.then(|| format!("{AT_SYNTAX_HINT}；`--at 100 100` 或 `--at 100 --at 200` 均不可用"))
 }
 
 /// 是否存在某个 `--at`，其后继 token 不含逗号（坐标被拆成两个词）。
@@ -811,6 +821,15 @@ mod tests {
         let v = parse_xy_json("100, 200").expect("xy");
         assert_eq!(v, serde_json::json!([100, 200]));
         assert!(parse_xy_json("bad").is_err());
+    }
+
+    #[test]
+    fn parse_xy_json_error_includes_at_hint() {
+        // 运行时解析失败须给出 --at 100,200 写法示例（TSI-2875 缺口）。
+        for bad in ["bad", "100,abc", "abc,200"] {
+            let err = parse_xy_json(bad).unwrap_err();
+            assert!(err.contains("--at 100,200"), "{bad}: {err}");
+        }
     }
 
     #[test]
