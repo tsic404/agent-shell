@@ -632,26 +632,39 @@ fn parse_key_name(name: &str) -> Result<KeyName, String> {
     Ok(key)
 }
 
-/// 窗口目标解析：标题子串 / `id:<native_id>`（daemon 返回的 WindowEntry）。
+/// 窗口目标解析：标题子串 / `id:<native_id>` / 裸 `native_id`（daemon 返回的 WindowEntry）。
 ///
-/// 匹配顺序：显式 id 前缀 → app_id 精确/包含 → 标题精确 → 标题子串。
-/// 未命中时错误信息列出候选（QA 定位失败的常见原因是不在目标会话内）。
+/// 匹配顺序：显式 id（`id:` 前缀或与 `native_id` 精确相等）→ 标题精确 →
+/// 标题/app_id 子串。未命中时错误信息列出候选（QA 定位失败的常见原因是不在目标会话内）。
 pub fn resolve_target_entry<'a>(
     spec: &str,
     windows: &'a [agent_shell_rpc::WindowEntry],
 ) -> Result<&'a agent_shell_rpc::WindowEntry, String> {
     let matches: Vec<&agent_shell_rpc::WindowEntry> = match spec.strip_prefix("id:") {
-        Some(id) => windows.iter().filter(|w| w.native_id == id).collect(),
+        Some(id) => windows
+            .iter()
+            .filter(|w| native_id_matches(id, &w.native_id))
+            .collect(),
         None => {
-            let by_title_exact: Vec<_> = windows.iter().filter(|w| w.title == spec).collect();
-            if !by_title_exact.is_empty() {
-                by_title_exact
+            // 裸 native_id 回退：`windows list` 返回的 native_id（如 KWin 的
+            // `{uuid}`）可直接复用，无需改写为 `id:{uuid}`。
+            let by_id: Vec<_> = windows
+                .iter()
+                .filter(|w| native_id_matches(spec, &w.native_id))
+                .collect();
+            if !by_id.is_empty() {
+                by_id
             } else {
-                // 子串回退：标题或 app_id 包含。
-                windows
-                    .iter()
-                    .filter(|w| w.title.contains(spec) || w.app_id.contains(spec))
-                    .collect()
+                let by_title_exact: Vec<_> = windows.iter().filter(|w| w.title == spec).collect();
+                if !by_title_exact.is_empty() {
+                    by_title_exact
+                } else {
+                    // 子串回退：标题或 app_id 包含。
+                    windows
+                        .iter()
+                        .filter(|w| w.title.contains(spec) || w.app_id.contains(spec))
+                        .collect()
+                }
             }
         }
     };
@@ -666,6 +679,21 @@ pub fn resolve_target_entry<'a>(
             titles(matches.into_iter())
         )),
     }
+}
+
+/// 候选 id 是否命中 native_id：精确相等，或互为 `{...}` 包裹形式。
+///
+/// KWin `internalId.toString()` 产出 `{uuid}`，用户可能裸传 `uuid` 或原文
+/// `{uuid}`；剥离单层花括号后比较可同时覆盖两种写法。
+fn native_id_matches(candidate: &str, native_id: &str) -> bool {
+    candidate == native_id || strip_braces(candidate) == strip_braces(native_id)
+}
+
+/// 剥离单层 `{...}` 花括号；非包裹形式原样返回。
+fn strip_braces(s: &str) -> &str {
+    s.strip_prefix('{')
+        .and_then(|rest| rest.strip_suffix('}'))
+        .unwrap_or(s)
 }
 
 fn titles<'a, I>(windows: I) -> String
@@ -814,6 +842,31 @@ mod tests {
         // 歧义要求 id: 消歧。
         let amb = resolve_target_entry("doc", &wins).unwrap_err();
         assert!(amb.contains("disambiguate"), "{amb}");
+    }
+
+    #[test]
+    fn resolve_target_entry_accepts_bare_native_id() {
+        // KWin `internalId.toString()` 产出 `{uuid}`；`windows list` 直接复制的
+        // 原文 `{uuid}` 与裸 `uuid` 均应命中，无需改写为 `id:{uuid}`。
+        let wins = vec![entry("{e6f8-4a2c}", "Editor"), entry("w2", "Terminal")];
+        assert_eq!(
+            resolve_target_entry("{e6f8-4a2c}", &wins)
+                .expect("braced native_id")
+                .native_id,
+            "{e6f8-4a2c}"
+        );
+        assert_eq!(
+            resolve_target_entry("e6f8-4a2c", &wins)
+                .expect("bare native_id")
+                .native_id,
+            "{e6f8-4a2c}"
+        );
+        assert_eq!(
+            resolve_target_entry("id:e6f8-4a2c", &wins)
+                .expect("id prefix with bare uuid")
+                .native_id,
+            "{e6f8-4a2c}"
+        );
     }
 
     #[test]
