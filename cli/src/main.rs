@@ -47,8 +47,8 @@ async fn dispatch(args: Cli) -> CmdResult {
 async fn dispatch_command(command: Command, out: OutputFormat) -> CmdResult {
     let mut c = DaemonClient::connect().await?;
     match command {
-        Command::Doctor => doctor(&mut c).await,
-        Command::Info => info(&mut c).await,
+        Command::Doctor => doctor(out, &mut c).await,
+        Command::Info => info(out, &mut c).await,
         Command::Windows(cmd) => windows(out, &mut c, cmd).await,
         Command::Workspaces(cmd) => workspaces(&mut c, cmd).await,
         Command::Input(cmd) => input(&mut c, cmd).await,
@@ -81,22 +81,53 @@ async fn dispatch_command(command: Command, out: OutputFormat) -> CmdResult {
 
 // ───────────────────────── doctor / info ─────────────────────────
 
-async fn doctor(c: &mut DaemonClient) -> CmdResult {
+async fn doctor(out: OutputFormat, c: &mut DaemonClient) -> CmdResult {
     let report = c.doctor().await?;
-    for line in &report.lines {
-        println!("{line}");
-    }
+    println!("{}", render_doctor(out, &report));
     Ok(if report.healthy { 0 } else { 2 })
 }
 
-async fn info(c: &mut DaemonClient) -> CmdResult {
+async fn info(out: OutputFormat, c: &mut DaemonClient) -> CmdResult {
     let r = c.info().await?;
-    println!("{}", r.detection);
-    println!("backend           : kwin-compositor (via daemon)");
-    for (name, status) in &r.capabilities {
-        println!("{:<24} {}", name, render_capability(status));
-    }
+    println!("{}", render_info(out, &r));
     Ok(0)
+}
+
+/// `doctor` 输出渲染：JSON 走结构化序列化，table 走逐行诊断文本。
+fn render_doctor(out: OutputFormat, report: &agent_shell_rpc::DoctorResult) -> String {
+    match out {
+        OutputFormat::Json => {
+            serde_json::to_string_pretty(report).expect("DoctorResult serializable")
+        }
+        OutputFormat::Table => report.lines.join("\n"),
+    }
+}
+
+/// `info` 报告的 backend 展示值。table 与 JSON 双格式共享同一常量，
+/// 保证两种输出信息等价（agent 自动化从 JSON 即可获知后端身份）。
+const INFO_BACKEND: &str = "kwin-compositor (via daemon)";
+
+/// `info` 输出渲染：JSON 走结构化序列化（含 backend），table 走检测摘要 + 能力位表。
+fn render_info(out: OutputFormat, r: &agent_shell_rpc::InfoResult) -> String {
+    match out {
+        OutputFormat::Json => {
+            let mut v = serde_json::to_value(r).expect("InfoResult serializable");
+            v.as_object_mut()
+                .expect("InfoResult serializes as object")
+                .insert("backend".to_owned(), Value::String(INFO_BACKEND.to_owned()));
+            serde_json::to_string_pretty(&v).expect("info json serializable")
+        }
+        OutputFormat::Table => {
+            let mut s = String::new();
+            s.push_str(&r.detection);
+            s.push_str("\nbackend           : ");
+            s.push_str(INFO_BACKEND);
+            for (name, status) in &r.capabilities {
+                s.push_str(&format!("\n{name:<24} {}", render_capability(status)));
+            }
+            s
+        }
+    }
 }
 
 /// 能力三态 → 终端标记。`Lazy` 与 doctor 的 ⚠ 事件脚本行同语义：
@@ -1125,11 +1156,12 @@ mod tests {
     use super::{
         a11y_query_exit_code, is_auth_required, job_status_outcome, log_query_timeout_error,
         parse_log_filter, pkg_failed_job_line, process_rootd_error, render_capability,
-        security_audit_params, security_request, sysctl_rpc_error, sysctl_set_accepted_line,
-        wait_for_job_impl, JobStatusSource, LOG_QUERY_TIMEOUT,
+        render_doctor, render_info, security_audit_params, security_request, sysctl_rpc_error,
+        sysctl_set_accepted_line, wait_for_job_impl, JobStatusSource, LOG_QUERY_TIMEOUT,
     };
     use crate::client::CallError;
-    use crate::RpcErrorCode;
+    use crate::{CapabilityStatus, OutputFormat, RpcErrorCode};
+    use agent_shell_rpc::{DoctorResult, InfoResult};
     use serde_json::{json, Value};
     use std::collections::VecDeque;
     use std::time::Duration;
@@ -1142,6 +1174,63 @@ mod tests {
         assert_eq!(
             render_capability(&crate::CapabilityStatus::Lazy),
             "⚠ (lazy)"
+        );
+    }
+
+    #[test]
+    fn render_info_json_is_structured_and_keeps_capabilities() {
+        // info --output-format json 应输出结构化对象，供 agent 自动化解析。
+        let r = InfoResult {
+            detection: "KDE (wayland)".into(),
+            capabilities: vec![
+                ("window_management".into(), CapabilityStatus::Enabled),
+                ("native_capture".into(), CapabilityStatus::Lazy),
+            ],
+        };
+        let v: Value = serde_json::from_str(&render_info(OutputFormat::Json, &r))
+            .expect("render_info json must parse");
+        assert_eq!(v["backend"], "kwin-compositor (via daemon)");
+        assert_eq!(v["detection"], "KDE (wayland)");
+        assert_eq!(v["capabilities"][0][0], "window_management");
+        assert_eq!(v["capabilities"][0][1], "enabled");
+        assert_eq!(v["capabilities"][1][1], "lazy");
+    }
+
+    #[test]
+    fn render_info_table_preserves_detection_and_markers() {
+        // table 模式行为保持不变：检测摘要 + backend 行 + 能力位表标记。
+        let r = InfoResult {
+            detection: "KDE (wayland)".into(),
+            capabilities: vec![("window_management".into(), CapabilityStatus::Enabled)],
+        };
+        let out = render_info(OutputFormat::Table, &r);
+        assert!(out.starts_with("KDE (wayland)\nbackend           : kwin-compositor (via daemon)"));
+        assert!(out.contains("window_management"));
+        assert!(out.contains("✓"));
+    }
+
+    #[test]
+    fn render_doctor_json_is_structured() {
+        // doctor --output-format json 应输出 {lines, healthy} 结构。
+        let report = DoctorResult {
+            lines: vec!["✓ DE 检测 : KDE".into()],
+            healthy: true,
+        };
+        let v: Value = serde_json::from_str(&render_doctor(OutputFormat::Json, &report))
+            .expect("render_doctor json must parse");
+        assert_eq!(v["healthy"], true);
+        assert_eq!(v["lines"][0], "✓ DE 检测 : KDE");
+    }
+
+    #[test]
+    fn render_doctor_table_joins_lines() {
+        let report = DoctorResult {
+            lines: vec!["line-a".into(), "line-b".into()],
+            healthy: false,
+        };
+        assert_eq!(
+            render_doctor(OutputFormat::Table, &report),
+            "line-a\nline-b"
         );
     }
 
