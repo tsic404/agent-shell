@@ -1,7 +1,7 @@
 # Agent Shell — Linux Desktop Agent Shell 设计文档
 
 > 版本：v1.0 · 2026-08-20
-> 作者：tsip404
+> 作者：tsic404
 > 状态：Draft
 
 ---

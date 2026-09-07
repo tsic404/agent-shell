@@ -44,7 +44,7 @@ members = [
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
-repository = "https://github.com/tsip404/agent-shell"
+repository = "https://github.com/tsic404/agent-shell"
 
 [workspace.dependencies]
 agent-shell-core = { path = "core" }
