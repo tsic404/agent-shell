@@ -14,6 +14,10 @@ pub struct Cli {
     #[arg(long = "output-format", global = true, default_value = "table")]
     pub output_format: OutputFormat,
 
+    /// 「daemon 连接提前关闭」时重建连接重试次数（§19 短退避）
+    #[arg(long = "retry", global = true, default_value_t = 0)]
+    pub retry: u32,
+
     #[command(subcommand)]
     pub command: Option<Command>,
 }

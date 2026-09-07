@@ -11,6 +11,7 @@
 use agent_shell_rpc::{method, Request, Response};
 use serde_json::{json, Value};
 use std::process::Stdio;
+use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 /// 结构化调用错误：RPC 错误携带 code，便于调用方按退出码分派
@@ -37,12 +38,22 @@ impl From<String> for CallError {
     }
 }
 
+/// 连接提前关闭错误前缀——`read_line` 收到 EOF（daemon 在写出响应前退出）
+/// 时返回。CLI 侧 `--retry` 重建连接重试，`subscribe` 据此判定流结束。
+const CLOSED_EARLY: &str = "daemon closed connection before responding";
+
+/// 连接重建后的短退避（毫秒）。portal/DBus 会话就绪竞态通常在百毫秒级
+/// 恢复（§19 短退避）。
+const RETRY_BACKOFF_MS: u64 = 150;
+
 /// 一个 daemon 连接上的客户端会话。
 pub struct DaemonClient {
     child: Option<tokio::process::Child>,
     stdin: tokio::process::ChildStdin,
     reader: BufReader<tokio::process::ChildStdout>,
     next_id: u64,
+    /// 「连接提前关闭」时的重建重试次数（`--retry N` 注入）。
+    retries: u32,
 }
 
 impl Drop for DaemonClient {
@@ -56,8 +67,13 @@ impl Drop for DaemonClient {
 }
 
 impl DaemonClient {
-    /// 建立到 daemon 的连接并完成握手探测。
+    /// 建立到 daemon 的连接（不重试「连接提前关闭」）。
     pub async fn connect() -> Result<Self, String> {
+        Self::connect_with_retries(0).await
+    }
+
+    /// 建立到 daemon 的连接并配置「连接提前关闭」时的重建重试次数。
+    pub async fn connect_with_retries(retries: u32) -> Result<Self, String> {
         // 自动激活：spawn 前台 daemon 子进程（stdio 管道承载 JSON-RPC）。
         // D-Bus/systemd activation 形态由 unit 层提供同名二进制；CLI 统一
         // 走 spawn 路径保证行为一致（首次查询 ~100ms 启动延迟可接受）。
@@ -76,6 +92,7 @@ impl DaemonClient {
             stdin,
             reader: BufReader::new(stdout),
             next_id: 1,
+            retries,
         })
     }
 
@@ -88,14 +105,47 @@ impl DaemonClient {
             .await
             .map_err(|e| format!("daemon read: {e}"))?;
         if n == 0 {
-            return Err("daemon closed connection before responding".into());
+            return Err(format!(
+                "{CLOSED_EARLY} (hint: daemon exited early — possible portal/DBus \
+                 session-permission failure or concurrent daemon startup; use --retry N \
+                 or ensure an active graphical login session)"
+            ));
+        }
+        // 半截响应：完整 JSON-RPC 行必以 `\n` 结尾（`to_line` 追加），读到 EOF
+        // 仍无换行说明 daemon 在写完一行前退出——归入传输层错误供 `--retry`
+        // 重建连接重试（TSI-2877 审查项 #2）。
+        if !line.ends_with('\n') {
+            return Err("daemon read: truncated response (EOF before newline)".into());
         }
         Ok(line)
     }
 
-    /// 单次请求往返。响应与 `events.notify` 通知共享行流，通知无 `id`——
-    /// 读到通知即跳过，直到拿到匹配本请求 id 的响应。
+    /// 单次请求往返，带「连接提前关闭」重建重试（§19 短退避）。
+    ///
+    /// daemon 可能在写出响应前退出（单实例锁竞争、portal GetSession 失败
+    /// 提前退出等）——此时按 `--retry N` 重建连接重试，避免偶发误报为
+    /// 「产品无响应」。仅传输层「提前关闭」触发重试；RPC 错误（有 code）
+    /// 与参数错误不重试。
     pub async fn call_rpc(&mut self, method: &str, params: Value) -> Result<Value, CallError> {
+        let mut attempt: u32 = 0;
+        loop {
+            match self.call_rpc_once(method, params.clone()).await {
+                Ok(v) => return Ok(v),
+                Err(CallError::Other(msg))
+                    if is_transport_error(&msg) && attempt < self.retries =>
+                {
+                    attempt += 1;
+                    tokio::time::sleep(Duration::from_millis(RETRY_BACKOFF_MS)).await;
+                    *self = Self::connect_with_retries(self.retries).await?;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    /// 单次请求往返（不重试）。响应与 `events.notify` 通知共享行流，通知无
+    /// `id`——读到通知即跳过，直到拿到匹配本请求 id 的响应。
+    async fn call_rpc_once(&mut self, method: &str, params: Value) -> Result<Value, CallError> {
         let id = self.next_id;
         self.next_id += 1;
         let req = if params.is_null() {
@@ -186,7 +236,7 @@ impl DaemonClient {
         loop {
             let line = match self.read_line().await {
                 Ok(l) => l,
-                Err(e) if e.contains("closed connection") => {
+                Err(e) if is_closed_early(&e) => {
                     eprintln!("event stream ended");
                     return Ok(());
                 }
@@ -223,6 +273,25 @@ impl DaemonClient {
     }
 }
 
+/// 传输层「连接提前关闭（EOF）」判定——`read_line` 收到 EOF（daemon 干净退出）。
+/// `subscribe` 据此判定事件流正常结束（exit 0）；其余传输错误（broken pipe /
+/// 读 I/O 错误）走 [`is_transport_error`] 归入 `--retry` 重试判定。
+fn is_closed_early(msg: &str) -> bool {
+    msg.contains(CLOSED_EARLY)
+}
+
+/// 传输层错误判定——daemon 连接在请求往返期间断开，均可重建连接重试：
+/// - 写侧/读侧 pipe 错误（`daemon write:` / `daemon flush:` / `daemon read:`）；
+/// - 读侧 EOF（`is_closed_early`）。
+///
+/// 与 RPC 错误（有 code）及协议错误（解析失败 / 响应 id 不符 / malformed）
+/// 区分——后者不重建连接重试。
+fn is_transport_error(msg: &str) -> bool {
+    msg.starts_with("daemon write:")
+        || msg.starts_with("daemon flush:")
+        || msg.starts_with("daemon read:")
+        || is_closed_early(msg)
+}
 /// 定位 daemon 二进制（委托 agent-shell-rpc::daemon_bin）。
 ///
 /// workspace target 目录用 `CARGO_MANIFEST_DIR` 拼绝对路径，不依赖 CWD
@@ -445,5 +514,40 @@ mod tests {
         let v = a11y_query_params(None, None, false);
         let obj = v.as_object().expect("params must be object");
         assert!(!obj.contains_key("all"), "all=false must be omitted");
+    }
+
+    /// `is_closed_early` 只命中读侧 EOF（daemon 干净退出）；`subscribe` 据此
+    /// 判流结束，不把 broken pipe 误判为流结束。
+    #[test]
+    fn is_closed_early_matches_only_eof() {
+        assert!(is_closed_early(
+            "daemon closed connection before responding (hint: ...)"
+        ));
+        assert!(!is_closed_early("daemon write: broken pipe"));
+        assert!(!is_closed_early("rpc error 1002: backend unavailable"));
+        assert!(!is_closed_early(""));
+    }
+
+    /// `is_transport_error` 必须命中写侧/读侧 pipe 传输错误与 EOF——daemon 在
+    /// 请求期间退出时三者同属可重建连接重试的失败模式（TSI-2877 审查项 #1），
+    /// 不得命中协议错误（响应 id 不符 / 解析失败）。
+    #[test]
+    fn is_transport_error_matches_pipe_failures_not_protocol() {
+        assert!(is_transport_error(
+            "daemon write: broken pipe (os error 32)"
+        ));
+        assert!(is_transport_error("daemon flush: broken pipe"));
+        assert!(is_transport_error("daemon read: broken pipe"));
+        // 半截响应：daemon 写出半行后退出（EOF 无换行）→ read_line 归一为
+        // 传输层错误，`--retry` 必须命中（TSI-2877 审查项 #2）。
+        assert!(is_transport_error(
+            "daemon read: truncated response (EOF before newline)"
+        ));
+        assert!(is_transport_error(
+            "daemon closed connection before responding (hint: ...)"
+        ));
+        assert!(!is_transport_error("response id mismatch: got 1 want 2"));
+        assert!(!is_transport_error("bad message: expected value"));
+        assert!(!is_transport_error("rpc error 1002: backend unavailable"));
     }
 }

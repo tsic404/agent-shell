@@ -48,14 +48,14 @@ type CmdResult = Result<i32, String>;
 async fn dispatch(args: Cli) -> CmdResult {
     // CLI 无状态：每条命令建一次连接（自动拉起 daemon，§22.2 激活策略）。
     match args.command {
-        Some(command) => dispatch_command(command, args.output_format).await,
-        None => repl::run_repl(args.output_format).await,
+        Some(command) => dispatch_command(command, args.output_format, args.retry).await,
+        None => repl::run_repl(args.output_format, args.retry).await,
     }
 }
 
 /// 分派具体子命令（REPL 与单次执行共用）。
-async fn dispatch_command(command: Command, out: OutputFormat) -> CmdResult {
-    let mut c = DaemonClient::connect().await?;
+async fn dispatch_command(command: Command, out: OutputFormat, retry: u32) -> CmdResult {
+    let mut c = DaemonClient::connect_with_retries(retry).await?;
     match command {
         Command::Doctor => doctor(out, &mut c).await,
         Command::Info => info(out, &mut c).await,

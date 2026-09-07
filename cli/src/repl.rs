@@ -10,7 +10,7 @@ use rustyline::error::ReadlineError;
 use rustyline::DefaultEditor;
 
 /// 进入 REPL 循环。返回退出码。
-pub async fn run_repl(out: OutputFormat) -> CmdResult {
+pub async fn run_repl(out: OutputFormat, retry: u32) -> CmdResult {
     let mut rl = DefaultEditor::new().map_err(|e| e.to_string())?;
     println!("agent-shell REPL — type 'exit' or 'quit' to leave.");
 
@@ -47,7 +47,7 @@ pub async fn run_repl(out: OutputFormat) -> CmdResult {
         match Cli::try_parse_from(argv.clone()) {
             Ok(args) => match args.command {
                 Some(command) => {
-                    if let Err(e) = dispatch_command(command, out).await {
+                    if let Err(e) = dispatch_command(command, out, retry).await {
                         eprintln!("error: {e}");
                     }
                 }
