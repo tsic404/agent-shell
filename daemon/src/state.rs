@@ -389,6 +389,15 @@ impl Daemon {
             .unwrap_or_default()
     }
 
+    /// 懒启动能力名集（事件流首次 `subscribe()` 才建立，激活前 false 非
+    /// 永久不可用）。无合成器时为空——`info` 据此把对应行标 `lazy` 而非 `✗`。
+    pub fn lazy_capabilities(&self) -> &'static [&'static str] {
+        self.compositor
+            .as_ref()
+            .map(|c| c.as_dyn().lazy_capabilities())
+            .unwrap_or(&[])
+    }
+
     /// doctor 报告用的合成器后端名。
     pub fn compositor_name(&self) -> &'static str {
         self.compositor

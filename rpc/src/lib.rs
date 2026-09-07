@@ -456,13 +456,80 @@ pub struct DoctorResult {
     pub healthy: bool,
 }
 
+/// info.show 能力状态。布尔不足以表达第三态——懒启动能力（如 KWin
+/// 事件脚本首次 `subscribe()` 才 load）在激活前为 false，但不代表永久
+/// 不可用；用 `Lazy` 与 `Disabled` 区分，避免 `info` 与 `doctor` 语义冲突。
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CapabilityStatus {
+    /// 能力可用。
+    Enabled,
+    /// 能力不可用。
+    Disabled,
+    /// 懒启动：首次订阅/调用时建立，激活前不可断言永久不可用。
+    Lazy,
+}
+
+impl CapabilityStatus {
+    /// 布尔真值映射（懒启动语义由调用方按能力名覆盖）。
+    pub fn from_bool(enabled: bool) -> Self {
+        if enabled {
+            Self::Enabled
+        } else {
+            Self::Disabled
+        }
+    }
+}
+
+/// 混合版本兼容：旧 daemon 的 `capabilities` 值是布尔，新线格式是
+/// snake_case 字符串。daemon 常驻用户会话、postinst 升级不重启，新 CLI
+/// 反序列化旧 daemon 的布尔时不能硬失败——故手写 `Deserialize` 同收两种，
+/// `Serialize` 仍走 snake_case 字符串（前向线格式）。
+impl<'de> Deserialize<'de> for CapabilityStatus {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct StatusVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for StatusVisitor {
+            type Value = CapabilityStatus;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("a boolean or a capability status string")
+            }
+
+            fn visit_bool<E>(self, enabled: bool) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(CapabilityStatus::from_bool(enabled))
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                match value {
+                    "enabled" => Ok(CapabilityStatus::Enabled),
+                    "disabled" => Ok(CapabilityStatus::Disabled),
+                    "lazy" => Ok(CapabilityStatus::Lazy),
+                    other => Err(E::unknown_variant(other, &["enabled", "disabled", "lazy"])),
+                }
+            }
+        }
+
+        deserializer.deserialize_any(StatusVisitor)
+    }
+}
+
 /// info.show 结果。
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct InfoResult {
     /// DE 检测摘要（core detect_report 渲染）。
     pub detection: String,
-    /// 能力位表：name → enabled。
-    pub capabilities: Vec<(String, bool)>,
+    /// 能力位表：name → 状态。
+    pub capabilities: Vec<(String, CapabilityStatus)>,
 }
 
 /// a11y.status 结果。
@@ -764,5 +831,39 @@ mod tests {
         let p: CaptureParams = serde_json::from_value(v).expect("de");
         assert_eq!(p.area, Some([0, 0, 800, 600]));
         assert_eq!(p.window, None);
+    }
+
+    /// 混合版本兼容（TSI-2822）：旧 daemon 发布尔 `capabilities` 值、新
+    /// daemon 发 snake_case 字符串，`CapabilityStatus` 两种都收，且新线格式
+    /// 字符串往返稳定。
+    #[test]
+    fn capability_status_roundtrips_bool_and_snake_case() {
+        // 旧布尔 JSON → 枚举。
+        assert_eq!(
+            serde_json::from_value::<CapabilityStatus>(json!(true)).expect("de bool"),
+            CapabilityStatus::Enabled
+        );
+        assert_eq!(
+            serde_json::from_value::<CapabilityStatus>(json!(false)).expect("de bool"),
+            CapabilityStatus::Disabled
+        );
+        // 新 snake_case 字符串 → 枚举。
+        assert_eq!(
+            serde_json::from_value::<CapabilityStatus>(json!("lazy")).expect("de str"),
+            CapabilityStatus::Lazy
+        );
+        // 枚举 → snake_case 字符串，且能原样反序列化回来。
+        for status in [
+            CapabilityStatus::Enabled,
+            CapabilityStatus::Disabled,
+            CapabilityStatus::Lazy,
+        ] {
+            let v = serde_json::to_value(status).expect("ser");
+            assert!(v.is_string(), "serialized must be a string, got {v}");
+            assert_eq!(
+                serde_json::from_value::<CapabilityStatus>(v).expect("de roundtrip"),
+                status
+            );
+        }
     }
 }

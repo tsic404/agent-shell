@@ -291,6 +291,16 @@ impl CompositorComponent for DdeCompositor {
         }
     }
 
+    /// 懒启动能力随分支后端声明：deepin-kwin / X11 复用 KWin 事件脚本
+    /// （首次 subscribe 才 load）；Treeland 无懒启动事件流。
+    fn lazy_capabilities(&self) -> &'static [&'static str] {
+        match &self.compositor {
+            Compositor::DeepinKwin(kwin) => kwin.lazy_capabilities(),
+            Compositor::Treeland { .. } => &[],
+            Compositor::X11(kwin) => kwin.lazy_capabilities(),
+        }
+    }
+
     async fn list_windows(&self) -> Result<Vec<WindowInfo>> {
         self.delegate_list_windows().await
     }

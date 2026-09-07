@@ -8,8 +8,8 @@ use agent_shell_core::error::AgentShellError;
 use agent_shell_core::security::{Operation, PermissionDecision, PermissionLevel};
 use agent_shell_core::types::{SemanticTarget, WindowInfo};
 use agent_shell_rpc::{
-    method, A11yElementResult, A11yQueryResult, A11yStatusResult, CaptureParams, DoctorResult,
-    InfoResult, InputParams, Request, Response, RpcErrorCode, WindowOpKind,
+    method, A11yElementResult, A11yQueryResult, A11yStatusResult, CapabilityStatus, CaptureParams,
+    DoctorResult, InfoResult, InputParams, Request, Response, RpcErrorCode, WindowOpKind,
 };
 use event::EventFilter;
 use serde_json::{json, Value};
@@ -318,22 +318,61 @@ async fn compositor_doctor_lines(d: &Daemon) -> Vec<String> {
     }
 }
 
+/// 能力位 → 展示状态：懒启动能力仅在尚未启用（`!enabled`）时标 Lazy，
+/// 其余按布尔真值映射。`info` 与测试共用，避免三态映射逻辑漂移。
+fn capability_status(lazy: &'static [&'static str], name: &str, enabled: bool) -> CapabilityStatus {
+    if lazy.contains(&name) && !enabled {
+        CapabilityStatus::Lazy
+    } else {
+        CapabilityStatus::from_bool(enabled)
+    }
+}
+
 async fn info(d: &Daemon) -> RpcResult {
     let detection = agent_shell_core::de_detection::detect_report_for_doctor();
     // 能力位表逐字段来自合成器声明（TSI-2501/2486 反模式：不得硬编码）。
     // capture 组件独立于 compositor（纯 X11 会话仍可截图），native_capture
     // 由 capture 探针真值决定（与 TSI-2569 的 Treeland window_management:false 同源）。
     let caps = d.compositor_capabilities();
+    let lazy = d.lazy_capabilities();
+    let status = |name: &str, enabled: bool| capability_status(lazy, name, enabled);
     let capabilities = vec![
-        ("window_management".into(), caps.window_management),
-        ("workspace_management".into(), caps.workspace_management),
-        ("monitor_layout".into(), caps.monitor_layout),
-        ("window_events".into(), caps.window_events),
-        ("workspace_events".into(), caps.workspace_events),
-        ("native_input".into(), caps.native_input),
-        ("native_capture".into(), d.capture.is_some()),
-        ("virtual_desktops".into(), caps.virtual_desktops),
-        ("effects_control".into(), caps.effects_control),
+        (
+            "window_management".into(),
+            status("window_management", caps.window_management),
+        ),
+        (
+            "workspace_management".into(),
+            status("workspace_management", caps.workspace_management),
+        ),
+        (
+            "monitor_layout".into(),
+            status("monitor_layout", caps.monitor_layout),
+        ),
+        (
+            "window_events".into(),
+            status("window_events", caps.window_events),
+        ),
+        (
+            "workspace_events".into(),
+            status("workspace_events", caps.workspace_events),
+        ),
+        (
+            "native_input".into(),
+            status("native_input", caps.native_input),
+        ),
+        (
+            "native_capture".into(),
+            status("native_capture", d.capture.is_some()),
+        ),
+        (
+            "virtual_desktops".into(),
+            status("virtual_desktops", caps.virtual_desktops),
+        ),
+        (
+            "effects_control".into(),
+            status("effects_control", caps.effects_control),
+        ),
     ];
     let r = InfoResult {
         detection,
@@ -1363,10 +1402,11 @@ mod tests {
         );
 
         // 逐字段等于合成器能力真值；native_capture 例外——capture 组件
-        // 独立于 compositor（纯 X11 会话仍可截图）。
+        // 独立于 compositor（纯 X11 会话仍可截图）。懒启动能力标 Lazy。
         let caps = d.compositor_capabilities();
-        for (name, enabled) in &r.capabilities {
-            let expected = match name.as_str() {
+        let lazy = d.lazy_capabilities();
+        for (name, status) in &r.capabilities {
+            let enabled = match name.as_str() {
                 "window_management" => caps.window_management,
                 "workspace_management" => caps.workspace_management,
                 "monitor_layout" => caps.monitor_layout,
@@ -1378,19 +1418,56 @@ mod tests {
                 "effects_control" => caps.effects_control,
                 other => panic!("unknown capability row: {other}"),
             };
-            assert_eq!(*enabled, expected, "capability row {name}");
+            assert_eq!(
+                *status,
+                capability_status(lazy, name, enabled),
+                "capability row {name}"
+            );
         }
-
         // 无合成器（CI/headless）不得硬编码 window_management:true。
         if !d.has_compositor() {
             let wm = r
                 .capabilities
                 .iter()
                 .find(|(n, _)| n == "window_management")
-                .map(|(_, enabled)| *enabled)
+                .map(|(_, status)| *status)
                 .expect("window_management row");
-            assert!(!wm, "headless must report window_management=false");
+            assert_eq!(
+                wm,
+                CapabilityStatus::Disabled,
+                "headless must report window_management disabled"
+            );
         }
+    }
+    #[test]
+    fn capability_status_maps_lazy_names_to_lazy() {
+        // 懒启动能力仅在未启用时标 Lazy；已启用按布尔真值标 Enabled。
+        let lazy = &["window_events", "workspace_events"];
+        assert_eq!(
+            capability_status(lazy, "window_events", false),
+            CapabilityStatus::Lazy
+        );
+        assert_eq!(
+            capability_status(lazy, "workspace_events", false),
+            CapabilityStatus::Lazy
+        );
+        // 同名懒能力已启用（T3b 落地后）→ Enabled，而非 Lazy。
+        assert_eq!(
+            capability_status(lazy, "window_events", true),
+            CapabilityStatus::Enabled
+        );
+        assert_eq!(
+            capability_status(lazy, "window_management", false),
+            CapabilityStatus::Disabled
+        );
+        assert_eq!(
+            capability_status(&[], "window_events", true),
+            CapabilityStatus::Enabled
+        );
+        assert_eq!(
+            capability_status(&[], "native_input", false),
+            CapabilityStatus::Disabled
+        );
     }
 
     #[tokio::test]

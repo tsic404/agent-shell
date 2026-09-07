@@ -9,7 +9,7 @@ mod client;
 mod format;
 mod repl;
 
-use agent_shell_rpc::{method, RpcErrorCode, WindowOpKind, MOUNT_POLKIT_ACTION};
+use agent_shell_rpc::{method, CapabilityStatus, RpcErrorCode, WindowOpKind, MOUNT_POLKIT_ACTION};
 use clap::Parser;
 use cli::{Cli, Command, OutputFormat};
 use client::{CallError, DaemonClient};
@@ -93,10 +93,20 @@ async fn info(c: &mut DaemonClient) -> CmdResult {
     let r = c.info().await?;
     println!("{}", r.detection);
     println!("backend           : kwin-compositor (via daemon)");
-    for (name, enabled) in &r.capabilities {
-        println!("{:<24} {}", name, if *enabled { "✓" } else { "✗" });
+    for (name, status) in &r.capabilities {
+        println!("{:<24} {}", name, render_capability(status));
     }
     Ok(0)
+}
+
+/// 能力三态 → 终端标记。`Lazy` 与 doctor 的 ⚠ 事件脚本行同语义：
+/// 首次订阅才建立，非永久不可用。
+fn render_capability(status: &CapabilityStatus) -> &'static str {
+    match status {
+        CapabilityStatus::Enabled => "✓",
+        CapabilityStatus::Disabled => "✗",
+        CapabilityStatus::Lazy => "⚠ (lazy)",
+    }
 }
 
 // ───────────────────────── windows / workspaces ─────────────────────────
@@ -1114,15 +1124,26 @@ fn sysctl_rpc_error(e: CallError) -> CmdResult {
 mod tests {
     use super::{
         a11y_query_exit_code, is_auth_required, job_status_outcome, log_query_timeout_error,
-        parse_log_filter, pkg_failed_job_line, process_rootd_error, security_audit_params,
-        security_request, sysctl_rpc_error, sysctl_set_accepted_line, wait_for_job_impl,
-        JobStatusSource, LOG_QUERY_TIMEOUT,
+        parse_log_filter, pkg_failed_job_line, process_rootd_error, render_capability,
+        security_audit_params, security_request, sysctl_rpc_error, sysctl_set_accepted_line,
+        wait_for_job_impl, JobStatusSource, LOG_QUERY_TIMEOUT,
     };
     use crate::client::CallError;
     use crate::RpcErrorCode;
     use serde_json::{json, Value};
     use std::collections::VecDeque;
     use std::time::Duration;
+
+    #[test]
+    fn render_capability_maps_status_to_terminal_marker() {
+        // info 能力位表终端标记：Lazy 用 ⚠ (lazy) 与 doctor 事件脚本行同语义。
+        assert_eq!(render_capability(&crate::CapabilityStatus::Enabled), "✓");
+        assert_eq!(render_capability(&crate::CapabilityStatus::Disabled), "✗");
+        assert_eq!(
+            render_capability(&crate::CapabilityStatus::Lazy),
+            "⚠ (lazy)"
+        );
+    }
 
     #[test]
     fn process_rootd_error_maps_all_five_branches() {

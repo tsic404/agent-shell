@@ -487,6 +487,12 @@ impl CompositorComponent for KWinCompositor {
         }
     }
 
+    /// 事件脚本懒启动（首次 `subscribe()` 才 load `event_monitor.js`），
+    /// 因此 `window_events`/`workspace_events` 激活前为 false 而非永久不可用。
+    fn lazy_capabilities(&self) -> &'static [&'static str] {
+        &["window_events", "workspace_events"]
+    }
+
     /// 窗口列表：始终走 list_windows.js（一次 callDBus 批量取全量详情）。
     ///
     /// 协议 stacking-order 仅提供 uuid 列表，逐窗 get_window_by_uuid 仍需
@@ -904,6 +910,18 @@ mod tests {
         assert_ne!(
             format!("{:?}", SessionKind::Wayland),
             format!("{:?}", SessionKind::X11)
+        );
+    }
+
+    /// 懒启动能力声明：事件脚本首次 `subscribe()` 才 load，`capabilities()`
+    /// 的 `window_events`/`workspace_events` false 非永久不可用（TSI-2822）。
+    #[tokio::test]
+    async fn lazy_capabilities_lists_event_streams() {
+        let bus = TestBus::start().await;
+        let comp = KWinCompositor::for_test(bridge(&bus).await, None);
+        assert_eq!(
+            comp.lazy_capabilities(),
+            &["window_events", "workspace_events"]
         );
     }
 

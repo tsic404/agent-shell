@@ -115,6 +115,13 @@ pub trait CompositorComponent: DesktopComponent {
     /// 能力掩码。
     fn capabilities(&self) -> BackendCapabilities;
 
+    /// 懒启动能力名集：这些能力在首次使用时才建立（如事件流在首次
+    /// `subscribe()` 才 load 脚本），激活前的 `false` 不代表永久不可用。
+    /// 默认空——后端按需覆盖。
+    fn lazy_capabilities(&self) -> &'static [&'static str] {
+        &[]
+    }
+
     /// 列出全部窗口。
     async fn list_windows(&self) -> Result<Vec<WindowInfo>>;
 
