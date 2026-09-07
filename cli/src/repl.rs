@@ -41,10 +41,10 @@ pub async fn run_repl(out: OutputFormat) -> CmdResult {
             }
         };
 
-        let mut argv = vec!["agent-shell".to_string()];
-        argv.extend(words);
+        let mut argv: Vec<std::ffi::OsString> = vec!["agent-shell".into()];
+        argv.extend(words.into_iter().map(Into::into));
 
-        match Cli::try_parse_from(argv) {
+        match Cli::try_parse_from(argv.clone()) {
             Ok(args) => match args.command {
                 Some(command) => {
                     if let Err(e) = dispatch_command(command, out).await {
@@ -55,6 +55,9 @@ pub async fn run_repl(out: OutputFormat) -> CmdResult {
             },
             Err(e) => {
                 eprintln!("{e}");
+                if let Some(hint) = crate::cli::at_syntax_hint(&argv, &e) {
+                    eprintln!("\nhint: {hint}");
+                }
             }
         }
     }

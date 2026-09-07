@@ -16,10 +16,20 @@ use client::{CallError, DaemonClient};
 use serde_json::{json, Value};
 
 fn main() {
-    let args = Cli::parse();
-    let code = tokio::runtime::Runtime::new()
-        .expect("tokio runtime")
-        .block_on(run(args));
+    let argv: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    let code = match Cli::try_parse_from(argv.clone()) {
+        Ok(args) => tokio::runtime::Runtime::new()
+            .expect("tokio runtime")
+            .block_on(run(args)),
+        Err(e) => {
+            let code = e.exit_code();
+            let _ = e.print();
+            if let Some(hint) = cli::at_syntax_hint(&argv, &e) {
+                eprintln!("\nhint: {hint}");
+            }
+            code
+        }
+    };
     std::process::exit(code);
 }
 
