@@ -181,8 +181,8 @@ pub enum InputCommand {
         /// 鼠标按键（left/middle/right/back/forward）
         #[arg(long, default_value = "left")]
         button: String,
-        /// 点击坐标 X,Y（缺省为当前位置）
-        #[arg(long)]
+        /// 点击坐标，格式 "X,Y"（如 100,200）；缺省为当前位置
+        #[arg(long, value_name = "X,Y")]
         at: Option<String>,
     },
     /// 鼠标滚动
@@ -689,6 +689,39 @@ pub fn parse_xy_json(s: &str) -> Result<serde_json::Value, String> {
     Ok(serde_json::json!([x, y]))
 }
 
+/// 识别 `input click --at` 的两种常见误用并返回合并写法提示。
+///
+/// `--at` 只接受单个 "X,Y" 值。用户常误写为：
+/// - `--at X Y`：坐标被拆成两个词，clap 报 `UnknownArgument`；
+/// - `--at X --at Y`：clap 报 `ArgumentConflict`，`InvalidArg` 为 "--at <X,Y>"。
+///
+/// `--at X Y` 的判定需同时满足两个条件：argv 中某个 `--at` 的后继 token
+/// 缺逗号（坐标被拆词，见 [`split_at_value`]），且 clap 报的意外参数是裸词
+/// （`InvalidArg` 不以 `-` 开头）。后者排除 `input key --at 5` 这类命令
+/// 本身无 `--at` 选项、`--at` 被当作意外 flag 的情况；前者排除
+/// `--at 100,200 extra`（用户已用对写法、仅多了裸词参数）。
+pub fn at_syntax_hint(args: &[std::ffi::OsString], err: &clap::Error) -> Option<String> {
+    use clap::error::{ContextKind, ErrorKind};
+    let invalid = err.get(ContextKind::InvalidArg).map(ToString::to_string);
+    let at_misuse = match err.kind() {
+        ErrorKind::ArgumentConflict => invalid.as_deref().is_some_and(|s| s.starts_with("--at")),
+        ErrorKind::UnknownArgument => {
+            split_at_value(args) && invalid.as_deref().is_some_and(|s| !s.starts_with('-'))
+        }
+        _ => false,
+    };
+    at_misuse.then(|| {
+        "`--at` 需要单个 \"X,Y\" 坐标（如 `--at 100,200`）；`--at 100 100` 或 `--at 100 --at 200` 均不可用"
+            .to_string()
+    })
+}
+
+/// 是否存在某个 `--at`，其后继 token 不含逗号（坐标被拆成两个词）。
+fn split_at_value(args: &[std::ffi::OsString]) -> bool {
+    args.windows(2)
+        .any(|w| w[0] == std::ffi::OsStr::new("--at") && !w[1].to_string_lossy().contains(','))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -778,6 +811,97 @@ mod tests {
         let v = parse_xy_json("100, 200").expect("xy");
         assert_eq!(v, serde_json::json!([100, 200]));
         assert!(parse_xy_json("bad").is_err());
+    }
+
+    #[test]
+    fn at_syntax_hint_detects_misuse() {
+        // `--at X Y` → clap UnknownArgument（第二个坐标被拒，裸词）。
+        let err = Cli::try_parse_from(["agent-shell", "input", "click", "--at", "100", "100"])
+            .unwrap_err();
+        assert!(at_syntax_hint(
+            &os_args(&["agent-shell", "input", "click", "--at", "100", "100"]),
+            &err
+        )
+        .is_some());
+
+        // `--at X --at Y` → clap ArgumentConflict（InvalidArg = "--at <X,Y>"）。
+        let err = Cli::try_parse_from([
+            "agent-shell",
+            "input",
+            "click",
+            "--at",
+            "100",
+            "--at",
+            "200",
+        ])
+        .unwrap_err();
+        assert!(at_syntax_hint(
+            &os_args(&[
+                "agent-shell",
+                "input",
+                "click",
+                "--at",
+                "100",
+                "--at",
+                "200"
+            ]),
+            &err
+        )
+        .is_some());
+
+        // 无关命令（无 --at）的 UnknownArgument 不提示。
+        let err =
+            Cli::try_parse_from(["agent-shell", "input", "scroll", "1", "2", "3"]).unwrap_err();
+        assert!(at_syntax_hint(
+            &os_args(&["agent-shell", "input", "scroll", "1", "2", "3"]),
+            &err
+        )
+        .is_none());
+
+        // --at 已正确但多了未知 flag：不误报（后继 token 含逗号）。
+        let err = Cli::try_parse_from([
+            "agent-shell",
+            "input",
+            "click",
+            "--at",
+            "100,200",
+            "--bogus",
+        ])
+        .unwrap_err();
+        assert!(at_syntax_hint(
+            &os_args(&[
+                "agent-shell",
+                "input",
+                "click",
+                "--at",
+                "100,200",
+                "--bogus"
+            ]),
+            &err
+        )
+        .is_none());
+
+        // 负例（审查要求）：--at 已正确，仅多了裸词参数，不提示。
+        let err =
+            Cli::try_parse_from(["agent-shell", "input", "click", "--at", "100,200", "extra"])
+                .unwrap_err();
+        assert!(at_syntax_hint(
+            &os_args(&["agent-shell", "input", "click", "--at", "100,200", "extra"]),
+            &err
+        )
+        .is_none());
+
+        // 负例（审查要求）：命令本身无 --at 选项，--at 被当作意外 flag，不提示。
+        let err = Cli::try_parse_from(["agent-shell", "input", "key", "--at", "5"]).unwrap_err();
+        assert!(at_syntax_hint(
+            &os_args(&["agent-shell", "input", "key", "--at", "5"]),
+            &err
+        )
+        .is_none());
+    }
+
+    fn os_args(args: &[&str]) -> Vec<std::ffi::OsString> {
+        args.iter().map(|s| std::ffi::OsString::from(*s)).collect()
     }
 
     fn entry(native: &str, title: &str) -> agent_shell_rpc::WindowEntry {
