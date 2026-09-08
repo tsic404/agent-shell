@@ -10,9 +10,7 @@ description = "agent-shell semantic routing layer: Command model, Executor, reso
 agent-shell-core.workspace = true
 async-trait.workspace = true
 tokio.workspace = true
-glob-match.workspace = true
 tracing.workspace = true
-regex.workspace = true
 
 [dev-dependencies]
 parking_lot.workspace = true

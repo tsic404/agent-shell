@@ -255,10 +255,20 @@ impl DaemonClient {
     pub async fn windows_list(
         &mut self,
         filter: Option<String>,
+        match_mode: Option<&str>,
     ) -> Result<(Vec<agent_shell_rpc::WindowEntry>, bool), String> {
-        let params = filter
-            .map(|f| json!({ "filter": f }))
-            .unwrap_or(Value::Null);
+        let mut params = serde_json::Map::new();
+        if let Some(f) = filter {
+            params.insert("filter".into(), json!(f));
+        }
+        if let Some(m) = match_mode {
+            params.insert("match".into(), json!(m));
+        }
+        let params = if params.is_empty() {
+            Value::Null
+        } else {
+            Value::Object(params)
+        };
         let v = self.call(method::WINDOWS_LIST, params).await?;
         #[derive(serde::Deserialize)]
         struct W {

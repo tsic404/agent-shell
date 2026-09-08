@@ -121,13 +121,43 @@ pub enum Command {
 
 // ───────────────────────── windows ─────────────────────────
 
+/// 窗口标题匹配模式（`windows list` / `windows wait` 的 `--match`）。
+///
+/// 与 core `TitleMatchMode` 一一对应，wire 值固定为小写 snake_case。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum MatchMode {
+    /// 子串包含（默认，兼容现有调用）
+    Substring,
+    /// 精确匹配
+    Exact,
+    /// 正则匹配
+    Regex,
+    /// Glob 通配符
+    Glob,
+}
+
+impl MatchMode {
+    /// 线格式字符串（与 core `TitleMatchMode` 的 snake_case serde 一致）。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MatchMode::Substring => "substring",
+            MatchMode::Exact => "exact",
+            MatchMode::Regex => "regex",
+            MatchMode::Glob => "glob",
+        }
+    }
+}
+
 #[derive(Subcommand, Debug)]
 pub enum WindowsCommand {
     /// 列出当前窗口
     List {
-        /// 按 app_id 过滤
+        /// 按 app_id 或标题过滤
         #[arg(long)]
         filter: Option<String>,
+        /// 标题匹配模式（默认 substring；须与 --filter 搭配）
+        #[arg(long = "match", value_enum, requires = "filter")]
+        match_mode: Option<MatchMode>,
     },
     /// 显示窗口详情
     Info { target: String },
@@ -145,10 +175,13 @@ pub enum WindowsCommand {
     Minimize { target: String },
     /// 关闭窗口
     Close { target: String },
-    /// 等待 app_id 窗口出现（轮询 windows.list）
+    /// 等待 app_id/标题窗口出现（轮询 windows.list）
     Wait {
-        /// 目标 app_id
+        /// 目标 app_id 或标题模式
         app_id: String,
+        /// 标题匹配模式（默认 substring）
+        #[arg(long = "match", value_enum)]
+        match_mode: Option<MatchMode>,
         /// 超时毫秒（默认 15000）
         #[arg(long)]
         timeout_ms: Option<u64>,
@@ -970,6 +1003,81 @@ mod tests {
             &err
         )
         .is_none());
+    }
+
+    #[test]
+    fn match_mode_wire_values_are_snake_case() {
+        assert_eq!(MatchMode::Substring.as_str(), "substring");
+        assert_eq!(MatchMode::Exact.as_str(), "exact");
+        assert_eq!(MatchMode::Regex.as_str(), "regex");
+        assert_eq!(MatchMode::Glob.as_str(), "glob");
+    }
+
+    #[test]
+    fn windows_list_parses_match_flag() {
+        let cli = Cli::try_parse_from([
+            "agent-shell",
+            "windows",
+            "list",
+            "--filter",
+            "Kate",
+            "--match",
+            "regex",
+        ])
+        .expect("parse");
+        match cli.command {
+            Some(Command::Windows(WindowsCommand::List { filter, match_mode })) => {
+                assert_eq!(filter.as_deref(), Some("Kate"));
+                assert_eq!(match_mode, Some(MatchMode::Regex));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+        // 默认无 --match：None（daemon 侧回落 substring）。
+        let cli = Cli::try_parse_from(["agent-shell", "windows", "list"]).expect("parse");
+        match cli.command {
+            Some(Command::Windows(WindowsCommand::List { filter, match_mode })) => {
+                assert!(filter.is_none());
+                assert!(match_mode.is_none());
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn windows_wait_parses_match_flag() {
+        let cli = Cli::try_parse_from([
+            "agent-shell",
+            "windows",
+            "wait",
+            "Konsole",
+            "--match",
+            "glob",
+        ])
+        .expect("parse");
+        match cli.command {
+            Some(Command::Windows(WindowsCommand::Wait {
+                app_id, match_mode, ..
+            })) => {
+                assert_eq!(app_id, "Konsole");
+                assert_eq!(match_mode, Some(MatchMode::Glob));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn windows_list_rejects_invalid_match_value() {
+        assert!(
+            Cli::try_parse_from(["agent-shell", "windows", "list", "--match", "bogus"]).is_err()
+        );
+    }
+
+    #[test]
+    fn windows_list_match_requires_filter() {
+        // `--match` 无 `--filter` 时 clap 报参数错误（避免静默全量返回）。
+        let err = Cli::try_parse_from(["agent-shell", "windows", "list", "--match", "regex"])
+            .unwrap_err();
+        assert!(err.to_string().contains("--filter"), "{err}");
     }
 
     fn os_args(args: &[&str]) -> Vec<std::ffi::OsString> {

@@ -460,6 +460,7 @@ pub enum SemanticTarget {
 
 /// 窗口标题匹配模式。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum TitleMatchMode {
     /// 子串包含
     Substring,
@@ -469,6 +470,52 @@ pub enum TitleMatchMode {
     Regex,
     /// Glob 通配符
     Glob,
+}
+
+/// 预编译标题匹配器（§15.3 第 3 级：子串 → 精确 → 正则 → glob）。
+///
+/// `Regex` 模式在构造时编译一次，供批量过滤（`windows list` 逐窗口）与
+/// 轮询（`windows wait` 每 200ms 一轮）复用，避免每次匹配重复编译同一
+/// pattern。非 `Regex` 模式不额外分配。
+pub struct TitleMatcher<'a> {
+    mode: TitleMatchMode,
+    pattern: &'a str,
+    regex: Option<regex::Regex>,
+}
+
+impl<'a> TitleMatcher<'a> {
+    /// 构造匹配器。`Regex` 在此预编译一次；编译失败按「不匹配」降级
+    /// （不向上抛错），与非法表达式应视为零命中的过滤语义一致。
+    pub fn new(mode: TitleMatchMode, pattern: &'a str) -> Self {
+        let regex = match mode {
+            TitleMatchMode::Regex => regex::Regex::new(pattern).ok(),
+            _ => None,
+        };
+        TitleMatcher {
+            mode,
+            pattern,
+            regex,
+        }
+    }
+
+    /// 原始 pattern（供 `app_id` 精确比对等旁路判断）。
+    pub fn pattern(&self) -> &str {
+        self.pattern
+    }
+
+    /// 标题是否命中。
+    pub fn matches(&self, title: &str) -> bool {
+        match self.mode {
+            TitleMatchMode::Substring => title.contains(self.pattern),
+            TitleMatchMode::Exact => title == self.pattern,
+            TitleMatchMode::Regex => self
+                .regex
+                .as_ref()
+                .map(|r| r.is_match(title))
+                .unwrap_or(false),
+            TitleMatchMode::Glob => glob_match::glob_match(self.pattern, title),
+        }
+    }
 }
 
 // ───────────────────────── 截图类型 ─────────────────────────
@@ -543,3 +590,53 @@ pub struct WindowFilter {
 
 /// 元数据映射（通用 KV 袋，用于 D-Bus hints 等透传场景）。
 pub type Metadata = HashMap<String, String>;
+
+#[cfg(test)]
+mod tests {
+    use super::{TitleMatchMode, TitleMatcher};
+
+    #[test]
+    fn match_modes_positive_and_negative() {
+        let cases = [
+            ("Konsole", TitleMatchMode::Substring, true),
+            ("GIMP", TitleMatchMode::Substring, false),
+            ("终端 — Konsole", TitleMatchMode::Exact, true),
+            ("终端", TitleMatchMode::Exact, false),
+            ("^Unt.*Kate$", TitleMatchMode::Regex, true),
+            ("^\\d+$", TitleMatchMode::Regex, false),
+            ("*Document*", TitleMatchMode::Glob, true),
+            ("*.pdf", TitleMatchMode::Glob, false),
+        ];
+        let titles = ["Untitled Document — Kate", "终端 — Konsole"];
+        for (pattern, mode, want_hit) in cases {
+            let matcher = TitleMatcher::new(mode, pattern);
+            let hit = titles.iter().any(|t| matcher.matches(t));
+            assert_eq!(
+                hit, want_hit,
+                "pattern {pattern:?} mode {mode:?} should be {want_hit}"
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_regex_is_no_match_not_panic() {
+        let matcher = TitleMatcher::new(TitleMatchMode::Regex, "([ bad");
+        assert!(!matcher.matches("终端 — Konsole"));
+    }
+
+    #[test]
+    fn match_mode_serde_is_snake_case() {
+        // 线格式契约：CLI 发送 lowercase，daemon 反序列化为同一枚举。
+        for (mode, wire) in [
+            (TitleMatchMode::Substring, "\"substring\""),
+            (TitleMatchMode::Exact, "\"exact\""),
+            (TitleMatchMode::Regex, "\"regex\""),
+            (TitleMatchMode::Glob, "\"glob\""),
+        ] {
+            let encoded = serde_json::to_string(&mode).expect("serialize");
+            assert_eq!(encoded, wire, "{mode:?}");
+            let decoded: TitleMatchMode = serde_json::from_str(wire).expect("deserialize");
+            assert_eq!(decoded, mode);
+        }
+    }
+}
