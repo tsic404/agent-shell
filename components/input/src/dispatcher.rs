@@ -7,6 +7,14 @@
 //! `is_available() == true` 的后端为 `active`；全部不可用则 `active = None`
 //! （调用返回错误，不 panic）。
 //!
+//! **操作期降级**（§12.2）：libei 的 `is_available` 仅验证 portal 在场、
+//! 不建立会话（授权弹窗延迟到首次注入），因此构造期选中 libei 不保证注入
+//! 成功。dispatcher 先经 `ensure_ready` 建立通道并校验所需能力——libei 会话
+//! 建立失败（`AccessDenied: Invalid session`）或能力缺失（门户仅授权 pointer
+//! 而缺 keyboard/scroll 等）即摘除并回落下一候选（ydotool/xdotool），且不重复
+//! 弹窗重试同一后端；通道就绪后注入一次，注入期错误直接返回调用方、不降级
+//! 重放（避免已注入部分事件后回落造成的重复键击/点击/文本）。
+//!
 //! 超时/重试（§19）：input 注入超时 1s、重试 3 次——由各后端的命令执行层
 //! 统一施加（[`super::ydotool`] / [`super::xdotool`]），dispatcher 不重复包装。
 
@@ -43,6 +51,18 @@ pub trait InputService: Send + Sync {
         }
     }
 
+    /// 建立/验证注入通道，但不注入任何事件。
+    ///
+    /// `op` 用于校验该操作所需能力——libei 建会话后据此检查 keyboard/
+    /// absolute-pointer/button/scroll 能力（门户可能只授权部分设备，如仅
+    /// pointer 而缺 keyboard）。命令型后端（ydotool/xdotool/XTest）无持久
+    /// 会话，默认 `Ok(())` 忽略 `op`。dispatcher 在执行注入操作前先调用本
+    /// 方法：失败（含能力缺失）发生在任何注入之前，可安全降级重放；注入期
+    /// 错误则直接返回调用方，不重放（避免重复键击/点击/文本）。
+    async fn ensure_ready(&self, _op: Op<'_>) -> Result<()> {
+        Ok(())
+    }
+
     /// 注入按键组合。
     async fn send_key(&self, combo: &KeyCombo) -> Result<()>;
 
@@ -59,10 +79,27 @@ pub trait InputService: Send + Sync {
     async fn mouse_scroll(&self, dx: i32, dy: i32) -> Result<()>;
 }
 
+/// 注入操作描述——把各后端统一接口归并为一个分派点，供 [`InputDispatcher::dispatch`]
+/// 沿降级链逐个尝试（不借走参数，`Copy` 便于循环内复用）。
+///
+/// `pub`：作为 [`InputService::ensure_ready`] 的参数，libei 据此校验所需能力
+/// （keyboard/absolute-pointer/button/scroll）。
+#[derive(Clone, Copy)]
+pub enum Op<'a> {
+    Key(&'a KeyCombo),
+    Text(&'a str, u32),
+    Move(i32, i32),
+    Click(MouseButton),
+    Scroll(i32, i32),
+}
+
 /// 带降级链的输入分发器（§12.2）。
+///
+/// `active` 用 `Mutex` 包裹：操作期降级会在注入失败时推进 active，doctor
+/// 与后续调用观察到的是降级后的真实选中后端。
 pub struct InputDispatcher {
     backends: Vec<Box<dyn InputService>>,
-    active: Option<usize>,
+    active: std::sync::Mutex<Option<usize>>,
 }
 
 impl InputDispatcher {
@@ -112,12 +149,15 @@ impl InputDispatcher {
             active = active.map(|i| backends[i].name()).unwrap_or("none"),
             "input dispatcher assembled"
         );
-        Ok(Self { backends, active })
+        Ok(Self {
+            backends,
+            active: std::sync::Mutex::new(active),
+        })
     }
 
     /// 当前激活的后端名（doctor：Healthy/Degraded 标明实际选中后端）。
     pub fn active_backend_name(&self) -> Option<&'static str> {
-        self.active.map(|i| self.backends[i].name())
+        self.current_active().map(|i| self.backends[i].name())
     }
 
     /// 候选后端名列表（诊断/测试用，按降级链顺序）。
@@ -127,44 +167,87 @@ impl InputDispatcher {
 
     /// active 后端健康检查。
     pub async fn active_health(&self) -> ComponentHealth {
-        match self.active {
+        match self.current_active() {
             Some(i) => self.backends[i].health().await,
             None => ComponentHealth::Unavailable,
         }
     }
 
-    fn active_backend(&self) -> Result<&dyn InputService> {
-        let i = self.active.ok_or_else(|| {
+    /// 读当前 active 下标（无锁竞争时直接取）。
+    fn current_active(&self) -> Option<usize> {
+        *self.active.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// 把失败后端从 active 摘除，active 前进到下一候选（末尾则 None）。
+    ///
+    /// 仅当 `failed` 仍是当前 active 时才推进——并发下其它调用可能已摘除
+    /// 更靠前的后端，此时保持现状。
+    fn demote(&self, failed: usize) {
+        let mut g = self.active.lock().unwrap_or_else(|p| p.into_inner());
+        if *g == Some(failed) {
+            *g = (failed + 1 < self.backends.len()).then_some(failed + 1);
+        }
+    }
+
+    /// 在降级链上执行一次注入操作：先逐个后端建立通道（`ensure_ready`），
+    /// 失败即摘除并试下一候选；通道就绪后注入一次，注入期错误直接返回，
+    /// 不降级重放（避免已注入部分事件后回落造成的重复键击/点击/文本）。
+    async fn dispatch(&self, op: Op<'_>) -> Result<()> {
+        let mut idx = self.current_active();
+        let mut last_err = None;
+        while let Some(i) = idx {
+            let backend = self.backends[i].as_ref();
+            // 通道建立/能力校验失败发生在任何注入之前——可安全降级重放。
+            if let Err(e) = backend.ensure_ready(op).await {
+                tracing::warn!(
+                    backend = self.backends[i].name(),
+                    error = %e,
+                    "input: backend setup failed; demoting to next candidate"
+                );
+                last_err = Some(e);
+                self.demote(i);
+                idx = self.current_active();
+                continue;
+            }
+            // 通道就绪：注入一次。注入期错误不再降级重放。
+            return match op {
+                Op::Key(c) => backend.send_key(c).await,
+                Op::Text(t, d) => backend.type_text(t, d).await,
+                Op::Move(x, y) => backend.mouse_move(x, y).await,
+                Op::Click(b) => backend.mouse_click(b).await,
+                Op::Scroll(dx, dy) => backend.mouse_scroll(dx, dy).await,
+            };
+        }
+        Err(last_err.unwrap_or_else(|| {
             AgentShellError::BackendUnavailable(
                 "input: no available backend in this session".into(),
             )
-        })?;
-        Ok(self.backends[i].as_ref())
+        }))
     }
 
-    /// 注入按键组合（委托 active 后端）。
+    /// 注入按键组合（经降级链，失败自动回落）。
     pub async fn send_key(&self, combo: &KeyCombo) -> Result<()> {
-        self.active_backend()?.send_key(combo).await
+        self.dispatch(Op::Key(combo)).await
     }
 
-    /// 键入文本（委托 active 后端）。
+    /// 键入文本（经降级链，失败自动回落）。
     pub async fn type_text(&self, text: &str, delay_ms: u32) -> Result<()> {
-        self.active_backend()?.type_text(text, delay_ms).await
+        self.dispatch(Op::Text(text, delay_ms)).await
     }
 
-    /// 移动鼠标（委托 active 后端）。
+    /// 移动鼠标（经降级链，失败自动回落）。
     pub async fn mouse_move(&self, x: i32, y: i32) -> Result<()> {
-        self.active_backend()?.mouse_move(x, y).await
+        self.dispatch(Op::Move(x, y)).await
     }
 
-    /// 点击鼠标（委托 active 后端）。
+    /// 点击鼠标（经降级链，失败自动回落）。
     pub async fn mouse_click(&self, button: MouseButton) -> Result<()> {
-        self.active_backend()?.mouse_click(button).await
+        self.dispatch(Op::Click(button)).await
     }
 
-    /// 滚动（委托 active 后端）。
+    /// 滚动（经降级链，失败自动回落）。
     pub async fn mouse_scroll(&self, dx: i32, dy: i32) -> Result<()> {
-        self.active_backend()?.mouse_scroll(dx, dy).await
+        self.dispatch(Op::Scroll(dx, dy)).await
     }
 }
 
@@ -208,6 +291,37 @@ mod tests {
         }
         async fn send_key(&self, _combo: &KeyCombo) -> Result<()> {
             Err(AgentShellError::Input("injection refused".into()))
+        }
+        async fn type_text(&self, _text: &str, _delay_ms: u32) -> Result<()> {
+            unimplemented!()
+        }
+        async fn mouse_move(&self, _x: i32, _y: i32) -> Result<()> {
+            unimplemented!()
+        }
+        async fn mouse_click(&self, _button: MouseButton) -> Result<()> {
+            unimplemented!()
+        }
+        async fn mouse_scroll(&self, _dx: i32, _dy: i32) -> Result<()> {
+            unimplemented!()
+        }
+    }
+
+    /// 通道建立即失败的假后端（模拟 libei 会话建立失败 `AccessDenied`）。
+    struct SetupFailingBackend;
+
+    #[async_trait]
+    impl InputService for SetupFailingBackend {
+        fn name(&self) -> &'static str {
+            "setup-failing"
+        }
+        async fn is_available(&self) -> bool {
+            true
+        }
+        async fn ensure_ready(&self, _op: Op<'_>) -> Result<()> {
+            Err(AgentShellError::BackendUnavailable("setup refused".into()))
+        }
+        async fn send_key(&self, _combo: &KeyCombo) -> Result<()> {
+            unimplemented!("never reached: ensure_ready fails first")
         }
         async fn type_text(&self, _text: &str, _delay_ms: u32) -> Result<()> {
             unimplemented!()
@@ -270,7 +384,10 @@ mod tests {
         active: Option<usize>,
     ) -> InputDispatcher {
         // 通过模块内私有字段构造——同 crate 测试可见。
-        InputDispatcher { backends, active }
+        InputDispatcher {
+            backends,
+            active: std::sync::Mutex::new(active),
+        }
     }
 
     #[tokio::test]
@@ -316,6 +433,30 @@ mod tests {
         assert!(matches!(err, AgentShellError::Input(msg) if msg.contains("refused")));
     }
 
+    #[tokio::test]
+    async fn operation_falls_back_when_active_backend_setup_fails() {
+        let failing = SetupFailingBackend; // ensure_ready 恒失败（注入前）
+        let ok = FakeBackend::new("ok", 0); // inject_ok = true
+        let d = dispatch_with(vec![Box::new(failing), Box::new(ok)], Some(0));
+        // active = "setup-failing"；通道建立失败后应摘除并降级到 "ok"。
+        d.send_key(&combo(true))
+            .await
+            .expect("falls back to next backend");
+        assert_eq!(d.active_backend_name(), Some("ok"));
+    }
+
+    #[tokio::test]
+    async fn injection_failure_is_not_replayed_on_next_backend() {
+        // 通道就绪后的注入期错误（send_key 已可能产生副作用）不应降级重放。
+        let failing = FailingBackend; // ensure_ready 默认 Ok，send_key 失败
+        let ok = FakeBackend::new("ok", 0);
+        let d = dispatch_with(vec![Box::new(failing), Box::new(ok)], Some(0));
+        let err = d.send_key(&combo(true)).await.unwrap_err();
+        assert!(matches!(err, AgentShellError::Input(msg) if msg.contains("refused")));
+        // 未降级：active 仍停留在注入期失败的后端。
+        assert_eq!(d.active_backend_name(), Some("failing"));
+    }
+
     #[test]
     fn timeout_constants_match_design() {
         // §19：input 注入超时 1s、重试 3 次。
@@ -326,10 +467,10 @@ mod tests {
     /// 测试辅助：对已构造的 dispatcher 重新执行「选第一个可用」逻辑，
     /// 使 FakeBackend 的探测计数语义生效。
     async fn reselect(mut d: InputDispatcher) -> InputDispatcher {
-        d.active = None;
+        *d.active.get_mut().expect("owned dispatcher uncontended") = None;
         for (i, b) in d.backends.iter().enumerate() {
             if b.is_available().await {
-                d.active = Some(i);
+                *d.active.get_mut().expect("owned dispatcher uncontended") = Some(i);
                 break;
             }
         }

@@ -143,12 +143,11 @@ impl CaptureDispatcher {
     /// 窗口直捕（X11-only；portal 无法定位 native window id）。
     /// 连接经 `OnceCell` 惰性建立并复用。
     ///
-    /// 纯 Wayland 会话（`x11_present == false`）无原生 X11 可捕——返回
-    /// `BackendUnavailable`，不建立只会产出全黑帧的 XWayland 连接。
+    /// 无 `DISPLAY`（无 X server 可达）返回 `BackendUnavailable`。
     pub async fn capture_window(&self, window: u32) -> Result<Frame> {
         if !self.x11_present {
             return Err(AgentShellError::BackendUnavailable(
-                "x11 capture unavailable: not a native X11 session".into(),
+                "x11 capture unavailable: no X server reachable".into(),
             ));
         }
         let x = self
@@ -263,6 +262,13 @@ impl CaptureDispatcher {
                 e
             })?;
             let frame = cap.capture_frame().await?;
+            if is_all_black(&frame) {
+                tracing::warn!(
+                    "X11 fallback captured an all-black frame (likely XWayland root without \
+                     compositor content); portal ScreenCast/Screenshot is the correct backend \
+                     for this session"
+                );
+            }
             self.set_active(Some(ActiveBackend::X11));
             return Ok(CapturedFrame::Pixels(frame));
         }
@@ -357,6 +363,20 @@ pub async fn doctor_line(dispatcher: Option<&CaptureDispatcher>) -> String {
     }
 }
 
+/// 判定帧是否全黑——纯 Wayland + XWayland 会话下 X11 兜底直捕 root 的典型产物。
+///
+/// 仅检查 RGB 通道（忽略 Bgrx 的填充字节 / Rgba 的 alpha），避免把
+/// 「alpha=255 的透明黑」误判为非黑。Rgb565/Clut8 无填充，逐字节比较。
+fn is_all_black(frame: &Frame) -> bool {
+    match frame.format {
+        PixelFormat::Bgra | PixelFormat::Bgrx | PixelFormat::Rgba => frame
+            .data
+            .chunks(4)
+            .all(|px| px.len() < 4 || px[..3].iter().all(|&b| b == 0)),
+        _ => frame.data.iter().all(|&b| b == 0),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -420,5 +440,45 @@ mod tests {
         let opts = screencast_options_for(None);
         assert!(opts.restore_token.is_none());
         assert!(opts.persist_mode.is_none());
+    }
+
+    #[test]
+    fn is_all_black_detects_black_frames() {
+        // Bgrx 全黑（RGB=0）应为黑，即使填充字节非 0。
+        let black_bgrx = Frame {
+            data: vec![0, 0, 0, 0, 0, 0, 0, 0],
+            width: 2,
+            height: 1,
+            stride: 8,
+            format: PixelFormat::Bgrx,
+        };
+        assert!(is_all_black(&black_bgrx));
+        // Rgba 透明黑（RGB=0、alpha=255）仍应判黑。
+        let transparent_black_rgba = Frame {
+            data: vec![0, 0, 0, 255, 0, 0, 0, 255],
+            width: 2,
+            height: 1,
+            stride: 8,
+            format: PixelFormat::Rgba,
+        };
+        assert!(is_all_black(&transparent_black_rgba));
+        // 非黑（任一 RGB 通道非 0）应判非黑。
+        let red_bgrx = Frame {
+            data: vec![0, 0, 1, 0],
+            width: 1,
+            height: 1,
+            stride: 4,
+            format: PixelFormat::Bgrx,
+        };
+        assert!(!is_all_black(&red_bgrx));
+        // Rgb565 全零为黑。
+        let black_rgb565 = Frame {
+            data: vec![0, 0, 0, 0],
+            width: 2,
+            height: 1,
+            stride: 4,
+            format: PixelFormat::Rgb565,
+        };
+        assert!(is_all_black(&black_rgb565));
     }
 }
