@@ -1,14 +1,17 @@
 //! daemon 侧截图捕获：经 capture 模块三级降级链（portal ScreenCast →
 //! Screenshot → X11 原生，§13），并保留窗口直捕（X11-only）与区域裁剪。
 //!
-//! CLI 传 `--window` 时走 X11 窗口直捕（portal 不支持 X11 window id）；
-//! 传 `--area` 在 daemon 侧裁剪——CLI 不持有任何显示服务连接。
+//! CLI 传 `--window` 时走 X11 窗口直捕（portal 无法定位 X11 window id）；
+//! 传 `--area` 在 daemon 侧裁剪——CLI 不持有任何显示服务连接。窗口目标
+//! 解析与 windows 子命令同口径（`id:` 前缀 / `{uuid}` 花括号均可剥离），
+//! 但直捕仍需要 X11 十进制窗口 id——原生 Wayland `{uuid}` 无对应 X11 id。
 
 use agent_shell_capture::{CaptureDispatcher, CapturedFrame, PixelFormat};
 use agent_shell_rpc::{CaptureResult, RpcErrorCode};
 
-/// 截图并落盘。`window` 为 X11 window id 十进制串（None=root）；
-/// `area` 为 X,Y,W,H 裁剪区域（对捕获画面坐标空间，先截后裁）。
+/// 截图并落盘。`window` 为窗口目标（`id:`/`{uuid}` 形式均可，解析后须为
+/// X11 十进制窗口 id；None=root）；`area` 为 X,Y,W,H 裁剪区域（对捕获画面
+/// 坐标空间，先截后裁）。
 pub async fn capture_to_file(
     capture: &CaptureDispatcher,
     window: Option<&str>,
@@ -18,12 +21,7 @@ pub async fn capture_to_file(
     if let Some(id) = window {
         // 窗口直捕：portal 无法定位 X11 window id，仅走 X11 路径
         //（连接由 dispatcher 惰性建立并复用——审查项 #5）。
-        let win: u32 = id.parse().map_err(|e| {
-            (
-                RpcErrorCode::InvalidParams,
-                format!("invalid window id {id:?}: {e}"),
-            )
-        })?;
+        let win = parse_window_id(id)?;
         let frame = capture
             .capture_window(win)
             .await
@@ -42,6 +40,33 @@ pub async fn capture_to_file(
         CapturedFrame::Pixels(frame) => write_frame_to_ppm(&frame, area, path),
         CapturedFrame::Png(src) => copy_png(&src, area, path),
     }
+}
+
+/// 规范化并解析 `--window` 目标为 X11 窗口 id（十进制）。
+///
+/// 与 windows 子命令的 `native_id_matches` 同口径：剥离 `id:` 前缀与单层
+/// `{...}` 花括号，覆盖 `windows list` 输出的 `{uuid}` 与裸 `uuid` 写法。
+/// 剥离后仍非数字（KWin `{uuid}` 等原生 Wayland id）无法映射到 X11 窗口——
+/// 窗口直捕是 X11-only 路径，返回带说明的参数错误而非裸 `invalid digit`。
+fn parse_window_id(spec: &str) -> Result<u32, (RpcErrorCode, String)> {
+    let trimmed = spec.trim();
+    let bare = trimmed.strip_prefix("id:").unwrap_or(trimmed).trim();
+    // 成对剥离：仅首尾同时为 `{`/`}` 才剥，`{42`/`42}`/`{{42}}` 原样保留
+    // 交给 parse 报错（与 windows 子命令的 `strip_braces` 同口径）。
+    let bare = bare
+        .strip_prefix('{')
+        .and_then(|r| r.strip_suffix('}'))
+        .unwrap_or(bare)
+        .trim();
+    bare.parse::<u32>().map_err(|e| {
+        (
+            RpcErrorCode::InvalidParams,
+            format!(
+                "invalid window id {spec:?}: {e} (window capture is X11-only; \
+                 Wayland `{{uuid}}` ids have no X11 window id)"
+            ),
+        )
+    })
 }
 
 /// 原始像素帧写为 PPM (P6)，带可选区域裁剪。
@@ -218,6 +243,32 @@ mod tests {
         assert_eq!(png_dimensions(&data).unwrap(), (1920, 1080));
         // 非 PNG。
         assert!(png_dimensions(b"JFIF-something-long-enough....").is_err());
+    }
+
+    #[test]
+    fn parse_window_id_accepts_braced_and_prefixed_forms() {
+        assert_eq!(parse_window_id("42").unwrap(), 42);
+        assert_eq!(parse_window_id("{42}").unwrap(), 42);
+        assert_eq!(parse_window_id("id:42").unwrap(), 42);
+        assert_eq!(parse_window_id("id:{42}").unwrap(), 42);
+    }
+
+    #[test]
+    fn parse_window_id_rejects_unbalanced_braces() {
+        // 成对剥离：非对称花括号不得被静默剥掉。
+        for bad in ["{42", "42}", "{{42}}"] {
+            let err = parse_window_id(bad).unwrap_err();
+            assert_eq!(err.0, RpcErrorCode::InvalidParams, "{bad}");
+        }
+    }
+
+    #[test]
+    fn parse_window_id_rejects_uuid_with_clear_error() {
+        // `windows list` 在 Wayland 下输出 `{uuid}`；窗口直捕是 X11-only，
+        // 应报 InvalidParams 并说明原因，而非裸 `invalid digit`。
+        let err = parse_window_id("{593a298c-79e4-408d-9b5e-7a3c1d2e3f4a}").unwrap_err();
+        assert_eq!(err.0, RpcErrorCode::InvalidParams);
+        assert!(err.1.contains("X11-only"), "{}", err.1);
     }
 
     #[test]

@@ -28,7 +28,7 @@ use futures_util::StreamExt;
 use reis::event::{DeviceCapability, EiEvent};
 use tokio::sync::Mutex;
 
-use super::dispatcher::{InputService, INPUT_TIMEOUT};
+use super::dispatcher::{InputService, Op, INPUT_TIMEOUT};
 use crate::keymap::{char_to_evdev, combo_to_press_sequence};
 
 /// portal 服务 bus 名。
@@ -392,6 +392,26 @@ impl InputService for LibeiInput {
             None => ComponentHealth::Degraded(
                 "portal present but EIS session not yet established (lazy)".into(),
             ),
+        }
+    }
+
+    async fn ensure_ready(&self, op: Op<'_>) -> Result<()> {
+        // 建立 portal→EI 会话（可能触发授权弹窗）但不注入。会话建立失败
+        // （如 `AccessDenied: Invalid session`）或所需能力缺失（门户可能只
+        // 授权部分设备，如仅 pointer 而缺 keyboard）都发生在任何注入之前，
+        // dispatcher 据此安全降级重放，而不会在注入期重试同一后端。
+        let s = self.ensure_connected().await?;
+        let missing = match op {
+            Op::Key(_) | Op::Text(..) => s.keyboard.is_none().then_some("keyboard"),
+            Op::Move(..) => s.pointer_absolute.is_none().then_some("absolute-pointer"),
+            Op::Click(_) => s.button.is_none().then_some("button"),
+            Op::Scroll(..) => s.scroll.is_none().then_some("scroll"),
+        };
+        match missing {
+            Some(cap) => Err(AgentShellError::BackendUnavailable(format!(
+                "libei: no {cap} capability"
+            ))),
+            None => Ok(()),
         }
     }
 
