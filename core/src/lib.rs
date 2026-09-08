@@ -37,6 +37,6 @@ pub use services::{
 };
 pub use types::{
     CaptureTarget, DesktopEnvironment, Key, KeyCombo, KeyName, MonitorId, MonitorInfo, MouseButton,
-    Rect, ScrollDelta, SemanticTarget, SessionInfo, TitleMatchMode, UnitStatus, WindowId,
-    WindowInfo, WindowState, WindowType, WorkspaceId, WorkspaceInfo,
+    Rect, ScrollDelta, SemanticTarget, SessionInfo, TitleMatchMode, TitleMatcher, UnitStatus,
+    WindowId, WindowInfo, WindowState, WindowType, WorkspaceId, WorkspaceInfo,
 };

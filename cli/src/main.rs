@@ -155,14 +155,16 @@ fn render_capability(status: &CapabilityStatus) -> &'static str {
 async fn windows(out: OutputFormat, c: &mut DaemonClient, cmd: cli::WindowsCommand) -> CmdResult {
     use cli::WindowsCommand as W;
     match cmd {
-        W::List { filter } => {
-            let (wins, from_cache) = c.windows_list(filter).await?;
+        W::List { filter, match_mode } => {
+            let (wins, from_cache) = c
+                .windows_list(filter, match_mode.map(cli::MatchMode::as_str))
+                .await?;
             emit_windows_json_or_table(out, &wins);
             eprintln!("# from_cache={from_cache}");
             Ok(0)
         }
         W::Info { target } => {
-            let wins = c.windows_list(None).await?.0;
+            let wins = c.windows_list(None, None).await?.0;
             let w = cli::resolve_target_entry(&target, &wins)?;
             if out == OutputFormat::Json {
                 let v = c.window_info(&w.native_id).await?;
@@ -186,11 +188,17 @@ async fn windows(out: OutputFormat, c: &mut DaemonClient, cmd: cli::WindowsComma
         } => window_op(c, out, target, WindowOpKind::Resize, [0, 0, width, height]).await,
         W::Minimize { target } => window_op(c, out, target, WindowOpKind::Minimize, [0; 4]).await,
         W::Close { target } => window_op(c, out, target, WindowOpKind::Close, [0; 4]).await,
-        W::Wait { app_id, timeout_ms } => {
+        W::Wait {
+            app_id,
+            match_mode,
+            timeout_ms,
+        } => {
             let timeout_ms = timeout_ms.unwrap_or(15_000);
             let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
             loop {
-                let (wins, _) = c.windows_list(Some(app_id.clone())).await?;
+                let (wins, _) = c
+                    .windows_list(Some(app_id.clone()), match_mode.map(cli::MatchMode::as_str))
+                    .await?;
                 if let Some(w) = wins.first() {
                     emit_windows_json_or_table(out, std::slice::from_ref(w));
                     return Ok(0);
@@ -215,7 +223,7 @@ async fn window_op(
     op: WindowOpKind,
     geo: [i32; 4],
 ) -> CmdResult {
-    let wins = c.windows_list(None).await?.0;
+    let wins = c.windows_list(None, None).await?.0;
     let w = cli::resolve_target_entry(&target, &wins)?;
     c.window_op(op, &w.native_id.clone(), geo).await?;
     Ok(0)

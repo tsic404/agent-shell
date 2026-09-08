@@ -27,7 +27,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use agent_shell_core::component::CompositorComponent;
 use agent_shell_core::error::{AgentShellError, Result};
 use agent_shell_core::security::{PermissionDecision, SecurityManager};
-use agent_shell_core::types::{SemanticTarget, TitleMatchMode, WindowInfo};
+use agent_shell_core::types::{SemanticTarget, TitleMatcher, WindowInfo};
 
 use crate::command::{Command, CommandResult};
 use crate::dispatcher::{not_implemented, CaptureDispatcher, ElementActions, InputDispatcher};
@@ -344,9 +344,10 @@ impl Executor {
 
             SemanticTarget::ByTitle(title, mode) => {
                 let windows = self.backend.list_windows().await?;
+                let matcher = TitleMatcher::new(*mode, title);
                 windows
                     .into_iter()
-                    .find(|w| title_matches(mode, title, &w.title))
+                    .find(|w| matcher.matches(&w.title))
                     .ok_or_else(|| AgentShellError::WindowNotFound(format!("title '{title}'")))
             }
 
@@ -376,20 +377,6 @@ impl Executor {
                 "router: target resolution for {other:?}"
             ))),
         }
-    }
-}
-
-/// 标题匹配（§15.3 第 3 级：子串 → 精确 → 正则 → glob）。
-///
-/// 正则编译失败按「不匹配」处理，不向上抛错。
-fn title_matches(mode: &TitleMatchMode, pattern: &str, title: &str) -> bool {
-    match mode {
-        TitleMatchMode::Substring => title.contains(pattern),
-        TitleMatchMode::Exact => title == pattern,
-        TitleMatchMode::Regex => regex::Regex::new(pattern)
-            .map(|r| r.is_match(title))
-            .unwrap_or(false),
-        TitleMatchMode::Glob => glob_match::glob_match(pattern, title),
     }
 }
 

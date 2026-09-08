@@ -6,7 +6,7 @@
 use crate::state::Daemon;
 use agent_shell_core::error::AgentShellError;
 use agent_shell_core::security::{Operation, PermissionDecision, PermissionLevel};
-use agent_shell_core::types::{SemanticTarget, WindowInfo};
+use agent_shell_core::types::{SemanticTarget, TitleMatchMode, TitleMatcher, WindowInfo};
 use agent_shell_rpc::{
     method, A11yElementResult, A11yQueryResult, A11yStatusResult, CapabilityStatus, CaptureParams,
     DoctorResult, InfoResult, InputParams, Request, Response, RpcErrorCode, WindowOpKind,
@@ -389,14 +389,24 @@ async fn windows_list(d: &mut Daemon, req: &Request) -> RpcResult {
         .as_ref()
         .and_then(|p| p.get("filter"))
         .and_then(|v| v.as_str());
-    let (wins, from_cache) = d.list_windows().await?;
-    let filtered: Vec<&WindowInfo> = match filter {
-        Some(f) => wins
-            .iter()
-            .filter(|w| w.app_id == f || w.title.contains(f))
-            .collect(),
-        None => wins.iter().collect(),
+    // 默认 substring：不传 `match` 时保持既有 `app_id == f || title.contains(f)`
+    // 语义，兼容旧 CLI 与 MCP（二者只发 `filter`）。
+    let mode = match req.params.as_ref().and_then(|p| p.get("match")) {
+        None | Some(serde_json::Value::Null) => TitleMatchMode::Substring,
+        Some(v) => serde_json::from_value(v.clone()).map_err(|e| {
+            (
+                RpcErrorCode::InvalidParams,
+                format!("bad params.match: {e}"),
+            )
+        })?,
     };
+    let (wins, from_cache) = d.list_windows().await?;
+    // 预编译 regex 一次，供逐窗口过滤复用（`windows wait` 200ms 轮询也走此路径）。
+    let matcher = filter.map(|f| TitleMatcher::new(mode, f));
+    let filtered: Vec<&WindowInfo> = wins
+        .iter()
+        .filter(|w| filter_matches(w, matcher.as_ref()))
+        .collect();
     let items: Vec<Value> = filtered
         .iter()
         .map(|w| {
@@ -414,6 +424,17 @@ async fn windows_list(d: &mut Daemon, req: &Request) -> RpcResult {
         })
         .collect();
     Ok(json!({ "windows": items, "from_cache": from_cache }))
+}
+
+/// `windows.list` 过滤谓词：app_id 精确命中，或标题按给定模式命中。
+///
+/// app_id 是稳定标识，恒用精确比较（不随 `--match` 变 glob/regex）；标题
+/// 匹配由预编译的 [`TitleMatcher`] 判定，`Substring` 即历史默认行为。
+fn filter_matches(w: &WindowInfo, matcher: Option<&TitleMatcher>) -> bool {
+    match matcher {
+        None => true,
+        Some(m) => w.app_id == m.pattern() || m.matches(&w.title),
+    }
 }
 
 async fn window_info(d: &mut Daemon, req: &Request) -> RpcResult {
@@ -1355,6 +1376,139 @@ mod tests {
         d.caller_id = "*".into();
         d.security = SecurityManager::with_config(AgentShellConfig::default());
         d
+    }
+
+    fn win(native_id: &str, title: &str, app_id: &str) -> WindowInfo {
+        use agent_shell_core::types::{DesktopEnvironment, Rect, WindowId, WindowType};
+        WindowInfo {
+            id: WindowId {
+                native_id: native_id.into(),
+                de_type: DesktopEnvironment::KDE,
+            },
+            title: title.into(),
+            app_id: app_id.into(),
+            pid: 1000,
+            geometry: Rect {
+                x: 0,
+                y: 0,
+                width: 800,
+                height: 600,
+            },
+            frame_geometry: Rect {
+                x: 0,
+                y: 0,
+                width: 800,
+                height: 600,
+            },
+            states: vec![],
+            workspace_id: None,
+            monitor_id: None,
+            stacking_order: 0,
+            desktop_file: None,
+            window_type: WindowType::Normal,
+            icon_geometry: None,
+            keep_above: false,
+        }
+    }
+
+    #[test]
+    fn filter_matches_covers_four_modes_and_app_id() {
+        let wins = vec![
+            win("a", "Untitled Document — Kate", "kate"),
+            win("b", "终端 — Konsole", "konsole"),
+            win("c", "Browser", "firefox"),
+        ];
+        let m = |mode, pattern| TitleMatcher::new(mode, pattern);
+
+        // 无 filter：全部命中。
+        for w in &wins {
+            assert!(filter_matches(w, None));
+        }
+
+        // app_id 精确命中，独立于标题匹配模式。
+        assert!(filter_matches(
+            &wins[2],
+            Some(&m(TitleMatchMode::Regex, "firefox"))
+        ));
+
+        // substring（历史默认）。
+        assert!(filter_matches(
+            &wins[1],
+            Some(&m(TitleMatchMode::Substring, "Kons"))
+        ));
+        // exact：标题必须完全相等。
+        assert!(filter_matches(
+            &wins[1],
+            Some(&m(TitleMatchMode::Exact, "终端 — Konsole"))
+        ));
+        assert!(!filter_matches(
+            &wins[1],
+            Some(&m(TitleMatchMode::Exact, "终端"))
+        ));
+        // regex。
+        assert!(filter_matches(
+            &wins[0],
+            Some(&m(TitleMatchMode::Regex, "^Unt.*Kate$"))
+        ));
+        assert!(!filter_matches(
+            &wins[0],
+            Some(&m(TitleMatchMode::Regex, "^\\d+$"))
+        ));
+        // glob。
+        assert!(filter_matches(
+            &wins[0],
+            Some(&m(TitleMatchMode::Glob, "*Document*"))
+        ));
+        assert!(!filter_matches(
+            &wins[0],
+            Some(&m(TitleMatchMode::Glob, "*.pdf"))
+        ));
+        // 非法 regex 视为不匹配（不 panic）。
+        assert!(!filter_matches(
+            &wins[0],
+            Some(&m(TitleMatchMode::Regex, "([ bad"))
+        ));
+    }
+
+    #[tokio::test]
+    async fn windows_list_invalid_match_returns_invalid_params() {
+        // 非法 `match` 值在 daemon 参数解析层失败，未触达 list_windows，
+        // 故 headless 下也稳定可测（不依赖合成器）。
+        let mut d = test_daemon().await;
+        let resp = dispatch(
+            &mut d,
+            &req(
+                method::WINDOWS_LIST,
+                Some(json!({ "filter": "x", "match": "bogus" })),
+            ),
+        )
+        .await;
+        let err = resp.error.expect("error");
+        assert_eq!(err.code, RpcErrorCode::InvalidParams as i32);
+        assert!(err.message.contains("params.match"), "{}", err.message);
+    }
+
+    #[tokio::test]
+    async fn windows_list_valid_match_is_not_rejected_as_invalid() {
+        // 合法 `match` 值通过解析；无合成器时走到 BackendUnavailable，
+        // 有合成器时正常返回列表——两者都不得是 InvalidParams。
+        let mut d = test_daemon().await;
+        let resp = dispatch(
+            &mut d,
+            &req(
+                method::WINDOWS_LIST,
+                Some(json!({ "filter": "x", "match": "regex" })),
+            ),
+        )
+        .await;
+        if let Some(err) = resp.error {
+            assert_ne!(
+                err.code,
+                RpcErrorCode::InvalidParams as i32,
+                "{}",
+                err.message
+            );
+        }
     }
 
     #[tokio::test]

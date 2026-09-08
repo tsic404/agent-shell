@@ -371,6 +371,7 @@ dependencies = [
  "async-trait",
  "dirs",
  "glob-match",
+ "regex",
  "serde",
  "serde_json",
  "thiserror 1.0.69",
@@ -542,9 +543,7 @@ version = "0.1.0"
 dependencies = [
  "agent-shell-core",
  "async-trait",
- "glob-match",
  "parking_lot",
- "regex",
  "tokio",
  "tracing",
 ]
