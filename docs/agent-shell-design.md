@@ -6124,6 +6124,11 @@ DE 源                     daemon                    订阅者
   持续的真实事件源推送；`events --replay` 数据同样只反映查询触发的差分历史。
 - 后续接线：把 `KWinCompositor::subscribe()` 的原始流包装为 `RawSource`，
   `add_source` 进 `EventNormalizer` 并 `run()`，以恢复本节描述的持续推送语义。
+- TSI-2912 决策：T3b 落地前，doctor 将事件脚本/事件流行标注为「可选」
+  （`⚠ 可选（T3b 待办；daemon 未装配事件归一化管线，subscribe 未接线）`），
+  不再以「未装配/未接线」呈现为待修复缺口——合成器原始流（KWin
+  `windowOpened`→`WindowClosed` 近似映射等）尚未语义正确，贸然接线会向订阅者
+  发布错误事件，故本期以标注代替装配。
 
 **事件去重/节流**：
 - 100ms 窗口内的连续 WindowMoved 合并

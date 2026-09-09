@@ -140,8 +140,8 @@ fn render_info(out: OutputFormat, r: &agent_shell_rpc::InfoResult) -> String {
     }
 }
 
-/// 能力三态 → 终端标记。`Lazy` 与 doctor 的 ⚠ 事件脚本行同语义：
-/// 首次订阅才建立，非永久不可用。
+/// 能力三态 → 终端标记。`Lazy`：首次订阅才建立，非永久不可用
+/// （对应合成器 `lazy_capabilities` 声明的 `window_events`/`workspace_events`）。
 fn render_capability(status: &CapabilityStatus) -> &'static str {
     match status {
         CapabilityStatus::Enabled => "✓",
@@ -1186,7 +1186,7 @@ mod tests {
 
     #[test]
     fn render_capability_maps_status_to_terminal_marker() {
-        // info 能力位表终端标记：Lazy 用 ⚠ (lazy) 与 doctor 事件脚本行同语义。
+        // info 能力位表终端标记：Lazy 用 ⚠ (lazy)（对应合成器懒启动能力）。
         assert_eq!(render_capability(&crate::CapabilityStatus::Enabled), "✓");
         assert_eq!(render_capability(&crate::CapabilityStatus::Disabled), "✗");
         assert_eq!(

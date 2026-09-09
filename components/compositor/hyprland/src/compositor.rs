@@ -226,14 +226,20 @@ impl HyprlandCompositor {
             Err(e) => lines.push(format!("⚠ hyprctl socket : {e}")),
         }
         let events_running = self.event.try_read().map(|g| g.is_some()).unwrap_or(false);
-        lines.push(if events_running {
-            "✓ 事件流        : connected (openwindow, closewindow, activewindow, workspacev2)"
-                .to_string()
-        } else {
-            "⚠ 事件流        : not started (lazy; daemon 事件归一化管线未装配，subscribe 未接线)"
-                .to_string()
-        });
+        lines.push(event_stream_doctor_line(events_running));
         lines
+    }
+}
+
+/// 事件流 doctor 行：事件任务在跑（`subscribe()` 已触发）报 connected，
+/// 否则如实标注为可选（T3b 待办）而非「未接线」缺口（TSI-2912）。
+fn event_stream_doctor_line(events_running: bool) -> String {
+    if events_running {
+        "✓ 事件流        : connected (openwindow, closewindow, activewindow, workspacev2)"
+            .to_string()
+    } else {
+        "⚠ 事件流        : 可选（T3b 待办；daemon 未装配事件归一化管线，subscribe 未接线）"
+            .to_string()
     }
 }
 
@@ -714,5 +720,26 @@ mod tests {
         assert_eq!(windows[0].stacking_order, 0);
         assert_eq!(windows[1].stacking_order, 1);
         assert_eq!(windows[2].stacking_order, 2);
+    }
+
+    /// 事件流 doctor 行如实标注为可选（T3b 待办），而非以「未接线」呈现为
+    /// 待修复缺口（TSI-2912）。
+    #[test]
+    fn event_stream_doctor_line_marks_optional_when_not_running() {
+        let line = event_stream_doctor_line(false);
+        assert!(
+            line.contains("⚠ 事件流") && line.contains("可选"),
+            "event stream line must mark optional: {line}"
+        );
+    }
+
+    /// 事件任务在跑时报 connected，而非可选待办。
+    #[test]
+    fn event_stream_doctor_line_reports_connected_when_running() {
+        let line = event_stream_doctor_line(true);
+        assert!(
+            line.contains("✓ 事件流") && line.contains("connected"),
+            "event stream line must report connected: {line}"
+        );
     }
 }
