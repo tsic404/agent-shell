@@ -249,7 +249,7 @@ impl KWinCompositor {
         lines.push(if event_loaded {
             "✓ 事件脚本    : loaded (workspace.windowAdded OK)".to_string()
         } else {
-            "⚠ 事件脚本    : not started (lazy; daemon 事件归一化管线未装配，subscribe 未接线)"
+            "⚠ 事件脚本    : 可选（T3b 待办；daemon 未装配事件归一化管线，subscribe 未接线）"
                 .to_string()
         });
         lines
@@ -986,5 +986,20 @@ mod tests {
         assert_eq!(comp.scripting_probe_ok(), Some(false));
         assert!(has_not_ready_bridge(&lines));
         assert!(!has_ready_bridge(&lines));
+    }
+
+    /// doctor 事件脚本行如实标注为可选（T3b 待办），而非以「未装配/未接线」
+    /// 呈现为待修复缺口（TSI-2912）。
+    #[tokio::test]
+    async fn doctor_event_script_line_marks_optional() {
+        let bus = TestBus::start().await;
+        let comp = KWinCompositor::for_test(bridge(&bus).await, None);
+        let lines = comp.doctor_lines();
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("⚠ 事件脚本") && l.contains("可选")),
+            "event script line must mark optional: {lines:#?}"
+        );
     }
 }
