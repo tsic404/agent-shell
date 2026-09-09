@@ -3,7 +3,8 @@
 //! 降级链构造顺序（§12.1/§12.2）：
 //! libei（Wayland 首选，非 X11 会话压入）→ ydotool（跨 DE 保底，需
 //! `ydotool` 可执行且 `/dev/uinput` 存在）→ XTest（仅原生 X11，连接成功
-//! 才压入）→ xdotool（仅 X11 且可执行存在）。随后取第一个
+//! 才压入）→ xdotool（`DISPLAY` 存在即压入：原生 X11 或 XWayland 会话，
+//! 且可执行存在）。随后取第一个
 //! `is_available() == true` 的后端为 `active`；全部不可用则 `active = None`
 //! （调用返回错误，不 panic）。
 //!
@@ -102,6 +103,16 @@ pub struct InputDispatcher {
     active: std::sync::Mutex<Option<usize>>,
 }
 
+/// xdotool 是否应入链（§12.2 最后兜底）：`DISPLAY` 存在且 `xdotool` 可执行。
+///
+/// 刻意不依赖 `de_type`：xdotool 直连 `DISPLAY` 指向的 X server，原生 X11
+/// 与 XWayland 会话均可注入。Wayland-only DE（Hyprland/Sway/WLRWayland）在
+/// XWayland 会话下（`DISPLAY` 存在）此前因 `supports_x11()` 为 false 而缺
+/// 最后一级兜底，ydotool 缺失时 input 完全不可用。
+fn xdotool_candidate(display: Option<&std::ffi::OsStr>, has_xdotool: bool) -> bool {
+    display.is_some() && has_xdotool
+}
+
 impl InputDispatcher {
     /// 按 DE 探测候选集合并选出第一个可用的 active 后端。
     pub async fn new(de_type: DesktopEnvironment) -> Result<Self> {
@@ -127,12 +138,15 @@ impl InputDispatcher {
                 backends.push(Box::new(xtest));
             }
         }
-
-        // 4. xdotool（X11 保底）。
-        if de_type.supports_x11()
-            && std::env::var_os("DISPLAY").is_some()
-            && which::which("xdotool").is_ok()
-        {
+        // 4. xdotool（X11 / XWayland 兜底）：`DISPLAY` 存在即入链——xdotool
+        //    直连 `DISPLAY` 指向的 X server（原生 X11 或 XWayland 均可），
+        //    不依赖 `de_type.supports_x11()`：Wayland-only DE（Hyprland/Sway/
+        //    WLRWayland）在 XWayland 会话下同样可经 xdotool 注入，作为
+        //    ydotool 之下的最后兜底（此前 Wayland 会话无此级时 input 全不可用）。
+        if xdotool_candidate(
+            std::env::var_os("DISPLAY").as_deref(),
+            which::which("xdotool").is_ok(),
+        ) {
             backends.push(Box::new(super::xdotool::XdotoolInput::new()));
         }
 
@@ -455,6 +469,19 @@ mod tests {
         assert!(matches!(err, AgentShellError::Input(msg) if msg.contains("refused")));
         // 未降级：active 仍停留在注入期失败的后端。
         assert_eq!(d.active_backend_name(), Some("failing"));
+    }
+
+    #[test]
+    fn xdotool_candidate_requires_display_and_binary() {
+        // §12.2 兜底：`DISPLAY` 存在（原生 X11 或 XWayland）且 `xdotool` 可
+        // 执行即入链；不依赖 de_type（Wayland-only DE 的 XWayland 会话同样
+        // 可经 xdotool 注入）。
+        assert!(!xdotool_candidate(None, true), "无 DISPLAY 不压入");
+        assert!(
+            !xdotool_candidate(Some(std::ffi::OsStr::new(":0")), false),
+            "无 xdotool 不压入"
+        );
+        assert!(xdotool_candidate(Some(std::ffi::OsStr::new(":0")), true));
     }
 
     #[test]
