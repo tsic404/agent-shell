@@ -87,7 +87,7 @@ impl ActiveBackend {
 /// 装配探测链（design/02 §4.2）：`capture: portal ScreenCast →
 /// Screenshot → X11`。ScreenCast 会话建立需用户弹窗确认，构造期只做
 /// 无副作用探测（bus 上 portal 是否可达、原生 X11 会话是否存在）；实际
-/// 后端在首次 `capture` 时惰性建立并记录到 `active`。
+/// 后端由首次 [`Self::capture`] 或 [`Self::probe`] 惰性建立并记录到 `active`。
 ///
 /// `token_store` 注入后，ScreenCast 优先尝试用持久化的 `restore_token`
 /// 静默恢复会话——恢复成功则无弹窗（无交互授权路径）。
@@ -190,56 +190,17 @@ impl CaptureDispatcher {
     /// ScreenCast——无 token 则直接降级到 Screenshot/X11（避免弹窗）。
     pub async fn capture(&self, target: CaptureTarget, interactive: bool) -> Result<CapturedFrame> {
         // L1: portal ScreenCast（流式，daemon 复用会话）。
-        if self.screencast_ok {
-            // interactive=false 且无 restore_token 时跳过——portal 无免弹窗选项。
-            let has_token = self
-                .token_store
-                .as_ref()
-                .and_then(|s| s.get_restore_token())
-                .is_some();
-            if interactive || has_token {
-                let mut guard = self.session.lock().await;
-                if guard.is_none() {
-                    let opts = self.build_screencast_options();
-                    match ScreenCastCapture::start_with_options(self.conn.clone(), target, &opts)
-                        .await
-                    {
-                        Ok(session) => {
-                            // Start 返回新 restore_token 时持久化（覆盖旧值，
-                            // token 单次有效）。persist_mode 未授权则无 token。
-                            if let Some(store) = &self.token_store {
-                                if let Some(new_token) = &session.restore_token {
-                                    store.save_restore_token(Some(new_token.clone()));
-                                }
-                            }
-                            *guard = Some(std::sync::Arc::new(session.capture));
-                        }
-                        Err(e) => {
-                            // 静默恢复失败（token 过期/会话不可用）且非交互
-                            // 时静默降级；交互时也继续尝试其它后端。
-                            if interactive {
-                                tracing::warn!("screencast start failed, degrade: {e}");
-                            } else {
-                                tracing::debug!(
-                                    "screencast restore/start failed (non-interactive): {e}"
-                                );
-                            }
-                        }
-                    }
+        if let Some(s) = self.ensure_screencast_session(target, interactive).await {
+            match s.capture_frame().await {
+                Ok(frame) => {
+                    self.set_active(Some(ActiveBackend::ScreenCast));
+                    return Ok(CapturedFrame::Pixels(frame));
                 }
-                if let Some(s) = guard.as_ref() {
-                    match s.capture_frame().await {
-                        Ok(frame) => {
-                            self.set_active(Some(ActiveBackend::ScreenCast));
-                            return Ok(CapturedFrame::Pixels(frame));
-                        }
-                        Err(e) => {
-                            tracing::warn!("screencast frame failed, degrade: {e}");
-                            // 会话失效即丢弃，下次重新走五步流程。
-                            *guard = None;
-                            self.set_active(None);
-                        }
-                    }
+                Err(e) => {
+                    tracing::warn!("screencast frame failed, degrade: {e}");
+                    // 会话失效即丢弃，下次重新走五步流程。
+                    *self.session.lock().await = None;
+                    self.set_active(None);
                 }
             }
         }
@@ -259,9 +220,16 @@ impl CaptureDispatcher {
         if self.x11_present {
             let cap = X11Capture::connect().map_err(|e| {
                 tracing::warn!("x11 capture unavailable: {e}");
+                // 失败即清 active——否则先前记录的 stale 后端会残留，
+                // doctor/selected_backend 持续报假「选中」状态。
+                self.set_active(None);
                 e
             })?;
-            let frame = cap.capture_frame().await?;
+            let frame = cap.capture_frame().await.map_err(|e| {
+                tracing::warn!("x11 capture frame failed: {e}");
+                self.set_active(None);
+                e
+            })?;
             if is_all_black(&frame) {
                 tracing::warn!(
                     "X11 fallback captured an all-black frame (likely XWayland root without \
@@ -278,6 +246,128 @@ impl CaptureDispatcher {
              X11 session)"
                 .into(),
         ))
+    }
+
+    /// 建立（或复用）ScreenCast 流会话，返回可复用的会话句柄。
+    ///
+    /// `interactive=false` 且无 `restore_token` 时直接返回 `None`（portal 无
+    /// 免弹窗选项，建立会话会弹授权窗）；有 token 则尝试静默恢复。建立失败
+    /// （token 过期 / portal 不可用）返回 `None`，由调用方降级。
+    async fn ensure_screencast_session(
+        &self,
+        target: CaptureTarget,
+        interactive: bool,
+    ) -> Option<std::sync::Arc<ScreenCastCapture>> {
+        if !self.screencast_ok {
+            return None;
+        }
+        let has_token = self
+            .token_store
+            .as_ref()
+            .and_then(|s| s.get_restore_token())
+            .is_some();
+        if !(interactive || has_token) {
+            return None;
+        }
+        let mut guard = self.session.lock().await;
+        if guard.is_none() {
+            let opts = self.build_screencast_options();
+            match ScreenCastCapture::start_with_options(self.conn.clone(), target, &opts).await {
+                Ok(session) => {
+                    // Start 返回新 restore_token 时持久化（覆盖旧值，
+                    // token 单次有效）。persist_mode 未授权则无 token。
+                    if let Some(store) = &self.token_store {
+                        if let Some(new_token) = &session.restore_token {
+                            store.save_restore_token(Some(new_token.clone()));
+                        }
+                    }
+                    *guard = Some(std::sync::Arc::new(session.capture));
+                }
+                Err(e) => {
+                    // 静默恢复失败（token 过期/会话不可用）且非交互时静默降级；
+                    // 交互时也继续尝试其它后端。
+                    if interactive {
+                        tracing::warn!("screencast start failed, degrade: {e}");
+                    } else {
+                        tracing::debug!("screencast restore/start failed (non-interactive): {e}");
+                    }
+                }
+            }
+        }
+        guard.as_ref().cloned()
+    }
+
+    /// 非交互会话探测（doctor 用）：逐级真实验证/建立降级链中首个可用后端，
+    /// 记录到 `active` 并返回。
+    ///
+    /// 不短路复用已记录的 `active`——已记录后端也可能已失效（ScreenCast 会话
+    /// 可在两次 capture 间失效、X11 连接可断开），必须逐级重验，失败即清状态
+    /// 并继续降级链。区别于 [`Self::capture`]：不产出帧/文件，全程
+    /// `interactive=false`（不弹授权窗）。ScreenCast 仅在持有 `restore_token`
+    /// 时尝试静默恢复；Screenshot 走无对话框全屏路径；X11 直捕一帧验证
+    /// （全黑帧视为非可用——纯 Wayland 会话 XWayland root 无合成器内容）。
+    ///
+    /// 返回 `None` 表示无任何后端可非交互建立，并将 `active` 清空。
+    pub async fn probe(&self) -> Option<ActiveBackend> {
+        // L1: ScreenCast 静默恢复（无 token 会弹窗，跳过）。
+        if let Some(s) = self
+            .ensure_screencast_session(CaptureTarget::Monitor, false)
+            .await
+        {
+            match s.capture_frame().await {
+                Ok(_) => {
+                    self.set_active(Some(ActiveBackend::ScreenCast));
+                    return Some(ActiveBackend::ScreenCast);
+                }
+                Err(e) => {
+                    tracing::debug!("screencast frame probe failed: {e}");
+                    *self.session.lock().await = None;
+                    self.set_active(None);
+                }
+            }
+        }
+
+        // L2: portal Screenshot（interactive=false 全屏、无对话框）。
+        if self.screenshot_ok {
+            match self.screenshot.capture(false).await {
+                Ok(path) => {
+                    // 探测产生的临时截图落盘（可能含敏感画面），验证后立即删除，
+                    // 避免每次 doctor 运行累积残留文件。
+                    if let Err(e) = std::fs::remove_file(&path) {
+                        tracing::debug!("probe screenshot cleanup failed {}: {e}", path.display());
+                    }
+                    self.set_active(Some(ActiveBackend::ScreenshotPortal));
+                    return Some(ActiveBackend::ScreenshotPortal);
+                }
+                Err(e) => tracing::debug!("screenshot portal probe failed (non-interactive): {e}"),
+            }
+        }
+
+        // L3: X11 原生（全黑帧判非可用——XWayland root 无内容）。
+        if self.x11_present {
+            match self
+                .x11
+                .get_or_try_init(|| async { X11Capture::connect() })
+                .await
+            {
+                Ok(cap) => match cap.capture_frame().await {
+                    Ok(frame) if !is_all_black(&frame) => {
+                        self.set_active(Some(ActiveBackend::X11));
+                        return Some(ActiveBackend::X11);
+                    }
+                    Ok(_) => tracing::warn!(
+                        "X11 probe captured an all-black frame (XWayland root without compositor \
+                         content); portal authorization required"
+                    ),
+                    Err(e) => tracing::debug!("x11 capture frame probe failed: {e}"),
+                },
+                Err(e) => tracing::debug!("x11 capture connect probe failed: {e}"),
+            }
+        }
+
+        // 逐级验证均失败：清空 stale active，doctor 据 None 渲染不可用/需授权。
+        self.set_active(None);
+        None
     }
 
     /// 构造 ScreenCast 建会话选项：尝试 restore_token 恢复 + persist_mode 持久化。
@@ -348,18 +438,40 @@ impl CaptureComponent for CaptureDispatcher {
     }
 }
 
-/// capture 组件 doctor 行（CLI collect_doctor 用）。
+/// capture 组件 doctor 行（daemon doctor 用）。
+///
+/// 先触发一次非交互会话探测（[`CaptureDispatcher::probe`]）——门户会话
+/// 惰性建立，未探测前 `selected_backend()` 恒 `None`，doctor 只能报
+/// 「候选」而无真实可用状态。探测后据实际选中的后端渲染。
 pub async fn doctor_line(dispatcher: Option<&CaptureDispatcher>) -> String {
     const LABEL: &str = "截图捕获";
     match dispatcher {
         None => format!("✗ {LABEL:<12}: 不可用（无 portal 且无原生 X11 会话，TTY？）"),
         Some(d) => {
-            let backends = d.available_backends().join(" → ");
-            match d.selected_backend() {
-                Some(b) => format!("✓ {LABEL:<12}: {}（选中 {}）", backends, b.name()),
-                None => format!("⚠ {LABEL:<12}: 候选 {backends}（尚未实际建立会话）"),
-            }
+            let active = d.probe().await;
+            render_capture_doctor_line(LABEL, &d.available_backends(), active)
         }
+    }
+}
+
+/// 渲染 capture doctor 行（纯函数，可单测）。
+///
+/// `active` 为 [`CaptureDispatcher::probe`] 的探测结果：`Some` = 已建立
+/// 真实会话；`None` = 非交互探测失败。`None` 的原因据候选集区分：含 portal
+/// 后端则多半是「需交互授权」；仅 X11 则是「无可用后端」——两者排查方向不同，
+/// 不混为一谈（X11 连接失败与授权无关）。
+fn render_capture_doctor_line(
+    label: &str,
+    backends: &[&'static str],
+    active: Option<ActiveBackend>,
+) -> String {
+    let chain = backends.join(" → ");
+    match active {
+        Some(b) => format!("✓ {label:<12}: {chain}（选中 {}）", b.name()),
+        None if backends.iter().any(|b| b.starts_with("portal-")) => {
+            format!("⚠ {label:<12}: 候选 {chain}（非交互探测未就绪，需 portal 交互授权）")
+        }
+        None => format!("⚠ {label:<12}: 候选 {chain}（非交互探测失败，无可用后端）"),
     }
 }
 
@@ -480,5 +592,46 @@ mod tests {
             format: PixelFormat::Rgb565,
         };
         assert!(is_all_black(&black_rgb565));
+    }
+
+    #[test]
+    fn render_capture_doctor_line_with_active_backend() {
+        // 已建立真实会话（probe 返回 Some）→ ✓ + 选中后端名。
+        let line = render_capture_doctor_line(
+            "截图捕获",
+            &["portal-screencast", "portal-screenshot", "x11-mit-shm"],
+            Some(ActiveBackend::ScreenCast),
+        );
+        assert!(
+            line.starts_with("✓ 截图捕获"),
+            "selected backend must render ✓: {line}"
+        );
+        assert!(line.contains("portal-screencast → portal-screenshot → x11-mit-shm"));
+        assert!(line.contains("选中 portal-screencast"), "{line}");
+    }
+
+    #[test]
+    fn render_capture_doctor_line_without_active_backend() {
+        // 非交互探测未就绪（probe 返回 None）→ ⚠ 提示需 portal 交互授权，
+        // 不再用旧的「尚未实际建立会话」（探测已真实执行过）。
+        let line = render_capture_doctor_line(
+            "截图捕获",
+            &["portal-screencast", "portal-screenshot"],
+            None,
+        );
+        assert!(line.starts_with("⚠ 截图捕获"), "{line}");
+        assert!(line.contains("候选 portal-screencast → portal-screenshot"));
+        assert!(line.contains("需 portal 交互授权"), "{line}");
+    }
+
+    #[test]
+    fn render_capture_doctor_line_without_active_backend_x11_only() {
+        // 候选集仅含 X11（无 portal 后端）→ 探测失败与授权无关，须渲染
+        // 「无可用后端」而非「需 portal 交互授权」（Radian 建议 3）。
+        let line = render_capture_doctor_line("截图捕获", &["x11-mit-shm"], None);
+        assert!(line.starts_with("⚠ 截图捕获"), "{line}");
+        assert!(line.contains("候选 x11-mit-shm"), "{line}");
+        assert!(line.contains("无可用后端"), "{line}");
+        assert!(!line.contains("portal"), "{line}");
     }
 }
