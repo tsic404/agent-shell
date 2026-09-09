@@ -218,8 +218,13 @@ pub enum InputCommand {
         #[arg(long, value_name = "X,Y")]
         at: Option<String>,
     },
-    /// 鼠标滚动
-    Scroll { dx: i32, dy: i32 },
+    /// 鼠标滚动（dx/dy 支持负数直传，如 `scroll -2 0` 向上滚动）
+    Scroll {
+        #[arg(allow_negative_numbers = true)]
+        dx: i32,
+        #[arg(allow_negative_numbers = true)]
+        dy: i32,
+    },
 }
 
 // ───────────────────────── screenshot ─────────────────────────
@@ -900,6 +905,43 @@ mod tests {
                 .native_id,
             "{e6f8-4a2c}"
         );
+    }
+
+    #[test]
+    fn scroll_accepts_negative_numbers_without_double_dash() {
+        // `input scroll -2 0` 不经 `--` 直接传负值（TSI-2915）。
+        let Cli {
+            command: Some(Command::Input(InputCommand::Scroll { dx, dy })),
+            ..
+        } = Cli::try_parse_from(["agent-shell", "input", "scroll", "-2", "0"]).expect("parse")
+        else {
+            panic!("expected scroll");
+        };
+        assert_eq!(dx, -2);
+        assert_eq!(dy, 0);
+
+        // 双负值与正负混合同样可直传。
+        let Cli {
+            command: Some(Command::Input(InputCommand::Scroll { dx, dy })),
+            ..
+        } = Cli::try_parse_from(["agent-shell", "input", "scroll", "3", "-4"]).expect("parse")
+        else {
+            panic!("expected scroll");
+        };
+        assert_eq!(dx, 3);
+        assert_eq!(dy, -4);
+
+        // `--` 分隔写法保持可用（向后兼容）。
+        let Cli {
+            command: Some(Command::Input(InputCommand::Scroll { dx, dy })),
+            ..
+        } = Cli::try_parse_from(["agent-shell", "input", "scroll", "--", "-2", "0"])
+            .expect("parse")
+        else {
+            panic!("expected scroll");
+        };
+        assert_eq!(dx, -2);
+        assert_eq!(dy, 0);
     }
 
     #[test]
