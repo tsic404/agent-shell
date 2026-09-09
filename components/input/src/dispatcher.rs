@@ -19,6 +19,7 @@
 //! 超时/重试（§19）：input 注入超时 1s、重试 3 次——由各后端的命令执行层
 //! 统一施加（[`super::ydotool`] / [`super::xdotool`]），dispatcher 不重复包装。
 
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use agent_shell_core::component::ComponentHealth;
@@ -101,6 +102,105 @@ pub enum Op<'a> {
 pub struct InputDispatcher {
     backends: Vec<Box<dyn InputService>>,
     active: std::sync::Mutex<Option<usize>>,
+    /// active 状态持久化文件；`None` = 不持久化（测试装配）。
+    state_path: Option<PathBuf>,
+}
+
+/// 状态文件名（D9 状态持久化：`$XDG_RUNTIME_DIR/agent-shell/input-active.json`）。
+const ACTIVE_STATE_FILE: &str = "input-active.json";
+
+/// 持久化的 active 后端状态（§12.2 操作期降级跨进程可见）。
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PersistedActive {
+    active: String,
+}
+
+/// 会话级状态目录 `$XDG_RUNTIME_DIR/agent-shell`（随登出清理）。
+///
+/// 操作期降级是登录会话内的事实（portal 授权每次登录重新判定），不应跨重启
+/// 粘连：用 `$XDG_RUNTIME_DIR` 而非 `~/.local/state`，既覆盖「瞬态 daemon
+/// 重启」这一缺口，又在下次登录时重新探测。未设置 `XDG_RUNTIME_DIR`
+/// （SSH/TTY）返回 `None`——该场景本就没有可持久化的降级链。
+fn runtime_state_dir() -> Option<PathBuf> {
+    std::env::var_os("XDG_RUNTIME_DIR").map(|d| PathBuf::from(d).join("agent-shell"))
+}
+
+/// active 状态文件路径；无会话运行目录时为 `None`（不持久化）。
+fn active_state_path() -> Option<PathBuf> {
+    runtime_state_dir().map(|d| d.join(ACTIVE_STATE_FILE))
+}
+
+/// 读取上次持久化的 active 后端名；文件缺失/损坏返回 `None`。
+fn load_persisted_active(path: &Path) -> Option<String> {
+    let content = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str::<PersistedActive>(&content)
+        .ok()
+        .map(|p| p.active)
+}
+
+/// 把持久化的 active 后端名解析为当前链中的下标（None = 未持久化/不在链中）。
+///
+/// 名字解析而非下标持久化：链顺序/成员随会话变化时（如切换 DE 导致某后端
+/// 不再压入）自动失效。可用性复验由 [`restore_persisted_active`] 完成。
+fn resolve_persisted_active(path: &Path, backends: &[Box<dyn InputService>]) -> Option<usize> {
+    let name = load_persisted_active(path)?;
+    backends.iter().position(|b| b.name() == name.as_str())
+}
+
+/// 恢复持久化的 active 后端：名字仍在链中且复验 `is_available()` 通过才覆盖
+/// 构造期探测结果；否则返回 `None`（回退首个可用候选，不复活损坏后端）。
+async fn restore_persisted_active(
+    path: &Path,
+    backends: &[Box<dyn InputService>],
+) -> Option<usize> {
+    let i = resolve_persisted_active(path, backends)?;
+    backends[i].is_available().await.then_some(i)
+}
+
+/// 原子写入 active 后端名（先写 `.tmp` 再 rename，避免崩溃产生半截文件）。
+///
+/// 失败不静默：持久化失败意味着下次重启回退到构造期快照，必须留下
+/// `tracing::warn!` 诊断痕迹供排查。
+fn persist_active(path: &Path, name: &str) {
+    let Some(dir) = path.parent() else {
+        tracing::warn!(path = %path.display(), "input: persist active state: no parent dir");
+        return;
+    };
+    if let Err(e) = std::fs::create_dir_all(dir) {
+        tracing::warn!(dir = %dir.display(), error = %e, "input: persist active state: create dir failed");
+        return;
+    }
+    let payload = PersistedActive {
+        active: name.to_string(),
+    };
+    let json = match serde_json::to_string(&payload) {
+        Ok(j) => j,
+        Err(e) => {
+            tracing::warn!(error = %e, "input: persist active state: serialize failed");
+            return;
+        }
+    };
+    let tmp = path.with_extension("json.tmp");
+    if let Err(e) = std::fs::write(&tmp, &json) {
+        tracing::warn!(path = %tmp.display(), error = %e, "input: persist active state: write tmp failed");
+        return;
+    }
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        tracing::warn!(path = %path.display(), error = %e, "input: persist active state: rename failed");
+    }
+}
+
+/// 清除持久化的 active 后端状态（demote 到链尾无候选时，避免重启复活已摘除后端）。
+fn clear_active_state(path: &Path) {
+    match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => tracing::warn!(
+            path = %path.display(),
+            error = %e,
+            "input: clear persisted active state failed"
+        ),
+    }
 }
 
 /// xdotool 是否应入链（§12.2 最后兜底）：`DISPLAY` 存在且 `xdotool` 可执行。
@@ -158,6 +258,15 @@ impl InputDispatcher {
                 break;
             }
         }
+        // 恢复操作期降级：上次 demote 持久化的后端名若仍在本链中，以其为
+        // 初始 active——瞬态 daemon 重启后 doctor 显示降级后的真实后端，
+        // 而非重新探测 libei 得到的构造期快照（也避免重复 portal 弹窗）。
+        let state_path = active_state_path();
+        if let Some(path) = &state_path {
+            if let Some(i) = restore_persisted_active(path, &backends).await {
+                active = Some(i);
+            }
+        }
         tracing::info!(
             candidates = backends.len(),
             active = active.map(|i| backends[i].name()).unwrap_or("none"),
@@ -166,6 +275,7 @@ impl InputDispatcher {
         Ok(Self {
             backends,
             active: std::sync::Mutex::new(active),
+            state_path,
         })
     }
 
@@ -195,11 +305,22 @@ impl InputDispatcher {
     /// 把失败后端从 active 摘除，active 前进到下一候选（末尾则 None）。
     ///
     /// 仅当 `failed` 仍是当前 active 时才推进——并发下其它调用可能已摘除
-    /// 更靠前的后端，此时保持现状。
+    /// 更靠前的后端，此时保持现状。持久化在锁内完成：并发 demote 串行化，
+    /// 避免旧写入的 rename 后完成覆盖新状态（lost update）。
     fn demote(&self, failed: usize) {
         let mut g = self.active.lock().unwrap_or_else(|p| p.into_inner());
-        if *g == Some(failed) {
-            *g = (failed + 1 < self.backends.len()).then_some(failed + 1);
+        if *g != Some(failed) {
+            return;
+        }
+        let next = (failed + 1 < self.backends.len()).then_some(failed + 1);
+        *g = next;
+        // 锁内持久化新的 active 后端；demote 到链尾（None）时清除状态文件，
+        // 避免瞬态 daemon 重启后复活已摘除后端。
+        if let Some(path) = self.state_path.as_deref() {
+            match next {
+                Some(i) => persist_active(path, self.backends[i].name()),
+                None => clear_active_state(path),
+            }
         }
     }
 
@@ -401,6 +522,7 @@ mod tests {
         InputDispatcher {
             backends,
             active: std::sync::Mutex::new(active),
+            state_path: None,
         }
     }
 
@@ -489,6 +611,90 @@ mod tests {
         // §19：input 注入超时 1s、重试 3 次。
         assert_eq!(INPUT_TIMEOUT, Duration::from_secs(1));
         assert_eq!(INPUT_RETRIES, 3);
+    }
+
+    #[tokio::test]
+    async fn demote_persists_active_backend_name() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state_path = dir.path().join("input-active.json");
+        let failing = SetupFailingBackend;
+        let ok = FakeBackend::new("ok", 0);
+        let d = InputDispatcher {
+            backends: vec![Box::new(failing), Box::new(ok)],
+            active: std::sync::Mutex::new(Some(0)),
+            state_path: Some(state_path.clone()),
+        };
+        d.send_key(&combo(true)).await.expect("falls back");
+        assert_eq!(d.active_backend_name(), Some("ok"));
+        // 降级后 active 名持久化到状态文件，供瞬态 daemon 重启后恢复。
+        let content = std::fs::read_to_string(&state_path).expect("state file written");
+        let parsed: PersistedActive = serde_json::from_str(&content).expect("valid json");
+        assert_eq!(parsed.active, "ok");
+    }
+
+    #[test]
+    fn resolve_persisted_active_restores_and_tolerates_stale_state() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state_path = dir.path().join("input-active.json");
+        let a = FakeBackend::new("libei", 0); // 构造期首个可用
+        let b = FakeBackend::new("ydotool", 0);
+        let backends: Vec<Box<dyn InputService>> = vec![Box::new(a), Box::new(b)];
+
+        // 未持久化 → None（回退首个可用）。
+        assert_eq!(resolve_persisted_active(&state_path, &backends), None);
+
+        // 持久化 "ydotool" → 恢复到其下标（跳过首个可用的 libei）。
+        persist_active(&state_path, "ydotool");
+        assert_eq!(
+            resolve_persisted_active(&state_path, &backends),
+            Some(1),
+            "restored backend must override construction-time first-available"
+        );
+
+        // 持久化名不在当前链中（如切换 DE）→ None。
+        persist_active(&state_path, "xdotool");
+        assert_eq!(resolve_persisted_active(&state_path, &backends), None);
+
+        // 损坏/缺失文件 → None，不 panic。
+        std::fs::write(&state_path, "not-json").unwrap();
+        assert_eq!(resolve_persisted_active(&state_path, &backends), None);
+        assert_eq!(
+            resolve_persisted_active(&dir.path().join("absent.json"), &backends),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn demote_to_none_clears_persisted_state() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state_path = dir.path().join("input-active.json");
+        persist_active(&state_path, "setup-failing");
+        let failing = SetupFailingBackend; // 唯一后端：demote 后链尾 → None
+        let d = InputDispatcher {
+            backends: vec![Box::new(failing)],
+            active: std::sync::Mutex::new(Some(0)),
+            state_path: Some(state_path.clone()),
+        };
+        let err = d.send_key(&combo(true)).await.unwrap_err();
+        assert!(matches!(err, AgentShellError::BackendUnavailable(_)));
+        assert_eq!(d.active_backend_name(), None);
+        // demote 到 None 清除状态文件，避免重启复活已摘除后端。
+        assert!(
+            !state_path.exists(),
+            "state file should be cleared on demote-to-none"
+        );
+    }
+
+    #[tokio::test]
+    async fn restore_persisted_active_requires_availability() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state_path = dir.path().join("input-active.json");
+        persist_active(&state_path, "ydotool");
+        // ydotool 名字在链中但 is_available() == false → 不得复活。
+        let libei = FakeBackend::new("libei", 0);
+        let ydotool = FakeBackend::new("ydotool", usize::MAX); // 永不可用
+        let backends: Vec<Box<dyn InputService>> = vec![Box::new(libei), Box::new(ydotool)];
+        assert_eq!(restore_persisted_active(&state_path, &backends).await, None);
     }
 
     /// 测试辅助：对已构造的 dispatcher 重新执行「选第一个可用」逻辑，
