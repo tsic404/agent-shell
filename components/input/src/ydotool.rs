@@ -84,9 +84,27 @@ async fn run_once(bin: &std::path::Path, args: &[&str]) -> std::result::Result<(
         .map_err(|e| e.to_string())?;
     if !out.status.success() {
         // 典型失败：ydotoold 未运行（socket 不存在）→ 错误信息透传给重试层。
-        return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
+        // ydotool 的诊断文本（「Please check if ydotoold is running」）输出在
+        // stdout 而非 stderr，故两流都并入，避免只读 stderr 得到空错误。
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let detail = failure_detail(&stdout, &stderr)
+            .unwrap_or_else(|| format!("ydotool exited with {}", out.status));
+        return Err(detail);
     }
     Ok(())
+}
+
+/// 合并 stdout/stderr 为可诊断信息：任一侧为空则只保留非空侧，两侧都空返回 None。
+fn failure_detail(stdout: &str, stderr: &str) -> Option<String> {
+    let stdout = stdout.trim();
+    let stderr = stderr.trim();
+    match (stdout.is_empty(), stderr.is_empty()) {
+        (true, true) => None,
+        (true, false) => Some(stderr.to_string()),
+        (false, true) => Some(stdout.to_string()),
+        (false, false) => Some(format!("{stdout}; {stderr}")),
+    }
 }
 
 #[async_trait]
@@ -229,6 +247,34 @@ mod tests {
         let steps_v = |dy: i32| dy.unsigned_abs();
         assert_eq!(steps_v(2), 2);
         assert_eq!(steps_v(-1), 1);
+    }
+
+    /// 回归测试（TSI-2911）：ydotool 失败诊断输出在 stdout 而非 stderr，
+    /// 只读 stderr 会得到空错误——failure_detail 必须并入两流。
+    #[test]
+    fn failure_detail_merges_stdout_and_stderr() {
+        // 真实 ydotool 行为：诊断全在 stdout，stderr 为空。
+        assert_eq!(
+            failure_detail(
+                "failed to connect socket `/run/user/1000/.ydotool_socket': No such file or directory\nPlease check if ydotoold is running.",
+                ""
+            ),
+            Some(
+                "failed to connect socket `/run/user/1000/.ydotool_socket': No such file or directory\nPlease check if ydotoold is running."
+                    .to_string()
+            )
+        );
+        // 两流都有：以 "; " 连接。
+        assert_eq!(
+            failure_detail("out msg", "err msg"),
+            Some("out msg; err msg".to_string())
+        );
+        // 仅 stderr。
+        assert_eq!(failure_detail("", "err msg"), Some("err msg".to_string()));
+        // 两侧都空 → None（调用方回退到 exit status）。
+        assert_eq!(failure_detail("", ""), None);
+        // 首尾空白被 trim。
+        assert_eq!(failure_detail("  \n", "  err \n"), Some("err".to_string()));
     }
 
     #[tokio::test]
