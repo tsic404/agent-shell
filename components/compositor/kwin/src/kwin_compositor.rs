@@ -235,7 +235,9 @@ impl KWinCompositor {
                     lines.push("✓ 输入注入   : fake_input authenticated ✓".into())
                 }
                 Some(_) => lines.push("⚠ 输入注入   : fake_input bound, not authenticated".into()),
-                None => lines.push("⚠ 输入注入   : 无 fake_input（降级 ydotool/XTest）".into()),
+                None => lines.push(
+                    "⚠ 输入注入   : 无 fake_input（降级 libei/ydotool/XTest/xdotool）".into(),
+                ),
             }
         }
         // 事件脚本是懒启动（subscribe 时才 load），未启动前如实报告。
