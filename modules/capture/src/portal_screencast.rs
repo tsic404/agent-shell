@@ -13,7 +13,7 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use agent_shell_core::error::{AgentShellError, Result};
+use agent_shell_core::error::{dbus_error, AgentShellError, Result};
 use zbus::zvariant::{self, ObjectPath};
 
 use crate::portal_common::{
@@ -197,11 +197,15 @@ impl ScreenCastCapture {
             "session_handle_token",
             zvariant::Value::from(format!("agent_shell_{pid}")),
         );
+        // CreateSession 非幂等（服务端真实创建 portal session）——重试若首次
+        // 调用已到达 portal 而回复丢失，会留下永不被 Close 的孤儿 session。
+        // 故不重试：瞬时失败由 capture 组件的三级降级链（ScreenCast → Screenshot
+        // → X11）兜底，AccessDenied 经 dbus_error 归一到 Permission（不重试）。
+        let create_body = (o,);
         let create_request: zvariant::OwnedObjectPath = proxy
-            .call("CreateSession", &(o,))
+            .call("CreateSession", &create_body)
             .await
-            .map_err(|e| AgentShellError::DBus(format!("CreateSession: {e}")))?;
-        // 返回的路径应与预算一致；不一致则用返回值重订阅（后端自定路径）。
+            .map_err(|e| dbus_error(format!("CreateSession: {e}")))?;
         // 注意：wait_for_response 在方法返回后才订阅 Response 信号，
         // 重新引入竞态——但此路径仅在后端不按规范返回路径时触发（非默认路径）。
         let (_, create_results) = if create_request.as_str() == create_path.as_str() {
@@ -247,7 +251,7 @@ impl ScreenCastCapture {
                 std::collections::HashMap<&str, zvariant::Value>,
             ), zvariant::OwnedObjectPath>("SelectSources", &(&session_path, o))
             .await
-            .map_err(|e| AgentShellError::DBus(format!("SelectSources: {e}")))?;
+            .map_err(|e| dbus_error(format!("SelectSources: {e}")))?;
         if select_request.as_str() == select_path.as_str() {
             drain_response_with_timeout(&mut select_stream, SCREENCAST_TIMEOUT, "SelectSources")
                 .await?;
@@ -277,7 +281,7 @@ impl ScreenCastCapture {
                 std::collections::HashMap<&str, zvariant::Value>,
             ), zvariant::OwnedObjectPath>("Start", &(&session_path, "", o))
             .await
-            .map_err(|e| AgentShellError::DBus(format!("Start: {e}")))?;
+            .map_err(|e| dbus_error(format!("Start: {e}")))?;
         let (_, results) = if start_request.as_str() == start_path.as_str() {
             match drain_response_with_timeout(&mut start_stream, SCREENCAST_TIMEOUT, "Start").await
             {
@@ -319,7 +323,7 @@ impl ScreenCastCapture {
                 &(&session_path, HashMap::<&str, zvariant::Value>::new()),
             )
             .await
-            .map_err(|e| AgentShellError::DBus(format!("OpenPipeWireRemote: {e}")))?;
+            .map_err(|e| dbus_error(format!("OpenPipeWireRemote: {e}")))?;
 
         // 5. 启动 PipeWire 订阅线程
         let (shutdown_tx, shutdown_rx) = std::sync::mpsc::channel::<()>();

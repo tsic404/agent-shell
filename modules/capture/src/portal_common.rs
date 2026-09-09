@@ -7,6 +7,7 @@
 //! - [`prepare_response_stream`] / [`drain_response_with_timeout`]：先订阅 `Response` 信号再发请求（避免竞态）；
 //! - [`wait_for_response`]：调用后订阅的旧路径（仅适用于 `Screenshot` 等单步调用）。
 
+use std::future::Future;
 use std::time::Duration;
 
 use agent_shell_core::error::AgentShellError;
@@ -15,6 +16,10 @@ use zbus::zvariant::ObjectPath;
 
 pub const PORTAL_SERVICE: &str = "org.freedesktop.portal.Desktop";
 pub const PORTAL_PATH: &str = "/org/freedesktop/portal/desktop";
+
+/// portal/DBus 方法调用的短退避（§19 短退避）。portal GetSession 就绪竞态
+/// 通常在百毫秒级恢复；Screenshot 与 ScreenCast 建会话共用此值，避免分叉调参。
+pub const PORTAL_RETRY_BACKOFF: Duration = Duration::from_millis(150);
 
 /// 构造指向 portal 服务的通用代理（interface 由调用方给定）。
 pub async fn portal_proxy<'a>(
@@ -196,6 +201,40 @@ fn percent_decode(s: &str) -> String {
     String::from_utf8(out).unwrap_or_else(|_| s.to_string())
 }
 
+/// 短退避重试 portal/DBus 调用（§19 短退避）。
+///
+/// 仅重试瞬时错误：`Permission`（用户拒绝 / 无活跃图形会话的 AccessDenied）
+/// 与 `Timeout` 语义明确，立即返回不重试；其余（D-Bus 竞态、Capture 失败等）
+/// 按短退避重试，至多 `attempts` 次（含首次）。`attempts == 0` 归一到 1 次
+/// 尝试（而非 panic）。
+pub async fn retry_transient<T, F, Fut>(
+    attempts: u32,
+    backoff: Duration,
+    mut f: F,
+) -> agent_shell_core::error::Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = agent_shell_core::error::Result<T>>,
+{
+    let mut last = None;
+    for attempt in 0..attempts.max(1) {
+        match f().await {
+            Ok(v) => return Ok(v),
+            Err(e @ (AgentShellError::Permission(_) | AgentShellError::Timeout(_))) => {
+                return Err(e);
+            }
+            Err(e) => {
+                if attempt + 1 < attempts {
+                    tracing::warn!(attempt, "portal/DBus call failed, retrying: {e}");
+                    tokio::time::sleep(backoff).await;
+                }
+                last = Some(e);
+            }
+        }
+    }
+    Err(last.expect("retry loop ran at least once"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -233,5 +272,78 @@ mod tests {
         assert_eq!(encode_sender_part(":1.42"), "1_42");
         assert_eq!(encode_sender_part(":1.99"), "1_99");
         assert_eq!(encode_sender_part(":1.0"), "1_0");
+    }
+
+    #[tokio::test]
+    async fn retry_transient_retries_db_errors_and_gives_up() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = AtomicUsize::new(0);
+        let err = retry_transient(3, Duration::from_millis(1), || async {
+            let n = calls.fetch_add(1, Ordering::SeqCst);
+            if n < 2 {
+                Err::<(), _>(AgentShellError::DBus("transient".into()))
+            } else {
+                Err::<(), _>(AgentShellError::Capture("final".into()))
+            }
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        assert!(matches!(err, AgentShellError::Capture(_)));
+    }
+    #[tokio::test]
+    async fn retry_transient_succeeds_after_transient_error() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = AtomicUsize::new(0);
+        let v = retry_transient(3, Duration::from_millis(1), || async {
+            let n = calls.fetch_add(1, Ordering::SeqCst);
+            if n == 0 {
+                Err(AgentShellError::DBus("transient".into()))
+            } else {
+                Ok(42u32)
+            }
+        })
+        .await
+        .expect("second attempt succeeds");
+        assert_eq!(v, 42);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn retry_transient_does_not_retry_permission_or_timeout() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        for kind in ["permission", "timeout"] {
+            let calls = AtomicUsize::new(0);
+            let ret = retry_transient(3, Duration::from_millis(1), || {
+                let calls = &calls;
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    let err = if kind == "permission" {
+                        AgentShellError::Permission("denied".into())
+                    } else {
+                        AgentShellError::Timeout("timed out".into())
+                    };
+                    Err::<u32, _>(err)
+                }
+            })
+            .await;
+            assert!(ret.is_err());
+            assert_eq!(calls.load(Ordering::SeqCst), 1, "no retry for {kind}");
+        }
+    }
+
+    /// `attempts == 0` 归一到 1 次尝试，返回错误而非 panic（TSI-2877 审查项 #2）。
+    #[tokio::test]
+    async fn retry_transient_zero_attempts_returns_error_not_panic() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = AtomicUsize::new(0);
+        let err = retry_transient(0, Duration::from_millis(1), || async {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Err::<(), _>(AgentShellError::DBus("fail".into()))
+        })
+        .await
+        .unwrap_err();
+        assert!(matches!(err, AgentShellError::DBus(_)));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 }

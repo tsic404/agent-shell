@@ -7,6 +7,7 @@
 //! 但直捕仍需要 X11 十进制窗口 id——原生 Wayland `{uuid}` 无对应 X11 id。
 
 use agent_shell_capture::{CaptureDispatcher, CapturedFrame, PixelFormat};
+use agent_shell_core::error::AgentShellError;
 use agent_shell_rpc::{CaptureResult, RpcErrorCode};
 
 /// 截图并落盘。`window` 为窗口目标（`id:`/`{uuid}` 形式均可，解析后须为
@@ -22,10 +23,7 @@ pub async fn capture_to_file(
         // 窗口直捕：portal 无法定位 X11 window id，仅走 X11 路径
         //（连接由 dispatcher 惰性建立并复用——审查项 #5）。
         let win = parse_window_id(id)?;
-        let frame = capture
-            .capture_window(win)
-            .await
-            .map_err(|e| (RpcErrorCode::BackendError, e.to_string()))?;
+        let frame = capture.capture_window(win).await.map_err(map_capture_err)?;
         return write_frame_to_ppm(&frame, area, path);
     }
 
@@ -34,7 +32,7 @@ pub async fn capture_to_file(
     let captured = capture
         .capture(agent_shell_capture::CaptureTarget::Monitor, true)
         .await
-        .map_err(|e| (RpcErrorCode::BackendUnavailable, e.to_string()))?;
+        .map_err(map_capture_err)?;
 
     match captured {
         CapturedFrame::Pixels(frame) => write_frame_to_ppm(&frame, area, path),
@@ -69,6 +67,18 @@ fn parse_window_id(spec: &str) -> Result<u32, (RpcErrorCode, String)> {
     })
 }
 
+/// capture 组件错误 → RPC 错误码。
+///
+/// `Permission`（portal AccessDenied / 用户取消 / 无活跃图形会话）归一到
+/// `Denied`，`BackendUnavailable` 保持其码，其余归 `BackendError`——避免把
+/// portal 会话权限问题误报为「后端不可用」（TSI-2877 明确错误码）。
+fn map_capture_err(e: AgentShellError) -> (RpcErrorCode, String) {
+    match e {
+        AgentShellError::Permission(msg) => (RpcErrorCode::Denied, msg),
+        AgentShellError::BackendUnavailable(msg) => (RpcErrorCode::BackendUnavailable, msg),
+        other => (RpcErrorCode::BackendError, other.to_string()),
+    }
+}
 /// 原始像素帧写为 PPM (P6)，带可选区域裁剪。
 ///
 /// 行基址按 stride 跳过行尾 padding；负坐标先拒绝（`as usize` 回绕会
@@ -370,5 +380,20 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("out.ppm");
         assert!(write_frame_to_ppm(&frame, None, &path.to_string_lossy()).is_err());
+    }
+
+    #[test]
+    fn map_capture_err_classifies_portal_permission_as_denied() {
+        // portal AccessDenied / 用户取消 / 无活跃图形会话 → Denied（明确错误码），
+        // 不得折叠为 BackendUnavailable。
+        let (code, msg) = map_capture_err(AgentShellError::Permission("denied".into()));
+        assert_eq!(code, RpcErrorCode::Denied);
+        assert!(msg.contains("denied"));
+
+        let (code, _) = map_capture_err(AgentShellError::BackendUnavailable("no backend".into()));
+        assert_eq!(code, RpcErrorCode::BackendUnavailable);
+
+        let (code, _) = map_capture_err(AgentShellError::Capture("capture failed".into()));
+        assert_eq!(code, RpcErrorCode::BackendError);
     }
 }
