@@ -20,6 +20,9 @@ libc.workspace = true
 ordered-stream.workspace = true
 pipewire.workspace = true
 rustix = { version = "1", features = ["fs", "mm", "shm"] }
+png = "0.18.1"
 
 [dev-dependencies]
 parking_lot.workspace = true
+tempfile.workspace = true
+crc32fast = "1"
