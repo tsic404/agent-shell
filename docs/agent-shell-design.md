@@ -6840,15 +6840,25 @@ fn check_session_validity() -> Result<SessionContext> {
 }
 ```
 
-**单实例保护**：同一 session 内不允许多个 daemon 实例。通过 `$XDG_RUNTIME_DIR/agent-shell.lock` 文件锁实现：
+**单实例保护**：同一 session 内不允许多个 daemon 实例。通过 `$XDG_RUNTIME_DIR/agent-shell.lock` 文件锁实现——锁竞争时排队等待前持锁者退出（有界超时），而非立即 fail-fast：
 
 ```rust
 fn acquire_lock() -> Result<File> {
     let path = Path::new(&env::var("XDG_RUNTIME_DIR")?).join("agent-shell.lock");
     let file = std::fs::OpenOptions::new()
         .create(true).write(true).read(true).open(&path)?;
-    if file.try_lock_exclusive().is_err() {
-        return Err(AgentShellError::BackendUnavailable("daemon already running"));
+    // 并发 spawn 下前一个瞬态 daemon 持锁至其完整生命周期结束，后一个须等待
+    // 其释放后接续服务；真正的常驻实例冲突在超时后仍会失败，不会永久阻塞。
+    let deadline = Instant::now() + LOCK_WAIT_TIMEOUT;
+    loop {
+        match file.try_lock_exclusive() {
+            Ok(_) => break,
+            Err(TryLockError::WouldBlock) if Instant::now() >= deadline => {
+                return Err(AgentShellError::BackendUnavailable("daemon already running"));
+            }
+            Err(TryLockError::WouldBlock) => thread::sleep(LOCK_POLL_INTERVAL),
+            Err(e) => return Err(e.into()),
+        }
     }
     Ok(file)  // 持有锁直到进程退出
 }
