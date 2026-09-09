@@ -332,12 +332,21 @@ impl CaptureDispatcher {
             match self.screenshot.capture(false).await {
                 Ok(path) => {
                     // 探测产生的临时截图落盘（可能含敏感画面），验证后立即删除，
-                    // 避免每次 doctor 运行累积残留文件。
+                    // 避免每次 doctor 运行累积残留文件。全黑/无效帧判非可用
+                    // （与 X11 的 is_all_black 同口径）：portal Screenshot 返回
+                    // 全空帧时不能据此报「选中 portal-screenshot」。
+                    let usable = !is_png_black_or_invalid(&path);
                     if let Err(e) = std::fs::remove_file(&path) {
                         tracing::debug!("probe screenshot cleanup failed {}: {e}", path.display());
                     }
-                    self.set_active(Some(ActiveBackend::ScreenshotPortal));
-                    return Some(ActiveBackend::ScreenshotPortal);
+                    if usable {
+                        self.set_active(Some(ActiveBackend::ScreenshotPortal));
+                        return Some(ActiveBackend::ScreenshotPortal);
+                    }
+                    tracing::warn!(
+                        "portal Screenshot probe captured an all-black/invalid frame; \
+                         degrading to next backend"
+                    );
                 }
                 Err(e) => tracing::debug!("screenshot portal probe failed (non-interactive): {e}"),
             }
@@ -489,6 +498,64 @@ fn is_all_black(frame: &Frame) -> bool {
     }
 }
 
+/// 解码输出缓冲上限。portal Screenshot 单帧全屏 PNG：8K RGBA ≈ 127 MiB，
+/// 留 ~2× 余量。伪造/损坏 PNG 的 IHDR 可声明超大宽高，`output_buffer_size()`
+/// 仅按 isize::MAX 封顶；分配前据此封顶，超限判非可用，避免数 GB memset
+/// 使 daemon 在 doctor 探测时 OOM。
+const PNG_DECODE_MAX_BYTES: usize = 256 * 1024 * 1024;
+
+/// 判定 Screenshot 落盘 PNG 是否「全黑或无效」——与 [`is_all_black`] 同口径：
+/// 解码失败（空文件 / 损坏 / 非 PNG）或所有像素 RGB 通道全 0 均视为非可用。
+///
+/// 仅判 RGB 通道（忽略 alpha），避免把「透明黑」误判为非黑。portal Screenshot
+/// 可用性必须以帧内容为准，而非仅「文件生成成功」——本地 portal 全空帧
+/// （全 0 字节）能落盘却不可用，须据此降级。
+fn is_png_black_or_invalid(path: &std::path::Path) -> bool {
+    use png::{ColorType, Decoder, Transformations};
+
+    let file = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(_) => return true,
+    };
+    let mut decoder = Decoder::new(std::io::BufReader::new(file));
+    // 归一化为 8-bit 颜色（palette/tRNS/低 bit 深度统一展开），简化通道判定。
+    decoder.set_transformations(Transformations::normalize_to_color8());
+    let mut reader = match decoder.read_info() {
+        Ok(r) => r,
+        Err(_) => return true,
+    };
+    let Some(buf_size) = reader.output_buffer_size() else {
+        return true;
+    };
+    // 分配前封顶：伪造 IHDR 可声明超大宽高，`output_buffer_size()` 仅以
+    // isize::MAX 封顶，直接 memset 会 OOM。超限判非可用。
+    if buf_size > PNG_DECODE_MAX_BYTES {
+        tracing::warn!(
+            buf_size,
+            "portal Screenshot PNG decode buffer exceeds cap; treating as invalid"
+        );
+        return true;
+    }
+    let mut buf = vec![0u8; buf_size];
+    let info = match reader.next_frame(&mut buf) {
+        Ok(i) => i,
+        Err(_) => return true,
+    };
+    let pixels = &buf[..info.buffer_size()];
+    match info.color_type {
+        ColorType::Rgb => pixels
+            .chunks(3)
+            .all(|px| px.len() < 3 || px.iter().all(|&b| b == 0)),
+        ColorType::Rgba => pixels
+            .chunks(4)
+            .all(|px| px.len() < 4 || px[..3].iter().all(|&b| b == 0)),
+        ColorType::Grayscale => pixels.iter().all(|&b| b == 0),
+        ColorType::GrayscaleAlpha => pixels.chunks(2).all(|px| px.len() < 2 || px[0] == 0),
+        // EXPAND 后 Indexed 不应出现；防御性按字节判黑。
+        ColorType::Indexed => pixels.iter().all(|&b| b == 0),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -592,6 +659,167 @@ mod tests {
             format: PixelFormat::Rgb565,
         };
         assert!(is_all_black(&black_rgb565));
+    }
+
+    /// 写一个 8-bit PNG 到 `dir` 下，返回文件路径。
+    fn write_png(
+        dir: &std::path::Path,
+        name: &str,
+        color: png::ColorType,
+        width: u32,
+        height: u32,
+        data: &[u8],
+    ) -> std::path::PathBuf {
+        let path = dir.join(name);
+        let file = std::fs::File::create(&path).unwrap();
+        let mut encoder = png::Encoder::new(std::io::BufWriter::new(file), width, height);
+        encoder.set_color(color);
+        encoder.set_depth(png::BitDepth::Eight);
+        let mut writer = encoder.write_header().unwrap();
+        writer.write_image_data(data).unwrap();
+        path
+    }
+
+    /// 构造 IHDR 声明超大宽高的最小 PNG（含合法 CRC），用于验证解码前封顶。
+    fn write_oversized_png(
+        dir: &std::path::Path,
+        name: &str,
+        width: u32,
+        height: u32,
+    ) -> std::path::PathBuf {
+        let path = dir.join(name);
+        let mut bytes = vec![137, 80, 78, 71, 13, 10, 26, 10];
+        let mut ihdr = Vec::with_capacity(13);
+        ihdr.extend_from_slice(&width.to_be_bytes());
+        ihdr.extend_from_slice(&height.to_be_bytes());
+        // depth 8 / RGB / compression / filter / interlace
+        ihdr.extend_from_slice(&[8, 2, 0, 0, 0]);
+        push_png_chunk(&mut bytes, b"IHDR", &ihdr);
+        push_png_chunk(&mut bytes, b"IDAT", &[]);
+        push_png_chunk(&mut bytes, b"IEND", &[]);
+        std::fs::write(&path, bytes).unwrap();
+        path
+    }
+
+    /// 追加一个 PNG chunk：length + type + data + CRC32(type || data)。
+    fn push_png_chunk(out: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
+        out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+        out.extend_from_slice(kind);
+        out.extend_from_slice(data);
+        let mut crc_input = Vec::with_capacity(4 + data.len());
+        crc_input.extend_from_slice(kind);
+        crc_input.extend_from_slice(data);
+        out.extend_from_slice(&crc32fast::hash(&crc_input).to_be_bytes());
+    }
+
+    #[test]
+    fn is_png_black_or_invalid_detects_black_frames() {
+        let dir = tempfile::tempdir().unwrap();
+        // 全黑 RGB。
+        let rgb_black = write_png(
+            dir.path(),
+            "rgb_black.png",
+            png::ColorType::Rgb,
+            2,
+            2,
+            &[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        );
+        assert!(is_png_black_or_invalid(&rgb_black));
+        // 不透明黑 RGBA（RGB=0、alpha=255）→ 忽略 alpha 仍判黑。
+        let opaque_black = write_png(
+            dir.path(),
+            "opaque_black.png",
+            png::ColorType::Rgba,
+            1,
+            2,
+            &[0, 0, 0, 255, 0, 0, 0, 255],
+        );
+        assert!(is_png_black_or_invalid(&opaque_black));
+        // 透明黑 RGBA（RGB=0、alpha=0）→ 忽略 alpha 仍判黑。
+        let transparent_black = write_png(
+            dir.path(),
+            "transparent_black.png",
+            png::ColorType::Rgba,
+            1,
+            2,
+            &[0, 0, 0, 0, 0, 0, 0, 0],
+        );
+        assert!(is_png_black_or_invalid(&transparent_black));
+        // 全黑灰度。
+        let gray_black = write_png(
+            dir.path(),
+            "gray_black.png",
+            png::ColorType::Grayscale,
+            2,
+            1,
+            &[0, 0],
+        );
+        assert!(is_png_black_or_invalid(&gray_black));
+        // 全黑灰度+alpha（gray=0、alpha=255）→ 忽略 alpha 仍判黑。
+        let gray_alpha_black = write_png(
+            dir.path(),
+            "gray_alpha_black.png",
+            png::ColorType::GrayscaleAlpha,
+            2,
+            1,
+            &[0, 255, 0, 255],
+        );
+        assert!(is_png_black_or_invalid(&gray_alpha_black));
+    }
+
+    #[test]
+    fn is_png_black_or_invalid_rejects_non_black_frames() {
+        let dir = tempfile::tempdir().unwrap();
+        // 非黑 RGB。
+        let red = write_png(
+            dir.path(),
+            "red.png",
+            png::ColorType::Rgb,
+            1,
+            1,
+            &[255, 0, 0],
+        );
+        assert!(!is_png_black_or_invalid(&red));
+        // 非黑灰度。
+        let gray = write_png(
+            dir.path(),
+            "gray.png",
+            png::ColorType::Grayscale,
+            1,
+            1,
+            &[128],
+        );
+        assert!(!is_png_black_or_invalid(&gray));
+        // 非黑灰度+alpha（gray=128、alpha=0）→ 灰度通道非 0，判非黑。
+        let gray_alpha = write_png(
+            dir.path(),
+            "gray_alpha.png",
+            png::ColorType::GrayscaleAlpha,
+            1,
+            1,
+            &[128, 0],
+        );
+        assert!(!is_png_black_or_invalid(&gray_alpha));
+    }
+
+    #[test]
+    fn is_png_black_or_invalid_detects_invalid_files() {
+        let dir = tempfile::tempdir().unwrap();
+        // 全 0 字节（非 PNG）。
+        let raw = dir.path().join("raw.bin");
+        std::fs::write(&raw, vec![0u8; 1024]).unwrap();
+        assert!(is_png_black_or_invalid(&raw));
+        // 不存在。
+        assert!(is_png_black_or_invalid(&dir.path().join("missing.png")));
+    }
+
+    #[test]
+    fn is_png_black_or_invalid_rejects_oversized_png() {
+        // IHDR 声明 100000×100000 RGB（≈ 28 GB），解码前封顶应判非可用，
+        // 而非触发数 GB memset 导致 OOM。
+        let dir = tempfile::tempdir().unwrap();
+        let huge = write_oversized_png(dir.path(), "huge.png", 100_000, 100_000);
+        assert!(is_png_black_or_invalid(&huge));
     }
 
     #[test]
