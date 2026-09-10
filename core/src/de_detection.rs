@@ -7,13 +7,16 @@
 //!
 //! 1. `XDG_CURRENT_DESKTOP` 环境变量（首要信号；**DDE 判断必须在 KDE 之前**——
 //!    deepin-kwin 注册 `org.kde.KWin` 但 `XDG_CURRENT_DESKTOP=Deepin`）。
-//! 2. Wayland 会话：D-Bus 服务名探测（可靠；deepin-kwin 与 org.kde.KWin 同名）。
+//! 2. D-Bus 服务名探测兜底（不依赖 WAYLAND_DISPLAY/DISPLAY——SSH 无显示
+//!    会话也能连 session bus 探测；deepin-kwin 与 org.kde.KWin 同名，
+//!    故 DDE 判断必须在 KDE 之前）。
 //! 3. X11 会话：`_NET_SUPPORTING_WM_CHECK` 识别窗口管理器。
 //! 4. 纯终端（TTY）：stdin/stdout 是 tty 且无 WAYLAND_DISPLAY/DISPLAY。
 //!
 //! 全部失败兜底返回 [`DesktopEnvironment::Unknown`]。
 
 use std::env;
+use std::path::Path;
 
 use crate::error::{AgentShellError, Result};
 use crate::types::DesktopEnvironment;
@@ -44,11 +47,11 @@ impl DetectionReport {
         format!("{} ({}, {})", self.de, session, self.source)
     }
 }
-
-/// 检测上下文：环境变量读取 + D-Bus 服务探测，均可注入以便单元测试。
+/// 检测上下文：环境变量读取 + D-Bus 服务探测 + session bus 可达性，均可注入以便单元测试。
 trait DetectionContext {
     fn env(&self, key: &str) -> Option<String>;
     fn dbus_service_exists(&self, name: &str) -> bool;
+    fn session_bus_reachable(&self) -> bool;
     fn x11_wm(&self) -> DesktopEnvironment;
     fn is_tty(&self) -> bool;
 }
@@ -63,6 +66,18 @@ impl DetectionContext for SystemContext {
 
     fn dbus_service_exists(&self, name: &str) -> bool {
         dbus_service_exists(name)
+    }
+
+    fn session_bus_reachable(&self) -> bool {
+        // `busctl --user` 经 $DBUS_SESSION_BUS_ADDRESS 或 $XDG_RUNTIME_DIR/bus
+        // （systemd user bus）解析地址；两者皆缺则连不上 user bus，探测必然
+        // 失败——返回 false 跳过探测，避免 TTY/CI 场景无效 fork+exec。
+        if self.env("DBUS_SESSION_BUS_ADDRESS").is_some() {
+            return true;
+        }
+        self.env("XDG_RUNTIME_DIR")
+            .map(|dir| Path::new(&dir).join("bus").exists())
+            .unwrap_or(false)
     }
 
     fn x11_wm(&self) -> DesktopEnvironment {
@@ -116,19 +131,37 @@ fn detect_report(ctx: &dyn DetectionContext) -> DetectionReport {
         }
     }
 
-    // 2. Wayland 会话：检查 D-Bus 服务名（可靠）
-    if ctx.env("WAYLAND_DISPLAY").is_some() {
-        if ctx.env("HYPRLAND_INSTANCE_SIGNATURE").is_some() {
+    // 2. D-Bus 服务名探测兜底（不依赖 WAYLAND_DISPLAY/DISPLAY——SSH 无显示
+    //    会话也能连 session bus 探测）。DDE 判断必须在 KDE 之前：
+    //    deepin-kwin 注册 org.kde.KWin 但属于 DDE（§16.1 / §10.2）。
+    if ctx.env("HYPRLAND_INSTANCE_SIGNATURE").is_some() {
+        return DetectionReport {
+            de: DesktopEnvironment::Hyprland,
+            source: "HYPRLAND_INSTANCE_SIGNATURE",
+        };
+    }
+    // session bus 可达才探测——TTY/CI 无 user bus 时零子进程，避免无效 fork+exec
+    // （busctl --user 经 $DBUS_SESSION_BUS_ADDRESS / $XDG_RUNTIME_DIR/bus 解析）。
+    if ctx.session_bus_reachable() {
+        // DDE 双名 session-bus 服务（§21.36：DDE25 org.deepin.dde.*，
+        // DDE20 com.deepin.daemon.*）；音频服务在 session bus。
+        if ctx.dbus_service_exists("org.deepin.dde.Audio1") {
             return DetectionReport {
-                de: DesktopEnvironment::Hyprland,
-                source: "HYPRLAND_INSTANCE_SIGNATURE",
+                de: DesktopEnvironment::DDE,
+                source: "dbus:org.deepin.dde.Audio1",
+            };
+        }
+        if ctx.dbus_service_exists("com.deepin.daemon.Audio") {
+            return DetectionReport {
+                de: DesktopEnvironment::DDE,
+                source: "dbus:com.deepin.daemon.Audio",
             };
         }
         if ctx.dbus_service_exists("org.kde.KWin") {
             return DetectionReport {
                 de: DesktopEnvironment::KDE,
                 source: "dbus:org.kde.KWin",
-            }; // deepin-kwin 同名
+            }; // deepin-kwin 同名（DDE 已在上方优先判定）
         }
         if ctx.dbus_service_exists("org.gnome.Shell") {
             return DetectionReport {
@@ -290,10 +323,11 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
-    /// 注入式检测上下文：环境变量来自表，D-Bus/X11/tty 可编程。
+    /// 注入式检测上下文：环境变量来自表，D-Bus/X11/tty/session bus 可达性可编程。
     struct FakeCtx {
         envs: HashMap<&'static str, String>,
         dbus: Vec<&'static str>,
+        bus_reachable: bool,
         tty: bool,
         x11_wm: DesktopEnvironment,
     }
@@ -303,13 +337,16 @@ mod tests {
             Self {
                 envs: envs.iter().map(|(k, v)| (*k, v.to_string())).collect(),
                 dbus: Vec::new(),
+                bus_reachable: false,
                 tty: false,
                 x11_wm: DesktopEnvironment::X11Generic,
             }
         }
 
+        /// 注入 D-Bus 服务名，并假设 session bus 可达（探测门槛通过）。
         fn with_dbus(mut self, services: &[&'static str]) -> Self {
             self.dbus = services.to_vec();
+            self.bus_reachable = true;
             self
         }
     }
@@ -327,6 +364,10 @@ mod tests {
 
         fn dbus_service_exists(&self, name: &str) -> bool {
             self.dbus.contains(&name)
+        }
+
+        fn session_bus_reachable(&self) -> bool {
+            self.bus_reachable
         }
 
         fn x11_wm(&self) -> DesktopEnvironment {
@@ -380,6 +421,54 @@ mod tests {
 
         let ctx = FakeCtx::new(&[("WAYLAND_DISPLAY", "wayland-0")]).with_dbus(&["org.kde.KWin"]);
         assert_eq!(detect(&ctx), DesktopEnvironment::KDE);
+    }
+
+    #[test]
+    fn headless_ssh_dbus_probe_resolves_gnome() {
+        // SSH 无显示会话：无 WAYLAND_DISPLAY/DISPLAY/XDG，仅 session bus 可达。
+        let ctx = FakeCtx::default().with_dbus(&["org.gnome.Shell"]);
+        assert_eq!(detect(&ctx), DesktopEnvironment::GNOME);
+    }
+
+    #[test]
+    fn headless_ssh_dbus_probe_resolves_dde_both_names() {
+        // DDE25 主名 org.deepin.dde.Audio1。
+        let ctx = FakeCtx::default().with_dbus(&["org.deepin.dde.Audio1"]);
+        assert_eq!(detect(&ctx), DesktopEnvironment::DDE);
+
+        // DDE20 旧名 com.deepin.daemon.Audio。
+        let ctx = FakeCtx::default().with_dbus(&["com.deepin.daemon.Audio"]);
+        assert_eq!(detect(&ctx), DesktopEnvironment::DDE);
+    }
+
+    #[test]
+    fn dde_dbus_beats_kde_when_deepin_kwin_shares_name() {
+        // deepin-kwin 同时注册 org.kde.KWin 与 deepin 音频服务——须判 DDE 而非 KDE。
+        let ctx = FakeCtx::default().with_dbus(&["org.kde.KWin", "org.deepin.dde.Audio1"]);
+        assert_eq!(detect(&ctx), DesktopEnvironment::DDE);
+    }
+
+    #[test]
+    fn unreachable_session_bus_skips_dbus_probe() {
+        // session bus 不可达时跳过 D-Bus 探测——即便臆造 dbus 名字也不命中，
+        // 直接落到 DISPLAY/TTY 判定（SystemContext 靠可达性门槛拦下无效子进程）。
+        let ctx = FakeCtx {
+            dbus: vec!["org.gnome.Shell"],
+            bus_reachable: false,
+            ..FakeCtx::new(&[("DISPLAY", ":0")])
+        };
+        assert_eq!(detect(&ctx), DesktopEnvironment::X11Generic);
+    }
+
+    #[test]
+    fn x11_session_dbus_beats_wm_check_when_gnome_shell_on_bus() {
+        // X11 会话（DISPLAY=:0）但 session bus 上存在 org.gnome.Shell——
+        // D-Bus 兜底先于 _NET_SUPPORTING_WM_CHECK 命中（§16.1「最终以 D-Bus 为准」）。
+        let mut ctx = FakeCtx::new(&[("DISPLAY", ":0")]).with_dbus(&["org.gnome.Shell"]);
+        ctx.x11_wm = DesktopEnvironment::X11Generic; // 即便 xprop 判不出 GNOME
+        let report = detect_report(&ctx);
+        assert_eq!(report.de, DesktopEnvironment::GNOME);
+        assert_eq!(report.source, "dbus:org.gnome.Shell");
     }
 
     #[test]
