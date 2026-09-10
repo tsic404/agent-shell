@@ -6,6 +6,8 @@
 
 use agent_shell_core::error::AgentShellError;
 
+use crate::version::GnomeVersion;
+
 /// org.gnome.Shell D-Bus 服务常量（§3.5 调研记录）。
 pub const SHELL_SERVICE: &str = "org.gnome.Shell";
 /// org.gnome.Shell 根对象路径（Eval / ShellVersion 所在）。
@@ -21,12 +23,35 @@ pub const DISPLAY_CONFIG_SERVICE: &str = "org.gnome.Mutter.DisplayConfig";
 /// DisplayConfig 对象路径。
 pub const DISPLAY_CONFIG_PATH: &str = "/org/gnome/Mutter/DisplayConfig";
 
-/// GNOME Eval 允许开关（gsettings key，GNOME 41+ 默认 false）。
+/// GNOME <47 Eval 允许开关提示（gsettings key，GNOME 41+ 默认 false）。
 ///
 /// `gsettings set org.gnome.shell developer-tools true` 打开；本 crate
 /// 不代改用户设置——探测失败时如实报错并走降级链。
-pub const EVAL_DISABLED_HINT: &str = "org.gnome.Shell.Eval unavailable (enable via: gsettings set \
+pub const EVAL_DISABLED_HINT_PRE47: &str =
+    "org.gnome.Shell.Eval unavailable (enable via: gsettings set \
      org.gnome.shell developer-tools true)";
+
+/// GNOME 47+ Eval 不可用提示。
+///
+/// 47 起 `org.gnome.shell developer-tools` gsettings key 被移除（实测
+/// `No such key "developer-tools"`），旧文案不可执行——改为指向 Shell
+/// Extension（`agent-shell-bridge@multica.dev`）安装/启用路径（§8.4
+/// 推荐生产路径）。
+pub const EVAL_DISABLED_HINT_47PLUS: &str =
+    "org.gnome.Shell.Eval unavailable (GNOME 47+ removed the \
+     developer-tools key; install & enable the Shell Extension: agent-shell-bridge@multica.dev)";
+
+/// 按 GNOME 版本选择 Eval 禁用提示文案（§8.4 双路径降级诊断）。
+///
+/// 47+ 的 `developer-tools` key 已移除，旧 gsettings 指令不可执行，
+/// 必须指向 Extension 安装/启用路径。
+pub fn eval_disabled_hint(version: &GnomeVersion) -> &'static str {
+    if version.is_47_plus() {
+        EVAL_DISABLED_HINT_47PLUS
+    } else {
+        EVAL_DISABLED_HINT_PRE47
+    }
+}
 
 /// Mutter 特有错误。
 #[derive(Debug, thiserror::Error)]
@@ -113,5 +138,22 @@ mod tests {
         let e = AgentShellError::from(MutterError::Wayland("NoCompositor".into()));
         assert!(matches!(e, AgentShellError::BackendUnavailable(_)));
         assert!(e.to_string().contains("mutter wayland"));
+    }
+
+    #[test]
+    fn eval_disabled_hint_branches_by_version() {
+        let pre47 = crate::version::parse_shell_version("45.2").unwrap();
+        let v47 = crate::version::parse_shell_version("47.0").unwrap();
+        assert_eq!(eval_disabled_hint(&pre47), EVAL_DISABLED_HINT_PRE47);
+        assert_eq!(eval_disabled_hint(&v47), EVAL_DISABLED_HINT_47PLUS);
+    }
+
+    #[test]
+    fn eval_disabled_hint_47plus_points_to_extension() {
+        // 47+ 已移除 developer-tools key，提示必须指向 Extension 且不得
+        // 出现旧 gsettings 指令（不可执行）；<47 保留原 gsettings 文案。
+        assert!(EVAL_DISABLED_HINT_47PLUS.contains(EXTENSION_ID));
+        assert!(!EVAL_DISABLED_HINT_47PLUS.contains("developer-tools true"));
+        assert!(EVAL_DISABLED_HINT_PRE47.contains("developer-tools true"));
     }
 }

@@ -11,7 +11,8 @@
 use serde_json::Value;
 use zbus::Connection;
 
-use crate::error::{MutterError, Result, EVAL_DISABLED_HINT, SHELL_PATH, SHELL_SERVICE};
+use crate::error::{eval_disabled_hint, MutterError, Result, SHELL_PATH, SHELL_SERVICE};
+use crate::version::GnomeVersion;
 
 /// org.gnome.Shell 根接口 proxy（Eval + ShellVersion 属性）。
 #[zbus::proxy(
@@ -116,12 +117,17 @@ pub(crate) mod parse {
 /// 不接受调用方注入任意 JS（Eval 本身即任意代码执行面，收敛入口）。
 pub struct GnomeEvalBridge {
     conn: Connection,
+    /// 构造期探测到的 GNOME 版本——Eval 禁用提示按版本分支（§8.4）。
+    version: GnomeVersion,
 }
 
 impl GnomeEvalBridge {
     /// 建桥：复用既有 session bus 连接（与 DisplayConfig 共享）。
-    pub fn new(conn: Connection) -> Self {
-        Self { conn }
+    ///
+    /// `version` 用于 Eval 禁用提示的版本分支：47+ 已移除
+    /// `developer-tools` key，提示改指向 Extension 安装路径。
+    pub fn new(conn: Connection, version: GnomeVersion) -> Self {
+        Self { conn, version }
     }
 
     /// 执行 JS 表达式并解析返回值：`(true, '"JSON"')` → `Value`。
@@ -138,7 +144,8 @@ impl GnomeEvalBridge {
             .map_err(|e| MutterError::Eval(format!("call failed at {SHELL_PATH}: {e}")))?;
         if !success {
             return Err(MutterError::Eval(format!(
-                "shell-side failure: {EVAL_DISABLED_HINT}"
+                "shell-side failure: {}",
+                eval_disabled_hint(&self.version)
             )));
         }
         serde_json::from_str(&result_json)

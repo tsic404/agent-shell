@@ -1628,11 +1628,15 @@ const DBusInterface = `
 ```rust
 // components/compositor/mutter/src/eval.rs
 
-pub struct GnomeEvalBridge { conn: Connection }
+pub struct GnomeEvalBridge {
+    conn: Connection,
+    version: GnomeVersion,  // 构造期探测的版本，决定禁用提示的版本分支
+}
 
 impl GnomeEvalBridge {
-    /// 建桥：复用既有 session bus 连接（与 DisplayConfig 共享）
-    pub fn new(conn: Connection) -> Self { ... }
+    /// 建桥：复用既有 session bus 连接（与 DisplayConfig 共享）。
+    /// version 用于 Eval 禁用提示的版本分支（47+ 指向 Extension 安装路径）。
+    pub fn new(conn: Connection, version: GnomeVersion) -> Self { ... }
 
     /// 执行 JS 表达式并解析返回值：(true, '"JSON"') → Value
     pub async fn eval_js(&self, js: &str) -> Result<serde_json::Value> {
@@ -1654,6 +1658,11 @@ impl GnomeEvalBridge {
     }
 }
 ```
+
+`eval_js` 在 `success=false` 时按 `version` 分支提示文案：GNOME <47 提示
+`gsettings set org.gnome.shell developer-tools true`；GNOME 47+ 该 key
+已移除（实测 `No such key`），改提示安装/启用 Extension
+`agent-shell-bridge@multica.dev`（见 §8.4 版本边界）。
 
 ### 8.3 Wayland 协议状况
 
