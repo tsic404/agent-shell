@@ -8,11 +8,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use agent_shell_core::error::{dbus_error, AgentShellError, Result};
-use zbus::zvariant::{self};
+use zbus::zvariant::{self, ObjectPath};
 
 use crate::portal_common::{
-    portal_proxy, retry_transient, string_field, uri_to_path, wait_for_response,
-    PORTAL_RETRY_BACKOFF, PORTAL_SERVICE,
+    drain_response_with_timeout, portal_proxy, prepare_response_stream, sender_part, string_field,
+    uri_to_path, wait_for_response, PORTAL_RETRY_BACKOFF, PORTAL_SERVICE,
 };
 
 /// screenshot 通道默认超时（§19.3）。
@@ -82,35 +82,81 @@ impl ScreenshotPortal {
         let proxy = portal_proxy(&self.conn, "org.freedesktop.portal.Screenshot")
             .await
             .map_err(|e| AgentShellError::DBus(format!("Screenshot portal proxy: {e}")))?;
-        // 方法调用本身短退避重试（portal GetSession 就绪竞态）；AccessDenied
-        // 归一到 Permission（用户拒绝/无活跃会话），不重试。
-        //
-        // `handle_token` 每次尝试用递增序列号重新生成：portal Request 路径含
-        // token，pid 进程内不变，若不叠加序列号，重试复用同一 token 仍会路径
-        // 冲突（TSI-2877 审查项 #1）。
-        // 序列号计数器取 self 字段（daemon 长生命周期内跨 capture 调用递增），
-        // 保证连续两次 screenshot 首 token 也不同（TSI-2877 审查项 #1）。
-        let token_seq = &self.token_seq;
-        let request_path: zvariant::OwnedObjectPath =
-            retry_transient(SCREENSHOT_MAX_ATTEMPTS, PORTAL_RETRY_BACKOFF, || {
-                let proxy = &proxy;
-                async move {
-                    let token = next_token(token_seq, std::process::id());
-                    let mut options = std::collections::HashMap::<&str, zvariant::Value>::new();
-                    options.insert("handle_token", zvariant::Value::from(token.as_str()));
-                    options.insert("interactive", zvariant::Value::from(interactive));
-                    let body = ("", options);
-                    proxy
-                        .call("Screenshot", &body)
-                        .await
-                        .map_err(|e| dbus_error(format!("Screenshot call: {e}")))
-                }
-            })
-            .await?;
+        let sender = sender_part(&self.conn)
+            .ok_or_else(|| AgentShellError::DBus("no unique name on session bus".into()))?;
 
+        // §19.3：最多 2 次尝试。每次生成新 token（TSI-2877 审查项 #1：pid
+        // 进程内不变，重试复用同一 token 会致 portal Request 路径冲突）；
+        // 关键：先在 handle_token 预算的路径上订阅 Response 信号，再发
+        // Screenshot 调用——否则 portal 对无授权 `interactive=false` 请求的
+        // 即时取消（code=1）可能在订阅建立前就到达，被 `wait_for_response`
+        // 遗漏而误判为 8s 超时（TSI-2971 debug 下订阅延迟放大该竞态）。
         let mut last_err = None;
         for attempt in 0..SCREENSHOT_MAX_ATTEMPTS {
-            match wait_for_response(&self.conn, &request_path, SCREENSHOT_TIMEOUT).await {
+            let token = next_token(&self.token_seq, std::process::id());
+            let request_path = ObjectPath::try_from(format!(
+                "/org/freedesktop/portal/desktop/request/{sender}/{token}"
+            ))
+            .map_err(|e| AgentShellError::DBus(format!("request path: {e}")))?;
+            // 先订阅再发请求（避免竞态）。流建立失败（瞬时 AddMatch 竞态）按
+            // 可重试 attempt 失败处理，而非 `?` 整体中断——与下方 proxy.call
+            // 瞬态分支同口径，保留 §19.3 的第二次尝试。
+            let mut stream = match prepare_response_stream(&self.conn, &request_path).await {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!(
+                        attempt,
+                        "portal Screenshot response stream setup failed: {e}"
+                    );
+                    last_err = Some(e);
+                    if attempt + 1 < SCREENSHOT_MAX_ATTEMPTS {
+                        tokio::time::sleep(PORTAL_RETRY_BACKOFF).await;
+                    }
+                    continue;
+                }
+            };
+
+            let mut options = std::collections::HashMap::<&str, zvariant::Value>::new();
+            options.insert("handle_token", zvariant::Value::from(token.as_str()));
+            options.insert("interactive", zvariant::Value::from(interactive));
+            let body = ("", options);
+
+            // 方法调用：AccessDenied 归一到 Permission（用户拒绝/无活跃会话），
+            // 与 Timeout 同为语义明确错误，不重试；其余瞬态错误（GetSession
+            // 就绪竞态）短退避后进入下一尝试。
+            let returned: zvariant::OwnedObjectPath = match proxy.call("Screenshot", &body).await {
+                Ok(p) => p,
+                Err(e) => {
+                    let e = dbus_error(format!("Screenshot call: {e}"));
+                    if matches!(
+                        e,
+                        AgentShellError::Permission(_) | AgentShellError::Timeout(_)
+                    ) {
+                        return Err(e);
+                    }
+                    tracing::warn!(attempt, "portal Screenshot call failed: {e}");
+                    last_err = Some(e);
+                    if attempt + 1 < SCREENSHOT_MAX_ATTEMPTS {
+                        tokio::time::sleep(PORTAL_RETRY_BACKOFF).await;
+                    }
+                    continue;
+                }
+            };
+
+            // portal 若未按 handle_token 规范返回预算路径（非常规实现），回退
+            // 到调用后订阅的旧路径——该路径有竞态，但仅非常规后端才会触发。
+            let result = if returned.as_str() == request_path.as_str() {
+                drain_response_with_timeout(&mut stream, SCREENSHOT_TIMEOUT, "Screenshot").await
+            } else {
+                tracing::warn!(
+                    "Screenshot path mismatch: expected {}, got {}",
+                    request_path,
+                    returned
+                );
+                wait_for_response(&self.conn, &returned, SCREENSHOT_TIMEOUT).await
+            };
+
+            match result {
                 Ok((_, results)) => {
                     let uri = string_field(&results, "uri").ok_or_else(|| {
                         AgentShellError::Capture("portal Screenshot: no uri in response".into())

@@ -511,7 +511,7 @@ const PNG_DECODE_MAX_BYTES: usize = 256 * 1024 * 1024;
 /// 可用性必须以帧内容为准，而非仅「文件生成成功」——本地 portal 全空帧
 /// （全 0 字节）能落盘却不可用，须据此降级。
 fn is_png_black_or_invalid(path: &std::path::Path) -> bool {
-    use png::{ColorType, Decoder, Transformations};
+    use png::{Decoder, Transformations};
 
     let file = match std::fs::File::open(path) {
         Ok(f) => f,
@@ -536,24 +536,39 @@ fn is_png_black_or_invalid(path: &std::path::Path) -> bool {
         );
         return true;
     }
-    let mut buf = vec![0u8; buf_size];
-    let info = match reader.next_frame(&mut buf) {
-        Ok(i) => i,
-        Err(_) => return true,
-    };
-    let pixels = &buf[..info.buffer_size()];
-    match info.color_type {
-        ColorType::Rgb => pixels
-            .chunks(3)
-            .all(|px| px.len() < 3 || px.iter().all(|&b| b == 0)),
-        ColorType::Rgba => pixels
-            .chunks(4)
-            .all(|px| px.len() < 4 || px[..3].iter().all(|&b| b == 0)),
-        ColorType::Grayscale => pixels.iter().all(|&b| b == 0),
-        ColorType::GrayscaleAlpha => pixels.chunks(2).all(|px| px.len() < 2 || px[0] == 0),
-        // EXPAND 后 Indexed 不应出现；防御性按字节判黑。
-        ColorType::Indexed => pixels.iter().all(|&b| b == 0),
+    // 逐行流式解码 + 短路：非黑像素（常见情形）在第一行即返回 false，
+    // 无需像 `next_frame` 那样先物化整帧 25MB+ 缓冲再全量扫描。debug 构建
+    // 下 PNG 解压/逐像素遍历无优化，全帧物化会放大每次 doctor 探测的开销。
+    let (color_type, _depth) = reader.output_color_type();
+    loop {
+        match reader.next_row() {
+            Ok(Some(row)) => {
+                if row_has_non_black(row.data(), color_type) {
+                    return false;
+                }
+            }
+            Ok(None) => return true,
+            Err(_) => return true,
+        }
     }
+}
+
+/// 单行是否含非黑像素（忽略 alpha 通道，与 [`is_all_black`] 同口径）。
+///
+/// `normalize_to_color8` 展开后每个像素为 1/2/3/4 字节：Rgb(3)/Rgba(4)/
+/// Grayscale(1)/GrayscaleAlpha(2)。`Indexed` 经 EXPAND 后不会出现，
+/// 保留防御分支（1 字节/像素）。
+fn row_has_non_black(data: &[u8], color_type: png::ColorType) -> bool {
+    use png::ColorType;
+    let (bpp, color_channels) = match color_type {
+        ColorType::Rgb => (3, 3),
+        ColorType::Rgba => (4, 3),
+        ColorType::Grayscale => (1, 1),
+        ColorType::GrayscaleAlpha => (2, 1),
+        ColorType::Indexed => (1, 1),
+    };
+    data.chunks(bpp)
+        .any(|px| px.iter().take(color_channels).any(|&b| b != 0))
 }
 
 #[cfg(test)]
@@ -800,6 +815,26 @@ mod tests {
             &[128, 0],
         );
         assert!(!is_png_black_or_invalid(&gray_alpha));
+    }
+
+    #[test]
+    fn is_png_black_or_invalid_detects_non_black_after_black_rows() {
+        // 逐行流式解码的跨行继续扫描路径：前两行全黑、第三行出现非黑像素，
+        // 应短路判非黑（`row_has_non_black == false` 后继续读下一行直至命中）。
+        let dir = tempfile::tempdir().unwrap();
+        let top_black_bottom_red = write_png(
+            dir.path(),
+            "top_black_bottom_red.png",
+            png::ColorType::Rgb,
+            2,
+            3,
+            &[
+                0, 0, 0, 0, 0, 0, // 第 1 行：黑
+                0, 0, 0, 0, 0, 0, // 第 2 行：黑
+                255, 0, 0, 255, 0, 0, // 第 3 行：红
+            ],
+        );
+        assert!(!is_png_black_or_invalid(&top_black_bottom_red));
     }
 
     #[test]
