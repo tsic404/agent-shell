@@ -1393,8 +1393,6 @@ dependencies = [
 [[package]]
 name = "libspa-sys"
 version = "0.10.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3b6e17bdaf63ed0d5e4144022624032b41fd9733112e8c74ac26fc9bf1291924"
 dependencies = [
  "bindgen",
  "cc",
