@@ -146,7 +146,7 @@ impl MutterCompositor {
         wayland_display_name: Option<String>,
     ) -> Result<Self> {
         let version = crate::version::detect_version(&conn).await?;
-        let eval = GnomeEvalBridge::new(conn.clone());
+        let eval = GnomeEvalBridge::new(conn.clone(), version.clone());
         let extension = ExtensionRunner::new(conn.clone());
 
         // 首选路径由版本归类决定（§8.4），失败即回退另一路径。
