@@ -15,6 +15,7 @@ agent-shell-core.workspace = true
 agent-shell-backend-dde.workspace = true
 agent-shell-rpc.workspace = true
 agent-shell-compositor-kwin.workspace = true
+agent-shell-compositor-mutter.workspace = true
 agent-shell-capture.workspace = true
 agent-shell-input.workspace = true
 agent-shell-event.workspace = true

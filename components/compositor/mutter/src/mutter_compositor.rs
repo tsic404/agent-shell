@@ -28,6 +28,16 @@ pub enum SessionKind {
     X11,
 }
 
+/// 窗口语义路径标识（不含桥接句柄，供 daemon 事件源映射等外部使用——
+/// 与 DDE `CompositorKind` 同角色）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GnomePathKind {
+    /// org.gnome.Shell.Eval（GNOME <47，polling 桥接）。
+    Eval,
+    /// Shell Extension AgentShell 接口（GNOME 47+，信号推送）。
+    Extension,
+}
+
 /// 窗口语义双路径（§8.4 核心接口）。
 pub enum GnomePath {
     /// org.gnome.Shell.Eval 直接执行（GNOME <47）。
@@ -42,6 +52,14 @@ impl GnomePath {
         match self {
             GnomePath::Eval(_) => "Eval",
             GnomePath::Extension(_) => "Extension",
+        }
+    }
+
+    /// 路径标识枚举（不含桥接句柄，可复制、可穷举）。
+    pub fn path_kind(&self) -> GnomePathKind {
+        match self {
+            GnomePath::Eval(_) => GnomePathKind::Eval,
+            GnomePath::Extension(_) => GnomePathKind::Extension,
         }
     }
 }
@@ -170,6 +188,13 @@ impl MutterCompositor {
         self.session
     }
 
+    /// 当前激活的窗口语义路径标识。daemon 事件源标注用——Eval 走 polling
+    /// 桥接（`MutterEval`），Extension 走 Shell Extension 信号
+    /// （`MutterExtension`），两者事件源标签不同。
+    pub fn path_kind(&self) -> GnomePathKind {
+        self.path.path_kind()
+    }
+
     /// `WaylandCompositor` 基类通道（§3.3：Wayland 系合成器共享的纯 core
     /// 层）。X11 会话无 Wayland 通道——此时合成器不经 `WaylandCompositor`
     /// 抽象使用（D-Bus 即基础通道），与设计文档一致。
@@ -242,6 +267,14 @@ impl MutterCompositor {
             "⚠ 窗口操作     : 受限（无 move/resize/workspace）".to_string(),
         ]);
         lines
+    }
+
+    /// doctor 输出的异步版本：先补齐 org.gnome.ScreenSaver 在位性懒探测
+    /// 再渲染（与 KWin `/Scripting`、DDE 分支的 `doctor_lines_async` 同口径，
+    /// 使 daemon doctor 路径不落空——TSI-2486 同类的懒探测修正）。
+    pub async fn doctor_lines_async(&self) -> Vec<String> {
+        let _ = self.ensure_screensaver_probe().await;
+        self.doctor_lines()
     }
 
     // ───────────────────────── 内部分派 ─────────────────────────

@@ -400,6 +400,7 @@ dependencies = [
  "agent-shell-backend-dde",
  "agent-shell-capture",
  "agent-shell-compositor-kwin",
+ "agent-shell-compositor-mutter",
  "agent-shell-core",
  "agent-shell-event",
  "agent-shell-input",

@@ -1,8 +1,8 @@
 //! daemon 核心状态：全部持久化连接的持有者（设计文档 §22.2 D1 / §23.2）。
 //!
 //! daemon 常驻用户会话，持有：
-//! - 合成器通道（KDE → KWin；DDE → DdeCompositor，deepin-kwin 分支复用 KWin
-//!   双通道，doctor 输出经 daemon 呈现）
+//! - 合成器通道（KDE → KWin；DDE → DdeCompositor；GNOME → MutterCompositor，
+//!   D-Bus Eval/Extension 双路径，doctor 输出经 daemon 呈现）
 //! - X11 通道（EWMH/ICCCM/XTest；XWayland 会话下输入注入降级用）
 //! - WindowStateCache（查询走缓存；T3b 事件归一化落地后改为事件驱动刷新，
 //!   当前以 TTL 短缓存近似——如实标注 `from_cache` 语义）
@@ -11,16 +11,17 @@ use agent_shell_a11y::AtSpiComponent;
 use agent_shell_backend_dde::{CompositorKind, DdeCompositor};
 use agent_shell_capture::CaptureDispatcher;
 use agent_shell_compositor_kwin::KWinCompositor;
+use agent_shell_compositor_mutter::{GnomePathKind, MutterCompositor};
 use agent_shell_core::component::{BackendCapabilities, CompositorComponent, DesktopComponent};
 use agent_shell_core::types::WindowInfo;
 use event::{EventHub, EventRing};
 use std::time::{Duration, Instant};
-
-/// daemon 持有的合成器后端。KDE 会话装 KWin，DDE 会话装 DdeCompositor
-/// （其 deepin-kwin 分支复用 KWin 双通道，doctor 输出经 daemon 呈现）。
+/// daemon 持有的合成器后端。KDE 会话装 KWin，DDE 会话装 DdeCompositor，
+/// GNOME 会话装 MutterCompositor（D-Bus Eval/Extension 双路径）。
 enum CompositorBackend {
     Kwin(Box<KWinCompositor>),
     Dde(DdeCompositor),
+    Mutter(Box<MutterCompositor>),
 }
 
 impl CompositorBackend {
@@ -28,19 +29,22 @@ impl CompositorBackend {
         match self {
             Self::Kwin(c) => c.as_ref(),
             Self::Dde(c) => c,
+            Self::Mutter(c) => c.as_ref(),
         }
     }
 
-    /// doctor 报告用的后端展示名（KWin 保留历史值，DDE 委托 trait 方法）。
+    /// doctor 报告用的后端展示名（KWin 保留历史值，DDE/Mutter 委托 trait 方法）。
     fn name(&self) -> &'static str {
         match self {
             Self::Kwin(_) => "kwin-compositor",
             Self::Dde(c) => c.name(),
+            Self::Mutter(c) => c.name(),
         }
     }
 
     /// 事件源标注：KWin 会话按 Wayland/X11 细分；DDE 会话按合成器形态
-    /// 细分（deepin-kwin→KWinWayland / Treeland→Treeland / X11→X11Generic）。
+    /// 细分（deepin-kwin→KWinWayland / Treeland→Treeland / X11→X11Generic）；
+    /// Mutter 会话按窗口语义路径细分（Eval→MutterEval / Extension→MutterExtension）。
     fn event_source_kind(&self) -> event::EventSource {
         match self {
             Self::Kwin(c) => match c.session_kind() {
@@ -48,6 +52,7 @@ impl CompositorBackend {
                 _ => event::EventSource::KWinWayland,
             },
             Self::Dde(c) => dde_event_source(c.compositor.kind()),
+            Self::Mutter(c) => mutter_event_source(c.path_kind()),
         }
     }
 
@@ -57,15 +62,18 @@ impl CompositorBackend {
         match self {
             Self::Kwin(c) => c.doctor_lines_async().await,
             Self::Dde(c) => c.doctor_lines_async().await,
+            Self::Mutter(c) => c.doctor_lines_async().await,
         }
     }
 
     /// 会话后端对应的 `WindowId` 环境标签。KWin 内部打 KDE 标签
-    /// （deepin-kwin 分支复用 KWin 亦同口径）；DDE 其余分支标 DDE。
+    /// （deepin-kwin 分支复用 KWin 亦同口径）；DDE 其余分支标 DDE；
+    /// Mutter 标 GNOME。
     fn de_type(&self) -> agent_shell_core::types::DesktopEnvironment {
         match self {
             Self::Kwin(_) => agent_shell_core::types::DesktopEnvironment::KDE,
             Self::Dde(c) => dde_de_type(c.compositor.kind()),
+            Self::Mutter(_) => agent_shell_core::types::DesktopEnvironment::GNOME,
         }
     }
 }
@@ -89,6 +97,15 @@ fn dde_de_type(kind: CompositorKind) -> agent_shell_core::types::DesktopEnvironm
             agent_shell_core::types::DesktopEnvironment::KDE
         }
         CompositorKind::Treeland => agent_shell_core::types::DesktopEnvironment::DDE,
+    }
+}
+
+/// Mutter 窗口语义路径 → 事件源标签（§18.1 映射：Eval 走 polling 桥接，
+/// Extension 走 Shell Extension 信号）。
+fn mutter_event_source(kind: GnomePathKind) -> event::EventSource {
+    match kind {
+        GnomePathKind::Eval => event::EventSource::MutterEval,
+        GnomePathKind::Extension => event::EventSource::MutterExtension,
     }
 }
 
@@ -147,8 +164,19 @@ impl Daemon {
                 .map(CompositorBackend::Dde)
                 .map_err(|e| tracing::warn!("dde compositor assemble failed: {e}"))
                 .ok(),
+            "gnome" => if is_wayland_session() {
+                MutterCompositor::new_wayland().await
+            } else {
+                MutterCompositor::new_x11().await
+            }
+            .map(Box::new)
+            .map(CompositorBackend::Mutter)
+            .map_err(|e| tracing::warn!("mutter compositor assemble failed: {e}"))
+            .ok(),
             other => {
-                tracing::warn!("no compositor component for {other:?} (implemented: KDE, DDE)");
+                tracing::warn!(
+                    "no compositor component for {other:?} (implemented: KDE, DDE, GNOME)"
+                );
                 None
             }
         };
@@ -434,6 +462,39 @@ fn session_kind() -> String {
     }
 }
 
+/// 校验 fd 是否为真实 socket（纯函数，供单测注入）。
+///
+/// `/proc/self/fd/{fd}` symlink 指向进程已打开文件；`metadata` 跟随 symlink，
+/// socket 报 `is_socket() == true`，非法/已关闭 fd 报 ENOENT → false。
+fn fd_is_socket(fd: i32) -> bool {
+    use std::os::unix::fs::FileTypeExt;
+    std::fs::metadata(format!("/proc/self/fd/{fd}"))
+        .map(|m| m.file_type().is_socket())
+        .unwrap_or(false)
+}
+
+/// `WAYLAND_SOCKET` 是否指向真实 socket fd。
+///
+/// socket 激活形态（systemd user service / fd 传递）下 `WAYLAND_SOCKET` 是
+/// 数字 fd；非法/非 socket fd 会经 wayland-client 传入 tokio I/O driver，在
+/// 后台 worker 线程 panic（`Bad file descriptor`）致 daemon abort——该 panic
+/// 不在 `degrade_wayland_failure` 降级路径上，须在装配前拦截。
+fn wayland_socket_is_socket() -> bool {
+    let Some(fd) = std::env::var_os("WAYLAND_SOCKET")
+        .and_then(|v| v.to_str().and_then(|s| s.parse::<i32>().ok()))
+    else {
+        return false;
+    };
+    fd_is_socket(fd)
+}
+
+/// 会话是否为 Wayland（与 `backends/{gnome,dde,kde}/src/assemble.rs`、
+/// `clipboard`、`displayserver/wayland/registry.rs` 同 `var_os().is_some()`
+/// 口径；`WAYLAND_SOCKET` 额外校验为真实 socket fd，见 [`wayland_socket_is_socket`]）。
+fn is_wayland_session() -> bool {
+    std::env::var_os("WAYLAND_DISPLAY").is_some() || wayland_socket_is_socket()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -477,6 +538,31 @@ mod tests {
         assert_eq!(dde_de_type(K::DeepinKwin), DE::KDE);
         assert_eq!(dde_de_type(K::X11), DE::KDE);
         assert_eq!(dde_de_type(K::Treeland), DE::DDE);
+    }
+
+    #[test]
+    fn mutter_event_source_maps_all_kinds() {
+        use agent_shell_compositor_mutter::GnomePathKind as K;
+        assert_eq!(mutter_event_source(K::Eval), event::EventSource::MutterEval);
+        assert_eq!(
+            mutter_event_source(K::Extension),
+            event::EventSource::MutterExtension
+        );
+    }
+
+    #[test]
+    fn fd_is_socket_rejects_bad_fds() {
+        // 非法/越界 fd 必须判 false——否则会传入 tokio I/O driver 致 worker
+        // 线程 panic、daemon abort（QA_FAILED 根因 ①）。
+        assert!(!fd_is_socket(-1));
+        assert!(!fd_is_socket(i32::MAX));
+    }
+
+    #[test]
+    fn fd_is_socket_accepts_real_socket() {
+        use std::os::fd::AsRawFd;
+        let (a, _b) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+        assert!(fd_is_socket(a.as_raw_fd()));
     }
 
     #[test]
