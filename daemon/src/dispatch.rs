@@ -843,8 +843,8 @@ async fn ime_type(d: &mut Daemon, req: &Request) -> RpcResult {
 ///
 /// rootd 未安装时返回 "rootd not installed" 并降级（§23.2）。
 /// rootd 已安装但版本不匹配时拒绝服务。
-async fn rootd_hello(_d: &mut Daemon) -> RpcResult {
-    match crate::rootd_client::connect().await {
+async fn rootd_hello(d: &mut Daemon) -> RpcResult {
+    match (d.rootd_connect)().await {
         Some(proxy) => {
             let version = proxy
                 .hello()
@@ -887,7 +887,7 @@ async fn rootd_hello(_d: &mut Daemon) -> RpcResult {
 /// 参数：{ "action": "start|stop|restart|enable|disable|reload", "unit": "nginx.service" }
 /// unit 名与 action 的语义校验在 rootd `service_control` 完成——daemon 纯路由，
 /// 不重复校验（rootd 是唯一的权威边界）。rootd 未安装时返回降级错误。
-async fn service_control(_d: &mut Daemon, req: &Request) -> RpcResult {
+async fn service_control(d: &mut Daemon, req: &Request) -> RpcResult {
     let params = params_of(req)?;
     let action = params
         .get("action")
@@ -898,7 +898,7 @@ async fn service_control(_d: &mut Daemon, req: &Request) -> RpcResult {
         .and_then(|v| v.as_str())
         .ok_or((RpcErrorCode::InvalidParams, "missing unit".into()))?;
 
-    let proxy = crate::rootd_client::connect().await.ok_or((
+    let proxy = (d.rootd_connect)().await.ok_or((
         RpcErrorCode::BackendUnavailable,
         "rootd not installed — privileged operation unavailable".into(),
     ))?;
@@ -942,8 +942,8 @@ async fn service_control(_d: &mut Daemon, req: &Request) -> RpcResult {
 /// 重载 systemd 管理器配置（rootd DaemonReload）。
 ///
 /// 无参数。rootd 未安装时返回降级错误。
-async fn daemon_reload(_d: &mut Daemon) -> RpcResult {
-    let proxy = crate::rootd_client::connect().await.ok_or((
+async fn daemon_reload(d: &mut Daemon) -> RpcResult {
+    let proxy = (d.rootd_connect)().await.ok_or((
         RpcErrorCode::BackendUnavailable,
         "rootd not installed — privileged operation unavailable".into(),
     ))?;
@@ -959,14 +959,14 @@ async fn daemon_reload(_d: &mut Daemon) -> RpcResult {
 ///
 /// 参数：{ "filter": { "unit": "nginx", "priority": "err" } }
 /// rootd 未安装时返回降级错误。
-async fn system_log_view(_d: &mut Daemon, req: &Request) -> RpcResult {
+async fn system_log_view(d: &mut Daemon, req: &Request) -> RpcResult {
     let params = params_of(req)?;
     let filter = params
         .get("filter")
         .map(|v| serde_json::to_string(v).unwrap_or_default())
         .unwrap_or_else(|| "{}".to_string());
 
-    let proxy = crate::rootd_client::connect().await.ok_or((
+    let proxy = (d.rootd_connect)().await.ok_or((
         RpcErrorCode::BackendUnavailable,
         "rootd not installed — system journal unavailable".into(),
     ))?;
@@ -982,14 +982,14 @@ async fn system_log_view(_d: &mut Daemon, req: &Request) -> RpcResult {
 ///
 /// 参数：{ "key": "kernel.hostname" }；返回 rootd 的 value 裸字符串。
 /// rootd 未安装时返回降级错误。
-async fn sysctl_get(_d: &mut Daemon, req: &Request) -> RpcResult {
+async fn sysctl_get(d: &mut Daemon, req: &Request) -> RpcResult {
     let params = params_of(req)?;
     let key = params
         .get("key")
         .and_then(|v| v.as_str())
         .ok_or((RpcErrorCode::InvalidParams, "missing key".into()))?;
 
-    let proxy = crate::rootd_client::connect().await.ok_or((
+    let proxy = (d.rootd_connect)().await.ok_or((
         RpcErrorCode::BackendUnavailable,
         "rootd not installed — privileged operation unavailable".into(),
     ))?;
@@ -1027,7 +1027,7 @@ fn is_auth_failed(e: &zbus::Error) -> bool {
 ///
 /// 参数：{ "key": "net.ipv4.ip_forward", "value": "1" }，value 支持
 /// string/number/bool。rootd 未安装时返回降级错误。
-async fn sysctl_set(_d: &mut Daemon, req: &Request) -> RpcResult {
+async fn sysctl_set(d: &mut Daemon, req: &Request) -> RpcResult {
     let params = params_of(req)?;
     let key = params
         .get("key")
@@ -1041,7 +1041,7 @@ async fn sysctl_set(_d: &mut Daemon, req: &Request) -> RpcResult {
         "value must be string/number/bool".into(),
     ))?;
 
-    let proxy = crate::rootd_client::connect().await.ok_or((
+    let proxy = (d.rootd_connect)().await.ok_or((
         RpcErrorCode::BackendUnavailable,
         "rootd not installed — privileged operation unavailable".into(),
     ))?;
@@ -1078,14 +1078,14 @@ fn json_to_zvariant(value: &Value) -> Option<zbus::zvariant::Value<'_>> {
 /// 参数：{ "hostname": "workstation-01" }
 /// 主机名校验在 rootd `validate_hostname` 完成——daemon 纯路由，
 /// 不重复校验（rootd 是唯一的权威边界）。rootd 未安装时返回降级错误。
-async fn hostname_set(_d: &mut Daemon, req: &Request) -> RpcResult {
+async fn hostname_set(d: &mut Daemon, req: &Request) -> RpcResult {
     let params = params_of(req)?;
     let hostname = params
         .get("hostname")
         .and_then(|v| v.as_str())
         .ok_or((RpcErrorCode::InvalidParams, "missing hostname".into()))?;
 
-    let proxy = crate::rootd_client::connect().await.ok_or((
+    let proxy = (d.rootd_connect)().await.ok_or((
         RpcErrorCode::BackendUnavailable,
         "rootd not installed — privileged operation unavailable".into(),
     ))?;
@@ -1104,7 +1104,7 @@ async fn hostname_set(_d: &mut Daemon, req: &Request) -> RpcResult {
 /// 不重复校验（rootd 是唯一的权威边界）。此处仅做表示层窄化：JSON 取值为
 /// i64，而 D-Bus 签名为 i32，超范围必须拒绝而非静默截断（`2³²+1234` 截断
 /// 成 `1234` 会绕过 rootd 校验并对无关进程发信号）。rootd 未安装时返回降级错误。
-async fn process_kill(_d: &mut Daemon, req: &Request) -> RpcResult {
+async fn process_kill(d: &mut Daemon, req: &Request) -> RpcResult {
     let params = params_of(req)?;
     let pid = params
         .get("pid")
@@ -1125,7 +1125,7 @@ async fn process_kill(_d: &mut Daemon, req: &Request) -> RpcResult {
         )
     })?;
 
-    let proxy = crate::rootd_client::connect().await.ok_or((
+    let proxy = (d.rootd_connect)().await.ok_or((
         RpcErrorCode::BackendUnavailable,
         "rootd not installed — privileged operation unavailable".into(),
     ))?;
@@ -1144,7 +1144,7 @@ async fn process_kill(_d: &mut Daemon, req: &Request) -> RpcResult {
 /// 参数：{ "device": "/dev/sda1", "target": "/mnt/data", "fstype": "ext4",
 ///         "options": ["rw", "noatime"] }
 /// rootd 未安装时返回降级错误。
-async fn mount(_d: &mut Daemon, req: &Request) -> RpcResult {
+async fn mount(d: &mut Daemon, req: &Request) -> RpcResult {
     let params = params_of(req)?;
     let device = params
         .get("device")
@@ -1164,7 +1164,7 @@ async fn mount(_d: &mut Daemon, req: &Request) -> RpcResult {
         .transpose()?
         .unwrap_or_default();
 
-    let proxy = crate::rootd_client::connect().await.ok_or((
+    let proxy = (d.rootd_connect)().await.ok_or((
         RpcErrorCode::BackendUnavailable,
         "rootd not installed — privileged operation unavailable".into(),
     ))?;
@@ -1186,14 +1186,14 @@ async fn mount(_d: &mut Daemon, req: &Request) -> RpcResult {
 ///
 /// 参数：{ "target": "/mnt/data" }
 /// rootd 未安装时返回降级错误。
-async fn unmount(_d: &mut Daemon, req: &Request) -> RpcResult {
+async fn unmount(d: &mut Daemon, req: &Request) -> RpcResult {
     let params = params_of(req)?;
     let target = params
         .get("target")
         .and_then(|v| v.as_str())
         .ok_or((RpcErrorCode::InvalidParams, "missing target".into()))?;
 
-    let proxy = crate::rootd_client::connect().await.ok_or((
+    let proxy = (d.rootd_connect)().await.ok_or((
         RpcErrorCode::BackendUnavailable,
         "rootd not installed — privileged operation unavailable".into(),
     ))?;
@@ -1227,14 +1227,14 @@ fn parse_mount_options(v: &Value) -> Result<Vec<String>, (RpcErrorCode, String)>
 /// `{found, method, progress, done, success, exit_code, stderr}`；
 /// 未知 job 时 rootd 返回 `{"found": false}`（job 可能已被 drain 淘汰）。
 /// rootd 未安装 → `BackendUnavailable` 降级错误。
-async fn job_status(_d: &mut Daemon, req: &Request) -> RpcResult {
+async fn job_status(d: &mut Daemon, req: &Request) -> RpcResult {
     let params = params_of(req)?;
     let job_id = params
         .get("job_id")
         .and_then(|v| v.as_str())
         .ok_or((RpcErrorCode::InvalidParams, "missing job_id".into()))?;
 
-    let proxy = crate::rootd_client::connect().await.ok_or((
+    let proxy = (d.rootd_connect)().await.ok_or((
         RpcErrorCode::BackendUnavailable,
         "rootd not installed — job status unavailable".into(),
     ))?;
@@ -1294,9 +1294,9 @@ fn parse_package_result(result: &str) -> RpcResult {
 ///
 /// 参数：{ "packages": ["nginx", "curl"] }。包名合法性由 rootd 校验
 /// （CLI/daemon 不重复校验）。返回 rootd 的 `{job_id, pm}`。
-async fn package_install(_d: &mut Daemon, req: &Request) -> RpcResult {
+async fn package_install(d: &mut Daemon, req: &Request) -> RpcResult {
     let packages = packages_param(req)?;
-    let proxy = crate::rootd_client::connect().await.ok_or((
+    let proxy = (d.rootd_connect)().await.ok_or((
         RpcErrorCode::BackendUnavailable,
         "rootd not installed — privileged operation unavailable".into(),
     ))?;
@@ -1308,9 +1308,9 @@ async fn package_install(_d: &mut Daemon, req: &Request) -> RpcResult {
 }
 
 /// 移除系统软件包（rootd PackageRemove，§23.4）。
-async fn package_remove(_d: &mut Daemon, req: &Request) -> RpcResult {
+async fn package_remove(d: &mut Daemon, req: &Request) -> RpcResult {
     let packages = packages_param(req)?;
-    let proxy = crate::rootd_client::connect().await.ok_or((
+    let proxy = (d.rootd_connect)().await.ok_or((
         RpcErrorCode::BackendUnavailable,
         "rootd not installed — privileged operation unavailable".into(),
     ))?;
@@ -1322,9 +1322,9 @@ async fn package_remove(_d: &mut Daemon, req: &Request) -> RpcResult {
 }
 
 /// 升级系统软件包（rootd PackageUpdate，§23.4；空数组 = 全部升级）。
-async fn package_update(_d: &mut Daemon, req: &Request) -> RpcResult {
+async fn package_update(d: &mut Daemon, req: &Request) -> RpcResult {
     let packages = packages_param(req)?;
-    let proxy = crate::rootd_client::connect().await.ok_or((
+    let proxy = (d.rootd_connect)().await.ok_or((
         RpcErrorCode::BackendUnavailable,
         "rootd not installed — privileged operation unavailable".into(),
     ))?;
@@ -1336,8 +1336,8 @@ async fn package_update(_d: &mut Daemon, req: &Request) -> RpcResult {
 }
 
 /// 刷新包元数据缓存（rootd PackageRefresh，§23.4；无参数）。
-async fn package_refresh(_d: &mut Daemon) -> RpcResult {
-    let proxy = crate::rootd_client::connect().await.ok_or((
+async fn package_refresh(d: &mut Daemon) -> RpcResult {
+    let proxy = (d.rootd_connect)().await.ok_or((
         RpcErrorCode::BackendUnavailable,
         "rootd not installed — privileged operation unavailable".into(),
     ))?;
@@ -1362,10 +1362,11 @@ mod tests {
         }
     }
 
-    /// rootd 在线时，rootd-degrade 测试的前置条件（rootd 缺席）不成立：
-    /// 环境性跳过（与 systemd `skip_environment` 同语义），保持 1002 断言不变。
-    async fn rootd_is_online() -> bool {
-        crate::rootd_client::connect().await.is_some()
+    /// 离线 rootd 连接器：恒返回 `None`，确定性覆盖「rootd 缺席 → 降级」路径。
+    /// 使 degrade 断言在 rootd 常驻主机（GNOME/DDE）上同样真实执行，而非依赖
+    /// 环境检测早退（早退会让 `cargo test` 静默空转、伪造 CI 绿）。
+    fn offline_rootd_connector() -> crate::rootd_client::RootdConnector {
+        || Box::pin(std::future::ready(None))
     }
 
     /// 测试基座：隔离 ambient env/config——`caller_id` 回落 `"*"`、security 用
@@ -2009,13 +2010,10 @@ mod tests {
     #[tokio::test]
     async fn service_control_extended_actions_reach_rootd_degrade() {
         // L4 放行后进入 handler：enable/disable/reload 经参数提取到达 rootd
-        // 连接。本环境无 rootd → BackendUnavailable 降级，证明扩展动作的
-        // 前置链路（参数解析 + 门禁放行）完整；rootd Ok 分支需实机。
-        if rootd_is_online().await {
-            eprintln!("SKIP: rootd 在线 → 非降级路径（环境性跳过）");
-            return;
-        }
+        // 连接。注入离线 rootd 连接器 → BackendUnavailable 降级，证明扩展
+        // 动作的前置链路（参数解析 + 门禁放行）完整；rootd Ok 分支需实机。
         let mut d = test_daemon().await;
+        d.rootd_connect = offline_rootd_connector();
         d.caller_id = "trusted".into();
         d.security
             .config
@@ -2042,12 +2040,9 @@ mod tests {
     #[tokio::test]
     async fn daemon_reload_reaches_rootd_degrade() {
         // L4 放行后进入 handler：daemon.reload 无参数直达 rootd 连接。
-        // 本环境无 rootd → BackendUnavailable 降级。
-        if rootd_is_online().await {
-            eprintln!("SKIP: rootd 在线 → 非降级路径（环境性跳过）");
-            return;
-        }
+        // 注入离线 rootd 连接器 → BackendUnavailable 降级。
         let mut d = test_daemon().await;
+        d.rootd_connect = offline_rootd_connector();
         d.caller_id = "trusted".into();
         d.security
             .config
@@ -2320,13 +2315,10 @@ mod tests {
     #[tokio::test]
     async fn hostname_set_valid_params_reaches_rootd_degrade() {
         // L4 放行后进入 handler：合法 hostname 通过参数提取，到达 rootd
-        // 连接。本环境无 rootd → BackendUnavailable 降级，证明成功路径的
-        // 前置链路（参数解析 + 门禁放行）完整；rootd Ok 分支需实机。
-        if rootd_is_online().await {
-            eprintln!("SKIP: rootd 在线 → 非降级路径（环境性跳过）");
-            return;
-        }
+        // 连接。注入离线 rootd 连接器 → BackendUnavailable 降级，证明成功
+        // 路径的前置链路（参数解析 + 门禁放行）完整；rootd Ok 分支需实机。
         let mut d = test_daemon().await;
+        d.rootd_connect = offline_rootd_connector();
         d.caller_id = "trusted".into();
         d.security
             .config
@@ -2433,14 +2425,11 @@ mod tests {
 
     #[tokio::test]
     async fn package_refresh_gate_pass_reaches_rootd_degrade() {
-        // L4 放行后进入 handler：无参数，到达 rootd 连接。本环境无 rootd
-        // → BackendUnavailable 降级，证明成功路径前置链路（门禁放行 +
-        // handler 执行）完整；rootd Ok 分支需实机。
-        if rootd_is_online().await {
-            eprintln!("SKIP: rootd 在线 → 非降级路径（环境性跳过）");
-            return;
-        }
+        // L4 放行后进入 handler：无参数，到达 rootd 连接。注入离线 rootd
+        // 连接器 → BackendUnavailable 降级，证明成功路径前置链路（门禁
+        // 放行 + handler 执行）完整；rootd Ok 分支需实机。
         let mut d = test_daemon().await;
+        d.rootd_connect = offline_rootd_connector();
         d.caller_id = "trusted".into();
         d.security
             .config
@@ -2517,7 +2506,11 @@ mod tests {
     }
     #[tokio::test]
     async fn sysctl_get_valid_key_without_rootd_returns_backend_unavailable() {
+        // 合法 key 到达 rootd 连接：注入离线 rootd 连接器 →
+        // BackendUnavailable 降级，证明无 rootd 时的降级路径在所有主机
+        // 确定性可测（rootd 常驻主机不再误入非降级路径）。
         let mut d = Daemon::connect(Duration::from_secs(1)).await;
+        d.rootd_connect = offline_rootd_connector();
         let resp = dispatch(
             &mut d,
             &req(method::SYSCTL_GET, Some(json!({"key": "kernel.hostname"}))),
@@ -2570,7 +2563,11 @@ mod tests {
     }
     #[tokio::test]
     async fn sysctl_set_valid_params_without_rootd_returns_backend_unavailable() {
+        // L4 放行后进入 handler：合法 key/value 到达 rootd 连接。注入离线
+        // rootd 连接器 → BackendUnavailable 降级，证明无 rootd 时的降级
+        // 路径在所有主机确定性可测（rootd 常驻主机不再误入非降级路径）。
         let mut d = Daemon::connect(Duration::from_secs(1)).await;
+        d.rootd_connect = offline_rootd_connector();
         d.caller_id = "trusted".into();
         d.security
             .config

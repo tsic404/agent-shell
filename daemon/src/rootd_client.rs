@@ -3,6 +3,8 @@
 //! daemon 经 system bus 调用 rootd 的白名单方法。rootd 未安装时
 //! 返回 None——上层据此降级为仅用户态操作（§23.2）。
 
+use std::future::Future;
+use std::pin::Pin;
 use zbus::proxy;
 
 /// rootd system bus 代理（org.agentshell.Rootd）。
@@ -104,4 +106,17 @@ pub async fn connect() -> Option<RootdProxy<'static>> {
         .build()
         .await
         .ok()
+}
+/// rootd 连接工厂：返回 `Some(proxy)` 表示在线、`None` 表示缺席（降级路径）。
+///
+/// 抽象为可注入的函数指针（§23.4 测试隔离）：生产经 [`connector`] 绑定真实
+/// [`connect`]；测试注入恒 `None` 的失败工厂，使无 rootd 降级路径在所有主机
+/// 确定性可测，而非依赖 rootd 缺席（rootd 常驻主机会误入非降级路径，见
+/// TSI-2968）。
+pub type RootdConnector = fn() -> Pin<Box<dyn Future<Output = Option<RootdProxy<'static>>> + Send>>;
+
+/// 生产连接器：真实 system bus 探测。daemon 所有 rootd 特权链路经此注入点，
+/// 使降级路径在测试中可确定性覆盖。
+pub fn connector() -> RootdConnector {
+    || Box::pin(connect())
 }

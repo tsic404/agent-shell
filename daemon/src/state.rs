@@ -115,6 +115,9 @@ pub struct Daemon {
     /// 发起调用的 agent 身份。由宿主编排层在启动 CLI/MCP 前经
     /// `AGENT_SHELL_AGENT_ID` 注入，子进程经 fork/exec 继承；未设置回落 `"*"`。
     pub caller_id: String,
+    /// rootd 连接工厂（§23.4）。生产绑定真实 system bus 探测；测试注入
+    /// 恒 `None` 的失败工厂，使无 rootd 降级路径在所有主机确定性可测。
+    pub rootd_connect: crate::rootd_client::RootdConnector,
     /// AT-SPI 组件（None = a11y bus 不可达，a11y.query 返回 BackendUnavailable）。
     pub a11y: Option<AtSpiComponent>,
     /// 事件枢纽（§22.5 D4：订阅者 fan-out 中心）。
@@ -181,6 +184,7 @@ impl Daemon {
             security,
             caller_id,
             a11y: AtSpiComponent::probe().await,
+            rootd_connect: crate::rootd_client::connector(),
             hub: EventHub::new(),
             ring: EventRing::default(),
             subscriptions: Vec::new(),
@@ -501,6 +505,7 @@ mod tests {
                 },
             ),
             caller_id: "*".into(),
+            rootd_connect: crate::rootd_client::connector(),
             a11y: None,
             hub: EventHub::new(),
             ring: EventRing::default(),
