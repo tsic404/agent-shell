@@ -9,10 +9,14 @@
 //! 3. 错误码 → CLI 退出码映射。
 
 use agent_shell_rpc::{method, Request, Response};
+use parking_lot::Mutex;
 use serde_json::{json, Value};
+use std::collections::VecDeque;
 use std::process::Stdio;
+use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::sync::Notify;
 
 /// 结构化调用错误：RPC 错误携带 code，便于调用方按退出码分派
 /// （如 mount 的 polkit 拒绝 → exit 2，其余 → exit 1）。
@@ -46,11 +50,58 @@ const CLOSED_EARLY: &str = "daemon closed connection before responding";
 /// 恢复（§19 短退避）。
 const RETRY_BACKOFF_MS: u64 = 150;
 
+/// daemon stderr 尾部保留上限（字节）。排空任务只保留最近输出、超出丢弃
+/// 最旧字节，防止长时间会话（`events subscribe` / RUST_LOG=debug）缓冲
+/// 无限增长；64KB 足以容纳锁竞争/启动失败的末行诊断。
+const STDERR_TAIL_CAP: usize = 64 * 1024;
+
+/// daemon stderr 尾部缓冲：后台任务持续排空管道，避免 64KB 管道缓冲写满
+/// 后 daemon 同步写阻塞停摆（TSI-2946 审查 #1）；连接提前关闭时取尾部
+/// 透传根因。
+struct StderrTail {
+    buf: Mutex<VecDeque<u8>>,
+    done: Notify,
+}
+
+/// 把 daemon stderr 交给后台排空任务：逐块读入、仅保留最近
+/// [`STDERR_TAIL_CAP`] 字节，stderr EOF（daemon 退出）时发 `done` 通知。
+/// 任务随 daemon 退出自然结束，无需显式取消。
+fn spawn_stderr_drain(mut stderr: tokio::process::ChildStderr) -> Arc<StderrTail> {
+    let tail = Arc::new(StderrTail {
+        buf: Mutex::new(VecDeque::with_capacity(STDERR_TAIL_CAP)),
+        done: Notify::new(),
+    });
+    let shared = Arc::clone(&tail);
+    tokio::spawn(async move {
+        let mut chunk = [0u8; 4096];
+        loop {
+            match stderr.read(&mut chunk).await {
+                Ok(0) | Err(_) => break, // EOF/读错误 → daemon 已退出
+                Ok(n) => {
+                    let mut buf = shared.buf.lock();
+                    buf.extend(&chunk[..n]);
+                    if buf.len() > STDERR_TAIL_CAP {
+                        let excess = buf.len() - STDERR_TAIL_CAP;
+                        buf.drain(..excess);
+                    }
+                }
+            }
+        }
+        // `notify_one`（非 `notify_waiters`）——无 waiter 时存一个 permit，
+        // 保证 drain_stderr 在任务先完成时仍能立即拿到通知，不会挂死。
+        shared.done.notify_one();
+    });
+    tail
+}
+
 /// 一个 daemon 连接上的客户端会话。
 pub struct DaemonClient {
     child: Option<tokio::process::Child>,
     stdin: tokio::process::ChildStdin,
     reader: BufReader<tokio::process::ChildStdout>,
+    /// daemon stderr 尾部缓冲（后台任务持续排空，见 [`spawn_stderr_drain`]）；
+    /// 连接提前关闭时取尾部透传诊断（TSI-2946）。
+    stderr_tail: Option<Arc<StderrTail>>,
     next_id: u64,
     /// 「连接提前关闭」时的重建重试次数（`--retry N` 注入）。
     retries: u32,
@@ -82,15 +133,17 @@ impl DaemonClient {
             .arg("--foreground")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .spawn()
             .map_err(|e| format!("spawn {exe}: {e}"))?;
         let stdin = child.stdin.take().ok_or("daemon child has no stdin")?;
         let stdout = child.stdout.take().ok_or("daemon child has no stdout")?;
+        let stderr_tail = child.stderr.take().map(spawn_stderr_drain);
         Ok(Self {
             child: Some(child),
             stdin,
             reader: BufReader::new(stdout),
+            stderr_tail,
             next_id: 1,
             retries,
         })
@@ -105,11 +158,19 @@ impl DaemonClient {
             .await
             .map_err(|e| format!("daemon read: {e}"))?;
         if n == 0 {
-            return Err(format!(
+            // 透传 daemon stderr 诊断（TSI-2946）：`.stderr(piped())` 下锁竞争
+            // `daemon already running`、portal 会话失败等早期退出根因原样可见，
+            // 而非只报通用「connection closed before responding」。
+            let diag = self.drain_stderr().await;
+            let mut msg = format!(
                 "{CLOSED_EARLY} (hint: daemon exited early — possible portal/DBus \
                  session-permission failure or concurrent daemon startup; use --retry N \
                  or ensure an active graphical login session)"
-            ));
+            );
+            if !diag.is_empty() {
+                msg.push_str(&format!(" [daemon: {diag}]"));
+            }
+            return Err(msg);
         }
         // 半截响应：完整 JSON-RPC 行必以 `\n` 结尾（`to_line` 追加），读到 EOF
         // 仍无换行说明 daemon 在写完一行前退出——归入传输层错误供 `--retry`
@@ -118,6 +179,23 @@ impl DaemonClient {
             return Err("daemon read: truncated response (EOF before newline)".into());
         }
         Ok(line)
+    }
+
+    /// 取 daemon 退出前的 stderr 尾部诊断（去首尾空白）。等待后台排空任务
+    /// 读到 EOF 后读取，保证 stdout EOF 观察到时最后字节已落入缓冲；
+    /// `notify_one` 无 waiter 时存 permit，任务先完成也不丢通知。`take()`
+    /// 保证幂等。
+    async fn drain_stderr(&mut self) -> String {
+        let Some(tail) = self.stderr_tail.take() else {
+            return String::new();
+        };
+        tail.done.notified().await;
+        let mut buf = tail.buf.lock();
+        let s = String::from_utf8_lossy(buf.make_contiguous())
+            .trim()
+            .to_string();
+        buf.clear();
+        s
     }
 
     /// 单次请求往返，带「连接提前关闭」重建重试（§19 短退避）。
@@ -211,8 +289,9 @@ impl DaemonClient {
     /// `subscriber_id` 响应打印一次；此后每条 `events.notify` 通知以
     /// pretty JSON 打印到 stdout，与普通查询命令的单行输出互不干扰。
     ///
-    /// 流结束（EOF，daemon 退出或空闲超时）显式提示并 exit 0；真实 I/O
-    /// 错误返回 Err 以非零退出（审查建议 2）。
+    /// 订阅响应收到后的 EOF 是正常流结束（daemon 退出或空闲超时）→ exit 0；
+    /// 响应收到前的 EOF 是 daemon 启动失败（锁竞争等），错误含 `[daemon: …]`
+    /// 诊断，返回 Err 非零退出（TSI-2946 审查 #2）。真实 I/O 错误亦返回 Err。
     pub async fn subscribe(&mut self, filter: Option<String>) -> Result<(), String> {
         let id = self.next_id;
         self.next_id += 1;
@@ -232,11 +311,13 @@ impl DaemonClient {
             .flush()
             .await
             .map_err(|e| format!("daemon flush: {e}"))?;
-
+        let mut subscribed = false;
         loop {
             let line = match self.read_line().await {
                 Ok(l) => l,
-                Err(e) if is_closed_early(&e) => {
+                // 订阅响应已收到后的 EOF 是正常流结束；未收到即 daemon 启动
+                // 失败，错误含 `[daemon: …]` 诊断，须上抛非零退出（审查 #2）。
+                Err(e) if is_closed_early(&e) && subscribed => {
                     eprintln!("event stream ended");
                     return Ok(());
                 }
@@ -249,6 +330,7 @@ impl DaemonClient {
             match msg.get("id") {
                 Some(vid) => {
                     if vid.as_u64() == Some(id) {
+                        subscribed = true;
                         let resp = Response::from_line(&line)?;
                         match (resp.result, resp.error) {
                             (Some(r), None) => {
@@ -549,5 +631,97 @@ mod tests {
         assert!(!is_transport_error("response id mismatch: got 1 want 2"));
         assert!(!is_transport_error("bad message: expected value"));
         assert!(!is_transport_error("rpc error 1002: backend unavailable"));
+    }
+
+    /// daemon 在写出响应前退出（锁竞争 `daemon already running` 等）时，
+    /// `read_line` 必须把排空的 daemon stderr 拼进错误信息——根因对用户可见，
+    /// 而非只剩通用 `connection closed before responding`（TSI-2946）。
+    #[tokio::test]
+    async fn read_line_surfaces_daemon_stderr_on_early_exit() {
+        let mut child = tokio::process::Command::new("sh")
+            .arg("-c")
+            .arg("echo 'error: daemon already running' >&2")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn sh");
+        let stdin = child.stdin.take().unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let stderr = child.stderr.take();
+        let mut client = DaemonClient {
+            child: Some(child),
+            stdin,
+            reader: BufReader::new(stdout),
+            stderr_tail: stderr.map(spawn_stderr_drain),
+            next_id: 1,
+            retries: 0,
+        };
+        let err = client.read_line().await.unwrap_err();
+        assert!(err.contains(CLOSED_EARLY), "must be closed-early: {err}");
+        assert!(
+            err.contains("error: daemon already running"),
+            "must surface daemon stderr: {err}"
+        );
+    }
+
+    /// `subscribe` 在收到订阅响应前 daemon 即退出（锁竞争启动失败）时，
+    /// 必须把含 `[daemon: …]` 诊断的错误上抛为 Err（非零退出），而非吞掉
+    /// 伪装成「event stream ended」成功（TSI-2946 审查 #2）。
+    #[tokio::test]
+    async fn subscribe_surfaces_daemon_stderr_when_exits_before_response() {
+        let mut child = tokio::process::Command::new("sh")
+            .arg("-c")
+            .arg("read _line; echo 'error: daemon already running' >&2")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn sh");
+        let stdin = child.stdin.take().unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let stderr = child.stderr.take();
+        let mut client = DaemonClient {
+            child: Some(child),
+            stdin,
+            reader: BufReader::new(stdout),
+            stderr_tail: stderr.map(spawn_stderr_drain),
+            next_id: 1,
+            retries: 0,
+        };
+        let err = client.subscribe(None).await.unwrap_err();
+        assert!(
+            err.contains("error: daemon already running"),
+            "must surface daemon stderr in subscribe: {err}"
+        );
+    }
+
+    /// `subscribe` 在收到订阅响应后的 EOF 是正常流结束（daemon 空闲退出），
+    /// 仍返回 Ok（exit 0），不因 stderr 透传改动而误判为失败。
+    #[tokio::test]
+    async fn subscribe_treats_post_response_eof_as_clean_end() {
+        let mut child = tokio::process::Command::new("sh")
+            .arg("-c")
+            .arg("read _line; printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"subscriber_id\":\"s1\"}}'")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn sh");
+        let stdin = child.stdin.take().unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let stderr = child.stderr.take();
+        let mut client = DaemonClient {
+            child: Some(child),
+            stdin,
+            reader: BufReader::new(stdout),
+            stderr_tail: stderr.map(spawn_stderr_drain),
+            next_id: 1,
+            retries: 0,
+        };
+        client
+            .subscribe(None)
+            .await
+            .expect("clean stream end must be Ok");
     }
 }

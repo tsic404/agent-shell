@@ -20,6 +20,7 @@ path = "src/bin/legacy_daemon.rs"
 # CLI 不直连任何系统服务：仅依赖 rpc 协议 crate（+ clap/tokio 传输）。
 agent-shell-rpc.workspace = true
 clap.workspace = true
+parking_lot.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio = { version = "1", features = ["full"] }
