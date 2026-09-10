@@ -11,7 +11,7 @@ mod repl;
 
 use agent_shell_rpc::{method, CapabilityStatus, RpcErrorCode, WindowOpKind, MOUNT_POLKIT_ACTION};
 use clap::Parser;
-use cli::{Cli, Command, OutputFormat};
+use cli::{Cli, Command, ExtensionCommand, OutputFormat};
 use client::{CallError, DaemonClient};
 use serde_json::{json, Value};
 
@@ -78,6 +78,7 @@ async fn dispatch_command(command: Command, out: OutputFormat, retry: u32) -> Cm
         Command::Secret(cmd) => secret(&mut c, cmd).await,
         Command::Shortcut(cmd) => shortcut(&mut c, cmd).await,
         Command::Timer(cmd) => timer(&mut c, cmd).await,
+        Command::Extension(cmd) => extension(out, &mut c, cmd).await,
         Command::Service(cmd) => service_cmd(&mut c, cmd).await,
         Command::Fs(cmd) => fs_cmd(&mut c, cmd).await,
         Command::Log(cmd) => log_cmd(&mut c, cmd).await,
@@ -147,6 +148,51 @@ fn render_capability(status: &CapabilityStatus) -> &'static str {
         CapabilityStatus::Enabled => "✓",
         CapabilityStatus::Disabled => "✗",
         CapabilityStatus::Lazy => "⚠ (lazy)",
+    }
+}
+
+// ───────────────────────── extension（GNOME Shell 扩展） ─────────────────────────
+
+/// `extension` 子命令：status/install/enable/uninstall 均返回统一
+/// [`agent_shell_rpc::ExtensionStatus`]。`status` 与 `enable` 在未就绪
+/// （未安装/未启用）时退出码 2（脚本可据此判定「未就绪」），与 doctor 的
+/// healthy 语义一致；`install`/`uninstall` 成功即 exit 0。
+async fn extension(out: OutputFormat, c: &mut DaemonClient, cmd: ExtensionCommand) -> CmdResult {
+    use ExtensionCommand as E;
+    let (status, check_ready) = match cmd {
+        E::Status => (c.extension_status().await?, true),
+        E::Install => (c.extension_install().await?, false),
+        E::Enable => (c.extension_enable().await?, true),
+        E::Uninstall => (c.extension_uninstall().await?, false),
+    };
+    println!("{}", render_extension_status(out, &status));
+    Ok(if check_ready && !(status.installed && status.enabled) {
+        2
+    } else {
+        0
+    })
+}
+
+/// `extension` 输出渲染：JSON 走结构化序列化，table 走逐行字段文本。
+fn render_extension_status(out: OutputFormat, s: &agent_shell_rpc::ExtensionStatus) -> String {
+    match out {
+        OutputFormat::Json => {
+            serde_json::to_string_pretty(s).expect("ExtensionStatus serializable")
+        }
+        OutputFormat::Table => {
+            let mut lines = vec![
+                format!("id               : {}", s.id),
+                format!("installed        : {}", s.installed),
+                format!("enabled          : {}", s.enabled),
+            ];
+            if let Some(d) = &s.dir {
+                lines.push(format!("dir              : {d}"));
+            }
+            if let Some(n) = &s.note {
+                lines.push(format!("hint             : {n}"));
+            }
+            lines.join("\n")
+        }
     }
 }
 
@@ -1174,8 +1220,9 @@ mod tests {
     use super::{
         a11y_query_exit_code, is_auth_required, job_status_outcome, log_query_timeout_error,
         parse_log_filter, pkg_failed_job_line, process_rootd_error, render_capability,
-        render_doctor, render_info, security_audit_params, security_request, sysctl_rpc_error,
-        sysctl_set_accepted_line, wait_for_job_impl, JobStatusSource, LOG_QUERY_TIMEOUT,
+        render_doctor, render_extension_status, render_info, security_audit_params,
+        security_request, sysctl_rpc_error, sysctl_set_accepted_line, wait_for_job_impl,
+        JobStatusSource, LOG_QUERY_TIMEOUT,
     };
     use crate::client::CallError;
     use crate::{CapabilityStatus, OutputFormat, RpcErrorCode};
@@ -1250,6 +1297,39 @@ mod tests {
             render_doctor(OutputFormat::Table, &report),
             "line-a\nline-b"
         );
+    }
+
+    #[test]
+    fn render_extension_status_table_shows_fields_and_hint() {
+        // extension status --output-format table：字段行 + note（未安装时提示）。
+        let s = agent_shell_rpc::ExtensionStatus {
+            id: "agent-shell-bridge@tsic.top".into(),
+            installed: false,
+            enabled: false,
+            dir: None,
+            note: Some("not installed — run `agent-shell extension install`".into()),
+        };
+        let out = render_extension_status(OutputFormat::Table, &s);
+        assert!(out.contains("installed        : false"));
+        assert!(out.contains("hint             : not installed"));
+        assert!(out.contains("agent-shell extension install"));
+    }
+
+    #[test]
+    fn render_extension_status_json_is_structured() {
+        let s = agent_shell_rpc::ExtensionStatus {
+            id: "agent-shell-bridge@tsic.top".into(),
+            installed: true,
+            enabled: true,
+            dir: Some(
+                "/home/u/.local/share/gnome-shell/extensions/agent-shell-bridge@tsic.top".into(),
+            ),
+            note: None,
+        };
+        let v: Value = serde_json::from_str(&render_extension_status(OutputFormat::Json, &s))
+            .expect("render_extension_status json must parse");
+        assert_eq!(v["installed"], true);
+        assert_eq!(v["enabled"], true);
     }
 
     #[test]

@@ -17,6 +17,8 @@
           pipewire
           systemdMinimal
           pkg-config
+          # extension.js 的 GJS 语法校验（doCheck 跑 `gjs --check-syntax`）
+          gjs
         ];
 
         # agent-shell workspace 根
@@ -52,6 +54,11 @@
             # udev rules for ydotool /dev/uinput（§20.3 权限模型）
             install -Dm644 packaging/debian/60-agent-shell-uinput.rules \
               $out/lib/udev/rules.d/60-agent-shell-uinput.rules
+            # GNOME Shell Extension（§8.1 系统级部署；用户级启用走 `agent-shell extension enable`）
+            install -Dm644 components/compositor/mutter/src/extension.js \
+              $out/share/gnome-shell/extensions/agent-shell-bridge@tsic.top/extension.js
+            install -Dm644 components/compositor/mutter/src/metadata.json \
+              $out/share/gnome-shell/extensions/agent-shell-bridge@tsic.top/metadata.json
           '';
 
           doCheck = true;

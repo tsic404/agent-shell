@@ -177,6 +177,15 @@ pub mod method {
     pub const TIMER_LIST: &str = "timer.list";
     /// Timer 下次触发。
     pub const TIMER_NEXT: &str = "timer.next";
+    // ── GNOME Shell 扩展（§8.1 安装/启用）──
+    /// 扩展安装/启用状态。
+    pub const EXTENSION_STATUS: &str = "extension.status";
+    /// 安装并启用（落盘 metadata.json + extension.js + user-enabled 标记）。
+    pub const EXTENSION_INSTALL: &str = "extension.install";
+    /// 启用已安装的扩展（user-enabled 标记）。
+    pub const EXTENSION_ENABLE: &str = "extension.enable";
+    /// 卸载扩展（移除文件并清启用标记）。
+    pub const EXTENSION_UNINSTALL: &str = "extension.uninstall";
     // ── rootd 特权代理（§23.4）──
     /// 启停/启用/禁用/重载系统服务（rootd ServiceStart/Stop/Restart/Enable/Disable/Reload）。
     pub const SERVICE_CONTROL: &str = "service.control";
@@ -559,6 +568,20 @@ pub struct A11yQueryResult {
     pub count: usize,
     pub elements: Vec<A11yElementResult>,
 }
+// ───────────────────────── GNOME Shell 扩展载荷 ─────────────────────────
+
+/// extension.status / install / enable / uninstall 结果（§8.1）。
+///
+/// `dir` 为已安装目录（用户优先）；`note` 携带可操作提示（未安装/未启用/
+/// 启用失败时非空），CLI 渲染与 doctor 共用同一字段语义。
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct ExtensionStatus {
+    pub id: String,
+    pub installed: bool,
+    pub enabled: bool,
+    pub dir: Option<String>,
+    pub note: Option<String>,
+}
 
 // ───────────────────────── 事件 / daemon / IME 载荷 ─────────────────────────
 
@@ -865,5 +888,32 @@ mod tests {
                 status
             );
         }
+    }
+
+    /// extension.* 结果结构往返稳定：CLI 从 daemon JSON 反序列化，
+    /// `note` 缺省为 null 亦能解析（部分成功场景）。
+    #[test]
+    fn extension_status_roundtrips() {
+        let s = ExtensionStatus {
+            id: "agent-shell-bridge@tsic.top".into(),
+            installed: true,
+            enabled: true,
+            dir: Some(
+                "/home/u/.local/share/gnome-shell/extensions/agent-shell-bridge@tsic.top".into(),
+            ),
+            note: None,
+        };
+        let v = serde_json::to_value(&s).expect("ser");
+        let back: ExtensionStatus = serde_json::from_value(v).expect("de");
+        assert_eq!(back, s);
+        // note 缺省字段 → None。
+        let minimal: ExtensionStatus = serde_json::from_value(json!({
+            "id": "agent-shell-bridge@tsic.top",
+            "installed": false,
+            "enabled": false,
+            "dir": null,
+        }))
+        .expect("de minimal");
+        assert_eq!(minimal.note, None);
     }
 }

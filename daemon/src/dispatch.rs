@@ -9,7 +9,8 @@ use agent_shell_core::security::{Operation, PermissionDecision, PermissionLevel}
 use agent_shell_core::types::{SemanticTarget, TitleMatchMode, TitleMatcher, WindowInfo};
 use agent_shell_rpc::{
     method, A11yElementResult, A11yQueryResult, A11yStatusResult, CapabilityStatus, CaptureParams,
-    DoctorResult, InfoResult, InputParams, Request, Response, RpcErrorCode, WindowOpKind,
+    DoctorResult, ExtensionStatus, InfoResult, InputParams, Request, Response, RpcErrorCode,
+    WindowOpKind,
 };
 use event::EventFilter;
 use serde_json::{json, Value};
@@ -108,6 +109,11 @@ pub async fn dispatch(daemon: &mut Daemon, req: &Request) -> Response {
         method::SHORTCUT_BIND => stub_ok("shortcut.bind"),
         method::SHORTCUT_TRIGGER => stub_ok("shortcut.trigger"),
         method::TIMER_LIST => stub_ok("timer.list"),
+        // ── GNOME Shell 扩展（§8.1 安装/启用）──
+        method::EXTENSION_STATUS => extension_status().await,
+        method::EXTENSION_INSTALL => extension_install().await,
+        method::EXTENSION_ENABLE => extension_enable().await,
+        method::EXTENSION_UNINSTALL => extension_uninstall().await,
         // ── rootd 特权代理（§23.4）──
         method::SERVICE_CONTROL => service_control(daemon, req).await,
         method::DAEMON_RELOAD => daemon_reload(daemon).await,
@@ -210,6 +216,10 @@ fn operation_for(method_name: &str, params: &Option<Value>) -> Option<Operation>
         (method::SHORTCUT_TRIGGER, L1),
         (method::TIMER_LIST, L0),
         (method::TIMER_NEXT, L0),
+        (method::EXTENSION_STATUS, L0),
+        (method::EXTENSION_INSTALL, L1),
+        (method::EXTENSION_ENABLE, L1),
+        (method::EXTENSION_UNINSTALL, L1),
         (method::SERVICE_CONTROL, L3),
         (method::DAEMON_RELOAD, L3),
         (method::SYSTEM_LOG_VIEW, L0),
@@ -287,6 +297,14 @@ async fn doctor(d: &mut Daemon) -> RpcResult {
     lines.push(agent_shell_capture::doctor_line(d.capture.as_ref()).await);
     // 5. input 组件（libei → ydotool → XTest 降级链，§12）。
     lines.push(input_doctor_line(d));
+    // 6. GNOME 47+ 合成器唯一通道是 Shell Extension：缺安装机制即窗口
+    //    语义整体缺失。仅 GNOME 会话渲染该行，缺失/未启用时给出可执行提示
+    //    （其它 DE 无此扩展，不输出噪声）。
+    if agent_shell_core::de_detection::detect_desktop_environment()
+        == agent_shell_core::types::DesktopEnvironment::GNOME
+    {
+        lines.push(extension_doctor_line());
+    }
     let healthy = !lines.iter().any(|l| l.starts_with('✗'));
     let r = DoctorResult { lines, healthy };
     Ok(serde_json::to_value(r).expect("DoctorResult serializable"))
@@ -316,6 +334,113 @@ async fn compositor_doctor_lines(d: &Daemon) -> Vec<String> {
     } else {
         Vec::new()
     }
+}
+
+// ───────────────────────── GNOME Shell 扩展（§8.1） ─────────────────────────
+
+/// doctor 的 Shell Extension 行（GNOME 会话专用）。安装/启用状态来自
+/// mutter `install` 模块真值，缺失/未启用时给出可执行命令提示。
+fn extension_doctor_line() -> String {
+    const LABEL: &str = "Shell 扩展";
+    let installed = agent_shell_compositor_mutter::install::is_installed();
+    let enabled = agent_shell_compositor_mutter::install::is_enabled();
+    match (installed, enabled) {
+        (true, true) => {
+            format!("✓ {LABEL:<12}: agent-shell-bridge@tsic.top (installed, enabled)")
+        }
+        (true, false) => {
+            format!("⚠ {LABEL:<12}: installed but not enabled — run `agent-shell extension enable`")
+        }
+        (false, _) => format!("✗ {LABEL:<12}: not installed — run `agent-shell extension install`"),
+    }
+}
+
+/// 组装 `extension.*` 的线格式状态（同步，供 handler 与 doctor 复用）。
+fn extension_status_sync() -> ExtensionStatus {
+    use agent_shell_compositor_mutter::install;
+    let installed = install::is_installed();
+    let enabled = install::is_enabled();
+    let note = if !installed {
+        if install::shell_version_mismatch() {
+            Some(
+                "installed but shell-version mismatch — GNOME will not load it; update metadata.json shell-version"
+                    .to_string(),
+            )
+        } else {
+            Some("not installed — run `agent-shell extension install`".to_string())
+        }
+    } else if !enabled {
+        Some("installed but not enabled — run `agent-shell extension enable`".to_string())
+    } else {
+        None
+    };
+    ExtensionStatus {
+        id: agent_shell_compositor_mutter::EXTENSION_ID.to_string(),
+        installed,
+        enabled,
+        dir: install::installed_dir().map(|d| d.display().to_string()),
+        note,
+    }
+}
+
+fn extension_status_result() -> RpcResult {
+    Ok(serde_json::to_value(extension_status_sync()).expect("ExtensionStatus serializable"))
+}
+
+/// extension.status — 查询安装/启用状态（L0 只读；含 GNOME 无扩展环境真值）。
+async fn extension_status() -> RpcResult {
+    tokio::task::spawn_blocking(extension_status_result)
+        .await
+        .map_err(|e| (RpcErrorCode::InternalError, e.to_string()))?
+}
+
+/// extension.install — 落盘 extension.js + metadata.json 并标记 user-enabled。
+///
+/// 文件落盘成功但启用失败（无 `gnome-extensions`/`dconf` 或 shell 未运行）
+/// 时不硬失败：返回 `installed=true, enabled=false` + `note` 提示手动启用。
+async fn extension_install() -> RpcResult {
+    let enable_err = tokio::task::spawn_blocking(|| {
+        let install = agent_shell_compositor_mutter::install::install();
+        match install {
+            Ok(_) => agent_shell_compositor_mutter::install::enable().err(),
+            Err(e) => Some(e),
+        }
+    })
+    .await
+    .map_err(|e| (RpcErrorCode::InternalError, e.to_string()))?;
+    let mut status = extension_status_sync();
+    if let Some(e) = enable_err {
+        status.note = Some(format!(
+            "{e}; run `agent-shell extension enable` after installing"
+        ));
+    }
+    Ok(serde_json::to_value(status).expect("ExtensionStatus serializable"))
+}
+
+/// extension.enable — 标记 user-enabled（需已安装）。
+///
+/// 未安装时返回状态（`installed:false` + note）而非后端错误——CLI 据此与
+/// `status` 对齐 exit 2（「未就绪」而非 daemon 后端失败）。
+async fn extension_enable() -> RpcResult {
+    let result = tokio::task::spawn_blocking(|| {
+        if !agent_shell_compositor_mutter::install::is_installed() {
+            return Ok(()); // 未安装：非错误，交由 status 报告 installed:false。
+        }
+        agent_shell_compositor_mutter::install::enable()
+    })
+    .await
+    .map_err(|e| (RpcErrorCode::InternalError, e.to_string()))?;
+    result.map_err(|e| (RpcErrorCode::BackendError, e))?;
+    extension_status().await
+}
+
+/// extension.uninstall — 清启用标记并移除用户扩展目录（幂等）。
+async fn extension_uninstall() -> RpcResult {
+    let result = tokio::task::spawn_blocking(agent_shell_compositor_mutter::install::uninstall)
+        .await
+        .map_err(|e| (RpcErrorCode::InternalError, e.to_string()))?;
+    result.map_err(|e| (RpcErrorCode::BackendError, e))?;
+    extension_status_result()
 }
 
 /// 能力位 → 展示状态：懒启动能力仅在尚未启用（`!enabled`）时标 Lazy，
@@ -1530,6 +1655,41 @@ mod tests {
         let r: DoctorResult = serde_json::from_value(v).expect("DoctorResult");
         assert!(!r.lines.is_empty());
         assert!(r.lines[0].starts_with("✓ DE 检测"));
+    }
+
+    #[tokio::test]
+    async fn extension_status_reports_structured_truth() {
+        // extension.status 是只读状态查询（不依赖合成器/不写文件），任何
+        // 会话（含 CI 无 GNOME）都应返回结构化真值；未安装时 note 非空。
+        let mut d = test_daemon().await;
+        let resp = dispatch(&mut d, &req(method::EXTENSION_STATUS, None)).await;
+        let v = resp.result.expect("ok");
+        let s: ExtensionStatus = serde_json::from_value(v).expect("ExtensionStatus");
+        assert_eq!(s.id, "agent-shell-bridge@tsic.top");
+        if !s.installed {
+            assert!(
+                s.note.is_some(),
+                "not installed must carry an actionable note"
+            );
+            assert!(s.note.unwrap().contains("extension install"));
+        }
+    }
+
+    #[tokio::test]
+    async fn extension_enable_uninstalled_returns_status_not_error() {
+        // 🟡 QA gap #2：enable 未安装时须返回结构化状态（installed:false），
+        // 而非 BackendError——CLI 据此与 status 对齐 exit 2（「未就绪」）。
+        let mut d = test_daemon().await;
+        let resp = dispatch(&mut d, &req(method::EXTENSION_ENABLE, None)).await;
+        let v = resp
+            .result
+            .expect("enable on uninstalled must return a status, not an error");
+        let s: ExtensionStatus = serde_json::from_value(v).expect("ExtensionStatus");
+        assert_eq!(s.id, "agent-shell-bridge@tsic.top");
+        assert!(
+            !s.installed,
+            "uninstalled extension must report installed:false"
+        );
     }
 
     #[tokio::test]

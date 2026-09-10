@@ -17,11 +17,18 @@ pub const AGENTSHELL_IFACE: &str = "org.gnome.Shell.AgentShell";
 /// Shell Extension 对象路径（extension.js 侧导出）。
 pub const AGENTSHELL_PATH: &str = "/org/gnome/Shell/AgentShell";
 /// Shell Extension 唯一标识。
-pub const EXTENSION_ID: &str = "agent-shell-bridge@multica.dev";
+pub const EXTENSION_ID: &str = "agent-shell-bridge@tsic.top";
 /// Mutter DisplayConfig 接口所在服务。
 pub const DISPLAY_CONFIG_SERVICE: &str = "org.gnome.Mutter.DisplayConfig";
 /// DisplayConfig 对象路径。
 pub const DISPLAY_CONFIG_PATH: &str = "/org/gnome/Mutter/DisplayConfig";
+
+/// daemon 在 session bus 上申请的 well-known 名称——extension.js 据此校验
+/// 方法调用确实来自 agent-shell-daemon（而非任意同 uid 进程），防止
+/// `org.gnome.Shell.AgentShell` 暴露面绕过 daemon 的调用方门禁（§8.1 安全）。
+///
+/// 必须与 extension.js 内的 `DAEMON_BUS_NAME` 保持一致。
+pub const DAEMON_BUS_NAME: &str = "org.agentshell.Daemon";
 
 /// GNOME <47 Eval 允许开关提示（gsettings key，GNOME 41+ 默认 false）。
 ///
@@ -35,11 +42,11 @@ pub const EVAL_DISABLED_HINT_PRE47: &str =
 ///
 /// 47 起 `org.gnome.shell developer-tools` gsettings key 被移除（实测
 /// `No such key "developer-tools"`），旧文案不可执行——改为指向 Shell
-/// Extension（`agent-shell-bridge@multica.dev`）安装/启用路径（§8.4
+/// Extension（`agent-shell-bridge@tsic.top`）安装/启用路径（§8.4
 /// 推荐生产路径）。
 pub const EVAL_DISABLED_HINT_47PLUS: &str =
     "org.gnome.Shell.Eval unavailable (GNOME 47+ removed the \
-     developer-tools key; install & enable the Shell Extension: agent-shell-bridge@multica.dev)";
+     developer-tools key; install & enable the Shell Extension: agent-shell-bridge@tsic.top)";
 
 /// 按 GNOME 版本选择 Eval 禁用提示文案（§8.4 双路径降级诊断）。
 ///

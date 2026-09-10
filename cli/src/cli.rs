@@ -93,6 +93,9 @@ pub enum Command {
     /// AT-SPI 无障碍（a11y bus 探测 + 语义查询）
     #[command(subcommand)]
     A11y(A11yCommand),
+    /// GNOME Shell 扩展安装/启用（§8.1，GNOME 47+ 合成器唯一通道）
+    #[command(subcommand)]
+    Extension(ExtensionCommand),
     /// 系统服务控制（rootd 特权链路，§23.4）
     #[command(subcommand)]
     Service(ServiceCommand),
@@ -481,6 +484,25 @@ pub enum TimerCommand {
     List,
     /// 查询下次触发
     Next { name: String },
+}
+
+// ───────────────────────── extension（GNOME Shell 扩展） ─────────────────────────
+
+/// GNOME Shell 扩展管理（`agent-shell-bridge@tsic.top`，§8.1）。
+///
+/// GNOME 47+ 上 `org.gnome.Shell.Eval` 默认禁用，Shell Extension 是
+/// 合成器装配分支唯一可用通道——安装/启用经 daemon 落盘到用户扩展目录
+/// 并写 user-enabled 标记（§8.4）。
+#[derive(Subcommand, Debug)]
+pub enum ExtensionCommand {
+    /// 查询安装/启用状态
+    Status,
+    /// 安装并启用（落盘 extension.js + metadata.json + user-enabled 标记）
+    Install,
+    /// 启用已安装的扩展（user-enabled 标记）
+    Enable,
+    /// 卸载扩展（移除用户目录并清启用标记）
+    Uninstall,
 }
 
 // ───────────────────────── service（rootd 特权链路） ─────────────────────────
