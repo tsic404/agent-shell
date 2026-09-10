@@ -150,7 +150,7 @@ impl Daemon {
     /// 存活以报告诊断细节，各方法在 `compositor=None` 时返回明确错误。
     pub async fn connect(idle_timeout: Duration) -> Self {
         let compositor = match session_kind().as_str() {
-            "kde" => if std::env::var("WAYLAND_DISPLAY").is_ok() {
+            "kde" => if is_wayland_session() {
                 KWinCompositor::new_wayland().await
             } else {
                 KWinCompositor::new_x11().await
