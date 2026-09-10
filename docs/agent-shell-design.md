@@ -3565,6 +3565,16 @@ impl<T> FallbackChain<T> {
 | portal ScreenCast 会话 | 10s | 1 | 2000ms |
 | 输入注入 (fake_input/XTest) | 1s | 3 | 100ms ×2 |
 | 截图 (portal→X11) | 8s | 2 | 1500ms |
+| 截图（交互，弹授权窗） | 5s | 1 | — |
+
+> **截图交互全链总预算**（TSI-2980）：`interactive=true` 下 portal 需用户点击
+> 授权，若无人应答则 ScreenCast Start 弹窗等待（10s）+ Screenshot 交互超时
+> （5s）逐级叠加。故 `CaptureDispatcher::capture` 对交互路径套单一总预算
+> `CAPTURE_INTERACTIVE_BUDGET = SCREENCAST_TIMEOUT + SCREENSHOT_TIMEOUT_INTERACTIVE`
+> （=15s）封顶——超预算快速失败（Timeout），而非吃满 2×8s + 10s ≈ 27.8s 后
+> 降级全黑 x11。`SCREENSHOT_TIMEOUT`（8s）是单次 portal 延迟口径，仅约束
+> 非交互/单步调用；交互弹窗场景改用更短的 `SCREENSHOT_TIMEOUT_INTERACTIVE`
+> 且不重试（超时后二次弹窗无意义）。
 
 ### 19.5 验证输出
 
