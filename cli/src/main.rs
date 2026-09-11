@@ -347,6 +347,11 @@ async fn a11y(c: &mut DaemonClient, cmd: cli::A11yCommand) -> CmdResult {
             println!("{}", serde_json::to_string_pretty(&r).expect("json"));
             Ok(a11y_query_exit_code(r.count, fail_on_empty))
         }
+        cli::A11yCommand::Click { path, bus } | cli::A11yCommand::Action { path, bus } => {
+            c.a11y_action(bus.as_deref(), &path).await?;
+            println!("action dispatched: {path}");
+            Ok(0)
+        }
     }
 }
 

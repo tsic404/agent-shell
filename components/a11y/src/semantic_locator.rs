@@ -113,6 +113,78 @@ impl<B: TreeSource> SemanticLocator<B> {
         }
     }
 
+    /// 按 AT-SPI `(bus_name, path)` 二元组定位元素（`a11y.action` 的 path
+    /// 定位，§14.4）。
+    ///
+    /// `a11y.query` 返回的每个元素携带 `bus_name` 与 `path`；AT-SPI 对象
+    /// 路径只在 bus_name 内唯一，两应用可同 path——仅按 path 匹配会在歧义
+    /// 时误命中首个元素（可能对错误应用执行破坏性动作）。故：
+    /// - `bus` 为 `Some` 时精确匹配 `(bus_name, path)`（query 联动传入）；
+    /// - `bus` 为 `None` 时按 path 匹配，但命中多个不同 bus_name 的元素时
+    ///   返回歧义错误，绝不静默取第一个。
+    ///
+    /// 找不到返回 [`AgentShellError::WindowNotFound`]。
+    pub async fn locate_by_path(&self, bus: Option<&str>, path: &str) -> Result<ElementNode> {
+        let mut matches: Vec<ElementNode> = Vec::new();
+        for window in self.bridge.all_windows().await? {
+            let root = self.bridge.window_as_element(&window).await?;
+            self.collect_by_path(&root, bus, path, 0, &mut matches)
+                .await?;
+        }
+        // 去重：同一节点可能经多窗口子树重复出现（嵌入/远程对象），按
+        // `(bus_name, path)` 二元组去重后再判定。
+        matches.sort_by(|a, b| {
+            (a.bus_name.as_str(), a.path.as_str()).cmp(&(b.bus_name.as_str(), b.path.as_str()))
+        });
+        matches.dedup_by(|a, b| a.bus_name == b.bus_name && a.path == b.path);
+        match matches.as_slice() {
+            [] => Err(AgentShellError::WindowNotFound(format!("a11y path {path}"))),
+            [one] => Ok(one.clone()),
+            many => {
+                let buses: Vec<&str> = many.iter().map(|n| n.bus_name.as_str()).collect();
+                Err(AgentShellError::WindowNotFound(format!(
+                    "a11y path {path} is ambiguous across bus names [{}]; pass --bus to disambiguate",
+                    buses.join(", ")
+                )))
+            }
+        }
+    }
+
+    /// 按 `(bus_name, path)` DFS 收集命中；`bus` 为 `None` 时退化为仅按
+    /// path 过滤。子节点读取失败向上传播（瞬时 D-Bus 错误不被折叠为
+    /// 「未找到」，避免掩盖后端故障）。
+    async fn collect_by_path(
+        &self,
+        node: &ElementNode,
+        bus: Option<&str>,
+        path: &str,
+        depth: u8,
+        out: &mut Vec<ElementNode>,
+    ) -> Result<()> {
+        if depth > MAX_TRAVERSE_DEPTH {
+            tracing::warn!(
+                path = %node.path,
+                depth,
+                "a11y tree traversal depth limit reached; truncating path lookup"
+            );
+            return Ok(());
+        }
+        if node.path == path && bus.is_none_or(|b| node.bus_name == b) {
+            out.push(node.clone());
+        }
+        let children = match self.bridge.children(node).await {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::debug!(path = %node.path, error = %e, "children fetch failed in path lookup");
+                return Err(e);
+            }
+        };
+        for child in &children {
+            Box::pin(self.collect_by_path(child, bus, path, depth + 1, out)).await?;
+        }
+        Ok(())
+    }
+
     /// 在子树内按 (role, name) 过滤搜索（DFS + 深度/条数保护）。
     ///
     /// `role`/`name` 均可选；两者同时为 `None` 时遍历全树（通配查询，
@@ -183,9 +255,9 @@ mod tests {
     use crate::tree::{AtspiRole, AtspiState, WindowNode};
     use async_trait::async_trait;
 
-    fn element_at(path: &str, role_name: &str, name: &str) -> ElementNode {
+    fn element_on_bus(bus: &str, path: &str, role_name: &str, name: &str) -> ElementNode {
         ElementNode {
-            bus_name: ":1.0".into(),
+            bus_name: bus.into(),
             path: path.into(),
             name: name.into(),
             role: AtspiRole {
@@ -194,6 +266,10 @@ mod tests {
             },
             states: AtspiState(0),
         }
+    }
+
+    fn element_at(path: &str, role_name: &str, name: &str) -> ElementNode {
+        element_on_bus(":1.0", path, role_name, name)
     }
 
     /// 假树源：以 path 为键的静态子树，供遍历测试注入。
@@ -343,5 +419,126 @@ mod tests {
             MAX_SEARCH_RESULTS,
             "global cap must bound cross-window accumulation"
         );
+    }
+
+    #[tokio::test]
+    async fn locate_by_path_finds_nested_element_across_windows() {
+        // `a11y.action` 的 path 定位：路径在单 bus 内唯一，跨窗口 DFS 命中
+        // 后返回完整 ElementNode（含 bus_name 以构造 Action 代理）。
+        let windows = vec![WindowNode {
+            bus_name: ":1.0".into(),
+            path: "/win0".into(),
+            name: "win0".into(),
+            states: AtspiState(0),
+        }];
+        let mut roots = std::collections::HashMap::new();
+        roots.insert("/win0".to_string(), element_at("/win0", "frame", "win0"));
+        let mut children = std::collections::HashMap::new();
+        children.insert(
+            "/win0".to_string(),
+            vec![element_at("/win0/btn", "push button", "OK")],
+        );
+        let locator = SemanticLocator::new(FakeWindows {
+            windows,
+            roots,
+            children,
+        });
+
+        // 无 bus：单命中，path-only 仍可定位。
+        let found = locator
+            .locate_by_path(None, "/win0/btn")
+            .await
+            .expect("path must resolve");
+        assert_eq!(found.path, "/win0/btn");
+        assert_eq!(found.bus_name, ":1.0");
+        assert_eq!(found.role.name, "push button");
+
+        // 带 bus：精确命中同一元素。
+        let found = locator
+            .locate_by_path(Some(":1.0"), "/win0/btn")
+            .await
+            .expect("tuple match must resolve");
+        assert_eq!(found.path, "/win0/btn");
+    }
+
+    #[tokio::test]
+    async fn locate_by_path_tuple_match_disambiguates_same_path_across_buses() {
+        // 两个应用各有一个 path 为 /btn 的元素但 bus 不同：仅按 path 是歧义，
+        // 必须报错而非静默取第一个；带 bus 精确命中目标应用。
+        let windows = vec![
+            WindowNode {
+                bus_name: ":1.1".into(),
+                path: "/w1".into(),
+                name: "w1".into(),
+                states: AtspiState(0),
+            },
+            WindowNode {
+                bus_name: ":1.2".into(),
+                path: "/w2".into(),
+                name: "w2".into(),
+                states: AtspiState(0),
+            },
+        ];
+        let mut roots = std::collections::HashMap::new();
+        roots.insert(
+            "/w1".to_string(),
+            element_on_bus(":1.1", "/w1", "frame", "w1"),
+        );
+        roots.insert(
+            "/w2".to_string(),
+            element_on_bus(":1.2", "/w2", "frame", "w2"),
+        );
+        let mut children = std::collections::HashMap::new();
+        children.insert(
+            "/w1".to_string(),
+            vec![element_on_bus(":1.1", "/btn", "push button", "OK")],
+        );
+        children.insert(
+            "/w2".to_string(),
+            vec![element_on_bus(":1.2", "/btn", "push button", "OK")],
+        );
+        let locator = SemanticLocator::new(FakeWindows {
+            windows,
+            roots,
+            children,
+        });
+
+        // 无 bus：歧义错误，绝不取第一个。
+        let err = locator
+            .locate_by_path(None, "/btn")
+            .await
+            .expect_err("ambiguous path must fail");
+        assert!(matches!(err, AgentShellError::WindowNotFound(_)), "{err:?}");
+
+        // 带 bus：精确命中目标应用。
+        let found = locator
+            .locate_by_path(Some(":1.2"), "/btn")
+            .await
+            .expect("tuple match must resolve");
+        assert_eq!(found.bus_name, ":1.2");
+        assert_eq!(found.path, "/btn");
+    }
+
+    #[tokio::test]
+    async fn locate_by_path_returns_window_not_found_for_unknown_path() {
+        let windows = vec![WindowNode {
+            bus_name: ":1.0".into(),
+            path: "/win0".into(),
+            name: "win0".into(),
+            states: AtspiState(0),
+        }];
+        let mut roots = std::collections::HashMap::new();
+        roots.insert("/win0".to_string(), element_at("/win0", "frame", "win0"));
+        let locator = SemanticLocator::new(FakeWindows {
+            windows,
+            roots,
+            children: std::collections::HashMap::new(),
+        });
+
+        let err = locator
+            .locate_by_path(None, "/does/not/exist")
+            .await
+            .expect_err("unknown path must fail");
+        assert!(matches!(err, AgentShellError::WindowNotFound(_)), "{err:?}");
     }
 }

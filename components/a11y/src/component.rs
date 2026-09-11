@@ -8,10 +8,13 @@
 use crate::action::ElementActions;
 use crate::atspi_bridge::AtspiBridge;
 use crate::semantic_locator::SemanticLocator;
+use crate::tree::ElementNode;
+use crate::A11yOps;
 use agent_shell_core::component::{
     A11yComponent, ComponentHealth, ComponentType, DesktopComponent,
 };
 use agent_shell_core::error::Result;
+use agent_shell_core::types::SemanticTarget;
 use async_trait::async_trait;
 
 /// AT-SPI 公共无障碍组件。
@@ -88,5 +91,20 @@ impl A11yComponent for AtSpiComponent {
     async fn registry_available(&self) -> Result<bool> {
         // trait 方法名沿用核心契约；实现委托给 bus_available
         Ok(AtspiBridge::bus_available().await)
+    }
+}
+
+#[async_trait]
+impl A11yOps for AtSpiComponent {
+    async fn locate(&self, target: &SemanticTarget) -> Result<Vec<ElementNode>> {
+        self.locator().locate(target).await
+    }
+
+    async fn locate_by_path(&self, bus: Option<&str>, path: &str) -> Result<ElementNode> {
+        self.locator().locate_by_path(bus, path).await
+    }
+
+    async fn click(&self, element: &ElementNode) -> Result<()> {
+        self.actions().click(element).await
     }
 }
