@@ -10,7 +10,8 @@
 use agent_shell_core::error::{AgentShellError, Result};
 
 /// DDE 20/25 双服务名（§21.36.1）：DDE25 主名 org.deepin.dde.*，
-/// DDE20 仅 com.deepin.daemon.*；先探新名，失败退旧名。
+/// DDE20 以 com.deepin.daemon.* 为主、少量 org.deepin.dde.* 兼容存在；
+/// 先探新名，失败退旧名。
 pub const DDE_POWER_NAMES: [&str; 2] = ["org.deepin.dde.Power1", "com.deepin.daemon.Power"];
 
 /// 探测 bus 上是否存在指定服务名（NameHasOwner）。

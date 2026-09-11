@@ -1,7 +1,8 @@
 //! DDE backend 服务封装（设计文档 §21.6 DDE 装配清单、§21.36 版本兼容矩阵）。
 //!
 //! DDE20/25 双服务名探测（§21.36.1/§21.36.4）：DDE25 主名 `org.deepin.dde.*`
-//! （`com.deepin.daemon.*` 别名并存、方法集一致），DDE20 仅 `com.deepin.daemon.*`。
+//! （`com.deepin.daemon.*` 别名并存、方法集一致），DDE20 以 `com.deepin.daemon.*`
+//! 为主、少量 `org.deepin.dde.*` 兼容存在（实测 UOS 20 Pro 混合命名）。
 //! 启动时先探新名，失败退旧名——不把版本假设写死（HIERARCHY 原则）。
 //!
 //! 「❓需真机确认」项的可降级路径：
