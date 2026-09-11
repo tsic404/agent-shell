@@ -403,6 +403,28 @@ impl DaemonClient {
         serde_json::from_value(v).map_err(|e| e.to_string())
     }
 
+    pub async fn extension_status(&mut self) -> Result<agent_shell_rpc::ExtensionStatus, String> {
+        let v = self.call0(method::EXTENSION_STATUS).await?;
+        serde_json::from_value(v).map_err(|e| e.to_string())
+    }
+
+    pub async fn extension_install(&mut self) -> Result<agent_shell_rpc::ExtensionStatus, String> {
+        let v = self.call0(method::EXTENSION_INSTALL).await?;
+        serde_json::from_value(v).map_err(|e| e.to_string())
+    }
+
+    pub async fn extension_enable(&mut self) -> Result<agent_shell_rpc::ExtensionStatus, String> {
+        let v = self.call0(method::EXTENSION_ENABLE).await?;
+        serde_json::from_value(v).map_err(|e| e.to_string())
+    }
+
+    pub async fn extension_uninstall(
+        &mut self,
+    ) -> Result<agent_shell_rpc::ExtensionStatus, String> {
+        let v = self.call0(method::EXTENSION_UNINSTALL).await?;
+        serde_json::from_value(v).map_err(|e| e.to_string())
+    }
+
     pub async fn windows_list(
         &mut self,
         filter: Option<String>,

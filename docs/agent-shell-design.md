@@ -1662,7 +1662,7 @@ impl GnomeEvalBridge {
 `eval_js` 在 `success=false` 时按 `version` 分支提示文案：GNOME <47 提示
 `gsettings set org.gnome.shell developer-tools true`；GNOME 47+ 该 key
 已移除（实测 `No such key`），改提示安装/启用 Extension
-`agent-shell-bridge@multica.dev`（见 §8.4 版本边界）。
+`agent-shell-bridge@tsic.top`（见 §8.4 版本边界）。
 
 ### 8.3 Wayland 协议状况
 
@@ -1725,7 +1725,7 @@ Eval 路径返回 `NotImplemented("mutter: window move unavailable on Eval path"
 // meta_window.activate() / delete() / minimized=max / maximize(val)
 ```
 
-**Extension 路径**（GNOME 47+）：通过 Shell Extension `agent-shell-bridge@multica.dev` 注册 D-Bus 接口：
+**Extension 路径**（GNOME 47+）：通过 Shell Extension `agent-shell-bridge@tsic.top` 注册 D-Bus 接口：
 - `GetWindows()` → JSON
 - `ActivateWindow(uuid)` / `CloseWindow(uuid)` / `MinimizeWindow(uuid)` / `MaximizeWindow(uuid)`
 - 信号：`WindowOpened` / `WindowClosed` / `ActiveWindowChanged`
@@ -1743,7 +1743,7 @@ Eval 路径返回 `NotImplemented("mutter: window move unavailable on Eval path"
 **验证输出**：
 
 ✓ GNOME 版本   : GNOME 47.0 (Eval 受限)
-✓ 后端路径     : Extension (agent-shell-bridge@multica.dev)
+✓ 后端路径     : Extension (agent-shell-bridge@tsic.top)
 ✓ D-Bus 接口   : org.gnome.Shell ✓, DisplayConfig ✓, ScreenSaver ✓
 ⚠ 窗口操作     : 受限（move 仅 Extension 路径；无 resize/workspace/事件流）
 ```

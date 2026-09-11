@@ -8,7 +8,7 @@
 //!
 //! - **Eval**（[`eval`]，GNOME <47）：`org.gnome.Shell.Eval` 直接执行 JS；
 //! - **Extension**（[`extension`]，GNOME 47+ 推荐）：Shell Extension
-//!   `agent-shell-bridge@multica.dev` 注册 `org.gnome.Shell.AgentShell`。
+//!   `agent-shell-bridge@tsic.top` 注册 `org.gnome.Shell.AgentShell`。
 //!
 //! 路径选择（§8.4）：版本探测 → GNOME <47 先 Eval、47+ 先 Extension；
 //! 初始路径探测失败自动回退另一路径。显示器配置走 [`display_config`] 的
@@ -23,6 +23,7 @@ pub mod display_config;
 pub mod error;
 pub mod eval;
 pub mod extension;
+pub mod install;
 pub mod version;
 
 mod mutter_compositor;
@@ -32,6 +33,6 @@ pub use display_config::{
 };
 pub use error::{MutterError, Result, EXTENSION_ID};
 pub use eval::GnomeEvalBridge;
-pub use extension::{ExtensionRunner, EXTENSION_JS};
+pub use extension::{ExtensionRunner, EXTENSION_JS, EXTENSION_METADATA};
 pub use mutter_compositor::{GnomePath, GnomePathKind, MutterCompositor, SessionKind};
 pub use version::{detect_version, parse_shell_version, GnomeMajor, GnomeVersion};

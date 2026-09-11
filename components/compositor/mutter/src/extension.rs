@@ -1,6 +1,6 @@
 //! Shell Extension 路径（设计文档 §8.1 路径 B / §8.4，GNOME 47+ 推荐）。
 //!
-//! GNOME Shell Extension `agent-shell-bridge@multica.dev` 在 session bus
+//! GNOME Shell Extension `agent-shell-bridge@tsic.top` 在 session bus
 //! 注册 `org.gnome.Shell.AgentShell` 接口（XML 定义见 §8.1）。Rust 端
 //! 只做客户端：调用方法、订阅信号。extension.js 本体由本 crate 内嵌
 //! 常量交付（单一事实来源），安装流程落盘后启用。
@@ -40,167 +40,19 @@ trait AgentShell {
 
 /// extension.js 源码（§8.1 XML 定义的实现，单一事实来源）。
 ///
-/// 安装位置：`~/.local/share/gnome-shell/extensions/agent-shell-bridge@multica.dev/`。
+/// 内容与 `components/compositor/mutter/src/extension.js` 同源（`include_str!`
+/// 内嵌），安装与打包均从该文件落盘——避免内容两处漂移。
+/// 安装位置：`~/.local/share/gnome-shell/extensions/agent-shell-bridge@tsic.top/`。
 /// GNOME 45+ 使用 ESM 导入；Wayland/X11 会话均可——接口经 Gio.DBus
 /// 注册，会话类型无关（§8.4 共享能力表）。
-pub const EXTENSION_JS: &str = r#"// agent-shell-bridge@multica.dev — org.gnome.Shell.AgentShell
-// 由 agent-shell-compositor-mutter 内嵌交付；安装到 extensions 目录后启用。
-import GLib from 'gi://GLib';
-import Gio from 'gi://Gio';
-import Meta from 'gi://Meta';
+pub const EXTENSION_JS: &str = include_str!("extension.js");
 
-const DBusInterface = `
-<node>
-  <interface name="org.gnome.Shell.AgentShell">
-    <method name="ListWindows"><arg type="s" direction="out"/></method>
-    <method name="GetActiveWindow"><arg type="s" direction="out"/></method>
-    <method name="FocusWindow"><arg type="u" name="window_id" direction="in"/></method>
-    <method name="MoveWindow">
-      <arg type="u" name="window_id" direction="in"/>
-      <arg type="i" name="x" direction="in"/>
-      <arg type="i" name="y" direction="in"/>
-    </method>
-    <method name="CloseWindow"><arg type="u" name="window_id" direction="in"/></method>
-    <method name="MinimizeWindow">
-      <arg type="u" name="window_id" direction="in"/>
-      <arg type="b" name="minimize" direction="in"/>
-    </method>
-    <method name="MaximizeWindow">
-      <arg type="u" name="window_id" direction="in"/>
-      <arg type="b" name="maximize" direction="in"/>
-    </method>
-    <method name="GetMonitorLayout"><arg type="s" direction="out"/></method>
-    <signal name="WindowOpened"><arg type="s" name="info"/></signal>
-    <signal name="WindowClosed"><arg type="u" name="window_id"/></signal>
-    <signal name="ActiveWindowChanged"><arg type="s" name="info"/></signal>
-  </interface>
-</node>`;
-
-class AgentShellBridge {
-    constructor() {
-        this._impl = null;
-        this._nodeInfo = null;
-        this._registrationIds = [];
-        this._signalIds = [];
-        this._watchers = new Map();
-    }
-
-    enable() {
-        this._nodeInfo = Gio.DBusNodeInfo.new_for_xml(DBusInterface);
-        this._impl = {
-            ListWindows: () => this._listWindows(),
-            GetActiveWindow: () => this._getActiveWindow(),
-            FocusWindow: id => this._withWindow(id, mw => mw.activate(global.get_current_time())),
-            MoveWindow: (id, x, y) => this._withWindow(id, mw => mw.move_frame(true, x, y)),
-            CloseWindow: id => this._withWindow(id, mw => mw.delete()),
-            MinimizeWindow: (id, minimize) =>
-                this._withWindow(id, mw => { mw.minimized = !!minimize; }),
-            MaximizeWindow: (id, maximize) => this._withWindow(id, mw =>
-                maximize ? mw.maximize(Meta.MaximizeFlags.BOTH)
-                         : mw.unmaximize(Meta.MaximizeFlags.BOTH)),
-            GetMonitorLayout: () => this._monitorLayout(),
-        };
-        const ownerId = Gio.bus_own_name(Gio.BusType.SESSION,
-            'org.gnome.Shell.AgentShell',
-            Gio.BusNameOwnerFlags.NONE, null, null, null);
-        this._registrationIds.push(ownerId);
-        const regId = Gio.DBus.session.register_object(
-            '/org/gnome/Shell/AgentShell', this._nodeInfo.interfaces[
-                'org.gnome.Shell.AgentShell'], this._impl, null, null);
-        this._registrationIds.push(regId);
-
-        // 窗口事件 → D-Bus 信号（§8.1 三信号）。
-        const display = global.display ?? global.compositor;
-        if (display) {
-            this._signalIds.push(display.connect('window-created', (_d, mw) =>
-                this._onWindowCreated(mw)));
-            this._signalIds.push(display.connect('window-destroyed', (_d, mw) =>
-                this._emit('WindowClosed', [mw.get_id() >>> 0])));
-            this._signalIds.push(display.connect('notify-focus-window', () =>
-                this._emit('ActiveWindowChanged', [this._getActiveWindow()])));
-        }
-    }
-
-    disable() {
-        const session = Gio.DBus.session;
-        for (const [, toId] of this._watchers) GLib.source_remove(toId);
-        this._watchers.clear();
-        for (const id of this._signalIds)
-            (global.display ?? global.compositor)?.disconnect(id);
-        this._signalIds = [];
-        for (const id of this._registrationIds.splice(0).reverse()) {
-            try { typeof id === 'number' && id > 0
-                ? Gio.bus_unown_name(id) : session.unregister_object(id); } catch {}
-        }
-        this._impl = null;
-        this._nodeInfo = null;
-    }
-
-    _withWindow(id, fn) {
-        const actor = global.get_window_actors()
-            .find(a => a.meta_window.get_id() === id);
-        if (!actor) throw new GLib.Error(GLib.quark_from_string('agent-shell'),
-            1, `window ${id} not found`);
-        fn(actor.meta_window);
-    }
-
-    _onWindowCreated(mw) {
-        // window-created 时 actor 属性未就绪，延迟一拍再取详情并广播。
-        const toId = GLib.idle_add(GLib.PRIORITY_DEFAULT_IDLE, () => {
-            this._watchers.delete(mw);
-            try { this._emit('WindowOpened', [this._windowJson(mw)]); } catch {}
-            return GLib.SOURCE_REMOVE;
-        });
-        this._watchers.set(mw, toId);
-    }
-
-    // 按 XML 声明类型构造 Variant：WindowClosed 是 u（uint32），
-    // WindowOpened / ActiveWindowChanged 是 s。类型不匹配时 GDBus
-    // 拒绝发送——Rust 端按同型反序列化，两端以本表为单一事实来源。
-    static SIGNAL_TYPES = {
-        'WindowOpened': ['s'],
-        'ActiveWindowChanged': ['s'],
-        'WindowClosed': ['u'],
-    };
-
-    _emit(name, params) {
-        const types = AgentShellBridge.SIGNAL_TYPES[name];
-        if (!types) throw new Error(`unknown signal ${name}`);
-        Gio.DBus.session.emit_signal(null, '/org/gnome/Shell/AgentShell',
-            'org.gnome.Shell.AgentShell', name,
-            new GLib.Variant(types, params));
-    }
-
-    _windowJson(a_or_mw) {
-        let mw = a_or_mw.meta_window ?? a_or_mw;
-        return JSON.stringify({
-            id: mw.get_id(), title: mw.get_title() || '',
-            appId: mw.get_wm_class() || '', pid: mw.get_pid(),
-            minimized: mw.minimized, maximized: mw.maximized,
-            fullscreen: mw.fullscreen,
-            geometry: mw.get_frame_rect(),
-            hasFocus: mw.has_focus()
-        });
-    }
-
-    _listWindows() {
-        return JSON.stringify(global.get_window_actors().map(a =>
-            JSON.parse(this._windowJson(a))));
-    }
-
-    _getActiveWindow() {
-        const a = global.get_window_actors().find(a => a.meta_window.has_focus());
-        return a === undefined ? '' : this._windowJson(a);
-    }
-
-    _monitorLayout() {
-        const mm = global.backend.get_monitor_manager();
-        return JSON.stringify(mm.get_monitors().map(m => m.get_properties?.() ?? {}));
-    }
-};
-
-export function init() { return new AgentShellBridge(); }
-"#;
+/// extension.js 配套的 metadata.json（uuid/shell-version/description）。
+///
+/// 与 [`EXTENSION_JS`] 同为单一事实来源
+/// （`components/compositor/mutter/src/metadata.json`），安装与打包均从
+/// 该文件落盘。GNOME Shell 从它读取扩展身份与版本约束。
+pub const EXTENSION_METADATA: &str = include_str!("metadata.json");
 
 /// Extension D-Bus 客户端（路径 B）。
 ///
@@ -499,15 +351,99 @@ mod tests {
     }
 
     #[test]
-    fn signal_variant_types_match_xml_declarations() {
-        // 🔴1 回归守卫：SIGNAL_TYPES 表必须与 XML 声明的 arg 类型一致——
-        // WindowClosed 是 u，两个 info 信号是 s。不一致时 GDBus 拒发，
-        // Rust 端 deserialize 静默丢事件。
-        assert!(EXTENSION_JS.contains("'WindowOpened': ['s'],"));
-        assert!(EXTENSION_JS.contains("'ActiveWindowChanged': ['s'],"));
-        assert!(EXTENSION_JS.contains("'WindowClosed': ['u'],"));
-        // emit 调用点不得再按统一 's' 构造（旧实现回归检测）。
-        assert!(!EXTENSION_JS.contains("params.map(() => 's')"));
+    fn signal_emits_use_tuple_variant_signatures() {
+        // 回归守卫：信号 Variant 须用元组签名 '(s)'/'(u)'，数组签名 ['s'] 会抛错
+        // 致三信号全部失效（审查🔴3）。
+        assert!(EXTENSION_JS.contains("new GLib.Variant('(u)', [mw.get_id() >>> 0])"));
+        assert!(EXTENSION_JS.contains("new GLib.Variant('(s)', [this._getActiveWindow()])"));
+        assert!(EXTENSION_JS.contains("new GLib.Variant('(s)', [this._windowJson(mw)])"));
+        // 不得再按数组形式构造 Variant。
+        assert!(!EXTENSION_JS.contains("new GLib.Variant(['"));
+        assert!(!EXTENSION_JS.contains("SIGNAL_TYPES"));
+    }
+
+    #[test]
+    fn extension_js_finds_interface_by_name_not_array_index() {
+        // 审查🔴1：interfaces 是数组，按名字符串索引得 undefined——须 find(name)。
+        assert!(EXTENSION_JS.contains("interfaces.find(i => i.name === IFACE_NAME)"));
+        assert!(!EXTENSION_JS.contains("interfaces['org.gnome.Shell.AgentShell']"));
+    }
+
+    #[test]
+    fn extension_js_registers_with_method_call_vtable() {
+        // 审查🔴2：方法分派须经含 method_call 的 vtable（普通对象不是合法 vtable）。
+        assert!(EXTENSION_JS.contains("new Gio.DBusInterfaceVTable()"));
+        assert!(EXTENSION_JS.contains(".method_call = "));
+        assert!(EXTENSION_JS.contains("register_object("));
+    }
+
+    #[test]
+    fn extension_js_validates_sender() {
+        // 审查🔴6：well-known 名暴露窗口控制，method_call 须先校验 sender
+        // 确为 daemon（持有 org.agentshell.Daemon 名）。
+        assert!(EXTENSION_JS.contains("_isAuthorized(sender)"));
+        assert!(EXTENSION_JS.contains("get_name_owner_sync(DAEMON_BUS_NAME)"));
+        assert!(EXTENSION_JS.contains("owner !== null && owner === sender"));
+        assert!(EXTENSION_JS.contains(".Error.Unauthorized"));
+    }
+
+    #[test]
+    fn daemon_bus_name_rust_js_cross_assertion() {
+        // 🟡 审查建议：DAEMON_BUS_NAME 在 Rust(error.rs) 与 JS(extension.js) 双源
+        // 定义，任一单侧改动会静默杀死 sender 校验（GNOME 47+ 无回退）。用 Rust
+        // 常量交叉断言 JS 内嵌源码，保证两侧同值。
+        assert!(EXTENSION_JS.contains(&format!(
+            "DAEMON_BUS_NAME = '{}'",
+            crate::error::DAEMON_BUS_NAME
+        )));
+    }
+
+    #[test]
+    fn extension_js_passes_gjs_syntax_check() {
+        // 🟡 审查建议：核心 D-Bus 行为仅靠 contains() 字符串断言，抓不住 GJS
+        // 语法/运行期类型错误。gjs 可用时跑 --check-syntax（-m ESM 模式）真校验；
+        // gjs 不可用（本地/无 GNOME CI）时跳过——Nix doCheck 注入 gjs 后生效。
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/src/extension.js");
+        let output = std::process::Command::new("gjs")
+            .args(["-m", "--check-syntax", path])
+            .output();
+        match output {
+            Ok(out) => assert!(
+                out.status.success(),
+                "gjs --check-syntax failed:\n{}",
+                String::from_utf8_lossy(&out.stderr)
+            ),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                eprintln!("gjs not found; skipping GJS syntax check");
+            }
+            Err(e) => panic!("failed to run gjs --check-syntax: {e}"),
+        }
+    }
+
+    #[test]
+    fn extension_js_uses_notify_focus_window_signal() {
+        // 审查🔴5：焦点信号是 notify::focus-window（属性通知），notify-focus-window 不存在。
+        assert!(EXTENSION_JS.contains("'notify::focus-window'"));
+        assert!(!EXTENSION_JS.contains("'notify-focus-window'"));
+    }
+
+    #[test]
+    fn extension_js_exports_default_extension_class() {
+        // GNOME 45+ ESM 入口：默认导出 Extension 子类（init() 返回对象不是 45+ 生命周期）。
+        assert!(EXTENSION_JS.contains("export default class"));
+        assert!(EXTENSION_JS.contains("extends Extension"));
+        assert!(EXTENSION_JS.contains(
+            "import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js'"
+        ));
+    }
+
+    #[test]
+    fn extension_js_separates_owner_and_registration_cleanup() {
+        // 审查🔴4：owner id 与 registration id 分离清理（前者 bus_unown_name，
+        // 后者 unregister_object），不得混用或空 catch 吞错。
+        assert!(EXTENSION_JS.contains("Gio.bus_unown_name(this._nameOwnerId)"));
+        assert!(EXTENSION_JS.contains("unregister_object(this._regId)"));
+        assert!(!EXTENSION_JS.contains("} catch {}"));
     }
 
     #[test]

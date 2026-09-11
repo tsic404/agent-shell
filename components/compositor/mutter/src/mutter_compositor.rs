@@ -8,7 +8,7 @@
 //!   落地 [`WaylandCompositor`] 继承层次（§3.3）；X11 会话下 D-Bus 仍是
 //!   唯一基础通道，无 Wayland 协议通道。
 use crate::display_config::DisplayConfig;
-use crate::error::{MutterError, Result};
+use crate::error::{MutterError, Result, DAEMON_BUS_NAME};
 use crate::eval::GnomeEvalBridge;
 use crate::extension::ExtensionRunner;
 use crate::version::{GnomeMajor, GnomeVersion};
@@ -112,6 +112,7 @@ impl MutterCompositor {
         let conn = Connection::session()
             .await
             .map_err(|e| MutterError::Version(format!("session bus connect: {e}")))?;
+        acquire_daemon_bus_name(&conn).await;
         // 构造期捕获 display 名（doctor 输出用）——`WAYLAND_DISPLAY` 优先，
         // `WAYLAND_SOCKET` 次之（`fd:{fd}` 与 `Connection::connect_to_env`
         // 的消费语义一致），两者均缺失时兜底 "wayland"（不应发生：调用方
@@ -129,6 +130,7 @@ impl MutterCompositor {
         let conn = Connection::session()
             .await
             .map_err(|e| MutterError::Version(format!("session bus connect: {e}")))?;
+        acquire_daemon_bus_name(&conn).await;
         Self::with_session(conn, SessionKind::X11, None, None).await
     }
 
@@ -258,7 +260,7 @@ impl MutterCompositor {
                 }
             ),
             format!(
-                "✓ 后端路径     : {} (agent-shell-bridge@multica.dev)",
+                "✓ 后端路径     : {} (agent-shell-bridge@tsic.top)",
                 self.path.kind()
             ),
             format!(
@@ -349,6 +351,24 @@ fn degrade_wayland_failure(
             tracing::warn!(error = %err, "wayland display server connect failed; falling back to D-Bus-only channel");
             None
         }
+    }
+}
+
+/// 在 session bus 上申请 daemon 的 well-known 名（[`DAEMON_BUS_NAME`]）。
+///
+/// extension.js 据此校验 `org.gnome.Shell.AgentShell` 的方法调用确实来自
+/// agent-shell-daemon（而非任意同 uid 进程）。申请失败不阻断装配——extension
+/// 侧的 sender 校验会在 probe 阶段如实报错，走既有降级链（§8.1 安全）。
+async fn acquire_daemon_bus_name(conn: &Connection) {
+    // request_name 用默认 flags（含 DoNotQueue）——名称已被他人持有时直接
+    // 返回 Error::NameTaken。单实例锁下正常应为 PrimaryOwner；失败不阻断装配，
+    // extension 侧的 sender 校验会在 probe 阶段如实报错，走既有降级链。
+    if let Err(e) = conn.request_name(DAEMON_BUS_NAME).await {
+        tracing::warn!(
+            error = %e,
+            name = DAEMON_BUS_NAME,
+            "request daemon well-known name failed; extension sender validation will reject calls"
+        );
     }
 }
 
@@ -839,7 +859,7 @@ mod tests {
         assert_eq!(lines[0], x11_protocol_line());
         assert!(lines[1].contains("GNOME 45.2 (Eval 可用)"), "{}", lines[1]);
         assert!(
-            lines[2].contains("Eval (agent-shell-bridge@multica.dev)"),
+            lines[2].contains("Eval (agent-shell-bridge@tsic.top)"),
             "{}",
             lines[2]
         );

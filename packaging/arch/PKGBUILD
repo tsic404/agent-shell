@@ -21,7 +21,7 @@ build() {
 package_agent-shell() {
     pkgdesc="Agent Shell — Linux desktop agent shell (daemon + CLI + MCP)"
     depends=('systemd' 'xdg-desktop-portal' 'pipewire' 'hicolor-icon-theme')
-    optdepends=('ydotool: input injection fallback (/dev/uinput)')
+    optdepends=('ydotool: input injection fallback (/dev/uinput)' 'gnome-shell: GNOME Shell Extension host')
 
     cd "$srcdir/agent-shell"
     # 二进制
@@ -34,6 +34,11 @@ package_agent-shell() {
     # udev rules for ydotool /dev/uinput（§20.3 权限模型）
     install -Dm644 packaging/debian/60-agent-shell-uinput.rules \
         "$pkgdir/usr/lib/udev/rules.d/60-agent-shell-uinput.rules"
+    # GNOME Shell Extension（§8.1 系统级部署；用户级启用走 `agent-shell extension enable`）
+    install -Dm644 components/compositor/mutter/src/extension.js \
+        "$pkgdir/usr/share/gnome-shell/extensions/agent-shell-bridge@tsic.top/extension.js"
+    install -Dm644 components/compositor/mutter/src/metadata.json \
+        "$pkgdir/usr/share/gnome-shell/extensions/agent-shell-bridge@tsic.top/metadata.json"
 }
 
 package_agent-shell-rootd() {
