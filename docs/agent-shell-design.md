@@ -5798,7 +5798,7 @@ Tool::new("list_timers").description("列出 systemd timer").input_schema(...);
 
 | 能力 | DDE 25 (Deepin 25, dde-daemon 6.1.84) | DDE 20 (UOS 20 Pro, dde-daemon 5.19.16) | 备注 |
 |------|-----------------------------------------|------------------------------------------|------|
-| **服务命名** | `org.deepin.dde.*`（主）+ `com.deepin.daemon.*`（别名） | 仅 `com.deepin.daemon.*` | DDE25 双名并存、方法集完全一致；DDE20 无 `org.deepin.dde.Audio1` 等 |
+| **服务命名** | `org.deepin.dde.*`（主）+ `com.deepin.daemon.*`（别名） | `com.deepin.daemon.*` 为主、少量 `org.deepin.dde.*` 兼容存在 | DDE25 双名并存、方法集完全一致；DDE20 以 `com.deepin.daemon.*` 为主、混入少量 `org.deepin.dde.*`（实测 UOS 20 Pro：25 + 2） |
 | **音频控制** | 根对象**无** `SetVolume/SetMute`；控制移到 **Sink 子对象** `SetVolume(d)`, `SetMute(b)`, `SetBalance(d)`, `SetFade(d)` | **同左**（Sink 子对象 `SetVolume(d)`） | 两版一致！旧文档假设「Audio1 根对象 SetVolume(v, isPlay)」**已过时** |
 | **音频属性** | `Sinks`/`DefaultSink`(object path)/`SinkInputs`/`Cards`(JSON)/`CurrentAudioServer=pipewire` | `Sinks`/`DefaultSink`/`Cards`(JSON)/Sink 属性 `Volume`/`Mute` | 结构一致 |
 | **显示** | Display1: `ApplyChanges()`(无参), `GetBrightness(a{sd})`, `SetBrightness(s,d)`, `CanSetBrightness`, `Save`, `GetAll` | **同左**（com.deepin.daemon.Display 方法集与 DDE25 完全一致） | 两版一致，无 `GetConfig()` 方法 |

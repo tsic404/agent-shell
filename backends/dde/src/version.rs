@@ -65,10 +65,12 @@ pub fn candidates_for(family: &str) -> Option<&'static [&'static str; 2]> {
 pub enum DdeMajor {
     /// DDE 25：`org.deepin.dde.*` 命中。
     V25,
-    /// DDE 20：仅 `com.deepin.daemon.*` 命中。
+    /// 仅 `com.deepin.daemon.*` 旧名命中（纯净旧名环境；DDE20 混入少量
+    /// `org.deepin.dde.*` 时归为 [`DdeMajor::Mixed`]）。
     V20,
-    /// 两代名混合命中（DDE25 上双名并存时可能出现）——调用点仍以各自
-    /// 探测命中的名字为准，归类仅用于 doctor 展示。
+    /// 两代名混合命中（DDE25 双名并存 / DDE20 少量 `org.deepin.dde.*`
+    /// 兼容存在，均可能出现）——调用点仍以各自探测命中的名字为准，
+    /// 归类仅用于 doctor 展示。
     Mixed,
     /// 无任何命中（非 DDE 环境 / 服务全缺席）。
     #[default]
