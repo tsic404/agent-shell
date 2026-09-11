@@ -22,6 +22,7 @@ use agent_shell_core::component::{
 };
 use agent_shell_core::error::{AgentShellError, Result};
 use async_trait::async_trait;
+use std::future::Future;
 
 pub use cache::CaptureCache;
 pub use portal_screencast::{
@@ -44,6 +45,18 @@ pub trait TokenStore: Send + Sync {
 
 /// 组件名（doctor 报告用）。
 pub const COMPONENT_NAME: &str = "capture";
+
+/// 交互捕获全链总预算（§13.1 / §19.3 澄清）：ScreenCast Start 弹窗等待
+/// （[`portal_screencast::SCREENCAST_TIMEOUT`]）+ Screenshot 交互超时
+/// （[`portal_screenshot::SCREENSHOT_TIMEOUT_INTERACTIVE`]）之和封顶。
+///
+/// 交互授权应在一两个弹窗周期内完成；超预算说明无人在场（自动化/无桌面
+/// 会话），快速失败而非继续叠加各级超时（2×SCREENSHOT_TIMEOUT + screencast
+/// 超时）吃满 ~27.8s 后降级全黑 x11（TSI-2980）。
+pub const CAPTURE_INTERACTIVE_BUDGET: std::time::Duration = std::time::Duration::from_secs(
+    portal_screencast::SCREENCAST_TIMEOUT.as_secs()
+        + portal_screenshot::SCREENSHOT_TIMEOUT_INTERACTIVE.as_secs(),
+);
 
 /// 捕获结果：帧或已落盘的 PNG 路径。
 #[derive(Clone, Debug)]
@@ -188,7 +201,28 @@ impl CaptureDispatcher {
     /// `interactive=true` 时允许弹窗授权（无 token 或恢复失败时）；
     /// `interactive=false` 时仅当 `token_store` 含 `restore_token` 才尝试
     /// ScreenCast——无 token 则直接降级到 Screenshot/X11（避免弹窗）。
+    ///
+    /// 交互路径受 [`CAPTURE_INTERACTIVE_BUDGET`] 总预算封顶：授权应在一两个
+    /// 弹窗周期内完成，超预算快速失败而非叠加各级超时（2×SCREENSHOT_TIMEOUT +
+    /// screencast 超时）吃满 ~27.8s 后降级全黑 x11（TSI-2980）。
     pub async fn capture(&self, target: CaptureTarget, interactive: bool) -> Result<CapturedFrame> {
+        if interactive {
+            capture_with_budget(CAPTURE_INTERACTIVE_BUDGET, self.capture_chain(target, true)).await
+        } else {
+            self.capture_chain(target, false).await
+        }
+    }
+
+    /// [`Self::capture`] 的降级链主体：ScreenCast → Screenshot → X11。
+    ///
+    /// `interactive=true` 时 Screenshot 先做非交互预探测（§13.1 建议 2）——
+    /// 已授权/免弹窗即时成功、无会话/自动化即时 Permission，两种情况都不
+    /// 弹窗、不吃交互超时预算；预探测失败才升级到交互弹窗。
+    async fn capture_chain(
+        &self,
+        target: CaptureTarget,
+        interactive: bool,
+    ) -> Result<CapturedFrame> {
         // L1: portal ScreenCast（流式，daemon 复用会话）。
         if let Some(s) = self.ensure_screencast_session(target, interactive).await {
             match s.capture_frame().await {
@@ -207,6 +241,20 @@ impl CaptureDispatcher {
 
         // L2: portal Screenshot。
         if self.screenshot.available().await {
+            // 交互先非交互预探测（§13.1 建议 2 / Radian 审查）：已授权/免弹窗
+            // 即时成功、无会话即时 Permission，均不弹窗；黑/无效帧与超时视为
+            // 预探测失败，升级到交互弹窗。预探测受交互预算约束（5s/单次口径），
+            // 不单独吃满 8s×2 超时（否则 ScreenCast 弹窗耗尽 10s 后会被外层
+            // 总预算截断，授权弹窗永不弹出）。
+            if interactive {
+                if let Some(frame) = self
+                    .screenshot_preprobe(portal_screenshot::SCREENSHOT_TIMEOUT_INTERACTIVE)
+                    .await
+                {
+                    self.set_active(Some(ActiveBackend::ScreenshotPortal));
+                    return Ok(frame);
+                }
+            }
             match self.screenshot.capture(interactive).await {
                 Ok(path) => {
                     self.set_active(Some(ActiveBackend::ScreenshotPortal));
@@ -246,6 +294,27 @@ impl CaptureDispatcher {
              X11 session)"
                 .into(),
         ))
+    }
+
+    /// 非交互预探测（§13.1 建议 2 / Radian 审查）：已授权/免弹窗即时成功；
+    /// 无会话/自动化即时 Permission。黑/无效帧、超时、Permission 均视为
+    /// 「未授权」跳过（返回 `None`），由调用方升级到交互弹窗。
+    ///
+    /// 受 `budget` 约束（交互预算内的短探测）：超时视为跳过而非失败——避免
+    /// 预探测的 8s×2 超时在 ScreenCast 弹窗耗尽预算后被外层总预算截断，致
+    /// 授权弹窗永不弹出（Radian 审查 #1）。
+    async fn screenshot_preprobe(&self, budget: std::time::Duration) -> Option<CapturedFrame> {
+        match tokio::time::timeout(budget, self.screenshot.capture(false)).await {
+            Ok(Ok(path)) => preprobe_frame(path).map(CapturedFrame::Png),
+            Ok(Err(e)) => {
+                tracing::debug!("screenshot non-interactive pre-probe failed: {e}");
+                None
+            }
+            Err(_) => {
+                tracing::debug!("screenshot non-interactive pre-probe timed out; escalate");
+                None
+            }
+        }
     }
 
     /// 建立（或复用）ScreenCast 流会话，返回可复用的会话句柄。
@@ -571,6 +640,36 @@ fn row_has_non_black(data: &[u8], color_type: png::ColorType) -> bool {
         .any(|px| px.iter().take(color_channels).any(|&b| b != 0))
 }
 
+/// 交互路径总预算封顶：在 `budget` 内执行 `fut`，超时返回 `Timeout`。
+///
+/// 抽成可注入预算的辅助函数以便单测（用极小 `budget` 确定性触发超时分支）——
+/// 与 [`CaptureDispatcher::capture_chain`] 解耦，测试不依赖真实 portal/X11
+/// （Radian 审查 #3）。
+async fn capture_with_budget<F>(budget: std::time::Duration, fut: F) -> Result<CapturedFrame>
+where
+    F: Future<Output = Result<CapturedFrame>>,
+{
+    match tokio::time::timeout(budget, fut).await {
+        Ok(res) => res,
+        Err(_) => Err(AgentShellError::Timeout(format!(
+            "interactive capture exceeded {}s total budget (no user authorization within budget)",
+            budget.as_secs()
+        ))),
+    }
+}
+
+/// 非交互预探测结果判定（纯函数，可单测）：黑/无效帧（与 [`CaptureDispatcher::probe`]
+/// 的 [`is_png_black_or_invalid`] 同口径）视为预探测失败并清理临时文件，返回
+/// `None`；否则返回 `Some(path)`（Radian 审查 #2）。
+fn preprobe_frame(path: std::path::PathBuf) -> Option<std::path::PathBuf> {
+    if is_png_black_or_invalid(&path) {
+        let _ = std::fs::remove_file(&path);
+        None
+    } else {
+        Some(path)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -601,6 +700,78 @@ mod tests {
         assert_eq!(store.get_restore_token().as_deref(), Some("tok1"));
         store.save_restore_token(None);
         assert!(store.get_restore_token().is_none());
+    }
+
+    /// 交互全链总预算 = ScreenCast 弹窗等待 + Screenshot 交互超时，且必须小于
+    /// 旧行为叠加的 2×SCREENSHOT_TIMEOUT + SCREENCAST_TIMEOUT——锚定「超时预算
+    /// 吃满后降级 x11」不再发生（TSI-2980）。
+    #[test]
+    fn capture_interactive_budget_bounds_degradation_chain() {
+        assert_eq!(
+            CAPTURE_INTERACTIVE_BUDGET,
+            portal_screencast::SCREENCAST_TIMEOUT
+                + portal_screenshot::SCREENSHOT_TIMEOUT_INTERACTIVE
+        );
+        let old_stacked =
+            portal_screenshot::SCREENSHOT_TIMEOUT * 2 + portal_screencast::SCREENCAST_TIMEOUT;
+        assert!(
+            CAPTURE_INTERACTIVE_BUDGET < old_stacked,
+            "interactive budget must be tighter than the stacked per-level timeouts"
+        );
+    }
+
+    /// 预算封顶行为：快速 future 原样通过；慢 future 被中止并归一到 `Timeout`
+    /// ——覆盖「timeout 中止 → Timeout」分支（Radian 审查 #3，可注入预算）。
+    #[tokio::test]
+    async fn capture_with_budget_passes_fast_and_times_out_slow() {
+        let fast = capture_with_budget(
+            std::time::Duration::from_secs(1),
+            std::future::ready(Ok(CapturedFrame::Png("fast.png".into()))),
+        )
+        .await;
+        assert!(fast.is_ok(), "fast future must pass through: {fast:?}");
+
+        let slow = capture_with_budget(std::time::Duration::from_millis(10), async {
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            Ok(CapturedFrame::Png("slow.png".into()))
+        })
+        .await;
+        assert!(
+            matches!(slow, Err(AgentShellError::Timeout(_))),
+            "slow future must be aborted into Timeout: {slow:?}"
+        );
+    }
+
+    /// 预探测结果判定：黑/无效帧 → `None` 并清理临时文件；有效帧 → `Some`
+    /// ——覆盖「预探测失败 → 升级弹窗」的前置判定分支（Radian 审查 #2/#3）。
+    #[test]
+    fn preprobe_frame_rejects_black_and_keeps_valid() {
+        let dir = tempfile::tempdir().unwrap();
+        // 全黑 PNG → 预探测失败并清理。
+        let black = write_png(
+            dir.path(),
+            "black.png",
+            png::ColorType::Rgb,
+            1,
+            1,
+            &[0, 0, 0],
+        );
+        assert!(preprobe_frame(black.clone()).is_none());
+        assert!(
+            !black.exists(),
+            "black frame must be removed after rejection"
+        );
+        // 非黑 PNG → 预探测成功保留。
+        let red = write_png(
+            dir.path(),
+            "red.png",
+            png::ColorType::Rgb,
+            1,
+            1,
+            &[255, 0, 0],
+        );
+        assert!(preprobe_frame(red.clone()).is_some());
+        assert!(red.exists(), "valid frame must be kept");
     }
 
     #[test]

@@ -2,7 +2,8 @@
 //!
 //! `org.freedesktop.portal.Screenshot.Screenshot` 返回 Request 对象；
 //! 必须等 `Response` 信号取回结果字典中的 `uri`，再解析为本地路径。
-//! 超时/重试按 §19.3：screenshot 8s / 最多尝试 2 次。
+//! 超时/重试按 §19.3：非交互 screenshot 8s / 最多 2 次；交互（弹授权窗）
+//! 5s / 单次——授权场景无需 8s、不重试（超时后二次弹窗无意义，§13.1）。
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -15,10 +16,33 @@ use crate::portal_common::{
     uri_to_path, wait_for_response, PORTAL_RETRY_BACKOFF, PORTAL_SERVICE,
 };
 
-/// screenshot 通道默认超时（§19.3）。
+/// screenshot 通道默认超时（§19.3；非交互 doctor/probe 路径）。
 pub const SCREENSHOT_TIMEOUT: Duration = Duration::from_secs(8);
+/// screenshot 交互（弹授权窗）超时：授权场景用户要么尽快点击、要么不在场，
+/// 无需按 portal 延迟口径等满 8s——更短超时让无人值守/自动化快速失败（§13.1）。
+pub const SCREENSHOT_TIMEOUT_INTERACTIVE: Duration = Duration::from_secs(5);
 /// screenshot 通道最大尝试次数（§19.3；含首次，共 2 次尝试）。
 pub const SCREENSHOT_MAX_ATTEMPTS: u32 = 2;
+
+/// 交互与否对应的 Screenshot 超时（§13.1 全链预算 / §19.3）。
+pub fn screenshot_timeout(interactive: bool) -> Duration {
+    if interactive {
+        SCREENSHOT_TIMEOUT_INTERACTIVE
+    } else {
+        SCREENSHOT_TIMEOUT
+    }
+}
+
+/// 交互与否对应的最大尝试次数：交互单次（超时/取消后重试只会二次弹窗），
+/// 非交互保留 §19.3 的 2 次（覆盖 GetSession 就绪竞态等瞬态错误）。
+pub fn screenshot_attempts(interactive: bool) -> u32 {
+    if interactive {
+        1
+    } else {
+        SCREENSHOT_MAX_ATTEMPTS
+    }
+}
+
 /// 生成 Screenshot 的 `handle_token`（pid + 序列号）。
 fn screenshot_token(pid: u32, seq: u64) -> String {
     format!("agent_shell_screenshot_{pid}_{seq}")
@@ -85,14 +109,17 @@ impl ScreenshotPortal {
         let sender = sender_part(&self.conn)
             .ok_or_else(|| AgentShellError::DBus("no unique name on session bus".into()))?;
 
-        // §19.3：最多 2 次尝试。每次生成新 token（TSI-2877 审查项 #1：pid
-        // 进程内不变，重试复用同一 token 会致 portal Request 路径冲突）；
-        // 关键：先在 handle_token 预算的路径上订阅 Response 信号，再发
-        // Screenshot 调用——否则 portal 对无授权 `interactive=false` 请求的
-        // 即时取消（code=1）可能在订阅建立前就到达，被 `wait_for_response`
-        // 遗漏而误判为 8s 超时（TSI-2971 debug 下订阅延迟放大该竞态）。
+        // §19.3：非交互最多 2 次尝试；交互单次（超时/取消后重试只会二次弹窗）。
+        // 每次生成新 token（TSI-2877 审查项 #1：pid 进程内不变，重试复用同一
+        // token 会致 portal Request 路径冲突）；关键：先在 handle_token 预算的
+        // 路径上订阅 Response 信号，再发 Screenshot 调用——否则 portal 对无授权
+        // `interactive=false` 请求的即时取消（code=1）可能在订阅建立前就到达，
+        // 被 `wait_for_response` 遗漏而误判为超时（TSI-2971 debug 下订阅延迟
+        // 放大该竞态）。
+        let timeout = screenshot_timeout(interactive);
+        let attempts = screenshot_attempts(interactive);
         let mut last_err = None;
-        for attempt in 0..SCREENSHOT_MAX_ATTEMPTS {
+        for attempt in 0..attempts {
             let token = next_token(&self.token_seq, std::process::id());
             let request_path = ObjectPath::try_from(format!(
                 "/org/freedesktop/portal/desktop/request/{sender}/{token}"
@@ -109,7 +136,7 @@ impl ScreenshotPortal {
                         "portal Screenshot response stream setup failed: {e}"
                     );
                     last_err = Some(e);
-                    if attempt + 1 < SCREENSHOT_MAX_ATTEMPTS {
+                    if attempt + 1 < attempts {
                         tokio::time::sleep(PORTAL_RETRY_BACKOFF).await;
                     }
                     continue;
@@ -136,7 +163,7 @@ impl ScreenshotPortal {
                     }
                     tracing::warn!(attempt, "portal Screenshot call failed: {e}");
                     last_err = Some(e);
-                    if attempt + 1 < SCREENSHOT_MAX_ATTEMPTS {
+                    if attempt + 1 < attempts {
                         tokio::time::sleep(PORTAL_RETRY_BACKOFF).await;
                     }
                     continue;
@@ -146,14 +173,14 @@ impl ScreenshotPortal {
             // portal 若未按 handle_token 规范返回预算路径（非常规实现），回退
             // 到调用后订阅的旧路径——该路径有竞态，但仅非常规后端才会触发。
             let result = if returned.as_str() == request_path.as_str() {
-                drain_response_with_timeout(&mut stream, SCREENSHOT_TIMEOUT, "Screenshot").await
+                drain_response_with_timeout(&mut stream, timeout, "Screenshot").await
             } else {
                 tracing::warn!(
                     "Screenshot path mismatch: expected {}, got {}",
                     request_path,
                     returned
                 );
-                wait_for_response(&self.conn, &returned, SCREENSHOT_TIMEOUT).await
+                wait_for_response(&self.conn, &returned, timeout).await
             };
 
             match result {
@@ -170,7 +197,7 @@ impl ScreenshotPortal {
                 Err(e) => {
                     tracing::warn!(attempt, "portal Screenshot attempt failed: {e}");
                     last_err = Some(e);
-                    if attempt + 1 < SCREENSHOT_MAX_ATTEMPTS {
+                    if attempt + 1 < attempts {
                         tokio::time::sleep(Duration::from_millis(1500)).await;
                     }
                 }
@@ -211,5 +238,17 @@ mod tests {
         assert_ne!(first, second);
         assert_eq!(first, screenshot_token(pid, 0));
         assert_eq!(second, screenshot_token(pid, 1));
+    }
+
+    /// 交互与非交互的超时/重试口径分离：交互走更短超时（授权场景无需 8s）、
+    /// 单次尝试（超时/取消后重试只会二次弹窗）；非交互保留 §19.3 默认。
+    #[test]
+    fn screenshot_timeout_and_attempts_split_by_interactive() {
+        assert_eq!(screenshot_timeout(false), SCREENSHOT_TIMEOUT);
+        assert_eq!(screenshot_timeout(true), SCREENSHOT_TIMEOUT_INTERACTIVE);
+        assert_eq!(screenshot_attempts(false), SCREENSHOT_MAX_ATTEMPTS);
+        assert_eq!(screenshot_attempts(true), 1);
+        // 交互超时必须短于非交互超时——这是「授权场景无需 8s」的锚定。
+        assert!(SCREENSHOT_TIMEOUT_INTERACTIVE < SCREENSHOT_TIMEOUT);
     }
 }
