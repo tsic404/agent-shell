@@ -770,7 +770,7 @@ pub mod duration {
         let (whole, frac, unit) = split_duration(s);
         let whole: u64 = whole
             .parse()
-            .map_err(|_| format!("非法时长 `{spec}`：期望形如 `10s`、`500ms`、`2m`"))?;
+            .map_err(|_| format!("非法时长 `{s}`：期望形如 `10s`、`500ms`、`2m`"))?;
         let multiplier_ms = match unit.trim().to_ascii_lowercase().as_str() {
             "" | "ms" => 1,
             "s" => 1_000,
@@ -780,7 +780,7 @@ pub mod duration {
         };
         let whole_ms = whole
             .checked_mul(multiplier_ms)
-            .ok_or_else(|| format!("时长超出范围 `{spec}`（期望形如 `10s`、`500ms`、`2m`）"))?;
+            .ok_or_else(|| format!("时长超出范围 `{s}`（期望形如 `10s`、`500ms`、`2m`）"))?;
         // 小数部分按毫秒截断：frac * multiplier / 10^len，除不尽部分舍去。
         if frac.is_empty() {
             return Ok(whole_ms);
@@ -791,18 +791,18 @@ pub mod duration {
         let frac_len = frac.len() as u32;
         let frac: u128 = frac
             .parse()
-            .map_err(|_| format!("非法时长 `{spec}`：期望形如 `10s`、`500ms`、`2m`"))?;
+            .map_err(|_| format!("非法时长 `{s}`：期望形如 `10s`、`500ms`、`2m`"))?;
         let denom = 10u128
             .checked_pow(frac_len)
-            .ok_or_else(|| format!("非法时长 `{spec}`：期望形如 `10s`、`500ms`、`2m`"))?;
+            .ok_or_else(|| format!("非法时长 `{s}`：期望形如 `10s`、`500ms`、`2m`"))?;
         let frac_ms = frac
             .checked_mul(multiplier_ms as u128)
             .and_then(|v| v.checked_div(denom))
-            .ok_or_else(|| format!("时长超出范围 `{spec}`（期望形如 `10s`、`500ms`、`2m`）"))?
+            .ok_or_else(|| format!("时长超出范围 `{s}`（期望形如 `10s`、`500ms`、`2m`）"))?
             as u64;
         whole_ms
             .checked_add(frac_ms)
-            .ok_or_else(|| format!("时长超出范围 `{spec}`（期望形如 `10s`、`500ms`、`2m`）"))
+            .ok_or_else(|| format!("时长超出范围 `{s}`（期望形如 `10s`、`500ms`、`2m`）"))
     }
 
     /// 把时长串切成 (整数部分, 小数部分, 单位部分)。
@@ -874,6 +874,14 @@ pub mod duration {
             let err = parse_duration("1 x").unwrap_err();
             assert!(!err.contains("` x"), "{err}");
             assert!(err.contains("`x`"), "{err}");
+        }
+
+        #[test]
+        fn bare_numeric_error_trims_leading_whitespace() {
+            // TSI-3078：无数字前缀输入（仅空白+单位）报错提示串不应含前导空白。
+            let err = parse_duration(" s").unwrap_err();
+            assert!(!err.contains("` s"), "{err}");
+            assert!(err.contains("`s`"), "{err}");
         }
     }
 }
