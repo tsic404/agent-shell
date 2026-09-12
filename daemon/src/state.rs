@@ -24,6 +24,16 @@ enum CompositorBackend {
     Mutter(Box<MutterCompositor>),
 }
 
+/// 原始事件源装配结果（区分「就绪 / 无原生流 / 失败」三态）。
+enum RawSourceOutcome {
+    /// 原始事件源就绪（KWin 事件脚本启动成功且接收端已取到）。
+    Ready(Box<dyn event::RawSource>),
+    /// 该后端无原生事件流（DDE Treeland / Mutter 未接线 / TTY）——查询差分兜底。
+    Unavailable,
+    /// 原始事件源装配失败（KWin 脚本启动失败 / 一次性队列已被占用）——可重试。
+    Failed(String),
+}
+
 impl CompositorBackend {
     fn as_dyn(&self) -> &dyn CompositorComponent {
         match self {
@@ -76,8 +86,21 @@ impl CompositorBackend {
             Self::Mutter(_) => agent_shell_core::types::DesktopEnvironment::GNOME,
         }
     }
+    /// 取原始事件源（§18.2），区分三态：
+    /// - KWin 会话：事件脚本启动成功 → [`RawSourceOutcome::Ready`]；失败
+    ///   （/Scripting 未就绪、一次性队列已被占用）→ [`RawSourceOutcome::Failed`]。
+    /// - DDE Treeland / Mutter 未接线（T3b 范围外）→ [`RawSourceOutcome::Unavailable`]，
+    ///   daemon 保持查询差分兜底。
+    async fn raw_source_outcome(&self) -> RawSourceOutcome {
+        match self {
+            Self::Kwin(c) => match c.subscribe_raw().await {
+                Ok(src) => RawSourceOutcome::Ready(src),
+                Err(e) => RawSourceOutcome::Failed(e.to_string()),
+            },
+            Self::Dde(_) | Self::Mutter(_) => RawSourceOutcome::Unavailable,
+        }
+    }
 }
-
 /// DDE 合成器形态 → 事件源标签（§18.1 映射；deepin-kwin 复用 org_kde
 /// 协议，与 KWinWayland 同源，不得误标 Treeland）。
 fn dde_event_source(kind: CompositorKind) -> event::EventSource {
@@ -109,12 +132,31 @@ fn mutter_event_source(kind: GnomePathKind) -> event::EventSource {
     }
 }
 
+/// 构造窗口信息解析器（§18.3 `resolve_window_info_by_id`）：归一化 open/focus
+/// 原始事件时按 id 回查完整 [`WindowInfo`]。捕获合成器的 `Arc` 克隆，返回
+/// `'static` future——归一化 task 的生命周期与 daemon 的 `&mut` 借用解耦。
+fn window_resolver(
+    compositor: std::sync::Arc<CompositorBackend>,
+) -> event::normalize::WindowResolver {
+    std::sync::Arc::new(move |native_id: &str| {
+        let comp = std::sync::Arc::clone(&compositor);
+        let native_id = native_id.to_string();
+        Box::pin(async move {
+            let id = agent_shell_core::types::WindowId {
+                native_id,
+                de_type: comp.de_type(),
+            };
+            comp.as_dyn().get_window_info(&id).await.ok()
+        })
+    })
+}
+
 /// 缓存条目有效期。T3b（EventHub 归一化）落地后由事件失效替代。
 const CACHE_TTL: Duration = Duration::from_secs(2);
 
 /// daemon 会话状态。
 pub struct Daemon {
-    compositor: Option<CompositorBackend>,
+    compositor: Option<std::sync::Arc<CompositorBackend>>,
     cache: Vec<WindowInfo>,
     cached_at: Option<Instant>,
     /// 空闲退出时限（§22.2：默认 30min，可配置）。
@@ -143,6 +185,9 @@ pub struct Daemon {
     pub ring: EventRing,
     /// 待 serve_connection 取走的订阅句柄（转发任务消费）。
     pub subscriptions: Vec<event::EventSubscription>,
+    /// 事件归一化管线是否已启动（首次 `events subscribe` 时惰性装配；
+    /// compositor 原始事件队列仅可消费一次，二次订阅不重复取流）。
+    event_pipeline_started: bool,
 }
 
 impl Daemon {
@@ -179,7 +224,8 @@ impl Daemon {
                 );
                 None
             }
-        };
+        }
+        .map(std::sync::Arc::new);
         // 输入降级链（libei → ydotool → XTest）：与 compositor 独立装配，
         // TTY/无后端会话探测失败返回 None，input.send 报 BackendUnavailable。
         let de_type = agent_shell_core::de_detection::detect_desktop_environment();
@@ -218,6 +264,7 @@ impl Daemon {
             hub: EventHub::new(),
             ring: EventRing::default(),
             subscriptions: Vec::new(),
+            event_pipeline_started: false,
         }
     }
 
@@ -256,39 +303,41 @@ impl Daemon {
             .list_windows()
             .await
             .map_err(|e| (agent_shell_rpc::RpcErrorCode::BackendError, e.to_string()))?;
-        // 窗口差异事件：把 list_windows 的刷新接回 `ring` 与 `hub.publish`，
-        // 使订阅者能收到事件、replay 有真实数据。首个快照（空缓存）会把
-        // 全部当前窗口计为 WindowOpened——符合事件语义（订阅/回放前窗口
-        // 即已存在）。后续刷新按 id 差分。事件源按会话类型标注（审查建议 4）。
-        // 注意：这是「查询驱动的轮询差分」，不是 §22.5 D4 的持续真实推送
-        // （EventNormalizer 装配留待 Phase 2/TSI-2317，见 docs 偏差记录）。
-        let source_kind = self.event_source_kind();
+        // 窗口差异事件（查询驱动轮询差分）：把 list_windows 的刷新接回
+        // `ring` 与 `hub.publish`，使订阅者能收到事件、replay 有真实数据。
+        // 管线激活后（`event_pipeline_started`）窗口事件由 EventNormalizer
+        // 持续推送（raw → 归一化 → hub+ring），此处差分不再发布——否则同一
+        // 窗口变化会被两条路径重复发布。差分仅作无管线（TTY / DDE Treeland /
+        // Mutter 未接线）时的兜底数据源。
         let now = Instant::now();
-        let opened = wins
-            .iter()
-            .filter(|w| {
-                !self
-                    .cache
-                    .iter()
-                    .any(|old| old.id.native_id == w.id.native_id)
-            })
-            .map(|w| event::DesktopEvent::WindowOpened {
-                info: w.clone(),
-                source: source_kind.clone(),
-                occurred_at: now,
-            });
-        let closed = self
-            .cache
-            .iter()
-            .filter(|old| !wins.iter().any(|w| w.id.native_id == old.id.native_id))
-            .map(|old| event::DesktopEvent::WindowClosed {
-                id: old.id.clone(),
-                source: source_kind.clone(),
-                occurred_at: now,
-            });
-        for evt in opened.chain(closed) {
-            self.ring.push(evt.clone());
-            self.hub.publish(evt).await;
+        if !self.event_pipeline_started {
+            let source_kind = self.event_source_kind();
+            let opened = wins
+                .iter()
+                .filter(|w| {
+                    !self
+                        .cache
+                        .iter()
+                        .any(|old| old.id.native_id == w.id.native_id)
+                })
+                .map(|w| event::DesktopEvent::WindowOpened {
+                    info: w.clone(),
+                    source: source_kind.clone(),
+                    occurred_at: now,
+                });
+            let closed = self
+                .cache
+                .iter()
+                .filter(|old| !wins.iter().any(|w| w.id.native_id == old.id.native_id))
+                .map(|old| event::DesktopEvent::WindowClosed {
+                    id: old.id.clone(),
+                    source: source_kind.clone(),
+                    occurred_at: now,
+                });
+            for evt in opened.chain(closed) {
+                self.ring.push(evt.clone());
+                self.hub.publish(evt).await;
+            }
         }
         self.cache = wins;
         self.cached_at = Some(now);
@@ -449,6 +498,71 @@ impl Daemon {
     pub fn subscriber_count(&self) -> usize {
         self.hub.subscriber_count()
     }
+    /// 惰性装配事件归一化管线（首次 `events subscribe` 时调用，幂等）。
+    ///
+    /// 取 compositor 原始事件源 → 注入 [`EventNormalizer`](event::EventNormalizer)
+    /// （共享 hub 与 ring）→ `run()`。返回：
+    /// - `Ok(())`：管线已装配，或此前已装配，或无原生流后端（差分兜底）；
+    /// - `Err(..)`：装配失败（KWin 脚本启动失败等），**未**置位启动标志，可重试。
+    pub async fn ensure_event_pipeline(
+        &mut self,
+    ) -> Result<(), (agent_shell_rpc::RpcErrorCode, String)> {
+        if self.event_pipeline_started {
+            return Ok(());
+        }
+        let Some(compositor) = self.compositor.as_ref().map(std::sync::Arc::clone) else {
+            // 无合成器（TTY/headless）：无原生事件流，订阅仍走查询差分兜底。
+            return Ok(());
+        };
+        let resolver = window_resolver(std::sync::Arc::clone(&compositor));
+        let outcome = compositor.raw_source_outcome().await;
+        self.apply_assembly_outcome(resolver, outcome)
+    }
+
+    /// 根据装配结果更新管线状态（纯逻辑，可单测注入任意 outcome）。
+    ///
+    /// 仅 [`RawSourceOutcome::Ready`] 置位启动标志；`Failed` 返回 Err 且不置位，
+    /// 使下次订阅可重试；`Unavailable`（无原生流后端）保持差分兜底。
+    fn apply_assembly_outcome(
+        &mut self,
+        resolver: event::normalize::WindowResolver,
+        outcome: RawSourceOutcome,
+    ) -> Result<(), (agent_shell_rpc::RpcErrorCode, String)> {
+        match outcome {
+            RawSourceOutcome::Ready(source) => {
+                Self::install_pipeline(&self.hub, &self.ring, resolver, source);
+                self.event_pipeline_started = true;
+                Ok(())
+            }
+            RawSourceOutcome::Unavailable => Ok(()),
+            RawSourceOutcome::Failed(msg) => {
+                Err((agent_shell_rpc::RpcErrorCode::BackendUnavailable, msg))
+            }
+        }
+    }
+
+    /// 装配归一化器并启动（可注入 source 的纯装配核心，便于单测）。
+    fn install_pipeline(
+        hub: &EventHub,
+        ring: &EventRing,
+        resolver: event::normalize::WindowResolver,
+        source: Box<dyn event::RawSource>,
+    ) {
+        let mut normalizer = event::EventNormalizer::new(hub.clone())
+            .with_ring(ring.clone())
+            .with_resolver(resolver);
+        normalizer.add_source(source);
+        normalizer.run();
+    }
+
+    /// 测试辅助：剥离合成器（模拟 headless/无显示服务器会话），使事件管线
+    /// 装配走「无原生流 → 查询差分兜底」的确定性成功路径，测试不依赖真实
+    /// KWin 运行状态。
+    #[cfg(test)]
+    pub(crate) fn with_compositor_none(mut self) -> Self {
+        self.compositor = None;
+        self
+    }
 }
 
 /// 当前会话的 DE 归类（与 core 检测同口径）。
@@ -598,6 +712,7 @@ mod tests {
             hub: EventHub::new(),
             ring: EventRing::default(),
             subscriptions: Vec::new(),
+            event_pipeline_started: false,
         };
         assert_eq!(d.compositor_name(), "unavailable");
     }
@@ -611,5 +726,65 @@ mod tests {
         let events = d.ring.snapshot();
         assert!(!events.is_empty());
         assert_eq!(events.len(), 1);
+    }
+
+    /// 假原始事件源：发一条 [`event::RawEvent::KWinWindowRemoved`]（无需 resolver
+    /// 即可归一化为 `WindowClosed`），用于装配链路的可注入单测。
+    struct FakeRawSource;
+
+    impl event::RawSource for FakeRawSource {
+        fn source_name(&self) -> &'static str {
+            "fake-kwin"
+        }
+        fn source_kind(&self) -> event::EventSource {
+            event::EventSource::KWinWayland
+        }
+        fn events(&self) -> futures::stream::BoxStream<'static, event::RawEvent> {
+            use futures::{stream, StreamExt};
+            stream::iter(std::iter::once(event::RawEvent::KWinWindowRemoved {
+                id: "42".into(),
+            }))
+            .boxed()
+        }
+    }
+
+    /// 空解析器：归一化 open/focus 事件时返回 `None`（本测试只走 close 路径）。
+    fn noop_resolver() -> event::normalize::WindowResolver {
+        std::sync::Arc::new(|_id: &str| {
+            Box::pin(async { None::<agent_shell_core::types::WindowInfo> })
+        })
+    }
+
+    /// 装配成功 → 归一化事件入 daemon ring（验收标准「subscribe 后 replay 返回
+    /// 真实归一化事件」的装配链路覆盖，TSI-3033 审查 #5）。
+    #[tokio::test]
+    async fn install_pipeline_feeds_normalized_events_into_ring() {
+        let d = Daemon::connect(Duration::from_secs(1)).await;
+        Daemon::install_pipeline(&d.hub, &d.ring, noop_resolver(), Box::new(FakeRawSource));
+        // 等归一化 task flush。
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let events = d.ring.snapshot();
+        assert_eq!(events.len(), 1, "装配成功应把归一化事件入 ring");
+        assert!(matches!(
+            events.first(),
+            Some(event::DesktopEvent::WindowClosed { id, .. }) if id.native_id == "42"
+        ));
+    }
+
+    /// 首启失败不置位启动标志（可重试）；成功后才置位（审查 #2 回归）。
+    #[tokio::test]
+    async fn failed_assembly_keeps_pipeline_retryable() {
+        let mut d = Daemon::connect(Duration::from_secs(1)).await;
+        let resolver = noop_resolver();
+        let err = d.apply_assembly_outcome(
+            resolver.clone(),
+            RawSourceOutcome::Failed("scripting not ready".into()),
+        );
+        assert!(err.is_err(), "装配失败必须返回错误");
+        assert!(!d.event_pipeline_started, "失败不得置位启动标志");
+        let ok =
+            d.apply_assembly_outcome(resolver, RawSourceOutcome::Ready(Box::new(FakeRawSource)));
+        assert!(ok.is_ok());
+        assert!(d.event_pipeline_started, "成功应置位启动标志");
     }
 }

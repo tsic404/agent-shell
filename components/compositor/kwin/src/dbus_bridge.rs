@@ -306,6 +306,14 @@ impl KWinBridge {
             .take()
             .map(|rx| KWinEventStream { rx: Mutex::new(rx) })
     }
+
+    /// 取长驻事件推送队列的**原始**接收端（`subscribe_raw` 用；仅首次有效）。
+    ///
+    /// 与 [`take_event_stream`] 共享同一底层队列——两者仅能取走一次，保证
+    /// 近似映射流（`KWinEventStream`）与归一化流（`KWinRawSource`）互斥。
+    pub(crate) async fn take_raw_event_rx(&self) -> Option<mpsc::UnboundedReceiver<Value>> {
+        self.event_rx.lock().await.take()
+    }
 }
 
 /// `com.agent_shell.Response` 响应服务（§7.3 策略 B，升级版）。

@@ -897,12 +897,15 @@ fn stub_ok(name: &str) -> RpcResult {
 /// 推送在 `serve_connection` 层：dispatch 返回订阅句柄后由主循环 spawn
 /// 转发任务，把匹配事件序列化为 JSON-RPC notification 写入 stdout。
 ///
-/// **当前范围（Phase 2/TSI-2317）**：`EventNormalizer` 尚未装配，KWin
-/// `subscribe()` 未被 daemon 消费——事件仅在 `windows_list` 触发窗口缓存
-/// 刷新时经差分产生。因此 `events subscribe` 只交付 `subscriber_id` 协议
-/// 与 replay 数据源，不含持续的原始事件流推送。偏差详见设计文档 §22.5。
+/// 首次订阅时惰性装配事件归一化管线（`ensure_event_pipeline`）：取 compositor
+/// 原始事件源 → `EventNormalizer` → hub + ring，使持续推送与 `--replay`
+/// 均有真实归一化事件（TSI-3033）。
 async fn events_subscribe(d: &mut Daemon, req: &Request) -> RpcResult {
     let filter = parse_event_filter(req)?;
+    // 先惰性装配管线：失败（KWin 脚本启动失败等）返回 BackendUnavailable，
+    // 不创建悬空订阅、不假报成功——否则客户端拿到 subscriber_id 却永远
+    // 收不到事件、replay 恒空（验收标准 2 静默失败）。
+    d.ensure_event_pipeline().await?;
     let sub = d.hub.subscribe(filter);
     let id = sub.id().to_string();
     // 订阅句柄暂存于 daemon，由 serve_connection 取走并 spawn 转发任务。
@@ -2223,7 +2226,7 @@ mod tests {
     }
     #[tokio::test]
     async fn events_subscribe_returns_subscriber_id() {
-        let mut d = test_daemon().await;
+        let mut d = test_daemon().await.with_compositor_none();
         let resp = dispatch(&mut d, &req(method::EVENTS_SUBSCRIBE, None)).await;
         let v = resp.result.expect("subscribe ok");
         let id = v.get("subscriber_id").and_then(|v| v.as_str()).expect("id");

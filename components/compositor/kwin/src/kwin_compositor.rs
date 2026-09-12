@@ -249,8 +249,7 @@ impl KWinCompositor {
         lines.push(if event_loaded {
             "✓ 事件脚本    : loaded (workspace.windowAdded OK)".to_string()
         } else {
-            "⚠ 事件脚本    : 可选（T3b 待办；daemon 未装配事件归一化管线，subscribe 未接线）"
-                .to_string()
+            "⚠ 事件脚本    : 未加载（懒启动，首次 events subscribe 时装配）".to_string()
         });
         lines
     }
@@ -397,6 +396,46 @@ impl KWinCompositor {
                 v.get("error").and_then(Value::as_str).unwrap_or("unknown")
             )))
         }
+    }
+    /// 确保长驻事件脚本在跑（幂等；首次 subscribe/subscribe_raw 时加载）。
+    ///
+    /// 订阅前刷新 /Scripting 探测（TSI-2374）：启动早期未就绪时由
+    /// `spawn_event_script` 内部的重试探测兜底，这里只做缓存预热。
+    async fn ensure_event_monitor(&self) -> Result<()> {
+        let _ = self.ensure_scripting_probe().await;
+        let mut handle = self.event_handle.lock().await;
+        if handle.is_none() {
+            // 幂等启动；句柄（含 StagedScript 暂存文件）原样保存在组件内
+            // 直到 stop/drop——不得重建副本，否则暂存文件被提前 Drop 删除。
+            *handle = Some(
+                crate::event_script::spawn_event_monitor(&self.bridge, self.version.is_v6())
+                    .await?,
+            );
+        }
+        Ok(())
+    }
+
+    /// 订阅原始事件流（§18.2）：确保事件脚本在跑，返回其 [`RawSource`]
+    /// 适配器，交由 daemon 的 `EventNormalizer` 归一化后 fan-out + 入 ring。
+    ///
+    /// 与 [`CompositorComponent::subscribe`] 共享同一底层队列，两者仅能成功
+    /// 一次——daemon 侧装配归一化管线用本方法取原始事件源。
+    pub async fn subscribe_raw(
+        &self,
+    ) -> agent_shell_core::error::Result<Box<dyn event::RawSource>> {
+        // 先确保事件脚本在跑（幂等，内部自带 /Scripting 重试探测），成功后再
+        // 取一次性接收端——若先取流后启动脚本，脚本启动失败（5s 探测窗口内
+        // /Scripting 未就绪、或 D-Bus 调用失败）时接收端随栈销毁，一次性事件
+        // 队列永久丢失，此后订阅只会命中「already subscribed」无法恢复。
+        self.ensure_event_monitor().await?;
+        let rx = self.bridge.take_raw_event_rx().await.ok_or_else(|| {
+            AgentShellError::BackendUnavailable("kwin event stream already subscribed".to_string())
+        })?;
+        let kind = match self.session_kind() {
+            SessionKind::X11 => event::EventSource::KWinX11,
+            SessionKind::Wayland => event::EventSource::KWinWayland,
+        };
+        Ok(Box::new(crate::event_source::KWinRawSource::new(rx, kind)))
     }
 }
 
@@ -765,29 +804,20 @@ impl CompositorComponent for KWinCompositor {
             })
             .collect())
     }
-
     /// 订阅事件流：确保长驻 event_monitor.js 在跑，返回其读取端。
     ///
-    /// 返回的是**原始推送流**（`KWinEventStream`）：每条为 event_monitor.js
-    /// 的 sendResult JSON（`{"event": "windowOpened", "id": ...}`）。
-    /// `capabilities().window_events` 为 false——DesktopEvent 归一化在 T3b
-    /// 落地；调用方若仍订阅，拿到的是明确的原始流而非永不产出的空壳。
+    /// 返回的是**近似映射流**（`KWinEventStream`）：每条为 event_monitor.js
+    /// 的 sendResult JSON（`{"event": "windowOpened", "id": ...}`）按最小集
+    /// 近似映射为 core `DesktopEvent`。daemon 侧归一化管线走
+    /// [`subscribe_raw`](Self::subscribe_raw) 取原始事件源；本方法保留给
+    /// 直接消费近似流的调用方（如 DDE deepin-kwin 委托）。
     async fn subscribe(&self) -> agent_shell_core::error::Result<Box<dyn EventStream>> {
+        // 与 `subscribe_raw` 同款顺序：先确保事件脚本在跑，成功后再取一次性
+        // 接收端，避免脚本启动失败时接收端随栈销毁、事件队列永久丢失。
+        self.ensure_event_monitor().await?;
         let stream = self.bridge.take_event_stream().await.ok_or_else(|| {
             AgentShellError::BackendUnavailable("kwin event stream already subscribed".to_string())
         })?;
-        // 订阅前刷新 /Scripting 探测（TSI-2374）：启动早期未就绪时由
-        // spawn_event_script 内部的重试探测兜底，这里只做缓存预热。
-        let _ = self.ensure_scripting_probe().await;
-        let mut handle = self.event_handle.lock().await;
-        if handle.is_none() {
-            // 幂等启动；句柄（含 StagedScript 暂存文件）原样保存在组件内
-            // 直到 stop/drop——不得重建副本，否则暂存文件被提前 Drop 删除。
-            *handle = Some(
-                crate::event_script::spawn_event_monitor(&self.bridge, self.version.is_v6())
-                    .await?,
-            );
-        }
         Ok(Box::new(stream))
     }
 }
@@ -988,18 +1018,22 @@ mod tests {
         assert!(!has_ready_bridge(&lines));
     }
 
-    /// doctor 事件脚本行如实标注为可选（T3b 待办），而非以「未装配/未接线」
-    /// 呈现为待修复缺口（TSI-2912）。
+    /// doctor 事件脚本行如实标注为「未加载（懒启动）」，不再以「T3b 待办」
+    /// 呈现（T3b 归一化管线已装配，见 TSI-3033）。
     #[tokio::test]
-    async fn doctor_event_script_line_marks_optional() {
+    async fn doctor_event_script_line_marks_unloaded() {
         let bus = TestBus::start().await;
         let comp = KWinCompositor::for_test(bridge(&bus).await, None);
         let lines = comp.doctor_lines();
         assert!(
             lines
                 .iter()
-                .any(|l| l.contains("⚠ 事件脚本") && l.contains("可选")),
-            "event script line must mark optional: {lines:#?}"
+                .any(|l| l.contains("⚠ 事件脚本") && l.contains("未加载")),
+            "event script line must mark unloaded: {lines:#?}"
+        );
+        assert!(
+            !lines.iter().any(|l| l.contains("T3b")),
+            "event script line must not mention T3b: {lines:#?}"
         );
     }
 }

@@ -12,10 +12,10 @@
 //!   `org.kde.KWin` Scripting 加载 JS 脚本，callDBus 回传结果。
 //!
 //! 能力够的走协议，协议不够的走 Scripting（§7.2 通道选择矩阵）。
-
 pub mod dbus_bridge;
 pub mod error;
 pub mod event_script;
+pub mod event_source;
 pub mod scripts;
 pub mod version;
 pub mod wayland;
