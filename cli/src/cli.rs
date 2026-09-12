@@ -850,38 +850,10 @@ fn split_at_value(args: &[std::ffi::OsString]) -> bool {
         .any(|w| w[0] == std::ffi::OsStr::new("--at") && !w[1].to_string_lossy().contains(','))
 }
 
-/// 解析人类可读时长（`windows wait --timeout`）为毫秒。
-///
-/// 支持单位后缀 `ms`/`s`/`m`/`h`（大小写不敏感，如 `10s`、`500ms`、`2m`）；
-/// 无后缀的裸数字按毫秒处理，与 `--timeout-ms` 语义一致。数值须为非负整数，
-/// 乘法溢出或非法单位返回带示例的错误串。
-pub fn parse_duration(spec: &str) -> Result<u64, String> {
-    let s = spec.trim();
-    let (num, unit) = split_duration(s);
-    let value: u64 = num
-        .parse()
-        .map_err(|_| format!("非法时长 `{spec}`：期望形如 `10s`、`500ms`、`2m`"))?;
-    let multiplier_ms = match unit.to_ascii_lowercase().as_str() {
-        "" | "ms" => 1,
-        "s" => 1_000,
-        "m" => 60_000,
-        "h" => 3_600_000,
-        other => return Err(format!("非法时长单位 `{other}`（支持 ms/s/m/h）")),
-    };
-    value
-        .checked_mul(multiplier_ms)
-        .ok_or_else(|| format!("时长超出范围 `{spec}`（期望形如 `10s`、`500ms`、`2m`）"))
-}
-
-/// 把时长串切成 (数值部分, 单位部分)：首个非 ASCII 数字处切分。
-fn split_duration(s: &str) -> (&str, &str) {
-    let idx = s
-        .char_indices()
-        .find(|(_, c)| !c.is_ascii_digit())
-        .map(|(i, _)| i)
-        .unwrap_or(s.len());
-    (&s[..idx], &s[idx..])
-}
+/// 人类可读时长解析——已迁至 `agent-shell-rpc::duration`（CLI 与 MCP 共享，
+/// TSI-3060）。此处 re-export 保持 `value_parser = parse_duration` 与调用点
+/// 不变。
+pub use agent_shell_rpc::duration::parse_duration;
 
 #[cfg(test)]
 mod tests {
@@ -935,28 +907,6 @@ mod tests {
     fn rejects_unknown_key() {
         assert!(parse_key_combo("nosuchkey").is_err());
         assert!(parse_key_combo("ctrl+alt").is_err());
-    }
-
-    #[test]
-    fn parses_duration_units_to_ms() {
-        assert_eq!(parse_duration("10s").unwrap(), 10_000);
-        assert_eq!(parse_duration("500ms").unwrap(), 500);
-        assert_eq!(parse_duration("2m").unwrap(), 120_000);
-        assert_eq!(parse_duration("1h").unwrap(), 3_600_000);
-        // 裸数字 = 毫秒，与 `--timeout-ms` 语义一致。
-        assert_eq!(parse_duration("15000").unwrap(), 15_000);
-        // 大小写不敏感，前后空白容忍。
-        assert_eq!(parse_duration(" 3S ").unwrap(), 3_000);
-    }
-
-    #[test]
-    fn rejects_invalid_duration() {
-        assert!(parse_duration("").is_err());
-        assert!(parse_duration("abc").is_err());
-        assert!(parse_duration("10x").is_err());
-        assert!(parse_duration("-5s").is_err());
-        assert!(parse_duration("18446744073709551616s").is_err());
-        assert!(parse_duration("18446744073709551615s").is_err());
     }
 
     #[test]

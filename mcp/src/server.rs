@@ -185,7 +185,11 @@ impl AgentShellMcpServer {
                 "等待窗口出现，带超时",
                 json!({
                     "type": "object",
-                    "properties": { "app_id": {"type":"string"}, "timeout_ms": {"type":"integer","default":15000} },
+                    "properties": {
+                        "app_id": {"type":"string"},
+                        "timeout": {"type":"string", "description": "人类可读超时时长（如 `10s`、`500ms`、`2m`、`1h`），与 CLI `--timeout` 对齐；与 `timeout_ms` 二选一"},
+                        "timeout_ms": {"type":"integer","default":15000, "description": "超时毫秒（默认 15000）；已被 `timeout` 取代，保留兼容"}
+                    },
                     "required": ["app_id"]
                 }),
             ),
@@ -365,10 +369,7 @@ impl AgentShellMcpServer {
             .get("app_id")
             .and_then(|v| v.as_str())
             .ok_or("missing required param: app_id")?;
-        let timeout_ms = args
-            .get("timeout_ms")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(15000);
+        let timeout_ms = Self::resolve_timeout_ms(args)?;
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
 
         loop {
@@ -385,11 +386,31 @@ impl AgentShellMcpServer {
                 }
             }
 
-            if tokio::time::Instant::now() >= deadline {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
                 return Ok(json!({"found": false, "app_id": app_id, "timeout_ms": timeout_ms}));
             }
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            tokio::time::sleep(remaining.min(std::time::Duration::from_millis(200))).await;
         }
+    }
+
+    /// wait_for_window 的 `timeout`（人类可读时长）与 `timeout_ms`（毫秒）
+    /// 二选一解析，缺省 15000ms。二者同时给出报错；`timeout` 复用 CLI
+    /// `--timeout` 的 `agent_shell_rpc::duration::parse_duration` 语义（TSI-3060）。
+    fn resolve_timeout_ms(args: &Value) -> Result<u64, String> {
+        let timeout = args.get("timeout");
+        let timeout_ms = args.get("timeout_ms");
+        if timeout.is_some() && timeout_ms.is_some() {
+            return Err("timeout 与 timeout_ms 二选一，不能同时提供".to_string());
+        }
+        if let Some(v) = timeout {
+            let spec = v
+                .as_str()
+                .ok_or("timeout 必须为字符串（如 `10s`、`500ms`、`2m`、`1h`）")?;
+            return agent_shell_rpc::duration::parse_duration(spec);
+        }
+        // 原 timeout_ms 行为保持不变：非整数按缺省 15000 处理。
+        Ok(timeout_ms.and_then(|v| v.as_u64()).unwrap_or(15_000))
     }
 }
 
@@ -601,6 +622,59 @@ mod tests {
         assert!(
             AgentShellMcpServer::map_tool("wait_for_window", &json!({"app_id": "x"})).is_none()
         );
+    }
+
+    #[test]
+    fn resolve_timeout_ms_defaults_to_15000() {
+        assert_eq!(
+            AgentShellMcpServer::resolve_timeout_ms(&json!({})).unwrap(),
+            15_000
+        );
+    }
+
+    #[test]
+    fn resolve_timeout_ms_parses_human_readable_timeout() {
+        assert_eq!(
+            AgentShellMcpServer::resolve_timeout_ms(&json!({"timeout": "10s"})).unwrap(),
+            10_000
+        );
+    }
+
+    #[test]
+    fn resolve_timeout_ms_keeps_timeout_ms_compat() {
+        assert_eq!(
+            AgentShellMcpServer::resolve_timeout_ms(&json!({"timeout_ms": 500})).unwrap(),
+            500
+        );
+    }
+
+    #[test]
+    fn resolve_timeout_ms_falls_back_on_non_integer_timeout_ms() {
+        // 兼容契约：timeout_ms 非整数（浮点/字符串）按缺省 15000 处理，
+        // 与原 `as_u64().unwrap_or(15000)` 行为一致（不回退）。
+        assert_eq!(
+            AgentShellMcpServer::resolve_timeout_ms(&json!({"timeout_ms": 500.5})).unwrap(),
+            15_000
+        );
+        assert_eq!(
+            AgentShellMcpServer::resolve_timeout_ms(&json!({"timeout_ms": "500"})).unwrap(),
+            15_000
+        );
+    }
+
+    #[test]
+    fn resolve_timeout_ms_rejects_both() {
+        assert!(AgentShellMcpServer::resolve_timeout_ms(&json!({
+            "timeout": "10s",
+            "timeout_ms": 500
+        }))
+        .is_err());
+    }
+
+    #[test]
+    fn resolve_timeout_ms_rejects_invalid_timeout() {
+        assert!(AgentShellMcpServer::resolve_timeout_ms(&json!({"timeout": "abc"})).is_err());
+        assert!(AgentShellMcpServer::resolve_timeout_ms(&json!({"timeout": 1000})).is_err());
     }
 
     #[test]
