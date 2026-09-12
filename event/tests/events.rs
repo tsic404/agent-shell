@@ -747,6 +747,37 @@ async fn reconnect_replays_from_normalizer_ring() {
     assert_eq!(got, 5);
 }
 
+/// `with_ring` 注入共享环：归一化发布的事件同时进入调用方的 replay 缓冲，
+/// 与 `norm.ring()` 指向同一底层 Arc——daemon 无需维护双份 ring。
+#[tokio::test]
+async fn with_ring_shares_replay_buffer_with_caller() {
+    struct CloseSource;
+    impl RawSource for CloseSource {
+        fn source_name(&self) -> &'static str {
+            "close-src"
+        }
+        fn source_kind(&self) -> EventSource {
+            EventSource::KWinWayland
+        }
+        fn events(&self) -> futures::stream::BoxStream<'static, RawEvent> {
+            stream::iter((0..3).map(|i| RawEvent::SwayWindowClose { id: i.to_string() })).boxed()
+        }
+    }
+
+    let hub = EventHub::with_capacity(8);
+    let caller_ring = EventRing::new(16);
+    let mut norm = EventNormalizer::new(hub.clone()).with_ring(caller_ring.clone());
+    norm.add_source(Box::new(CloseSource));
+    norm.run();
+    // 等 task flush
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(caller_ring.len(), 3, "注入的共享环应收到归一化事件");
+    assert!(matches!(
+        caller_ring.snapshot().first(),
+        Some(DesktopEvent::WindowClosed { id, .. }) if id.native_id == "0"
+    ));
+}
+
 /// 修复审查问题 3 回归：停滞订阅者不得阻塞 High 发布，也不得队头阻塞
 /// 其他订阅者；超时后降级丢弃并计数。
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -120,6 +120,15 @@ impl EventNormalizer {
         self
     }
 
+    /// 注入外部环形缓冲（与 daemon 的 `events --replay` 数据源共享）。
+    ///
+    /// 默认新建 [`EventRing`]；装配层（daemon）需要归一化事件进入其既有
+    /// replay 缓冲时注入共享环，避免维护双份 ring 导致 replay 漏掉事件。
+    pub fn with_ring(mut self, ring: crate::ring::EventRing) -> Self {
+        self.ring = ring;
+        self
+    }
+
     /// 注册一个事件源。
     pub fn add_source(&mut self, source: Box<dyn RawSource>) -> &mut Self {
         self.sources.push(source);

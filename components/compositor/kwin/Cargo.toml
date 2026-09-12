@@ -8,6 +8,7 @@ description = "agent-shell KWin compositor component (org_kde_* Wayland protocol
 
 [dependencies]
 agent-shell-core.workspace = true
+agent-shell-event.workspace = true
 agent-shell-compositor-wayland-core.workspace = true
 agent-shell-displayserver-wayland.workspace = true
 agent-shell-displayserver-x11.workspace = true
@@ -19,6 +20,7 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+futures.workspace = true
 tracing.workspace = true
 uuid = { version = "1", features = ["v4"] }
 tempfile.workspace = true
