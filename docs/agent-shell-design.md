@@ -3122,7 +3122,7 @@ router.register(Tool::new("wait_for_window")
         "properties": {
             "app_id": {"type": "string"},
             "timeout": {"type": "string", "description": "人类可读超时时长（如 10s/500ms/2m/1h），与 CLI --timeout 对齐；与 timeout_ms 二选一"},
-            "timeout_ms": {"type": "integer", "default": 15000, "description": "超时毫秒（默认 15000）；已被 timeout 取代，保留兼容"}
+            "timeout_ms": {"type": "integer", "minimum": 0, "default": 15000, "description": "超时毫秒（默认 15000）；已被 timeout 取代，保留兼容"}
         },
         "required": ["app_id"]
     })));
