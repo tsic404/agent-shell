@@ -3706,6 +3706,21 @@ strip = true
 
 系统依赖（非 Rust crate）：`xdg-desktop-portal`（必）、`pipewire`（必）、`systemd`（启用 systemd 组件时）。
 
+### 20.7 glibc 兼容与静态构建
+
+在 glibc 较新的本机（如 Arch glibc 2.44）构建出的二进制会引用 `GLIBC_2.29` 及
+以上符号版本，无法在 DDE 20（glibc 2.28）/ DDE 25（glibc 2.38）真机加载。
+`agent-shell`（CLI）、`agent-shell-rootd`、`agent-shell-mcp` 均为纯 Rust，无原生
+C 库依赖，可静态链接 musl 以完全摆脱 glibc 门槛：
+
+```sh
+./packaging/musl/build-musl.sh
+```
+
+`agent-shell-daemon` 运行时动态链接 `libpipewire` / `libwayland-client`（C 库），
+无法静态化，需在目标 glibc 上构建（DDE 25 → Debian 11；DDE 20 → UOS 20 本机）。
+完整矩阵见 `packaging/musl/README.md`。
+
 ## 附录 A：模块依赖图
 
 ```
