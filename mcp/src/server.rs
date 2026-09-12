@@ -188,7 +188,7 @@ impl AgentShellMcpServer {
                     "properties": {
                         "app_id": {"type":"string"},
                         "timeout": {"type":"string", "description": "人类可读超时时长（如 `10s`、`500ms`、`2m`、`1h`），与 CLI `--timeout` 对齐；与 `timeout_ms` 二选一"},
-                        "timeout_ms": {"type":"integer","default":15000, "description": "超时毫秒（默认 15000）；已被 `timeout` 取代，保留兼容"}
+                        "timeout_ms": {"type":"integer","minimum":0,"default":15000, "description": "超时毫秒（默认 15000）；已被 `timeout` 取代，保留兼容"}
                     },
                     "required": ["app_id"]
                 }),
@@ -409,7 +409,14 @@ impl AgentShellMcpServer {
                 .ok_or("timeout 必须为字符串（如 `10s`、`500ms`、`2m`、`1h`）")?;
             return agent_shell_rpc::duration::parse_duration(spec);
         }
-        // 原 timeout_ms 行为保持不变：非整数按缺省 15000 处理。
+        // timeout_ms 为负整数时显式报错（schema 亦声明 minimum:0）；非整数
+        // （浮点/字符串）仍按缺省 15000 处理，与原 as_u64().unwrap_or(15000)
+        // 行为一致（不回退）。
+        if let Some(n) = timeout_ms.and_then(|v| v.as_i64()) {
+            if n < 0 {
+                return Err("timeout_ms 必须为非负整数".to_string());
+            }
+        }
         Ok(timeout_ms.and_then(|v| v.as_u64()).unwrap_or(15_000))
     }
 }
@@ -588,6 +595,22 @@ mod tests {
     }
 
     #[test]
+    fn test_wait_for_window_timeout_ms_schema_minimum_zero() {
+        // 契约声明：timeout_ms 下限为 0，负整数在 MCP schema 层即被拒绝。
+        let tools = AgentShellMcpServer::build_tools();
+        let tool = tools
+            .iter()
+            .find(|t| t.name.as_ref() == "wait_for_window")
+            .expect("wait_for_window tool registered");
+        let timeout_ms = tool
+            .input_schema
+            .get("properties")
+            .and_then(|p| p.get("timeout_ms"))
+            .expect("wait_for_window schema has timeout_ms");
+        assert_eq!(timeout_ms.get("minimum").and_then(|v| v.as_i64()), Some(0));
+    }
+
+    #[test]
     fn test_map_tool_list_windows() {
         let (m, p) =
             AgentShellMcpServer::map_tool("list_windows", &json!({"app_id": "firefox"})).unwrap();
@@ -660,6 +683,13 @@ mod tests {
             AgentShellMcpServer::resolve_timeout_ms(&json!({"timeout_ms": "500"})).unwrap(),
             15_000
         );
+    }
+
+    #[test]
+    fn resolve_timeout_ms_rejects_negative_timeout_ms() {
+        // 负整数不再静默回落 15000：schema 声明 minimum:0，此处显式报错。
+        assert!(AgentShellMcpServer::resolve_timeout_ms(&json!({"timeout_ms": -5})).is_err());
+        assert!(AgentShellMcpServer::resolve_timeout_ms(&json!({"timeout_ms": -1})).is_err());
     }
 
     #[test]
