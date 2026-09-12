@@ -767,6 +767,9 @@ pub mod duration {
     /// 单位返回带示例的错误串。
     pub fn parse_duration(spec: &str) -> Result<u64, String> {
         let s = spec.trim();
+        if s.is_empty() {
+            return Err("空时长串（期望形如 `10s`、`500ms`、`2m`）".to_string());
+        }
         let (whole, frac, unit) = split_duration(s);
         let whole: u64 = whole
             .parse()
@@ -866,6 +869,16 @@ pub mod duration {
             assert!(parse_duration("1.").is_err());
             assert!(parse_duration("18446744073709551616s").is_err());
             assert!(parse_duration("18446744073709551615s").is_err());
+        }
+
+        #[test]
+        fn empty_or_whitespace_input_yields_readable_error() {
+            // TSI-3083：空串/仅空白输入报错串应为可读提示，而非空反引号。
+            for spec in ["", "   ", "\t\n", "  "] {
+                let err = parse_duration(spec).unwrap_err();
+                assert!(!err.contains("``"), "{spec:?} -> {err}");
+                assert!(err.contains("空时长串"), "{spec:?} -> {err}");
+            }
         }
 
         #[test]
