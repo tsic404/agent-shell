@@ -1,7 +1,12 @@
 #!/bin/sh
 # build-deb.sh — 构建 agent-shell + agent-shell-rootd deb 包（§20.2 打包）
 #
-# 前置：cargo build --release 已完成（产出 target/release/ 二进制）
+# 前置：target/release/ 下已有要打包的二进制。
+#
+#   - CLI / rootd / mcp（纯 Rust）→ ./packaging/musl/build-musl.sh（静态 musl，
+#     覆盖 DDE 20/25，见 packaging/musl/README.md）
+#   - daemon（动态链接 libpipewire）→ ./packaging/debian/build-daemon.sh
+#     （Debian 12 / glibc 2.36 兼容构建器，覆盖 DDE 25）
 #
 # 用法：./packaging/debian/build-deb.sh [target-dir]
 #

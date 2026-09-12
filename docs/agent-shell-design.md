@@ -3718,8 +3718,10 @@ C 库依赖，可静态链接 musl 以完全摆脱 glibc 门槛：
 ```
 
 `agent-shell-daemon` 运行时动态链接 `libpipewire` / `libwayland-client`（C 库），
-无法静态化，需在目标 glibc 上构建（DDE 25 → Debian 11；DDE 20 → UOS 20 本机）。
-完整矩阵见 `packaging/musl/README.md`。
+无法静态化，需在目标 glibc 兼容构建器产出（DDE 25 → Debian 12，见
+`packaging/debian/build-daemon.sh`）。注意 `pipewire`/`libspa` 0.10.1 要求
+pipewire 头 ≥ 0.3.65：Debian 11（0.3.19）无法构建，DDE 20（UOS 20 自带
+0.3.15）同样受此门槛阻塞。完整矩阵见 `packaging/musl/README.md`。
 
 ## 附录 A：模块依赖图
 

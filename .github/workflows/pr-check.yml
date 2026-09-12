@@ -89,3 +89,20 @@ jobs:
 
       - name: Check libspa-sys vendor sync
         run: bash scripts/check-libspa-sys-vendor.sh
+
+  # daemon 的 glibc 兼容构建：daemon 动态链接 libpipewire，不能 musl 静态化，
+  # 需在 glibc ≤ 2.38 的构建器产出。Debian 12（glibc 2.36, pipewire 0.3.65）是
+  # 满足「glibc ≤ DDE 25 的 2.38 且 pipewire ≥ 0.3.65（libspa 0.10.1 要求）」的
+  # 最老仍受支持发行版（TSI-3061）。
+  daemon-compat:
+    runs-on: ubuntu-latest
+    env:
+      DOCKER_BUILDKIT: "1"
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Build daemon on Debian 12 compat builder
+        run: bash packaging/debian/build-daemon.sh
+
+      - name: Verify daemon glibc requirement (<= DDE 25's 2.38)
+        run: bash scripts/check-daemon-glibc.sh target/release/agent-shell-daemon
