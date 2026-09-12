@@ -95,6 +95,8 @@ pub mod method {
     pub const A11Y_STATUS: &str = "a11y.status";
     /// 语义查询（role/name 过滤，§14.3）。
     pub const A11Y_QUERY: &str = "a11y.query";
+    /// 触发元素 AT-SPI Action（DoAction(0)，§14.4）。
+    pub const A11Y_ACTION: &str = "a11y.action";
     // ── 事件（§22.5 D4）──
     /// 订阅事件流（返回 subscriber_id；事件经 notification 推送）。
     pub const EVENTS_SUBSCRIBE: &str = "events.subscribe";

@@ -7,7 +7,7 @@
 //! - WindowStateCache（查询走缓存；T3b 事件归一化落地后改为事件驱动刷新，
 //!   当前以 TTL 短缓存近似——如实标注 `from_cache` 语义）
 
-use agent_shell_a11y::AtSpiComponent;
+use agent_shell_a11y::{A11yOps, AtSpiComponent};
 use agent_shell_backend_dde::{CompositorKind, DdeCompositor};
 use agent_shell_capture::CaptureDispatcher;
 use agent_shell_compositor_kwin::KWinCompositor;
@@ -136,7 +136,7 @@ pub struct Daemon {
     /// 恒 `None` 的失败工厂，使无 rootd 降级路径在所有主机确定性可测。
     pub rootd_connect: crate::rootd_client::RootdConnector,
     /// AT-SPI 组件（None = a11y bus 不可达，a11y.query 返回 BackendUnavailable）。
-    pub a11y: Option<AtSpiComponent>,
+    pub a11y: Option<std::sync::Arc<dyn A11yOps>>,
     /// 事件枢纽（§22.5 D4：订阅者 fan-out 中心）。
     pub hub: EventHub,
     /// 事件环形缓冲（§22.5 D4：CLI `events --replay`）。
@@ -211,7 +211,9 @@ impl Daemon {
             ime_session: crate::ime_session::ImeSession::new(),
             security,
             caller_id,
-            a11y: AtSpiComponent::probe().await,
+            a11y: AtSpiComponent::probe()
+                .await
+                .map(|a| std::sync::Arc::new(a) as std::sync::Arc<dyn A11yOps>),
             rootd_connect: crate::rootd_client::connector(),
             hub: EventHub::new(),
             ring: EventRing::default(),

@@ -2597,6 +2597,10 @@ impl SemanticLocator {
         out: &mut Vec<ElementNode>,
         depth: u8,
     ) { ... }
+
+    /// 按 AT-SPI `(bus_name, path)` 二元组定位元素（`a11y.action` 的 path
+    /// 定位）：整树 DFS 回查；`bus` 缺省时按 path 匹配并在歧义时报错。
+    pub async fn locate_by_path(&self, bus: Option<&str>, path: &str) -> Result<ElementNode> { ... }
 }
 ```
 

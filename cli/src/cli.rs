@@ -268,6 +268,24 @@ pub enum A11yCommand {
         #[arg(short = 'c', long = "fail-on-empty", default_value_t = false)]
         fail_on_empty: bool,
     },
+    /// 点击元素（触发 AT-SPI Action 主动作 DoAction(0)）
+    Click {
+        /// 元素对象路径（`a11y query` 结果中的 path 字段）
+        path: String,
+        /// 元素总线名（`a11y query` 结果中的 bus_name 字段）；跨应用同 path
+        /// 时用于消歧
+        #[arg(long)]
+        bus: Option<String>,
+    },
+    /// 执行元素 AT-SPI Action（主动作 DoAction(0)，与 click 同义）
+    Action {
+        /// 元素对象路径（`a11y query` 结果中的 path 字段）
+        path: String,
+        /// 元素总线名（`a11y query` 结果中的 bus_name 字段）；跨应用同 path
+        /// 时用于消歧
+        #[arg(long)]
+        bus: Option<String>,
+    },
 }
 
 // ───────────────────────── events ─────────────────────────

@@ -68,6 +68,7 @@ pub async fn dispatch(daemon: &mut Daemon, req: &Request) -> Response {
         method::SCREENSHOT_CAPTURE => screenshot_capture(daemon, req).await,
         method::A11Y_STATUS => a11y_status().await,
         method::A11Y_QUERY => a11y_query(daemon, req).await,
+        method::A11Y_ACTION => a11y_action(daemon, req).await,
         // ── 事件（§22.5 D4）──
         method::EVENTS_SUBSCRIBE => events_subscribe(daemon, req).await,
         method::EVENTS_UNSUBSCRIBE => events_unsubscribe(daemon, req).await,
@@ -182,6 +183,7 @@ fn operation_for(method_name: &str, params: &Option<Value>) -> Option<Operation>
         (method::INPUT_SEND, L1),
         (method::SCREENSHOT_CAPTURE, L2),
         (method::A11Y_STATUS, L0),
+        (method::A11Y_ACTION, L1),
         (method::EVENTS_SUBSCRIBE, L0),
         (method::EVENTS_UNSUBSCRIBE, L0),
         (method::EVENTS_REPLAY, L0),
@@ -718,14 +720,10 @@ async fn a11y_query(d: &Daemon, req: &Request) -> RpcResult {
         parent_role: None,
         parent_name: None,
     };
-    let nodes = component
-        .locator()
-        .locate(&target)
-        .await
-        .map_err(|e| match e {
-            AgentShellError::BackendUnavailable(msg) => (RpcErrorCode::BackendUnavailable, msg),
-            other => (RpcErrorCode::BackendError, other.to_string()),
-        })?;
+    let nodes = component.locate(&target).await.map_err(|e| match e {
+        AgentShellError::BackendUnavailable(msg) => (RpcErrorCode::BackendUnavailable, msg),
+        other => (RpcErrorCode::BackendError, other.to_string()),
+    })?;
     let elements = nodes
         .into_iter()
         .map(|n| A11yElementResult {
@@ -742,6 +740,66 @@ async fn a11y_query(d: &Daemon, req: &Request) -> RpcResult {
         elements,
     };
     Ok(serde_json::to_value(r).expect("A11yQueryResult serializable"))
+}
+
+/// 触发元素主动作（§14.4 `ElementActions::click` → Action.DoAction(0)）。
+///
+/// `(bus, path)` 定位：`a11y.query` 结果携带 `bus_name` 与 `path`——对象
+/// 路径只在 bus_name 内唯一，故 `bus` 传入时按二元组精确匹配；`bus` 缺省
+/// 时按 path 匹配，歧义（多 bus 同 path）返回 NotFound 而非静默取第一个。
+/// 参数校验先于后端可用性判定——坏载荷恒返回 InvalidParams，不被 AT-SPI
+/// 是否可达掩盖（CI/headless 环境回归锚定）。
+async fn a11y_action(d: &Daemon, req: &Request) -> RpcResult {
+    let params = params_of(req)?;
+    let path = match params.get("path") {
+        None | Some(Value::Null) => {
+            return Err((
+                RpcErrorCode::InvalidParams,
+                "a11y.action requires `path`".to_string(),
+            ))
+        }
+        Some(Value::String(s)) if s.is_empty() => {
+            return Err((
+                RpcErrorCode::InvalidParams,
+                "a11y.action path must be non-empty".to_string(),
+            ))
+        }
+        Some(Value::String(s)) => s.clone(),
+        Some(_) => {
+            return Err((
+                RpcErrorCode::InvalidParams,
+                "a11y.action path must be a string".to_string(),
+            ))
+        }
+    };
+    let bus = match params.get("bus") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(s)) if s.is_empty() => None,
+        Some(Value::String(s)) => Some(s.clone()),
+        Some(_) => {
+            return Err((
+                RpcErrorCode::InvalidParams,
+                "a11y.action bus must be a string".to_string(),
+            ))
+        }
+    };
+    let component = d.a11y.as_ref().ok_or((
+        RpcErrorCode::BackendUnavailable,
+        "AT-SPI unavailable".to_string(),
+    ))?;
+    let node = component
+        .locate_by_path(bus.as_deref(), &path)
+        .await
+        .map_err(|e| match e {
+            AgentShellError::WindowNotFound(msg) => (RpcErrorCode::NotFound, msg),
+            AgentShellError::BackendUnavailable(msg) => (RpcErrorCode::BackendUnavailable, msg),
+            other => (RpcErrorCode::BackendError, other.to_string()),
+        })?;
+    component.click(&node).await.map_err(|e| match e {
+        AgentShellError::BackendUnavailable(msg) => (RpcErrorCode::BackendUnavailable, msg),
+        other => (RpcErrorCode::BackendError, other.to_string()),
+    })?;
+    Ok(json!({ "ok": true }))
 }
 
 // ───────────────────────── 事件 / daemon / IME ─────────────────────────
@@ -1476,8 +1534,11 @@ async fn package_refresh(d: &mut Daemon) -> RpcResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agent_shell_a11y::{A11yOps, AtspiRole, AtspiState, ElementNode};
     use agent_shell_core::security::{AgentShellConfig, SecurityManager};
     use agent_shell_rpc::method;
+    use async_trait::async_trait;
+    use parking_lot::Mutex;
     use std::time::Duration;
 
     fn req(method_name: &str, params: Option<Value>) -> Request {
@@ -2020,6 +2081,146 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn a11y_action_non_string_path_is_invalid_params() {
+        // 参数校验先于后端可用性判定：headless（无 AT-SPI bus）环境也须
+        // 返回 InvalidParams，与 a11y.query 的类型校验约定一致。
+        let mut d = test_daemon().await;
+        for params in [json!({"path": 42}), json!({"path": null}), json!({})] {
+            let resp = dispatch(&mut d, &req(method::A11Y_ACTION, Some(params))).await;
+            assert_eq!(
+                resp.error.expect("error").code,
+                RpcErrorCode::InvalidParams as i32,
+                "bad path payload must be InvalidParams"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a11y_action_empty_path_is_invalid_params() {
+        let mut d = test_daemon().await;
+        let resp = dispatch(&mut d, &req(method::A11Y_ACTION, Some(json!({"path": ""})))).await;
+        assert_eq!(
+            resp.error.expect("error").code,
+            RpcErrorCode::InvalidParams as i32,
+            "empty path must be InvalidParams"
+        );
+    }
+
+    #[tokio::test]
+    async fn a11y_action_valid_path_passes_validation() {
+        // 合法 path 通过校验后进入后端判定：headless 无 a11y 组件 →
+        // BackendUnavailable；a11y 可达但树查询失败 → BackendError/NotFound。
+        // 关键断言：合法载荷绝不可判 InvalidParams（校验未误拒）。
+        let mut d = test_daemon().await;
+        let resp = dispatch(
+            &mut d,
+            &req(
+                method::A11Y_ACTION,
+                Some(json!({"path": "/org/a11y/atspi/accessible/42"})),
+            ),
+        )
+        .await;
+        match resp.error {
+            Some(err) => assert_ne!(
+                err.code,
+                RpcErrorCode::InvalidParams as i32,
+                "valid path must not be InvalidParams"
+            ),
+            None => {
+                let v = resp.result.expect("action ok");
+                assert_eq!(v.get("ok").and_then(|v| v.as_bool()), Some(true));
+            }
+        }
+    }
+
+    /// 假 a11y 组件：断言 `a11y.action` 的「定位 → 动作」成功派发链路
+    /// （建议项 4），无需真实 AT-SPI bus。
+    struct FakeA11y {
+        clicked: Mutex<Vec<(String, String)>>, // (bus_name, path)
+    }
+
+    #[async_trait]
+    impl A11yOps for FakeA11y {
+        async fn locate(
+            &self,
+            _target: &SemanticTarget,
+        ) -> agent_shell_core::error::Result<Vec<ElementNode>> {
+            Ok(vec![])
+        }
+
+        async fn locate_by_path(
+            &self,
+            bus: Option<&str>,
+            path: &str,
+        ) -> agent_shell_core::error::Result<ElementNode> {
+            Ok(ElementNode {
+                bus_name: bus.unwrap_or(":1.test").to_string(),
+                path: path.to_string(),
+                name: "probe-button".into(),
+                role: AtspiRole {
+                    code: 43,
+                    name: "push button".into(),
+                },
+                states: AtspiState(0),
+            })
+        }
+
+        async fn click(&self, element: &ElementNode) -> agent_shell_core::error::Result<()> {
+            self.clicked
+                .lock()
+                .push((element.bus_name.clone(), element.path.clone()));
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn a11y_action_requires_confirmation_when_whitelist_below_l1() {
+        // a11y.action 是副作用接口（Action.DoAction），L1；`"*"` 白名单只有
+        // L0 时必须确认——证明 A11Y_ACTION 已注册进 OPS 门禁表（阻塞项 2）。
+        let mut d = test_daemon().await;
+        d.security
+            .config
+            .permissions
+            .allow
+            .insert("*".into(), vec![PermissionLevel::L0]);
+        let resp = dispatch(
+            &mut d,
+            &req(method::A11Y_ACTION, Some(json!({"path": "/p"}))),
+        )
+        .await;
+        assert_eq!(
+            resp.error.expect("error").code,
+            RpcErrorCode::ConfirmationRequired as i32
+        );
+    }
+
+    #[tokio::test]
+    async fn a11y_action_dispatches_locate_then_click() {
+        // 建议项 4：注入 fake a11y 组件，断言定位 → 动作成功派发（而非仅在
+        // headless 下断言「非 InvalidParams」）。
+        let mut d = test_daemon().await;
+        let fake = std::sync::Arc::new(FakeA11y {
+            clicked: Mutex::new(Vec::new()),
+        });
+        d.a11y = Some(fake.clone() as std::sync::Arc<dyn A11yOps>);
+        let resp = dispatch(
+            &mut d,
+            &req(
+                method::A11Y_ACTION,
+                Some(json!({"path": "/btn", "bus": ":1.test"})),
+            ),
+        )
+        .await;
+        let v = resp.result.expect("action ok");
+        assert_eq!(v.get("ok").and_then(|v| v.as_bool()), Some(true));
+        let clicks = fake.clicked.lock();
+        assert_eq!(
+            clicks.as_slice(),
+            &[(":1.test".to_string(), "/btn".to_string())],
+            "click must be dispatched with (bus, path) tuple"
+        );
+    }
     #[tokio::test]
     async fn events_subscribe_returns_subscriber_id() {
         let mut d = test_daemon().await;

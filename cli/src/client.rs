@@ -544,6 +544,17 @@ impl DaemonClient {
             .await?;
         serde_json::from_value(v).map_err(|e| e.to_string())
     }
+
+    pub async fn a11y_action(&mut self, bus: Option<&str>, path: &str) -> Result<(), String> {
+        let mut params = serde_json::Map::new();
+        params.insert("path".into(), json!(path));
+        if let Some(b) = bus {
+            params.insert("bus".into(), json!(b));
+        }
+        self.call(method::A11Y_ACTION, Value::Object(params))
+            .await
+            .map(|_| ())
+    }
 }
 
 /// `a11y.query` 参数构造：`None` 条件省略该键，而非序列化为 JSON `null`；

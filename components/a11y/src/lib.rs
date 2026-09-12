@@ -18,6 +18,24 @@ pub mod component;
 pub mod semantic_locator;
 pub mod tree;
 
+use agent_shell_core::error::Result;
+use agent_shell_core::types::SemanticTarget;
+use async_trait::async_trait;
+
+/// daemon 侧 a11y 操作抽象（语义定位 + 元素动作）。
+///
+/// 生产实现为 [`AtSpiComponent`]；测试注入 fake 断言「定位 → 动作」的
+/// 成功派发，而非只在 headless 下断言参数校验（建议项 4）。
+#[async_trait]
+pub trait A11yOps: Send + Sync {
+    /// 按语义描述定位元素（`a11y.query`，§14.3）。
+    async fn locate(&self, target: &SemanticTarget) -> Result<Vec<ElementNode>>;
+    /// 按 `(bus_name, path)` 二元组定位元素（`a11y.action`，§14.4）。
+    async fn locate_by_path(&self, bus: Option<&str>, path: &str) -> Result<ElementNode>;
+    /// 触发元素主动作（`Action.DoAction(0)`，§14.4）。
+    async fn click(&self, element: &ElementNode) -> Result<()>;
+}
+
 pub use action::{ElementActions, PointerInput};
 pub use atspi_bridge::AtspiBridge;
 pub use component::AtSpiComponent;
