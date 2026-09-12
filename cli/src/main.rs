@@ -250,12 +250,13 @@ async fn windows(out: OutputFormat, c: &mut DaemonClient, cmd: cli::WindowsComma
                     emit_windows_json_or_table(out, std::slice::from_ref(w));
                     return Ok(0);
                 }
-                if std::time::Instant::now() >= deadline {
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                if remaining.is_zero() {
                     return Err(format!(
                         "window '{app_id}' did not appear within {timeout_ms}ms"
                     ));
                 }
-                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                tokio::time::sleep(remaining.min(std::time::Duration::from_millis(200))).await;
             }
         }
     }
