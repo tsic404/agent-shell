@@ -46,17 +46,24 @@ pub trait TokenStore: Send + Sync {
 /// 组件名（doctor 报告用）。
 pub const COMPONENT_NAME: &str = "capture";
 
-/// 交互捕获全链总预算（§13.1 / §19.3 澄清）：ScreenCast Start 弹窗等待
-/// （[`portal_screencast::SCREENCAST_TIMEOUT`]）+ Screenshot 交互超时
-/// （[`portal_screenshot::SCREENSHOT_TIMEOUT_INTERACTIVE`]）之和封顶。
+/// portal 授权探测预算（TSI-3054）：portal 段（ScreenCast Start 弹窗等待 +
+/// Screenshot 交互超时）单独封顶 6s，为 x11 兜底与进程启动/RPC 往返留出
+/// 余量。
 ///
-/// 交互授权应在一两个弹窗周期内完成；超预算说明无人在场（自动化/无桌面
-/// 会话），快速失败而非继续叠加各级超时（2×SCREENSHOT_TIMEOUT + screencast
-/// 超时）吃满 ~27.8s 后降级全黑 x11（TSI-2980）。
-pub const CAPTURE_INTERACTIVE_BUDGET: std::time::Duration = std::time::Duration::from_secs(
-    portal_screencast::SCREENCAST_TIMEOUT.as_secs()
-        + portal_screenshot::SCREENSHOT_TIMEOUT_INTERACTIVE.as_secs(),
-);
+/// 无 portal 授权时，ScreenCast Start 弹窗无人应答会吃满
+/// [`portal_screencast::SCREENCAST_TIMEOUT`]（10s）+
+/// [`portal_screenshot::SCREENSHOT_TIMEOUT_INTERACTIVE`]（5s）= 15s。QA 验收
+/// （TC-301/303）以 8s 为命令超时上限（`timeout 8` → exit 124），故 portal
+/// 段封顶 6s、端到端（portal + x11 兜底）由 [`CAPTURE_END_TO_END_BUDGET`]
+/// 封顶 7s——保证无授权时 8s 内必出结果（x11 帧）或快速失败。
+pub const PORTAL_PROBE_BUDGET: std::time::Duration = std::time::Duration::from_secs(6);
+
+/// 端到端捕获截止（TSI-3054）：portal 探测 + x11 兜底整体封顶 7s，低于 QA
+/// 验收 `timeout 8` 上限（留 1s 余量给进程启动与 RPC 往返）。
+///
+/// 单独约束 portal 段（[`PORTAL_PROBE_BUDGET`]）不足以防 x11 兜底自身阻塞；
+/// 此截止把「portal 探测 + x11 抓帧」作为整体兜底，超时即快速失败。
+pub const CAPTURE_END_TO_END_BUDGET: std::time::Duration = std::time::Duration::from_secs(7);
 
 /// 捕获结果：帧或已落盘的 PNG 路径。
 #[derive(Clone, Debug)]
@@ -110,6 +117,11 @@ pub struct CaptureDispatcher {
     screenshot_ok: bool,
     screenshot: ScreenshotPortal,
     x11_present: bool,
+    /// 当前是否 Wayland 会话（`WAYLAND_DISPLAY`/`WAYLAND_SOCKET` 存在）。
+    ///
+    /// Wayland 下 portal 是唯一授权闸门：无授权时降级 x11 会静默抓取
+    /// XWayland root（越权），须快速失败而非抓屏（TSI-3054 审查 #2）。
+    wayland_session: bool,
     active: std::sync::Mutex<Option<ActiveBackend>>,
     /// restore_token 持久化（daemon 的 PortalSessionManager；无则 None）。
     token_store: Option<std::sync::Arc<dyn TokenStore>>,
@@ -137,6 +149,7 @@ impl CaptureDispatcher {
         let screenshot = ScreenshotPortal::with_connection(conn.clone());
         let screenshot_ok = screenshot.available().await;
         let x11_present = X11Capture::display_present();
+        let wayland_session = is_wayland_session();
         if !screencast_ok && !screenshot_ok && !x11_present {
             return None;
         }
@@ -146,6 +159,7 @@ impl CaptureDispatcher {
             screenshot_ok,
             screenshot,
             x11_present,
+            wayland_session,
             active: std::sync::Mutex::new(None),
             token_store,
             session: tokio::sync::Mutex::new(None),
@@ -195,30 +209,63 @@ impl CaptureDispatcher {
         *self.active.lock().unwrap_or_else(|p| p.into_inner()) = backend;
     }
 
-    /// 单帧捕获：ScreenCast 流式取最新帧 → 失败/不可用降级 Screenshot → 再降级 X11。
+    /// 单帧捕获：portal（ScreenCast → Screenshot）→ 失败/超时按会话降级 X11 或快速失败。
     ///
     /// ScreenCast 会话优先尝试 `restore_token` 静默恢复（无弹窗）；
     /// `interactive=true` 时允许弹窗授权（无 token 或恢复失败时）；
     /// `interactive=false` 时仅当 `token_store` 含 `restore_token` 才尝试
     /// ScreenCast——无 token 则直接降级到 Screenshot/X11（避免弹窗）。
     ///
-    /// 交互路径受 [`CAPTURE_INTERACTIVE_BUDGET`] 总预算封顶：授权应在一两个
-    /// 弹窗周期内完成，超预算快速失败而非叠加各级超时（2×SCREENSHOT_TIMEOUT +
-    /// screencast 超时）吃满 ~27.8s 后降级全黑 x11（TSI-2980）。
+    /// 交互路径端到端（portal 探测 + x11 兜底）受 [`CAPTURE_END_TO_END_BUDGET`]
+    /// 封顶：无 portal 授权时弹窗无人应答，portal 段先被 [`PORTAL_PROBE_BUDGET`]
+    /// 截断，随后降级 x11（原生 X11 会话）或快速失败（Wayland/无 x11），
+    /// 全程保证 8s 内出结果（TSI-3054）。
     pub async fn capture(&self, target: CaptureTarget, interactive: bool) -> Result<CapturedFrame> {
         if interactive {
-            capture_with_budget(CAPTURE_INTERACTIVE_BUDGET, self.capture_chain(target, true)).await
+            capture_with_budget(
+                CAPTURE_END_TO_END_BUDGET,
+                self.capture_portal_then_fallback(target, true),
+            )
+            .await
         } else {
-            self.capture_chain(target, false).await
+            self.capture_portal_then_fallback(target, false).await
         }
     }
 
-    /// [`Self::capture`] 的降级链主体：ScreenCast → Screenshot → X11。
+    /// portal 段（受 [`PORTAL_PROBE_BUDGET`] 子预算）→ 失败/超时降级 x11 或快速失败。
+    ///
+    /// portal 失败后的去向由 [`portal_fallback`] 决定：原生 X11 会话降级 x11；
+    /// Wayland 会话拒绝静默抓 XWayland root（越权）、无 x11 兜底时快速失败
+    /// 并给出明确报错（TSI-3054 审查 #2/#3）。
+    async fn capture_portal_then_fallback(
+        &self,
+        target: CaptureTarget,
+        interactive: bool,
+    ) -> Result<CapturedFrame> {
+        let portal = if interactive {
+            capture_with_budget(PORTAL_PROBE_BUDGET, self.capture_portal(target, true)).await
+        } else {
+            self.capture_portal(target, false).await
+        };
+        match portal {
+            Ok(frame) => Ok(frame),
+            Err(e) => {
+                tracing::warn!("portal capture unavailable: {e}");
+                match portal_fallback(self.wayland_session, self.x11_present) {
+                    PortalFallback::X11 => self.capture_x11().await,
+                    PortalFallback::Fail(err) => Err(err),
+                }
+            }
+        }
+    }
+
+    /// [`Self::capture`] 的 portal 段主体：ScreenCast → Screenshot。
     ///
     /// `interactive=true` 时 Screenshot 先做非交互预探测（§13.1 建议 2）——
     /// 已授权/免弹窗即时成功、无会话/自动化即时 Permission，两种情况都不
-    /// 弹窗、不吃交互超时预算；预探测失败才升级到交互弹窗。
-    async fn capture_chain(
+    /// 弹窗、不吃交互超时预算；预探测失败才升级到交互弹窗。全部失败返回
+    /// `BackendUnavailable`，由调用方降级 x11。
+    async fn capture_portal(
         &self,
         target: CaptureTarget,
         interactive: bool,
@@ -264,36 +311,39 @@ impl CaptureDispatcher {
             }
         }
 
-        // L3: X11 原生。
-        if self.x11_present {
-            let cap = X11Capture::connect().map_err(|e| {
-                tracing::warn!("x11 capture unavailable: {e}");
-                // 失败即清 active——否则先前记录的 stale 后端会残留，
-                // doctor/selected_backend 持续报假「选中」状态。
-                self.set_active(None);
-                e
-            })?;
-            let frame = cap.capture_frame().await.map_err(|e| {
-                tracing::warn!("x11 capture frame failed: {e}");
-                self.set_active(None);
-                e
-            })?;
-            if is_all_black(&frame) {
-                tracing::warn!(
-                    "X11 fallback captured an all-black frame (likely XWayland root without \
-                     compositor content); portal ScreenCast/Screenshot is the correct backend \
-                     for this session"
-                );
-            }
-            self.set_active(Some(ActiveBackend::X11));
-            return Ok(CapturedFrame::Pixels(frame));
-        }
-
         Err(AgentShellError::BackendUnavailable(
-            "no capture backend available (portal ScreenCast/Screenshot unreachable, no native \
-             X11 session)"
-                .into(),
+            "portal capture unavailable (ScreenCast/Screenshot unreachable or denied)".into(),
         ))
+    }
+
+    /// X11 原生兜底（portal 不可用/超时/拒绝后）。
+    ///
+    /// 仅在 [`portal_fallback`] 判定「原生 X11 会话可兜底」时被调用，故此处
+    /// 不再复核 `x11_present`（决策与最终错误由纯函数集中，可单测）。全黑帧
+    /// （XWayland root 无合成器内容）保留并告警——上层据 [`Self::probe`] /
+    /// doctor 报告降级链真实状态。
+    async fn capture_x11(&self) -> Result<CapturedFrame> {
+        let cap = X11Capture::connect().map_err(|e| {
+            tracing::warn!("x11 capture unavailable: {e}");
+            // 失败即清 active——否则先前记录的 stale 后端会残留，
+            // doctor/selected_backend 持续报假「选中」状态。
+            self.set_active(None);
+            e
+        })?;
+        let frame = cap.capture_frame().await.map_err(|e| {
+            tracing::warn!("x11 capture frame failed: {e}");
+            self.set_active(None);
+            e
+        })?;
+        if is_all_black(&frame) {
+            tracing::warn!(
+                "X11 fallback captured an all-black frame (likely XWayland root without \
+                 compositor content); portal ScreenCast/Screenshot is the correct backend \
+                 for this session"
+            );
+        }
+        self.set_active(Some(ActiveBackend::X11));
+        Ok(CapturedFrame::Pixels(frame))
     }
 
     /// 非交互预探测（§13.1 建议 2 / Radian 审查）：已授权/免弹窗即时成功；
@@ -640,11 +690,12 @@ fn row_has_non_black(data: &[u8], color_type: png::ColorType) -> bool {
         .any(|px| px.iter().take(color_channels).any(|&b| b != 0))
 }
 
-/// 交互路径总预算封顶：在 `budget` 内执行 `fut`，超时返回 `Timeout`。
+/// 预算封顶：在 `budget` 内执行 `fut`，超时返回 `Timeout`。
 ///
 /// 抽成可注入预算的辅助函数以便单测（用极小 `budget` 确定性触发超时分支）——
-/// 与 [`CaptureDispatcher::capture_chain`] 解耦，测试不依赖真实 portal/X11
-/// （Radian 审查 #3）。
+/// 与 [`CaptureDispatcher::capture_portal`] / 端到端截止解耦，测试不依赖真实
+/// portal/X11（Radian 审查 #3）。超时后的去向（降级 x11 或快速失败）由调用方
+/// 的 [`portal_fallback`] 决策（TSI-3054）。
 async fn capture_with_budget<F>(budget: std::time::Duration, fut: F) -> Result<CapturedFrame>
 where
     F: Future<Output = Result<CapturedFrame>>,
@@ -652,10 +703,60 @@ where
     match tokio::time::timeout(budget, fut).await {
         Ok(res) => res,
         Err(_) => Err(AgentShellError::Timeout(format!(
-            "interactive capture exceeded {}s total budget (no user authorization within budget)",
+            "capture exceeded {}s budget",
             budget.as_secs()
         ))),
     }
+}
+/// portal 失败后的降级去向（纯函数决策结果）。
+#[derive(Debug)]
+enum PortalFallback {
+    /// 原生 X11 会话：降级 x11-mit-shm 抓屏。
+    X11,
+    /// 快速失败：Wayland 下拒绝静默抓 XWayland root，或没有任何兜底后端。
+    Fail(AgentShellError),
+}
+
+/// portal 失败后的降级决策（纯函数，可单测）。
+///
+/// - Wayland 会话：portal 是唯一授权闸门，无授权降级 x11 会静默抓取
+///   XWayland root（越权），必须快速失败并给出明确报错（TSI-3054 审查 #2）。
+/// - 原生 X11 会话且 `x11_present`：降级 x11-mit-shm。
+/// - 无任何兜底：快速失败。
+fn portal_fallback(wayland: bool, x11_present: bool) -> PortalFallback {
+    if wayland {
+        PortalFallback::Fail(AgentShellError::Permission(
+            "portal authorization unavailable on Wayland; refusing to capture the screen \
+             (X11 fallback would grab XWayland root without authorization)"
+                .into(),
+        ))
+    } else if x11_present {
+        PortalFallback::X11
+    } else {
+        PortalFallback::Fail(AgentShellError::BackendUnavailable(
+            "no capture backend available (portal unavailable/denied, no native X11 session)"
+                .into(),
+        ))
+    }
+}
+
+/// 是否 Wayland 会话：`WAYLAND_DISPLAY` 或 `WAYLAND_SOCKET` 存在。
+///
+/// 与 `components/clipboard`、`daemon` 的 `is_wayland_session` 同口径
+/// （`var_os().is_some()`）；抽出纯函数版 [`is_wayland_session_with`] 以便单测。
+fn is_wayland_session() -> bool {
+    is_wayland_session_with(
+        std::env::var_os("WAYLAND_DISPLAY").as_deref(),
+        std::env::var_os("WAYLAND_SOCKET").as_deref(),
+    )
+}
+
+/// 纯函数版 Wayland 会话判定（可单测，不触碰进程环境变量）。
+fn is_wayland_session_with(
+    wayland_display: Option<&std::ffi::OsStr>,
+    wayland_socket: Option<&std::ffi::OsStr>,
+) -> bool {
+    wayland_display.is_some() || wayland_socket.is_some()
 }
 
 /// 非交互预探测结果判定（纯函数，可单测）：黑/无效帧（与 [`CaptureDispatcher::probe`]
@@ -702,22 +803,69 @@ mod tests {
         assert!(store.get_restore_token().is_none());
     }
 
-    /// 交互全链总预算 = ScreenCast 弹窗等待 + Screenshot 交互超时，且必须小于
-    /// 旧行为叠加的 2×SCREENSHOT_TIMEOUT + SCREENCAST_TIMEOUT——锚定「超时预算
-    /// 吃满后降级 x11」不再发生（TSI-2980）。
+    /// portal 探测预算 = 6s、端到端截止 = 7s：两者都必须小于 QA 验收的 8s
+    /// 上限与旧行为叠加的 2×SCREENSHOT_TIMEOUT + SCREENCAST_TIMEOUT（≈27.8s）
+    /// 及旧的 15s 交互预算——锚定「无 portal 授权 8s 内降级 x11 或快速失败」
+    /// （TSI-3054 审查 #1）。
     #[test]
-    fn capture_interactive_budget_bounds_degradation_chain() {
-        assert_eq!(
-            CAPTURE_INTERACTIVE_BUDGET,
-            portal_screencast::SCREENCAST_TIMEOUT
-                + portal_screenshot::SCREENSHOT_TIMEOUT_INTERACTIVE
+    fn capture_budgets_leave_margin_for_x11_fallback() {
+        assert_eq!(PORTAL_PROBE_BUDGET, std::time::Duration::from_secs(6));
+        assert_eq!(CAPTURE_END_TO_END_BUDGET, std::time::Duration::from_secs(7));
+        assert!(
+            CAPTURE_END_TO_END_BUDGET < std::time::Duration::from_secs(8),
+            "end-to-end deadline must stay under the QA 8s timeout (leave margin)"
+        );
+        assert!(
+            PORTAL_PROBE_BUDGET < CAPTURE_END_TO_END_BUDGET,
+            "portal probe must leave room for the x11 fallback within the end-to-end deadline"
         );
         let old_stacked =
             portal_screenshot::SCREENSHOT_TIMEOUT * 2 + portal_screencast::SCREENCAST_TIMEOUT;
+        assert!(PORTAL_PROBE_BUDGET < old_stacked);
         assert!(
-            CAPTURE_INTERACTIVE_BUDGET < old_stacked,
-            "interactive budget must be tighter than the stacked per-level timeouts"
+            PORTAL_PROBE_BUDGET
+                < portal_screencast::SCREENCAST_TIMEOUT
+                    + portal_screenshot::SCREENSHOT_TIMEOUT_INTERACTIVE
         );
+    }
+
+    /// portal 失败后的降级决策（TSI-3054 审查 #2/#3，纯函数确定性测）：
+    /// 原生 X11 会话降级 x11；Wayland 会话快速失败（拒绝静默抓 XWayland
+    /// root）；无 x11 兜底时快速失败并给出明确报错。
+    #[test]
+    fn portal_fallback_decides_x11_or_fail() {
+        // 原生 X11 + DISPLAY 可达 → 降级 x11。
+        assert!(matches!(portal_fallback(false, true), PortalFallback::X11));
+        // Wayland（即使 XWayland DISPLAY 存在）→ 快速失败，不静默抓屏。
+        match portal_fallback(true, true) {
+            PortalFallback::Fail(AgentShellError::Permission(msg)) => {
+                assert!(msg.contains("Wayland"), "unexpected msg: {msg}");
+            }
+            other => panic!("expected Permission fail on Wayland, got {other:?}"),
+        }
+        // 无任何兜底（x11_present=false）→ 快速失败。
+        match portal_fallback(false, false) {
+            PortalFallback::Fail(AgentShellError::BackendUnavailable(msg)) => {
+                assert!(
+                    msg.contains("no native X11 session"),
+                    "unexpected msg: {msg}"
+                );
+            }
+            other => panic!("expected BackendUnavailable, got {other:?}"),
+        }
+    }
+
+    /// Wayland 会话判定：任一 env（`WAYLAND_DISPLAY` / `WAYLAND_SOCKET`）存在即真。
+    #[test]
+    fn wayland_session_detection() {
+        use std::ffi::OsStr;
+        assert!(!is_wayland_session_with(None, None));
+        assert!(is_wayland_session_with(Some(OsStr::new("wayland-0")), None));
+        assert!(is_wayland_session_with(None, Some(OsStr::new("12"))));
+        assert!(is_wayland_session_with(
+            Some(OsStr::new("wayland-0")),
+            Some(OsStr::new("12"))
+        ));
     }
 
     /// 预算封顶行为：快速 future 原样通过；慢 future 被中止并归一到 `Timeout`

@@ -3580,14 +3580,18 @@ impl<T> FallbackChain<T> {
 | 截图 (portal→X11) | 8s | 2 | 1500ms |
 | 截图（交互，弹授权窗） | 5s | 1 | — |
 
-> **截图交互全链总预算**（TSI-2980）：`interactive=true` 下 portal 需用户点击
-> 授权，若无人应答则 ScreenCast Start 弹窗等待（10s）+ Screenshot 交互超时
-> （5s）逐级叠加。故 `CaptureDispatcher::capture` 对交互路径套单一总预算
-> `CAPTURE_INTERACTIVE_BUDGET = SCREENCAST_TIMEOUT + SCREENSHOT_TIMEOUT_INTERACTIVE`
-> （=15s）封顶——超预算快速失败（Timeout），而非吃满 2×8s + 10s ≈ 27.8s 后
-> 降级全黑 x11。`SCREENSHOT_TIMEOUT`（8s）是单次 portal 延迟口径，仅约束
-> 非交互/单步调用；交互弹窗场景改用更短的 `SCREENSHOT_TIMEOUT_INTERACTIVE`
-> 且不重试（超时后二次弹窗无意义）。
+> **portal 授权探测 + x11 兜底两级预算**（TSI-3054）：`interactive=true` 下 portal
+> 需用户点击授权，若无人应答则 ScreenCast Start 弹窗等待（10s）+ Screenshot
+> 交互超时（5s）逐级叠加。故 `CaptureDispatcher::capture` 对 **portal 段**
+> （ScreenCast → Screenshot）套 `PORTAL_PROBE_BUDGET = 6s` 子预算，portal 超时/
+> 失败后再降级 x11-mit-shm（`capture_x11`）；「portal 探测 + x11 兜底」整体由
+> `CAPTURE_END_TO_END_BUDGET = 7s` 端到端封顶，低于 QA 验收 `timeout 8` 上限
+> （留 1s 余量给进程启动与 RPC 往返）——保证无 portal 授权时 8s 内必出结果
+> （x11 帧）或快速失败。Wayland 会话下 portal 是唯一授权闸门，超时/拒绝不
+> 静默抓 XWayland root（越权），`portal_fallback` 判定快速失败并给出明确报错。
+> `SCREENSHOT_TIMEOUT`（8s）是单次 portal 延迟口径，仅约束非交互/单步调用；
+> 交互弹窗场景改用更短的 `SCREENSHOT_TIMEOUT_INTERACTIVE` 且不重试（超时后
+> 二次弹窗无意义）。
 
 ### 19.5 验证输出
 
