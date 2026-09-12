@@ -237,9 +237,10 @@ async fn windows(out: OutputFormat, c: &mut DaemonClient, cmd: cli::WindowsComma
         W::Wait {
             app_id,
             match_mode,
+            timeout,
             timeout_ms,
         } => {
-            let timeout_ms = timeout_ms.unwrap_or(15_000);
+            let timeout_ms = timeout.or(timeout_ms).unwrap_or(15_000);
             let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
             loop {
                 let (wins, _) = c
