@@ -763,33 +763,70 @@ pub mod duration {
     ///
     /// 支持单位后缀 `ms`/`s`/`m`/`h`（大小写不敏感）；无后缀的裸数字按
     /// 毫秒处理，与 `--timeout-ms`/`timeout_ms` 语义一致。数值须为非负
-    /// 整数，乘法溢出或非法单位返回带示例的错误串。
+    /// 整数，可选小数（如 `1.5s`，小数部分按毫秒截断）。乘法溢出或非法
+    /// 单位返回带示例的错误串。
     pub fn parse_duration(spec: &str) -> Result<u64, String> {
         let s = spec.trim();
-        let (num, unit) = split_duration(s);
-        let value: u64 = num
+        let (whole, frac, unit) = split_duration(s);
+        let whole: u64 = whole
             .parse()
             .map_err(|_| format!("非法时长 `{spec}`：期望形如 `10s`、`500ms`、`2m`"))?;
-        let multiplier_ms = match unit.to_ascii_lowercase().as_str() {
+        let multiplier_ms = match unit.trim().to_ascii_lowercase().as_str() {
             "" | "ms" => 1,
             "s" => 1_000,
             "m" => 60_000,
             "h" => 3_600_000,
             other => return Err(format!("非法时长单位 `{other}`（支持 ms/s/m/h）")),
         };
-        value
+        let whole_ms = whole
             .checked_mul(multiplier_ms)
+            .ok_or_else(|| format!("时长超出范围 `{spec}`（期望形如 `10s`、`500ms`、`2m`）"))?;
+        // 小数部分按毫秒截断：frac * multiplier / 10^len，除不尽部分舍去。
+        if frac.is_empty() {
+            return Ok(whole_ms);
+        }
+        // 全精度计算用 u128：frac(≤1.8e19) × multiplier(≤3.6e6) ≈ 6.5e25，
+        // 远小于 u128 上限，无需截断位数即可精确且不溢出；商 < multiplier
+        // 故结果可安全回落到 u64。
+        let frac_len = frac.len() as u32;
+        let frac: u128 = frac
+            .parse()
+            .map_err(|_| format!("非法时长 `{spec}`：期望形如 `10s`、`500ms`、`2m`"))?;
+        let denom = 10u128
+            .checked_pow(frac_len)
+            .ok_or_else(|| format!("非法时长 `{spec}`：期望形如 `10s`、`500ms`、`2m`"))?;
+        let frac_ms = frac
+            .checked_mul(multiplier_ms as u128)
+            .and_then(|v| v.checked_div(denom))
+            .ok_or_else(|| format!("时长超出范围 `{spec}`（期望形如 `10s`、`500ms`、`2m`）"))?
+            as u64;
+        whole_ms
+            .checked_add(frac_ms)
             .ok_or_else(|| format!("时长超出范围 `{spec}`（期望形如 `10s`、`500ms`、`2m`）"))
     }
 
-    /// 把时长串切成 (数值部分, 单位部分)：首个非 ASCII 数字处切分。
-    fn split_duration(s: &str) -> (&str, &str) {
-        let idx = s
-            .char_indices()
-            .find(|(_, c)| !c.is_ascii_digit())
-            .map(|(i, _)| i)
-            .unwrap_or(s.len());
-        (&s[..idx], &s[idx..])
+    /// 把时长串切成 (整数部分, 小数部分, 单位部分)。
+    ///
+    /// 整数部分是首个非 ASCII 数字/小数点前的数字；小数部分是小数点后的
+    /// 连续数字（无小数点则为空）；单位部分是剩余部分，交由调用方 `trim`。
+    fn split_duration(s: &str) -> (&str, &str, &str) {
+        let bytes = s.as_bytes();
+        let whole_end = bytes
+            .iter()
+            .position(|&b| !b.is_ascii_digit())
+            .unwrap_or(bytes.len());
+        if bytes.get(whole_end) == Some(&b'.')
+            && bytes.get(whole_end + 1).is_some_and(|b| b.is_ascii_digit())
+        {
+            let frac_end = bytes[whole_end + 1..]
+                .iter()
+                .position(|&b| !b.is_ascii_digit())
+                .map(|i| whole_end + 1 + i)
+                .unwrap_or(bytes.len());
+            (&s[..whole_end], &s[whole_end + 1..frac_end], &s[frac_end..])
+        } else {
+            (&s[..whole_end], "", &s[whole_end..])
+        }
     }
 
     #[cfg(test)]
@@ -806,6 +843,16 @@ pub mod duration {
             assert_eq!(parse_duration("15000").unwrap(), 15_000);
             // 大小写不敏感，前后空白容忍。
             assert_eq!(parse_duration(" 3S ").unwrap(), 3_000);
+            // 数字与单位之间的空白容忍（TSI-3067）。
+            assert_eq!(parse_duration("1 s").unwrap(), 1_000);
+            // 小数秒折算为毫秒（TSI-3067）。
+            assert_eq!(parse_duration("1.5s").unwrap(), 1_500);
+            assert_eq!(parse_duration("0.25s").unwrap(), 250);
+            // 长小数按毫秒精度截断，不溢出（审查项）。
+            assert_eq!(parse_duration("0.9999999999999999999s").unwrap(), 999);
+            // m/h 单位小数全精度折算（u128，不截断位数，无 off-by-1ms）。
+            assert_eq!(parse_duration("1.1234837m").unwrap(), 67_409);
+            assert_eq!(parse_duration("0.12346112h").unwrap(), 444_460);
         }
 
         #[test]
@@ -814,8 +861,19 @@ pub mod duration {
             assert!(parse_duration("abc").is_err());
             assert!(parse_duration("10x").is_err());
             assert!(parse_duration("-5s").is_err());
+            // 小数点后无数字仍按非法输入报错（审查项：不回退旧语义）。
+            assert!(parse_duration("1.s").is_err());
+            assert!(parse_duration("1.").is_err());
             assert!(parse_duration("18446744073709551616s").is_err());
             assert!(parse_duration("18446744073709551615s").is_err());
+        }
+
+        #[test]
+        fn unit_error_trims_leading_whitespace() {
+            // TSI-3067：非法单位提示串不应含前导空白。
+            let err = parse_duration("1 x").unwrap_err();
+            assert!(!err.contains("` x"), "{err}");
+            assert!(err.contains("`x`"), "{err}");
         }
     }
 }
