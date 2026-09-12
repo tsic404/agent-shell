@@ -42,16 +42,3 @@ jobs:
 
       - name: Build (Rust)
         run: cargo build --release
-
-  compat-check:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-
-      # vendored libspa-sys 的 UOS 20 (pipewire 0.3.15) 兼容性回归：
-      # 旧头编译 + 与上游 crates.io 副本同步核对（见 scripts/）。
-      - name: Check libspa-sys old-header compat
-        run: bash scripts/check-libspa-sys-compat.sh
-
-      - name: Check libspa-sys vendor sync
-        run: bash scripts/check-libspa-sys-vendor.sh

@@ -108,11 +108,3 @@ futures-lite = "2"
 [profile.release]
 lto = true
 strip = true
-
-# UOS 20 (deepin 20) 自带 pipewire 0.3.15，其 SPA 头缺少 pipewire-rs 0.6+
-# 在 type-info.c 中无条件引用的多个 spa_type_* 符号（如 spa_type_device_event_id、
-# spa_type_prop_float_array），导致 libspa-sys 构建失败。这里以 vendored 副本替换
-# crates.io 的 libspa-sys，并在 type-info.c 中用 PW_CHECK_VERSION 按版本门控这些
-# 符号（详见 vendor/libspa-sys/）。pipewire crate 保持 0.10 不动。
-[patch.crates-io]
-libspa-sys = { path = "vendor/libspa-sys" }
