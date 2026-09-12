@@ -570,14 +570,17 @@ impl CaptureComponent for CaptureDispatcher {
 ///
 /// 先触发一次非交互会话探测（[`CaptureDispatcher::probe`]）——门户会话
 /// 惰性建立，未探测前 `selected_backend()` 恒 `None`，doctor 只能报
-/// 「候选」而无真实可用状态。探测后据实际选中的后端渲染。
+/// 「候选」而无真实可用状态。探测后据实际选中的后端渲染；探测失败时复用
+/// [`portal_fallback`] 决策，Wayland 无授权明示「已拒绝 x11 兜底」而非
+/// 笼统「探测未就绪」（TSI-3075）。
 pub async fn doctor_line(dispatcher: Option<&CaptureDispatcher>) -> String {
     const LABEL: &str = "截图捕获";
     match dispatcher {
         None => format!("✗ {LABEL:<12}: 不可用（无 portal 且无原生 X11 会话，TTY？）"),
         Some(d) => {
             let active = d.probe().await;
-            render_capture_doctor_line(LABEL, &d.available_backends(), active)
+            let fallback = portal_fallback(d.wayland_session, d.x11_present);
+            render_capture_doctor_line(LABEL, &d.available_backends(), active, fallback)
         }
     }
 }
@@ -585,21 +588,47 @@ pub async fn doctor_line(dispatcher: Option<&CaptureDispatcher>) -> String {
 /// 渲染 capture doctor 行（纯函数，可单测）。
 ///
 /// `active` 为 [`CaptureDispatcher::probe`] 的探测结果：`Some` = 已建立
-/// 真实会话；`None` = 非交互探测失败。`None` 的原因据候选集区分：含 portal
-/// 后端则多半是「需交互授权」；仅 X11 则是「无可用后端」——两者排查方向不同，
-/// 不混为一谈（X11 连接失败与授权无关）。
+/// 真实会话；`None` = 非交互探测失败。失败去向复用 [`portal_fallback`]
+/// 决策：Wayland 下 portal 是唯一授权闸门，降级 x11 会静默抓 XWayland
+/// root（越权），故「已拒绝 x11 兜底」——但 [`CaptureDispatcher::probe`]
+/// 不携带具体失败原因（未授权、传输错误、黑帧皆可能），故不武断「无授权」，
+/// 仅保留「已拒绝 x11 兜底」信号（TSI-3075）。候选链无 `x11-mit-shm`（纯
+/// Wayland，无 XWayland）时无兜底可拒，如实报无可用后端。
 fn render_capture_doctor_line(
     label: &str,
     backends: &[&'static str],
     active: Option<ActiveBackend>,
+    fallback: PortalFallback,
 ) -> String {
     let chain = backends.join(" → ");
     match active {
         Some(b) => format!("✓ {label:<12}: {chain}（选中 {}）", b.name()),
-        None if backends.iter().any(|b| b.starts_with("portal-")) => {
-            format!("⚠ {label:<12}: 候选 {chain}（非交互探测未就绪，需 portal 交互授权）")
-        }
-        None => format!("⚠ {label:<12}: 候选 {chain}（非交互探测失败，无可用后端）"),
+        None => match fallback {
+            // Wayland + XWayland 候选链含 x11：portal 是唯一授权闸门，降级
+            // x11 会静默抓 XWayland root（越权）——portal_fallback 已判定拒绝。
+            // probe() 不携带失败原因，不武断「无授权」，仅保留「已拒绝 x11
+            // 兜底」信号（TSI-3075 + 审查）。
+            PortalFallback::Fail(AgentShellError::Permission(_))
+                if backends.contains(&ActiveBackend::X11.name()) =>
+            {
+                format!(
+                    "⚠ {label:<12}: 候选 {chain}（Wayland 下 portal 未就绪/未授权，已拒绝 x11 兜底）"
+                )
+            }
+            // 纯 Wayland（无 XWayland）候选链无 x11：无兜底可拒，如实报无可用后端。
+            PortalFallback::Fail(AgentShellError::Permission(_)) => {
+                format!(
+                    "⚠ {label:<12}: 候选 {chain}（Wayland 下 portal 未就绪/未授权，无可用后端）"
+                )
+            }
+            // 原生 X11：x11 兜底可用，含 portal 候选时非交互探测未就绪
+            // 多半仍是 portal 未授权；仅 X11 候选则是「无可用后端」。
+            _ if backends.iter().any(|b| b.starts_with("portal-")) => {
+                format!("⚠ {label:<12}: 候选 {chain}（非交互探测未就绪，需 portal 交互授权）")
+            }
+            // 无任何可用后端（原生 X11 探测失败 / 无 x11 无 portal）。
+            _ => format!("⚠ {label:<12}: 候选 {chain}（非交互探测失败，无可用后端）"),
+        },
     }
 }
 
@@ -1183,6 +1212,7 @@ mod tests {
             "截图捕获",
             &["portal-screencast", "portal-screenshot", "x11-mit-shm"],
             Some(ActiveBackend::ScreenCast),
+            PortalFallback::X11,
         );
         assert!(
             line.starts_with("✓ 截图捕获"),
@@ -1193,13 +1223,14 @@ mod tests {
     }
 
     #[test]
-    fn render_capture_doctor_line_without_active_backend() {
-        // 非交互探测未就绪（probe 返回 None）→ ⚠ 提示需 portal 交互授权，
-        // 不再用旧的「尚未实际建立会话」（探测已真实执行过）。
+    fn render_capture_doctor_line_without_active_backend_native_x11() {
+        // 原生 X11 会话、含 portal 候选（probe 返回 None）→ ⚠ 提示需 portal
+        // 交互授权，不再用旧的「尚未实际建立会话」（探测已真实执行过）。
         let line = render_capture_doctor_line(
             "截图捕获",
             &["portal-screencast", "portal-screenshot"],
             None,
+            PortalFallback::X11,
         );
         assert!(line.starts_with("⚠ 截图捕获"), "{line}");
         assert!(line.contains("候选 portal-screencast → portal-screenshot"));
@@ -1207,10 +1238,49 @@ mod tests {
     }
 
     #[test]
+    fn render_capture_doctor_line_without_active_backend_wayland_refuses_x11() {
+        // Wayland + XWayland 候选链含 x11（probe 返回 None、portal_fallback
+        // 拒绝 x11 兜底）→ 明示「已拒绝 x11 兜底」；probe() 不携带失败原因，
+        // 故不武断「无授权」，只报「portal 未就绪/未授权」（TSI-3075 + 审查）。
+        let line = render_capture_doctor_line(
+            "截图捕获",
+            &["portal-screencast", "portal-screenshot", "x11-mit-shm"],
+            None,
+            PortalFallback::Fail(AgentShellError::Permission(
+                "portal authorization unavailable on Wayland".into(),
+            )),
+        );
+        assert!(line.starts_with("⚠ 截图捕获"), "{line}");
+        assert!(line.contains("候选 portal-screencast → portal-screenshot → x11-mit-shm"));
+        assert!(line.contains("Wayland 下 portal 未就绪/未授权"), "{line}");
+        assert!(line.contains("已拒绝 x11 兜底"), "{line}");
+    }
+
+    #[test]
+    fn render_capture_doctor_line_without_active_backend_pure_wayland_no_x11() {
+        // 纯 Wayland（无 XWayland，候选链无 x11-mit-shm）→ 无兜底可拒，
+        // 如实报「无可用后端」而非「已拒绝 x11 兜底」（Radian 审查）。
+        let line = render_capture_doctor_line(
+            "截图捕获",
+            &["portal-screencast", "portal-screenshot"],
+            None,
+            PortalFallback::Fail(AgentShellError::Permission(
+                "portal authorization unavailable on Wayland".into(),
+            )),
+        );
+        assert!(line.starts_with("⚠ 截图捕获"), "{line}");
+        assert!(line.contains("候选 portal-screencast → portal-screenshot"));
+        assert!(line.contains("Wayland 下 portal 未就绪/未授权"), "{line}");
+        assert!(line.contains("无可用后端"), "{line}");
+        assert!(!line.contains("已拒绝 x11 兜底"), "{line}");
+    }
+
+    #[test]
     fn render_capture_doctor_line_without_active_backend_x11_only() {
         // 候选集仅含 X11（无 portal 后端）→ 探测失败与授权无关，须渲染
         // 「无可用后端」而非「需 portal 交互授权」（Radian 建议 3）。
-        let line = render_capture_doctor_line("截图捕获", &["x11-mit-shm"], None);
+        let line =
+            render_capture_doctor_line("截图捕获", &["x11-mit-shm"], None, PortalFallback::X11);
         assert!(line.starts_with("⚠ 截图捕获"), "{line}");
         assert!(line.contains("候选 x11-mit-shm"), "{line}");
         assert!(line.contains("无可用后端"), "{line}");
