@@ -43,6 +43,40 @@ jobs:
       - name: Build (Rust)
         run: cargo build --release
 
+  # 静态 musl 构建：三个纯 Rust 二进制（CLI / rootd / mcp）不得依赖宿主 glibc，
+  # 保证 DDE 20（glibc 2.28）/ DDE 25（glibc 2.38）可加载（TSI-3053）。
+  musl-static:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Setup Rust (musl target)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      - name: Install musl-tools
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Build static musl binaries
+        run: |
+          cargo build --release --target x86_64-unknown-linux-musl \
+            -p agent-shell-cli \
+            -p agent-shell-rootd \
+            -p mcp
+
+      - name: Verify statically linked (no glibc)
+        run: |
+          set -euo pipefail
+          for b in agent-shell agent-shell-rootd agent-shell-mcp; do
+            f="target/x86_64-unknown-linux-musl/release/$b"
+            test -x "$f" || { echo "$f: missing (build did not produce it)" >&2; exit 1; }
+            if readelf -d "$f" | grep -q 'NEEDED'; then
+              echo "$b: has shared library deps" >&2; exit 1
+            fi
+            echo "ok: $b is static (no NEEDED)"
+          done
+
   compat-check:
     runs-on: ubuntu-latest
     steps:
