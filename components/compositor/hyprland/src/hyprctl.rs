@@ -228,11 +228,51 @@ fn expect_ok(text: &str, what: &str) -> Result<()> {
 mod tests {
     use super::*;
 
-    fn temp_his(tag: &str) -> (std::path::PathBuf, String) {
-        let dir =
-            std::env::temp_dir().join(format!("agent-shell-hyprctl-{tag}-{}", std::process::id()));
-        std::fs::create_dir_all(dir.join("hypr").join("t1")).expect("mkdir");
-        (dir, String::from("t1"))
+    /// Unix socket `sockaddr_un.sun_path` 容量（含结尾 NUL）：Linux 为 108
+    /// 字节，macOS 为 104。按平台取值，避免 macOS 上 104–107 字节路径漏检
+    /// 后在 `bind` 才报 SUN_LEN 超限。
+    #[cfg(target_os = "macos")]
+    const SUN_PATH_LEN: usize = 104;
+    #[cfg(not(target_os = "macos"))]
+    const SUN_PATH_LEN: usize = 108;
+
+    /// 构造测试 socket 目录：返回「最长 socket 路径（`.socket2.sock`）短于
+    /// [`SUN_PATH_LEN`] 且可写」的目录。
+    ///
+    /// CI/真机的 `TMPDIR` 常指向极深的任务工作目录，直接拼接会顶爆
+    /// `sun_path` 让 `bind` 报 "path must be shorter than SUN_LEN"。这里
+    /// 优先 `temp_dir()`，超限时依次探测 `/tmp`、`target/test-tmp`，取首个
+    /// 「长度达标且可创建」者——不假设任一候选必然存在或可写。
+    fn temp_his(tag: &str) -> (PathBuf, String) {
+        let leaf = format!("agent-shell-hyprctl-{tag}-{}", std::process::id());
+        let his = String::from("t1");
+
+        let mut candidates: Vec<PathBuf> = vec![std::env::temp_dir()];
+        let tmp = PathBuf::from("/tmp");
+        if candidates[0] != tmp {
+            candidates.push(tmp);
+        }
+        if let Ok(cwd) = std::env::current_dir() {
+            candidates.push(cwd.join("target").join("test-tmp"));
+        }
+
+        for base in candidates {
+            let dir = base.join(&leaf);
+            // 以最长的 socket 名 `.socket2.sock`（13 字节）衡量，兼顾更短的
+            // `.socket.sock`（12 字节），避免 107 字节边界的 off-by-one。
+            let socket2 = dir.join("hypr").join(&his).join(".socket2.sock");
+            if socket2.as_os_str().as_encoded_bytes().len() >= SUN_PATH_LEN {
+                continue;
+            }
+            if std::fs::create_dir_all(dir.join("hypr").join(&his)).is_ok() {
+                return (dir, his);
+            }
+        }
+
+        panic!(
+            "no usable short socket dir (tried temp_dir, /tmp, target/test-tmp); \
+             socket path must stay below {SUN_PATH_LEN} bytes"
+        );
     }
 
     /// 验收标准：非 Hyprland 会话下 new() 报 BackendUnavailable。
