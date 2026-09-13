@@ -59,6 +59,12 @@ async fn run(idle_timeout: Duration, _foreground: bool) {
             std::process::exit(1);
         }
     };
+    // 版本自报：`<crate-version> (<git-commit>)`（§20.7 QA 二进制版本约定）。
+    tracing::info!(
+        "agent-shell-daemon {} ({}) starting",
+        env!("CARGO_PKG_VERSION"),
+        env!("AGENT_SHELL_GIT_COMMIT")
+    );
     // 连接来源说明（§22.2 激活策略）：
     // - systemd --user 常驻形态：CLI 经 fork/exec `--foreground` 子进程建立
     //   stdio 管道连接；unit 常驻实例的 stdin=null，不承载协议。

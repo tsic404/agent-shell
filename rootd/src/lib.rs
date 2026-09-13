@@ -613,7 +613,7 @@ fn test_spawn_sleep(args: &[Value], slot: &CommandSlot) -> RootResult {
 
 fn hello() -> RootResult {
     Ok(json!({
-        "version": env!("CARGO_PKG_VERSION"),
+        "version": concat!(env!("CARGO_PKG_VERSION"), " (", env!("AGENT_SHELL_GIT_COMMIT"), ")"),
         "security_model": SECURITY_MODEL_VERSION,
     }))
 }
@@ -1491,7 +1491,17 @@ mod tests {
     fn hello_reports_version_and_security_model() {
         let r = dispatch("Hello", &[]).expect("hello");
         assert_eq!(r["security_model"], SECURITY_MODEL_VERSION);
-        assert!(r["version"].as_str().is_some());
+        // §20.7：version 必须是 `<crate-version> (<git-commit>)` 形态，
+        // 而非裸 `CARGO_PKG_VERSION`——QA 据此回溯真机二进制来源。
+        assert_eq!(
+            r["version"].as_str().expect("version is a string"),
+            concat!(
+                env!("CARGO_PKG_VERSION"),
+                " (",
+                env!("AGENT_SHELL_GIT_COMMIT"),
+                ")"
+            )
+        );
     }
 
     #[test]

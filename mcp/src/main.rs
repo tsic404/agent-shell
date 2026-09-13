@@ -10,6 +10,12 @@ async fn main() {
         )
         .with_writer(std::io::stderr)
         .init();
+    // 版本自报：`<crate-version> (<git-commit>)`（§20.7 QA 二进制版本约定）。
+    tracing::info!(
+        "agent-shell-mcp {} ({}) starting",
+        env!("CARGO_PKG_VERSION"),
+        env!("AGENT_SHELL_GIT_COMMIT")
+    );
 
     if let Err(e) = agent_shell_mcp::server::run_stdio().await {
         eprintln!("MCP server error: {e}");

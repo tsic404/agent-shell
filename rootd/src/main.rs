@@ -44,7 +44,12 @@ fn main() -> ExitCode {
 /// 错误类型用 `Box<dyn std::error::Error>`——快速实现足够；生产环境
 /// 可用 `thiserror` 定义具体错误类型，但不影响功能。
 async fn run_dbus_service() -> Result<(), Box<dyn std::error::Error>> {
-    let version = env!("CARGO_PKG_VERSION");
+    let version = concat!(
+        env!("CARGO_PKG_VERSION"),
+        " (",
+        env!("AGENT_SHELL_GIT_COMMIT"),
+        ")"
+    );
     eprintln!("agent-shell-rootd {version} starting (system bus service)");
 
     // 连接 system bus
