@@ -1,12 +1,20 @@
 #!/bin/sh
-# prerm — agent-shell-rootd 移除前停止服务
+# prerm — agent-shell / agent-shell-rootd 移除前停止/禁用服务
 set -e
 
 case "$1" in
     remove|deconfigure)
-        if [ -d /run/systemd/system ]; then
+        # rootd 系统单元停用——仅在 agent-shell-rootd 包移除时执行
+        #（$DPKG_MAINTSCRIPT_PACKAGE 区分当前包，避免 agent-shell 包移除时
+        #  误停/误禁用独立安装的 rootd）
+        if [ -d /run/systemd/system ] && [ "${DPKG_MAINTSCRIPT_PACKAGE:-}" = "agent-shell-rootd" ]; then
             systemctl stop agent-shell-rootd.service || true
             systemctl disable agent-shell-rootd.service || true
+        fi
+        # user daemon 单元禁用——仅在 agent-shell 包移除时执行
+        #（对称 postinst 的 --global enable，避免卸载后悬挂符号链接残留）
+        if [ -d /run/systemd/system ] && [ "${DPKG_MAINTSCRIPT_PACKAGE:-}" = "agent-shell" ]; then
+            systemctl --global disable agent-shell-daemon.service || true
         fi
         ;;
 esac

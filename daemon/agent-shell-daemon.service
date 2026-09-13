@@ -8,7 +8,7 @@ After=graphical-session.target
 
 [Service]
 Type=simple
-ExecStart=%h/.cargo/bin/agent-shell-daemon --idle-timeout-secs 1800
+ExecStart=/usr/bin/agent-shell-daemon --idle-timeout-secs 1800
 Restart=on-failure
 RestartSec=2
 # daemon 与 CLI 经 stdio JSON-RPC 互连时由调用方 fork/exec；
