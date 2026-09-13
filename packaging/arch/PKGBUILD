@@ -8,6 +8,8 @@ pkgrel=1
 arch=('x86_64' 'aarch64')
 url="https://github.com/tsic404/agent-shell"
 license=('MIT')
+# pipewire：portal-screencast feature（默认）所需；--no-default-features 构建可省略
+# （无 dev 头发行版，TSI-3111）。
 makedepends=('cargo' 'pipewire' 'systemd' 'polkit')
 source=("agent-shell::git+$url")
 sha256sums=('SKIP')
@@ -20,8 +22,10 @@ build() {
 
 package_agent-shell() {
     pkgdesc="Agent Shell — Linux desktop agent shell (daemon + CLI + MCP)"
+    # pipewire：portal-screencast feature（默认）所需（ScreenCast 流式路径运行时库）。
     depends=('systemd' 'xdg-desktop-portal' 'pipewire' 'hicolor-icon-theme')
-    optdepends=('ydotool: input injection fallback (/dev/uinput)' 'gnome-shell: GNOME Shell Extension host')
+    optdepends=('ydotool: input injection fallback (/dev/uinput)'
+                'gnome-shell: GNOME Shell Extension host')
 
     cd "$srcdir/agent-shell"
     # 二进制

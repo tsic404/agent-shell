@@ -13,11 +13,11 @@ path = "src/main.rs"
 
 [dependencies]
 agent-shell-core.workspace = true
-agent-shell-backend-dde.workspace = true
+agent-shell-backend-dde = { path = "../backends/dde", default-features = false }
 agent-shell-rpc.workspace = true
 agent-shell-compositor-kwin.workspace = true
 agent-shell-compositor-mutter.workspace = true
-agent-shell-capture.workspace = true
+agent-shell-capture = { path = "../modules/capture", default-features = false }
 agent-shell-input.workspace = true
 agent-shell-event.workspace = true
 agent-shell-a11y.workspace = true
@@ -30,6 +30,16 @@ dirs = "5"
 libc.workspace = true
 zbus.workspace = true
 uuid = { workspace = true }
+
+[features]
+default = ["portal-screencast"]
+# 透传 capture 的 portal-screencast（含 backend-dde 的级联）：默认开启，
+# `--no-default-features` 时级联关闭，使无 PipeWire dev 头环境可编译 daemon。
+portal-screencast = [
+    "agent-shell-capture/portal-screencast",
+    "agent-shell-backend-dde/portal-screencast",
+]
+
 [dev-dependencies]
 tempfile = "3"
 async-trait.workspace = true

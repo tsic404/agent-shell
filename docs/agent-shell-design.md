@@ -3705,11 +3705,11 @@ strip = true
 | zbus | D-Bus 通信 | ✅ |
 | x11rb | X11 协议 | Wayland-only 可省 |
 | wayland-client | Wayland 协议 | X11-only 可省 |
-| pipewire (lib) | ScreenCast | ✅ |
+| pipewire (lib) | ScreenCast | 可选（portal-screencast feature） |
 | libei (lib) | 输入注入 | 降级可用 ydotoool 替代 |
 | atspi (lib) | 无障碍 | 降级可用 AT-SPI D-Bus 直连 |
 
-系统依赖（非 Rust crate）：`xdg-desktop-portal`（必）、`pipewire`（必）、`systemd`（启用 systemd 组件时）。
+系统依赖（非 Rust crate）：`xdg-desktop-portal`（必）、`pipewire`（可选，`portal-screencast` feature；无 dev 头发行版用 `--no-default-features` 构建）、`systemd`（启用 systemd 组件时）。
 ### 20.7 QA 二进制版本/commit 约定
 
 **背景**：真机 QA 目录（如 `/home/uos/agent-shell-test/bin/`）里可能存在未打
@@ -6005,7 +6005,7 @@ kwin     = []
 dde      = ["kwin"]
 gnome    = []
 hyprland = []
-portal   = []
+portal-screencast = []        # capture crate：PipeWire ScreenCast（默认，可 --no-default-features 关闭）
 
 Cargo.toml workspace members:
 core, components/*, backends/*, router, event, cli, mcp, daemon, rootd, sdk,
@@ -6021,7 +6021,7 @@ cli, mcp, event, sdk, daemon
 | `gnome` | GNOME Eval/Extension | zbus + gsettings 可选 |
 | `hyprland` | hyprctl socket | tokio Unix socket |
 | `x11` | xdotool/wmctrl fallback | 命令调用 |
-| `portal-services` | 跨 DE portal 服务 | zbus |
+| `portal-screencast` | capture：PipeWire ScreenCast（默认，§20.6 可选） | pipewire |
 | `ime` | IBus/Fcitx 支持 | zbus |
 
 **编译策略**：

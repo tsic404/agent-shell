@@ -13,7 +13,7 @@ agent-shell-power.workspace = true
 agent-shell-launcher.workspace = true
 agent-shell-audio.workspace = true
 agent-shell-a11y.workspace = true
-agent-shell-capture.workspace = true
+agent-shell-capture = { path = "../../modules/capture", default-features = false }
 agent-shell-input.workspace = true
 agent-shell-clipboard.workspace = true
 agent-shell-logind.workspace = true
@@ -32,3 +32,9 @@ wayland-client = { version = "0.31", features = ["log"] }
 wayland-backend = "0.3"
 wayland-scanner = "0.31"
 agent-shell-displayserver-wayland.workspace = true
+
+[features]
+default = ["portal-screencast"]
+# 透传 capture 的 portal-screencast：DDE 后端经 `CaptureDispatcher::assemble`
+# 走 ScreenCast → Screenshot → X11 三级链。默认开启，daemon 级联时关闭。
+portal-screencast = ["agent-shell-capture/portal-screencast"]

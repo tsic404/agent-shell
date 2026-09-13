@@ -14,6 +14,8 @@
 
         # §20.6 打包依赖清单：系统依赖
         buildInputs = with pkgs; [
+          # pipewire 可选：仅 portal-screencast feature（默认）需要；
+          # 无 dev 头发行版用 --no-default-features 构建即可省略（TSI-3111）。
           pipewire
           systemdMinimal
           pkg-config
