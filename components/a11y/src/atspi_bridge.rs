@@ -28,6 +28,10 @@ pub const BUS_SERVICE: &str = "org.a11y.Bus";
 const COORD_TYPE_SCREEN: u32 = 0;
 /// 语义遍历最大深度保护（深层 Web 树可达数十层）。
 pub const MAX_TRAVERSE_DEPTH: u8 = 24;
+/// session bus 方法调用超时：GetAddress 触发懒激活时，在无 AT-SPI 的隔离
+/// 会话（dbus-run-session）里避免挂满 dbus-daemon 默认激活超时 ~120s
+/// （对齐 §19 超时表 D-Bus 5s）。
+const SESSION_CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// AT-SPI D-Bus 桥接。
 ///
@@ -46,11 +50,40 @@ impl AtspiBridge {
     /// 统一归一为 [`AgentShellError::BackendUnavailable`]——装配层据此
     /// 判定组件 Unavailable 而非崩溃。
     pub async fn connect() -> Result<Self> {
-        let session = zbus::Connection::session()
+        let session = zbus::connection::Builder::session()
+            .map_err(|e| AgentShellError::BackendUnavailable(format!("session bus: {e}")))?
+            .method_timeout(SESSION_CALL_TIMEOUT)
+            .build()
             .await
             .map_err(|e| AgentShellError::BackendUnavailable(format!("session bus: {e}")))?;
 
-        // org.a11y.Bus 无 owner（ServiceUnknown）→ a11y 支持未启用
+        let dbus = zbus::fdo::DBusProxy::new(&session)
+            .await
+            .map_err(|e| AgentShellError::BackendUnavailable(format!("DBusProxy: {e}")))?;
+        let has_owner = dbus
+            .name_has_owner(
+                BUS_SERVICE.try_into().map_err(|e| {
+                    AgentShellError::BackendUnavailable(format!("bad bus name: {e}"))
+                })?,
+            )
+            .await
+            .map_err(|e| AgentShellError::BackendUnavailable(format!("NameHasOwner: {e}")))?;
+
+        // 无 owner 时查询可激活列表：可激活 → GetAddress 按需启动 a11y bus；
+        // 不可激活 → 提前返回，不触发激活（避免 ~120s 停顿，TSI-3086）。
+        let activatable: Vec<zbus::names::OwnedBusName> = if has_owner {
+            Vec::new()
+        } else {
+            dbus.list_activatable_names().await.map_err(|e| {
+                AgentShellError::BackendUnavailable(format!("ListActivatableNames: {e}"))
+            })?
+        };
+        if !should_probe_address(has_owner, &activatable) {
+            return Err(AgentShellError::BackendUnavailable(
+                "org.a11y.Bus not owned and not activatable; AT-SPI support disabled".into(),
+            ));
+        }
+
         let bus = zbus::Proxy::new(&session, BUS_SERVICE, "/org/a11y/bus", "org.a11y.Bus")
             .await
             .map_err(|e| AgentShellError::BackendUnavailable(format!("org.a11y.Bus: {e}")))?;
@@ -403,6 +436,18 @@ impl AtspiBridge {
     }
 }
 
+/// 判定是否应调用 `GetAddress` 继续装配（纯函数，无 I/O）。
+///
+/// 三态（单测覆盖）：
+/// - `has_owner` → 继续（owner 已在位，正常路径）；
+/// - `!has_owner` 且 [`BUS_SERVICE`] 在 `activatable` 列表 → 继续
+///   （可激活，GetAddress 按需启动 accessibility bus）；
+/// - `!has_owner` 且不在列表 → 跳过（无 at-spi2-core，避免激活挂满
+///   dbus-daemon 默认激活超时 ~120s）。
+fn should_probe_address(has_owner: bool, activatable: &[zbus::names::OwnedBusName]) -> bool {
+    has_owner || activatable.iter().any(|n| n.as_str() == BUS_SERVICE)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -425,5 +470,20 @@ mod tests {
     fn constants_match_atspi_headers() {
         assert_eq!(REGISTRY_SERVICE, "org.a11y.atspi.Registry");
         assert_eq!(ROOT_PATH, "/org/a11y/atspi/accessible/root");
+    }
+
+    #[test]
+    fn should_probe_address_three_states() {
+        let owned = |name: &str| zbus::names::OwnedBusName::try_from(name).expect("valid bus name");
+        // owner 已在位 → 继续（无需查可激活列表）
+        assert!(should_probe_address(true, &[]));
+        // 无 owner 但可激活 → 继续（GetAddress 懒启动 accessibility bus）
+        assert!(should_probe_address(false, &[owned(BUS_SERVICE)]));
+        // 无 owner 且不可激活 → 提前返回（无 at-spi2-core，避免 ~120s 停顿）
+        assert!(!should_probe_address(
+            false,
+            &[owned("org.freedesktop.DBus")]
+        ));
+        assert!(!should_probe_address(false, &[]));
     }
 }
