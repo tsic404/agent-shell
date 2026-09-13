@@ -1,11 +1,11 @@
 //! agent-shell-daemon 入口（设计文档 §22.2 D1 / §23.2）。
 //!
-//! 三种运行模式：
-//! 1. **systemd --user 常驻**（默认）：stdin/stdout 为 socket-activated
-//!    连接（`Accept=no` + `StandardInput=socket` 由 unit 层接线）；本实现
-//!    以「每连接一协程，行分隔 JSON-RPC」服务。
-//! 2. **空闲超时退出**（默认 30min，`--idle-timeout-secs` 可配置）。
-//! 3. **前台调试**：`--foreground` 直接在当前终端 stdio 上服务。
+//! 单一形态：从 inherited stdin 逐行读 JSON-RPC、逐行写响应，stdin EOF 或
+//! 空闲超时（默认 30min，`--idle-timeout-secs` 可配置）即退出。CLI/MCP 经
+//! fork/exec 本二进制并以 stdio 管道承载协议——瞬态子进程随父进程退出
+//! （stdin EOF）自行终止，不残留孤儿。手动调试用管道保持 stdin 打开即可
+//! 维持运行（`tail -f /dev/null | agent-shell-daemon`）；`/dev/null`、
+//! 重定向或后台等非交互 stdin 会立即 EOF 退出。
 
 mod a11y;
 mod capture;
@@ -25,16 +25,16 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 fn main() {
     let mut idle_secs: u64 = 30 * 60;
-    let mut foreground = false;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
             "--idle-timeout-secs" => {
                 idle_secs = args.next().and_then(|v| v.parse().ok()).unwrap_or(1800)
             }
-            "--foreground" => foreground = true,
             other => {
-                eprintln!("unknown arg: {other} (usage: agent-shell-daemon [--foreground] [--idle-timeout-secs N])");
+                eprintln!(
+                    "unknown arg: {other} (usage: agent-shell-daemon [--idle-timeout-secs N])"
+                );
                 std::process::exit(2);
             }
         }
@@ -48,9 +48,9 @@ fn main() {
         .init();
 
     let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
-    runtime.block_on(run(Duration::from_secs(idle_secs), foreground));
+    runtime.block_on(run(Duration::from_secs(idle_secs)));
 }
-async fn run(idle_timeout: Duration, _foreground: bool) {
+async fn run(idle_timeout: Duration) {
     // 单实例锁（§22.2 D1）——失败说明已有 daemon 运行。
     let lock = match single_instance::SingleInstanceLock::acquire() {
         Ok(l) => l,
@@ -60,8 +60,8 @@ async fn run(idle_timeout: Duration, _foreground: bool) {
         }
     };
     // 连接来源说明（§22.2 激活策略）：
-    // - systemd --user 常驻形态：CLI 经 fork/exec `--foreground` 子进程建立
-    //   stdio 管道连接；unit 常驻实例的 stdin=null，不承载协议。
+    // - 当前唯一形态：CLI/MCP fork/exec 本二进制为瞬态子进程，经 stdio 管道
+    //   承载 JSON-RPC；父进程退出 → stdin EOF → 本进程随之退出。
     // - 手动管道/测试：stdin/stdout 即协议通道。
     // LISTEN_FDs (systemd socket activation) — Phase 3 待接线：当前仅记录检测
     // 到 LISTEN_FDs 的存在，但不使用 fd 接受连接，统一从 inherited stdio 读取。
