@@ -5314,7 +5314,7 @@ systemctl --user status agent-shell
 **生命周期**：
 - D-Bus session activation（首次调用自动启动）
 - 空闲超时退出（可配置）
-- `agent-shell daemon` 手动前台模式（调试）
+- 手动调试：直接运行 `agent-shell-daemon`，从 stdin 逐行读 JSON-RPC、stdin EOF 即退出（无常驻 flag；管道保持 stdin 打开可维持运行）
 
 ---
 
@@ -5935,7 +5935,7 @@ function winDesktops(w) {
 **daemon 激活策略**：
 - D-Bus session activation：首个需要 daemon 的操作自动拉起（`agent-shell.service` systemd user unit, `Restart=on-failure`）
 - 空闲超时退出（默认 30min，可配置）：避免常驻浪费
-- `agent-shell daemon` 手动前台模式用于调试
+- 手动调试：直接运行 `agent-shell-daemon`，从 stdin 读 JSON-RPC、stdin EOF 即退出
 
 **CLI-Daemon 协议**：JSON-RPC 2.0 over stdio（daemon 与 CLI 进程互连），与 MCP 传输同构，复用序列化代码：
 

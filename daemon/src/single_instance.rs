@@ -20,7 +20,7 @@ pub struct SingleInstanceLock {
 
 /// 默认排他锁最长等待时间。
 ///
-/// 并发 spawn 时 CLI 每命令拉起一个 `--foreground` 瞬态 daemon，锁被前一个
+/// 并发 spawn 时 CLI 每命令拉起一个瞬态 daemon，锁被前一个
 /// daemon 持有至其**完整生命周期**结束（启动 ~1s + 命令服务 + 退出；`doctor`
 /// 含 portal 会话探测与截图，单命令最坏可达数秒）。排队等待窗口必须覆盖单条
 /// 命令时长，后一个 daemon 才能在锁释放后接续服务，而非过早判死。同时保持有界：

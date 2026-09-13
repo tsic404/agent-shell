@@ -28,11 +28,10 @@ struct DaemonConnection {
 }
 
 impl DaemonConnection {
-    /// 定位并 spawn `agent-shell-daemon --foreground`，返回长连接。
+    /// 定位并 spawn `agent-shell-daemon`，返回长连接。
     fn connect() -> Result<Self, String> {
         let bin = find_daemon_binary()?;
         let mut child = Command::new(&bin)
-            .arg("--foreground")
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null())

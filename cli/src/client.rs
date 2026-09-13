@@ -3,7 +3,7 @@
 //! CLI 是瞬态无状态进程，不直连任何系统服务（D-Bus/Wayland/X11/portal/
 //! AT-SPI）。本模块负责：
 //! 1. daemon 连接获取——优先 systemd socket activation（LISTEN_FDS），
-//!    否则 fork/exec `agent-shell-daemon --foreground` 子进程并经 stdio
+//!    否则 fork/exec `agent-shell-daemon` 子进程并经 stdio
 //!    通信（自动激活语义，§22.2 激活策略）；
 //! 2. 请求/响应往返（行分隔 JSON-RPC 2.0）；
 //! 3. 错误码 → CLI 退出码映射。
@@ -125,12 +125,11 @@ impl DaemonClient {
 
     /// 建立到 daemon 的连接并配置「连接提前关闭」时的重建重试次数。
     pub async fn connect_with_retries(retries: u32) -> Result<Self, String> {
-        // 自动激活：spawn 前台 daemon 子进程（stdio 管道承载 JSON-RPC）。
+        // 自动激活：spawn 瞬态 daemon 子进程（stdio 管道承载 JSON-RPC）。
         // D-Bus/systemd activation 形态由 unit 层提供同名二进制；CLI 统一
         // 走 spawn 路径保证行为一致（首次查询 ~100ms 启动延迟可接受）。
         let exe = find_daemon_binary()?;
         let mut child = tokio::process::Command::new(&exe)
-            .arg("--foreground")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())

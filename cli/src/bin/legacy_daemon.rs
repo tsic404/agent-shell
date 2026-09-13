@@ -8,8 +8,8 @@
 //! 二进制连接后验证。
 //!
 //! 夹具协议：从 stdin 逐行读 JSON-RPC 请求，对 `info.show` 回旧布尔格式
-//! 响应，其余方法回 method-not-found；EOF 或读错误即退出。CLI 以
-//! `--foreground` 拉起本夹具，参数被忽略。
+//! 响应，其余方法回 method-not-found；EOF 或读错误即退出。CLI 以同名
+//! 二进制（`agent-shell-daemon`）经 stdio 拉起本夹具，无参数。
 
 use std::io::{BufRead, Write};
 
