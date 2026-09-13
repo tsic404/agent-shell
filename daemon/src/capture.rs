@@ -2,7 +2,9 @@
 //! Screenshot → X11 原生，§13），并保留窗口直捕（X11-only）与区域裁剪。
 //!
 //! CLI 传 `--window` 时走 X11 窗口直捕（portal 无法定位 X11 window id）；
-//! 传 `--area` 在 daemon 侧裁剪——CLI 不持有任何显示服务连接。窗口目标
+//! 传 `--area` 走原始像素链（ScreenCast → X11，跳过 portal Screenshot PNG
+//! 段——PNG 无法裁剪）后在 daemon 侧裁剪——CLI 不持有任何显示服务连接。
+//! 窗口目标
 //! 解析与 windows 子命令同口径（`id:` 前缀 / `{uuid}` 花括号均可剥离），
 //! 但直捕仍需要 X11 十进制窗口 id——原生 Wayland `{uuid}` 无对应 X11 id。
 
@@ -13,6 +15,10 @@ use agent_shell_rpc::{CaptureResult, RpcErrorCode};
 /// 截图并落盘。`window` 为窗口目标（`id:`/`{uuid}` 形式均可，解析后须为
 /// X11 十进制窗口 id；None=root）；`area` 为 X,Y,W,H 裁剪区域（对捕获画面
 /// 坐标空间，先截后裁）。
+///
+/// 区域裁剪需要原始像素帧——portal Screenshot 只落全屏 PNG、无法裁剪，故
+/// `area` 走 [`agent_shell_capture::CaptureDispatcher::capture_pixels`]
+/// （ScreenCast → X11 像素链，跳过 Screenshot PNG 段）。
 pub async fn capture_to_file(
     capture: &CaptureDispatcher,
     window: Option<&str>,
@@ -27,6 +33,16 @@ pub async fn capture_to_file(
         return write_frame_to_ppm(&frame, area, path);
     }
 
+    // 区域裁剪需原始像素帧：portal Screenshot 落盘 PNG 无法裁剪，走
+    // ScreenCast → X11 像素链（跳过 Screenshot PNG 段）。
+    if area.is_some() {
+        let frame = capture
+            .capture_pixels(agent_shell_capture::CaptureTarget::Monitor, true)
+            .await
+            .map_err(map_capture_err)?;
+        return write_frame_to_ppm(&frame, area, path);
+    }
+
     // 全链降级：portal ScreenCast → Screenshot → X11 根窗口。
     // ScreenCast 需弹窗授权（§21.22），daemon 场景允许交互。
     let captured = capture
@@ -35,8 +51,8 @@ pub async fn capture_to_file(
         .map_err(map_capture_err)?;
 
     match captured {
-        CapturedFrame::Pixels(frame) => write_frame_to_ppm(&frame, area, path),
-        CapturedFrame::Png(src) => copy_png(&src, area, path),
+        CapturedFrame::Pixels(frame) => write_frame_to_ppm(&frame, None, path),
+        CapturedFrame::Png(src) => copy_png(&src, path),
     }
 }
 
@@ -183,18 +199,10 @@ fn write_frame_to_ppm(
 }
 
 /// portal Screenshot 落盘的 PNG 复制到目标路径并读回尺寸。
-/// `area` 裁剪对 PNG 变体不适用（portal 全屏截取）——显式报错而非静默忽略。
-fn copy_png(
-    src: &std::path::Path,
-    area: Option<[i32; 4]>,
-    path: &str,
-) -> Result<CaptureResult, (RpcErrorCode, String)> {
-    if area.is_some() {
-        return Err((
-            RpcErrorCode::InvalidParams,
-            "area crop not supported on portal Screenshot (PNG) backend".into(),
-        ));
-    }
+///
+/// 区域裁剪不经过此路径——`--area` 走 [`agent_shell_capture::CaptureDispatcher::capture_pixels`]
+/// 像素链，PNG 无法裁剪，故此处无需 area 参数。
+fn copy_png(src: &std::path::Path, path: &str) -> Result<CaptureResult, (RpcErrorCode, String)> {
     let data = std::fs::read(src).map_err(|e| {
         (
             RpcErrorCode::BackendError,
