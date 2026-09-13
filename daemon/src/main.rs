@@ -24,21 +24,13 @@ use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 fn main() {
-    let mut idle_secs: u64 = 30 * 60;
-    let mut args = std::env::args().skip(1);
-    while let Some(a) = args.next() {
-        match a.as_str() {
-            "--idle-timeout-secs" => {
-                idle_secs = args.next().and_then(|v| v.parse().ok()).unwrap_or(1800)
-            }
-            other => {
-                eprintln!(
-                    "unknown arg: {other} (usage: agent-shell-daemon [--idle-timeout-secs N])"
-                );
-                std::process::exit(2);
-            }
+    let idle_secs = match parse_idle_timeout(std::env::args().skip(1)) {
+        Ok(secs) => secs,
+        Err(msg) => {
+            eprintln!("{msg} (usage: agent-shell-daemon [--idle-timeout-secs N])");
+            std::process::exit(2);
         }
-    }
+    };
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -50,6 +42,29 @@ fn main() {
     let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
     runtime.block_on(run(Duration::from_secs(idle_secs)));
 }
+
+/// 解析 daemon 命令行参数，返回空闲超时秒数（默认 30min）。
+///
+/// 未知参数、缺失值或不可解析的值统一走 `Err`，由调用方以 exit 2 报错——
+/// 与 `unknown arg` 行为一致。TSI-3103：不可解析值不得静默回退默认 1800。
+fn parse_idle_timeout(mut args: impl Iterator<Item = String>) -> Result<u64, String> {
+    let mut idle_secs: u64 = 30 * 60;
+    while let Some(a) = args.next() {
+        match a.as_str() {
+            "--idle-timeout-secs" => {
+                let v = args
+                    .next()
+                    .ok_or_else(|| "missing value for --idle-timeout-secs".to_string())?;
+                idle_secs = v
+                    .parse()
+                    .map_err(|_| format!("invalid --idle-timeout-secs value: {v}"))?;
+            }
+            other => return Err(format!("unknown arg: {other}")),
+        }
+    }
+    Ok(idle_secs)
+}
+
 async fn run(idle_timeout: Duration) {
     // 单实例锁（§22.2 D1）——失败说明已有 daemon 运行。
     let lock = match single_instance::SingleInstanceLock::acquire() {
@@ -151,4 +166,48 @@ async fn write_line(out: &Arc<tokio::sync::Mutex<tokio::io::Stdout>>, line: Stri
     let mut stdout = out.lock().await;
     let _ = stdout.write_all(line.as_bytes()).await;
     let _ = stdout.flush().await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(args: &[&str]) -> Result<u64, String> {
+        parse_idle_timeout(args.iter().map(|s| s.to_string()))
+    }
+
+    #[test]
+    fn default_when_no_args() {
+        assert_eq!(parse(&[]).unwrap(), 1800);
+    }
+
+    #[test]
+    fn explicit_value_wins() {
+        assert_eq!(parse(&["--idle-timeout-secs", "60"]).unwrap(), 60);
+    }
+
+    #[test]
+    fn unparseable_value_errors() {
+        let err = parse(&["--idle-timeout-secs", "abc"]).unwrap_err();
+        assert!(
+            err.contains("abc"),
+            "error should name the bad value: {err}"
+        );
+    }
+
+    #[test]
+    fn missing_value_errors() {
+        assert!(parse(&["--idle-timeout-secs"]).is_err());
+    }
+
+    #[test]
+    fn unknown_arg_errors() {
+        let err = parse(&["--bogus"]).unwrap_err();
+        assert!(err.contains("unknown arg"));
+    }
+
+    #[test]
+    fn negative_value_rejected_as_unparseable() {
+        assert!(parse(&["--idle-timeout-secs", "-1"]).is_err());
+    }
 }
