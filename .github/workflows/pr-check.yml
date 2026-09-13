@@ -42,3 +42,6 @@ jobs:
 
       - name: Build (Rust)
         run: cargo build --release
+
+      - name: Test (Packaging)
+        run: sh packaging/debian/build-deb-arch.test.sh
