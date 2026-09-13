@@ -304,8 +304,25 @@ impl CaptureDispatcher {
             }
             match self.screenshot.capture(interactive).await {
                 Ok(path) => {
-                    self.set_active(Some(ActiveBackend::ScreenshotPortal));
-                    return Ok(CapturedFrame::Png(path));
+                    // 校验产物确为可解码的非黑 PNG：DDE 的 xdg-desktop-portal-dde
+                    // 委托 KWin 落盘 JPEG（实测 /tmp/kwin_screenshot_*.jpg），
+                    // portal 却把「成功」返回成 CapturedFrame::Png，默认流程不会
+                    // 触发 x11 兜底，daemon 按 PNG 解析报「not a PNG file」。
+                    // 非 PNG / 损坏 / 全黑一律视为 portal 不可用，降级 x11
+                    // （原生 X11 会话）或快速失败（Wayland / 无 x11）。
+                    match validated_screenshot_frame(path) {
+                        Some(p) => {
+                            self.set_active(Some(ActiveBackend::ScreenshotPortal));
+                            return Ok(CapturedFrame::Png(p));
+                        }
+                        None => {
+                            tracing::warn!(
+                                "portal Screenshot returned a non-PNG/invalid artifact \
+                                 (e.g. JPEG from xdg-desktop-portal-dde); degrading to next backend"
+                            );
+                            self.set_active(None);
+                        }
+                    }
                 }
                 Err(e) => tracing::warn!("screenshot portal failed, degrade: {e}"),
             }
@@ -355,7 +372,7 @@ impl CaptureDispatcher {
     /// 授权弹窗永不弹出（Radian 审查 #1）。
     async fn screenshot_preprobe(&self, budget: std::time::Duration) -> Option<CapturedFrame> {
         match tokio::time::timeout(budget, self.screenshot.capture(false)).await {
-            Ok(Ok(path)) => preprobe_frame(path).map(CapturedFrame::Png),
+            Ok(Ok(path)) => validated_screenshot_frame(path).map(CapturedFrame::Png),
             Ok(Err(e)) => {
                 tracing::debug!("screenshot non-interactive pre-probe failed: {e}");
                 None
@@ -653,7 +670,8 @@ fn is_all_black(frame: &Frame) -> bool {
 const PNG_DECODE_MAX_BYTES: usize = 256 * 1024 * 1024;
 
 /// 判定 Screenshot 落盘 PNG 是否「全黑或无效」——与 [`is_all_black`] 同口径：
-/// 解码失败（空文件 / 损坏 / 非 PNG）或所有像素 RGB 通道全 0 均视为非可用。
+/// 解码失败（空文件 / 损坏 / 非 PNG / 截断 / bad CRC）或所有像素 RGB 通道
+/// 全 0 均视为非可用。
 ///
 /// 仅判 RGB 通道（忽略 alpha），避免把「透明黑」误判为非黑。portal Screenshot
 /// 可用性必须以帧内容为准，而非仅「文件生成成功」——本地 portal 全空帧
@@ -684,21 +702,30 @@ fn is_png_black_or_invalid(path: &std::path::Path) -> bool {
         );
         return true;
     }
-    // 逐行流式解码 + 短路：非黑像素（常见情形）在第一行即返回 false，
-    // 无需像 `next_frame` 那样先物化整帧 25MB+ 缓冲再全量扫描。debug 构建
-    // 下 PNG 解压/逐像素遍历无优化，全帧物化会放大每次 doctor 探测的开销。
+    // 逐行流式解码，不物化整帧缓冲（8K 单帧 25MB+，debug 下解压/逐像素
+    // 遍历无优化，全帧物化会放大每次 doctor 探测的开销）。命中非黑行只
+    // 标记、不提前返回——必须读尽全部行再 `finish()` 校验 trailer，否则
+    // 首行非黑但截断/损坏（bad CRC、IDAT 截断、缺 IEND）的 PNG 会漏过
+    // 校验，以 `CapturedFrame::Png` 交给 daemon。
     let (color_type, _depth) = reader.output_color_type();
+    let mut has_non_black = false;
     loop {
         match reader.next_row() {
             Ok(Some(row)) => {
                 if row_has_non_black(row.data(), color_type) {
-                    return false;
+                    has_non_black = true;
                 }
             }
-            Ok(None) => return true,
+            Ok(None) => break,
             Err(_) => return true,
         }
     }
+    // 读尽 IDAT 后 IEND 仍未消费：`finish()` 读至输入末尾并校验 trailer
+    // CRC，截断（缺 IEND / IDAT 不完整）或坏 CRC 在此返回 Err，判不可用。
+    if reader.finish().is_err() {
+        return true;
+    }
+    !has_non_black
 }
 
 /// 单行是否含非黑像素（忽略 alpha 通道，与 [`is_all_black`] 同口径）。
@@ -788,10 +815,11 @@ fn is_wayland_session_with(
     wayland_display.is_some() || wayland_socket.is_some()
 }
 
-/// 非交互预探测结果判定（纯函数，可单测）：黑/无效帧（与 [`CaptureDispatcher::probe`]
-/// 的 [`is_png_black_or_invalid`] 同口径）视为预探测失败并清理临时文件，返回
-/// `None`；否则返回 `Some(path)`（Radian 审查 #2）。
-fn preprobe_frame(path: std::path::PathBuf) -> Option<std::path::PathBuf> {
+/// 校验 portal Screenshot 落盘产物是否可用（纯函数，可单测）：非 PNG（如
+/// xdg-desktop-portal-dde 委托 KWin 落盘的 JPEG）、损坏或全黑（与
+/// [`is_png_black_or_invalid`] 同口径）一律判不可用并清理临时文件，返回
+/// `None`；可用则返回 `Some(path)`。调用方据 `None` 降级 x11 / 快速失败。
+fn validated_screenshot_frame(path: std::path::PathBuf) -> Option<std::path::PathBuf> {
     if is_png_black_or_invalid(&path) {
         let _ = std::fs::remove_file(&path);
         None
@@ -919,12 +947,12 @@ mod tests {
         );
     }
 
-    /// 预探测结果判定：黑/无效帧 → `None` 并清理临时文件；有效帧 → `Some`
-    /// ——覆盖「预探测失败 → 升级弹窗」的前置判定分支（Radian 审查 #2/#3）。
+    /// 产物校验：黑/无效帧 → `None` 并清理临时文件；有效帧 → `Some`
+    /// ——覆盖「预探测失败 → 升级弹窗」与「非 PNG 产物 → 降级」的判定分支。
     #[test]
-    fn preprobe_frame_rejects_black_and_keeps_valid() {
+    fn validated_screenshot_frame_rejects_black_and_keeps_valid() {
         let dir = tempfile::tempdir().unwrap();
-        // 全黑 PNG → 预探测失败并清理。
+        // 全黑 PNG → 不可用并清理。
         let black = write_png(
             dir.path(),
             "black.png",
@@ -933,12 +961,12 @@ mod tests {
             1,
             &[0, 0, 0],
         );
-        assert!(preprobe_frame(black.clone()).is_none());
+        assert!(validated_screenshot_frame(black.clone()).is_none());
         assert!(
             !black.exists(),
             "black frame must be removed after rejection"
         );
-        // 非黑 PNG → 预探测成功保留。
+        // 非黑 PNG → 可用保留。
         let red = write_png(
             dir.path(),
             "red.png",
@@ -947,8 +975,28 @@ mod tests {
             1,
             &[255, 0, 0],
         );
-        assert!(preprobe_frame(red.clone()).is_some());
+        assert!(validated_screenshot_frame(red.clone()).is_some());
         assert!(red.exists(), "valid frame must be kept");
+    }
+
+    /// JPEG 产物回归锚定：DDE 的 xdg-desktop-portal-dde 委托 KWin 落盘
+    /// JPEG（实测 /tmp/kwin_screenshot_*.jpg），portal 却返回「成功」。
+    /// 非 PNG 产物必须判为不可用并清理，由调用方降级 x11，而非把 JPEG 当
+    /// PNG 解析报「not a PNG file」（TSI-3084）。
+    #[test]
+    fn validated_screenshot_frame_rejects_jpeg_artifact() {
+        let dir = tempfile::tempdir().unwrap();
+        let jpeg = dir.path().join("kwin_screenshot.jpg");
+        // JPEG SOI（FF D8 FF E0）+ 非全零填充：非 PNG 魔数、非「空/全 0」。
+        let mut bytes = vec![0xFF, 0xD8, 0xFF, 0xE0];
+        bytes.extend(std::iter::repeat(0x11).take(1024));
+        std::fs::write(&jpeg, &bytes).unwrap();
+        assert!(is_png_black_or_invalid(&jpeg));
+        assert!(validated_screenshot_frame(jpeg.clone()).is_none());
+        assert!(
+            !jpeg.exists(),
+            "JPEG artifact must be removed after rejection"
+        );
     }
 
     #[test]
@@ -1203,6 +1251,42 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let huge = write_oversized_png(dir.path(), "huge.png", 100_000, 100_000);
         assert!(is_png_black_or_invalid(&huge));
+    }
+
+    /// 首行非黑但尾部截断/损坏的 PNG 必须判不可用——首个非黑行即短路返回
+    /// 「可用」会让 bad CRC / IDAT 截断 / 缺 IEND 的产物漏过校验，以
+    /// `CapturedFrame::Png` 交给 daemon（Radian 审查 / sourcery-ai 反馈）。
+    #[test]
+    fn is_png_black_or_invalid_rejects_corrupt_non_black_png() {
+        let dir = tempfile::tempdir().unwrap();
+        // 2×2 RGB：首行红（非黑）、次行黑。IDAT 完整可解出首行，损坏在尾部。
+        let src = write_png(
+            dir.path(),
+            "src.png",
+            png::ColorType::Rgb,
+            2,
+            2,
+            &[255, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        );
+        let valid = std::fs::read(&src).unwrap();
+
+        // (1) 缺 IEND：截掉末尾 12 字节（IEND chunk）。
+        let missing_iend = dir.path().join("missing_iend.png");
+        std::fs::write(&missing_iend, &valid[..valid.len() - 12]).unwrap();
+        assert!(is_png_black_or_invalid(&missing_iend));
+
+        // (2) IDAT 截断：再截深一层，砍掉 IEND + 一段 IDAT 数据。
+        let truncated_idat = dir.path().join("truncated_idat.png");
+        std::fs::write(&truncated_idat, &valid[..valid.len() - 24]).unwrap();
+        assert!(is_png_black_or_invalid(&truncated_idat));
+
+        // (3) 坏 trailer CRC：翻转 IEND 的 CRC 末字节（文件末尾 4 字节）。
+        let bad_crc = dir.path().join("bad_crc.png");
+        let mut bytes = valid.clone();
+        let n = bytes.len();
+        bytes[n - 1] ^= 0xFF;
+        std::fs::write(&bad_crc, &bytes).unwrap();
+        assert!(is_png_black_or_invalid(&bad_crc));
     }
 
     #[test]
