@@ -27,6 +27,13 @@ case "$1" in
             systemctl enable agent-shell-rootd.service || true
             # 不自动 start——由管理员按需启动（polkit 首次授权触发）
         fi
+        # user daemon 单元启用——仅在 agent-shell 包安装时执行
+        #（--global enable 为所有用户在 graphical-session.target.wants 建立
+        #  符号链接；单元文件由 build-deb.sh 安装到 /usr/lib/systemd/user/，
+        #  使 Restart=on-failure 在图形会话常驻形态下生效）
+        if [ -d /run/systemd/system ] && [ "${DPKG_MAINTSCRIPT_PACKAGE:-}" = "agent-shell" ]; then
+            systemctl --global enable agent-shell-daemon.service || true
+        fi
         ;;
 esac
 

@@ -49,6 +49,9 @@
           # 安装 systemd user service + udev rules + 二进制
           postInstall = ''
             # systemd user service（§22.2 D1）
+            # nix 部署二进制位于 $out/bin，ExecStart 需替换 deb/arch 的 /usr/bin 路径
+            substituteInPlace daemon/agent-shell-daemon.service \
+              --replace-fail '/usr/bin/agent-shell-daemon' "$out/bin/agent-shell-daemon"
             install -Dm644 daemon/agent-shell-daemon.service \
               $out/lib/systemd/user/agent-shell-daemon.service
             # udev rules for ydotool /dev/uinput（§20.3 权限模型）
