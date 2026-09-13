@@ -5720,8 +5720,6 @@ agent-shell security revoke "my-agent"      # 撤销
 agent-shell security audit                  # 审计日志
 
 # Daemon
-agent-shell daemon start                    # 启动守护进程
-agent-shell daemon stop
 agent-shell daemon status
 agent-shell daemon sessions                 # 查看 portal 会话
 
