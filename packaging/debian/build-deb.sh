@@ -44,6 +44,7 @@ cat > "$PKG1/DEBIAN/control" <<EOF
 Package: agent-shell
 Architecture: $ARCH
 Version: $VERSION
+Maintainer: Agent Shell <agent-shell@example.com>
 Depends: systemd, xdg-desktop-portal, pipewire
 Description: Agent Shell — Linux desktop agent shell
  Agent Shell is a desktop automation framework.
@@ -74,6 +75,7 @@ cat > "$PKG2/DEBIAN/control" <<EOF
 Package: agent-shell-rootd
 Architecture: $ARCH
 Version: $VERSION
+Maintainer: Agent Shell <agent-shell@example.com>
 Depends: policykit-1, systemd
 Description: Agent Shell rootd — privileged proxy (systemd system unit)
  Agent Shell rootd: thin privileged proxy, whitelisted D-Bus + polkit.
