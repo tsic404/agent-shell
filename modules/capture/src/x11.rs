@@ -14,7 +14,7 @@
 use agent_shell_core::error::{AgentShellError, Result};
 use agent_shell_displayserver_x11::X11DisplayServer;
 
-use crate::portal_screencast::{Frame, PixelFormat};
+use crate::types::{Frame, PixelFormat};
 
 /// X11 原生捕获器：持有独立连接，按需抓取根窗口/指定窗口。
 ///

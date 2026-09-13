@@ -18,6 +18,13 @@ concurrency:
 jobs:
   check:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # default：完整门禁（lint + test + 默认 build）。
+        # no-pipewire：不装 libpipewire-0.3-dev，验证 --no-default-features 下
+        # capture/daemon 无需 PipeWire dev 头即可编译（TSI-3111）。
+        profile: [default, no-pipewire]
     steps:
       - uses: actions/checkout@v7
 
@@ -30,18 +37,26 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Install system deps
+        if: matrix.profile == 'default'
         run: sudo apt-get update && sudo apt-get install -y libpipewire-0.3-dev
 
       - name: Lint (Rust)
+        if: matrix.profile == 'default'
         run: |
           cargo fmt --check
           cargo clippy -- -D warnings
 
       - name: Test (Rust)
+        if: matrix.profile == 'default'
         run: cargo test
 
       - name: Build (Rust)
+        if: matrix.profile == 'default'
         run: cargo build --release
 
       - name: Test (Packaging)
+        if: matrix.profile == 'default'
         run: sh packaging/debian/build-deb-arch.test.sh
+      - name: Build (Rust, no PipeWire dev headers)
+        if: matrix.profile == 'no-pipewire'
+        run: cargo build --release -p agent-shell-capture -p agent-shell-daemon --no-default-features

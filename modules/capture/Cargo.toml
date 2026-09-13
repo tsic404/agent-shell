@@ -18,9 +18,15 @@ zbus.workspace = true
 zvariant.workspace = true
 libc.workspace = true
 ordered-stream.workspace = true
-pipewire.workspace = true
+pipewire = { workspace = true, optional = true }
 rustix = { version = "1", features = ["fs", "mm", "shm"] }
 png = "0.18.1"
+
+[features]
+default = ["portal-screencast"]
+# portal ScreenCast（PipeWire 流式）路径。关闭时 ScreenCast 分支编译期排除，
+# 无需 PipeWire dev 头（libpipewire-0.3.pc / spa 头）即可编译 capture 与 daemon。
+portal-screencast = ["dep:pipewire"]
 
 [dev-dependencies]
 parking_lot.workspace = true

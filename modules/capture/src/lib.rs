@@ -13,8 +13,10 @@
 
 pub mod cache;
 pub mod portal_common;
+#[cfg(feature = "portal-screencast")]
 pub mod portal_screencast;
 pub mod portal_screenshot;
+pub mod types;
 pub mod x11;
 
 use agent_shell_core::component::{
@@ -25,11 +27,10 @@ use async_trait::async_trait;
 use std::future::Future;
 
 pub use cache::CaptureCache;
-pub use portal_screencast::{
-    CaptureTarget, Frame, PersistMode, PixelFormat, ScreenCastCapture, ScreenCastOptions,
-    ScreenCastSession,
-};
+#[cfg(feature = "portal-screencast")]
+pub use portal_screencast::{PersistMode, ScreenCastCapture, ScreenCastOptions, ScreenCastSession};
 pub use portal_screenshot::{ScreenshotPortal, SCREENSHOT_MAX_ATTEMPTS, SCREENSHOT_TIMEOUT};
+pub use types::{CaptureTarget, Frame, PixelFormat};
 pub use x11::X11Capture;
 
 /// portal restore_token 持久化抽象——daemon 侧 `PortalSessionManager` 实现。
@@ -51,7 +52,7 @@ pub const COMPONENT_NAME: &str = "capture";
 /// 余量。
 ///
 /// 无 portal 授权时，ScreenCast Start 弹窗无人应答会吃满
-/// [`portal_screencast::SCREENCAST_TIMEOUT`]（10s）+
+/// `SCREENCAST_TIMEOUT`（10s）+
 /// [`portal_screenshot::SCREENSHOT_TIMEOUT_INTERACTIVE`]（5s）= 15s。QA 验收
 /// （TC-301/303）以 8s 为命令超时上限（`timeout 8` → exit 124），故 portal
 /// 段封顶 6s、端到端（portal + x11 兜底）由 [`CAPTURE_END_TO_END_BUDGET`]
@@ -112,6 +113,9 @@ impl ActiveBackend {
 /// `token_store` 注入后，ScreenCast 优先尝试用持久化的 `restore_token`
 /// 静默恢复会话——恢复成功则无弹窗（无交互授权路径）。
 pub struct CaptureDispatcher {
+    /// session bus 连接。仅在 `portal-screencast` 下被 ScreenCast 会话使用
+    /// （ScreenshotPortal 自持连接）。
+    #[cfg(feature = "portal-screencast")]
     conn: zbus::Connection,
     screencast_ok: bool,
     screenshot_ok: bool,
@@ -124,8 +128,11 @@ pub struct CaptureDispatcher {
     wayland_session: bool,
     active: std::sync::Mutex<Option<ActiveBackend>>,
     /// restore_token 持久化（daemon 的 PortalSessionManager；无则 None）。
+    /// 仅在 `portal-screencast` feature 下被 ScreenCast 路径读取。
+    #[cfg(feature = "portal-screencast")]
     token_store: Option<std::sync::Arc<dyn TokenStore>>,
     /// 已建立的 ScreenCast 流会话（daemon 复用，避免反复弹窗 §21.22）。
+    #[cfg(feature = "portal-screencast")]
     session: tokio::sync::Mutex<Option<std::sync::Arc<ScreenCastCapture>>>,
     /// X11 捕获器（惰性建连，daemon 复用连接——审查项 #5）。
     x11: tokio::sync::OnceCell<X11Capture>,
@@ -138,14 +145,20 @@ impl CaptureDispatcher {
     }
 
     /// 按探测链装配，注入 `restore_token` 持久化后端。
-    ///
-    /// `token_store` 为 daemon 的 `PortalSessionManager`；注入后 ScreenCast
-    /// 优先尝试 `restore_token` 静默恢复，避免交互弹窗（§22.7 D5）。
     pub async fn with_token_store(
         token_store: Option<std::sync::Arc<dyn TokenStore>>,
     ) -> Option<Self> {
         let conn = zbus::Connection::session().await.ok()?;
+        // ScreenCast 通道仅在 `portal-screencast` feature 开启时探测；关闭时
+        // screencast_ok 恒 false，ScreenCast 分支编译期排除（TSI-3111）。
+        #[cfg(feature = "portal-screencast")]
         let screencast_ok = ScreenCastCapture::available(&conn).await;
+        #[cfg(not(feature = "portal-screencast"))]
+        let screencast_ok = false;
+        // feature 关闭时无 ScreenCast 路径可注入 token_store，仅丢弃。
+        #[cfg(not(feature = "portal-screencast"))]
+        let _ = token_store;
+
         let screenshot = ScreenshotPortal::with_connection(conn.clone());
         let screenshot_ok = screenshot.available().await;
         let x11_present = X11Capture::display_present();
@@ -154,6 +167,7 @@ impl CaptureDispatcher {
             return None;
         }
         Some(Self {
+            #[cfg(feature = "portal-screencast")]
             conn,
             screencast_ok,
             screenshot_ok,
@@ -161,7 +175,9 @@ impl CaptureDispatcher {
             x11_present,
             wayland_session,
             active: std::sync::Mutex::new(None),
+            #[cfg(feature = "portal-screencast")]
             token_store,
+            #[cfg(feature = "portal-screencast")]
             session: tokio::sync::Mutex::new(None),
             x11: tokio::sync::OnceCell::new(),
         })
@@ -267,21 +283,24 @@ impl CaptureDispatcher {
     /// `BackendUnavailable`，由调用方降级 x11。
     async fn capture_portal(
         &self,
-        target: CaptureTarget,
+        _target: CaptureTarget,
         interactive: bool,
     ) -> Result<CapturedFrame> {
-        // L1: portal ScreenCast（流式，daemon 复用会话）。
-        if let Some(s) = self.ensure_screencast_session(target, interactive).await {
-            match s.capture_frame().await {
-                Ok(frame) => {
-                    self.set_active(Some(ActiveBackend::ScreenCast));
-                    return Ok(CapturedFrame::Pixels(frame));
-                }
-                Err(e) => {
-                    tracing::warn!("screencast frame failed, degrade: {e}");
-                    // 会话失效即丢弃，下次重新走五步流程。
-                    *self.session.lock().await = None;
-                    self.set_active(None);
+        // L1: portal ScreenCast（流式，daemon 复用会话）。feature 关闭时编译期排除。
+        #[cfg(feature = "portal-screencast")]
+        {
+            if let Some(s) = self.ensure_screencast_session(_target, interactive).await {
+                match s.capture_frame().await {
+                    Ok(frame) => {
+                        self.set_active(Some(ActiveBackend::ScreenCast));
+                        return Ok(CapturedFrame::Pixels(frame));
+                    }
+                    Err(e) => {
+                        tracing::warn!("screencast frame failed, degrade: {e}");
+                        // 会话失效即丢弃，下次重新走五步流程。
+                        *self.session.lock().await = None;
+                        self.set_active(None);
+                    }
                 }
             }
         }
@@ -367,6 +386,7 @@ impl CaptureDispatcher {
         }
     }
 
+    #[cfg(feature = "portal-screencast")]
     /// 建立（或复用）ScreenCast 流会话，返回可复用的会话句柄。
     ///
     /// `interactive=false` 且无 `restore_token` 时直接返回 `None`（portal 无
@@ -428,20 +448,23 @@ impl CaptureDispatcher {
     ///
     /// 返回 `None` 表示无任何后端可非交互建立，并将 `active` 清空。
     pub async fn probe(&self) -> Option<ActiveBackend> {
-        // L1: ScreenCast 静默恢复（无 token 会弹窗，跳过）。
-        if let Some(s) = self
-            .ensure_screencast_session(CaptureTarget::Monitor, false)
-            .await
+        // L1: ScreenCast 静默恢复（无 token 会弹窗，跳过）。feature 关闭时编译期排除。
+        #[cfg(feature = "portal-screencast")]
         {
-            match s.capture_frame().await {
-                Ok(_) => {
-                    self.set_active(Some(ActiveBackend::ScreenCast));
-                    return Some(ActiveBackend::ScreenCast);
-                }
-                Err(e) => {
-                    tracing::debug!("screencast frame probe failed: {e}");
-                    *self.session.lock().await = None;
-                    self.set_active(None);
+            if let Some(s) = self
+                .ensure_screencast_session(CaptureTarget::Monitor, false)
+                .await
+            {
+                match s.capture_frame().await {
+                    Ok(_) => {
+                        self.set_active(Some(ActiveBackend::ScreenCast));
+                        return Some(ActiveBackend::ScreenCast);
+                    }
+                    Err(e) => {
+                        tracing::debug!("screencast frame probe failed: {e}");
+                        *self.session.lock().await = None;
+                        self.set_active(None);
+                    }
                 }
             }
         }
@@ -501,18 +524,21 @@ impl CaptureDispatcher {
     /// 构造 ScreenCast 建会话选项：尝试 restore_token 恢复 + persist_mode 持久化。
     ///
     /// 委托 [`screencast_options_for`]——纯函数，可单测。
+    #[cfg(feature = "portal-screencast")]
     fn build_screencast_options(&self) -> ScreenCastOptions {
         screencast_options_for(self.token_store.as_deref())
     }
 
     /// 关闭持有的 ScreenCast 会话（daemon 退出前调用）。
     pub async fn shutdown(&self) {
+        #[cfg(feature = "portal-screencast")]
         if let Some(s) = self.session.lock().await.take() {
             let _ = s.close_session().await;
         }
     }
 }
 
+#[cfg(feature = "portal-screencast")]
 /// 从 `TokenStore` 构造 ScreenCast 建会话选项（纯函数，可单测）。
 ///
 /// - 有 `token_store` 且存有 `restore_token`：传入以尝试静默恢复。
@@ -835,7 +861,9 @@ mod tests {
     /// portal 探测预算 = 6s、端到端截止 = 7s：两者都必须小于 QA 验收的 8s
     /// 上限与旧行为叠加的 2×SCREENSHOT_TIMEOUT + SCREENCAST_TIMEOUT（≈27.8s）
     /// 及旧的 15s 交互预算——锚定「无 portal 授权 8s 内降级 x11 或快速失败」
-    /// （TSI-3054 审查 #1）。
+    /// （TSI-3054 审查 #1）。`SCREENCAST_TIMEOUT` 仅在 `portal-screencast` 下
+    /// 存在，故整测随 feature 排除。
+    #[cfg(feature = "portal-screencast")]
     #[test]
     fn capture_budgets_leave_margin_for_x11_fallback() {
         assert_eq!(PORTAL_PROBE_BUDGET, std::time::Duration::from_secs(6));
@@ -951,6 +979,7 @@ mod tests {
         assert!(red.exists(), "valid frame must be kept");
     }
 
+    #[cfg(feature = "portal-screencast")]
     #[test]
     fn screencast_options_with_token_and_stored_restore_token() {
         // 有 token_store + 已存 token → options 应携带 restore_token
@@ -963,6 +992,7 @@ mod tests {
         assert_eq!(opts.persist_mode, Some(PersistMode::UntilRevoked));
     }
 
+    #[cfg(feature = "portal-screencast")]
     #[test]
     fn screencast_options_with_token_store_but_no_token() {
         // 有 token_store 但无已存 token → persist_mode 设但 restore_token=None。
@@ -975,6 +1005,7 @@ mod tests {
         assert_eq!(opts.persist_mode, Some(PersistMode::UntilRevoked));
     }
 
+    #[cfg(feature = "portal-screencast")]
     #[test]
     fn screencast_options_without_token_store() {
         // 无 token_store → options 应为默认（无 restore_token、无 persist_mode）。
