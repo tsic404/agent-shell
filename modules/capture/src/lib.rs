@@ -4,7 +4,7 @@
 //!
 //! 1. portal ScreenCast → PipeWire 流式（各 Wayland DE 公共首选，§3.5.3）
 //! 2. portal Screenshot → PNG 单帧
-//! 3. X11 原生 MIT-SHM（X11Generic 会话直用）
+//! 3. X11 原生捕获（X11Generic 会话直用）
 //!
 //! 另含跨帧变化检测缓存 [`cache::CaptureCache`]（§13.4）。
 //!
@@ -97,7 +97,7 @@ impl ActiveBackend {
         match self {
             Self::ScreenCast => "portal-screencast",
             Self::ScreenshotPortal => "portal-screenshot",
-            Self::X11 => "x11-mit-shm",
+            Self::X11 => "x11",
         }
     }
 }
@@ -592,7 +592,7 @@ pub async fn doctor_line(dispatcher: Option<&CaptureDispatcher>) -> String {
 /// 决策：Wayland 下 portal 是唯一授权闸门，降级 x11 会静默抓 XWayland
 /// root（越权），故「已拒绝 x11 兜底」——但 [`CaptureDispatcher::probe`]
 /// 不携带具体失败原因（未授权、传输错误、黑帧皆可能），故不武断「无授权」，
-/// 仅保留「已拒绝 x11 兜底」信号（TSI-3075）。候选链无 `x11-mit-shm`（纯
+/// 仅保留「已拒绝 x11 兜底」信号（TSI-3075）。候选链无 `x11`（纯
 /// Wayland，无 XWayland）时无兜底可拒，如实报无可用后端。
 fn render_capture_doctor_line(
     label: &str,
@@ -740,7 +740,7 @@ where
 /// portal 失败后的降级去向（纯函数决策结果）。
 #[derive(Debug)]
 enum PortalFallback {
-    /// 原生 X11 会话：降级 x11-mit-shm 抓屏。
+    /// 原生 X11 会话：降级 x11 抓屏。
     X11,
     /// 快速失败：Wayland 下拒绝静默抓 XWayland root，或没有任何兜底后端。
     Fail(AgentShellError),
@@ -750,7 +750,7 @@ enum PortalFallback {
 ///
 /// - Wayland 会话：portal 是唯一授权闸门，无授权降级 x11 会静默抓取
 ///   XWayland root（越权），必须快速失败并给出明确报错（TSI-3054 审查 #2）。
-/// - 原生 X11 会话且 `x11_present`：降级 x11-mit-shm。
+/// - 原生 X11 会话且 `x11_present`：降级 x11。
 /// - 无任何兜底：快速失败。
 fn portal_fallback(wayland: bool, x11_present: bool) -> PortalFallback {
     if wayland {
@@ -1210,7 +1210,7 @@ mod tests {
         // 已建立真实会话（probe 返回 Some）→ ✓ + 选中后端名。
         let line = render_capture_doctor_line(
             "截图捕获",
-            &["portal-screencast", "portal-screenshot", "x11-mit-shm"],
+            &["portal-screencast", "portal-screenshot", "x11"],
             Some(ActiveBackend::ScreenCast),
             PortalFallback::X11,
         );
@@ -1218,7 +1218,7 @@ mod tests {
             line.starts_with("✓ 截图捕获"),
             "selected backend must render ✓: {line}"
         );
-        assert!(line.contains("portal-screencast → portal-screenshot → x11-mit-shm"));
+        assert!(line.contains("portal-screencast → portal-screenshot → x11"));
         assert!(line.contains("选中 portal-screencast"), "{line}");
     }
 
@@ -1244,21 +1244,21 @@ mod tests {
         // 故不武断「无授权」，只报「portal 未就绪/未授权」（TSI-3075 + 审查）。
         let line = render_capture_doctor_line(
             "截图捕获",
-            &["portal-screencast", "portal-screenshot", "x11-mit-shm"],
+            &["portal-screencast", "portal-screenshot", "x11"],
             None,
             PortalFallback::Fail(AgentShellError::Permission(
                 "portal authorization unavailable on Wayland".into(),
             )),
         );
         assert!(line.starts_with("⚠ 截图捕获"), "{line}");
-        assert!(line.contains("候选 portal-screencast → portal-screenshot → x11-mit-shm"));
+        assert!(line.contains("候选 portal-screencast → portal-screenshot → x11"));
         assert!(line.contains("Wayland 下 portal 未就绪/未授权"), "{line}");
         assert!(line.contains("已拒绝 x11 兜底"), "{line}");
     }
 
     #[test]
     fn render_capture_doctor_line_without_active_backend_pure_wayland_no_x11() {
-        // 纯 Wayland（无 XWayland，候选链无 x11-mit-shm）→ 无兜底可拒，
+        // 纯 Wayland（无 XWayland，候选链无 x11）→ 无兜底可拒，
         // 如实报「无可用后端」而非「已拒绝 x11 兜底」（Radian 审查）。
         let line = render_capture_doctor_line(
             "截图捕获",
@@ -1279,10 +1279,9 @@ mod tests {
     fn render_capture_doctor_line_without_active_backend_x11_only() {
         // 候选集仅含 X11（无 portal 后端）→ 探测失败与授权无关，须渲染
         // 「无可用后端」而非「需 portal 交互授权」（Radian 建议 3）。
-        let line =
-            render_capture_doctor_line("截图捕获", &["x11-mit-shm"], None, PortalFallback::X11);
+        let line = render_capture_doctor_line("截图捕获", &["x11"], None, PortalFallback::X11);
         assert!(line.starts_with("⚠ 截图捕获"), "{line}");
-        assert!(line.contains("候选 x11-mit-shm"), "{line}");
+        assert!(line.contains("候选 x11"), "{line}");
         assert!(line.contains("无可用后端"), "{line}");
         assert!(!line.contains("portal"), "{line}");
     }

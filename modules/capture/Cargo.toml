@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "agent-shell capture component: portal ScreenCast (PipeWire) / portal Screenshot / X11 MIT-SHM fallback chain"
+description = "agent-shell capture component: portal ScreenCast (PipeWire) / portal Screenshot / X11 fallback chain"
 
 [dependencies]
 agent-shell-core.workspace = true

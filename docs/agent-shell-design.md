@@ -3585,7 +3585,7 @@ impl<T> FallbackChain<T> {
 > 需用户点击授权，若无人应答则 ScreenCast Start 弹窗等待（10s）+ Screenshot
 > 交互超时（5s）逐级叠加。故 `CaptureDispatcher::capture` 对 **portal 段**
 > （ScreenCast → Screenshot）套 `PORTAL_PROBE_BUDGET = 6s` 子预算，portal 超时/
-> 失败后再降级 x11-mit-shm（`capture_x11`）；「portal 探测 + x11 兜底」整体由
+> 失败后再降级 x11（`capture_x11`）；「portal 探测 + x11 兜底」整体由
 > `CAPTURE_END_TO_END_BUDGET = 7s` 端到端封顶，低于 QA 验收 `timeout 8` 上限
 > （留 1s 余量给进程启动与 RPC 往返）——保证无 portal 授权时 8s 内必出结果
 > （x11 帧）或快速失败。Wayland 会话下 portal 是唯一授权闸门，超时/拒绝不
