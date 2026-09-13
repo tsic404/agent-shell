@@ -221,14 +221,46 @@ impl CaptureDispatcher {
     /// 截断，随后降级 x11（原生 X11 会话）或快速失败（Wayland/无 x11），
     /// 全程保证 8s 内出结果（TSI-3054）。
     pub async fn capture(&self, target: CaptureTarget, interactive: bool) -> Result<CapturedFrame> {
+        self.capture_impl(target, interactive, false).await
+    }
+
+    /// 区域裁剪所需的原始像素捕获（`--area` 路径）：ScreenCast → X11。
+    ///
+    /// portal Screenshot 只落全屏 PNG、无像素数据，无法在 daemon 侧裁剪；
+    /// 故 `--area` 跳过 Screenshot 段（`require_pixels`），ScreenCast 返回的
+    /// 原始帧可直接裁剪。ScreenCast 不可用/未授权时按 [`portal_fallback`]
+    /// 降级：原生 X11 会话抓 X11 root 帧；Wayland/无 x11 会话返回
+    /// [`AgentShellError::NotSupported`]（Screenshot PNG 无法裁剪），映射到
+    /// `InvalidParams` 而非冒充授权拒绝。
+    pub async fn capture_pixels(&self, target: CaptureTarget, interactive: bool) -> Result<Frame> {
+        match self.capture_impl(target, interactive, true).await? {
+            CapturedFrame::Pixels(frame) => Ok(frame),
+            CapturedFrame::Png(_) => Err(AgentShellError::Capture(
+                "capture_pixels: unexpected portal Screenshot PNG (Screenshot 段应被跳过)".into(),
+            )),
+        }
+    }
+
+    /// [`Self::capture`] / [`Self::capture_pixels`] 的共享主体。
+    ///
+    /// `require_pixels` 为真时 portal Screenshot（PNG 落盘）不是可用终端——
+    /// 调用方（区域裁剪）需要原始像素帧，该段被跳过，portal 失败后降级去向
+    /// 仍由 [`portal_fallback`] 决定。
+    async fn capture_impl(
+        &self,
+        target: CaptureTarget,
+        interactive: bool,
+        require_pixels: bool,
+    ) -> Result<CapturedFrame> {
         if interactive {
             capture_with_budget(
                 CAPTURE_END_TO_END_BUDGET,
-                self.capture_portal_then_fallback(target, true),
+                self.capture_portal_then_fallback(target, true, require_pixels),
             )
             .await
         } else {
-            self.capture_portal_then_fallback(target, false).await
+            self.capture_portal_then_fallback(target, false, require_pixels)
+                .await
         }
     }
 
@@ -241,14 +273,28 @@ impl CaptureDispatcher {
         &self,
         target: CaptureTarget,
         interactive: bool,
+        require_pixels: bool,
     ) -> Result<CapturedFrame> {
         let portal = if interactive {
-            capture_with_budget(PORTAL_PROBE_BUDGET, self.capture_portal(target, true)).await
+            capture_with_budget(
+                PORTAL_PROBE_BUDGET,
+                self.capture_portal(target, true, require_pixels),
+            )
+            .await
         } else {
-            self.capture_portal(target, false).await
+            self.capture_portal(target, false, require_pixels).await
         };
         match portal {
             Ok(frame) => Ok(frame),
+            Err(AgentShellError::NotSupported(msg)) => {
+                // Screenshot 可用但被跳过（PNG 无法裁剪）：能力缺口，非 portal
+                // 故障。原生 X11 会话仍降级 x11 抓原始像素；Wayland/无 x11
+                // 如实返回专用错误，不冒充授权拒绝。
+                match portal_fallback(self.wayland_session, self.x11_present) {
+                    PortalFallback::X11 => self.capture_x11().await,
+                    PortalFallback::Fail(_) => Err(AgentShellError::NotSupported(msg)),
+                }
+            }
             Err(e) => {
                 tracing::warn!("portal capture unavailable: {e}");
                 match portal_fallback(self.wayland_session, self.x11_present) {
@@ -265,10 +311,16 @@ impl CaptureDispatcher {
     /// 已授权/免弹窗即时成功、无会话/自动化即时 Permission，两种情况都不
     /// 弹窗、不吃交互超时预算；预探测失败才升级到交互弹窗。全部失败返回
     /// `BackendUnavailable`，由调用方降级 x11。
+    ///
+    /// `require_pixels` 为真时跳过 Screenshot 段——其只落全屏 PNG，调用方
+    /// （区域裁剪）需要原始像素帧，PNG 无法裁剪。Screenshot 可用却跳过时
+    /// 返回 [`AgentShellError::NotSupported`]（能力缺口，非 portal 故障），
+    /// 交由 [`Self::capture_portal_then_fallback`] 决定降级 x11 或如实报错。
     async fn capture_portal(
         &self,
         target: CaptureTarget,
         interactive: bool,
+        require_pixels: bool,
     ) -> Result<CapturedFrame> {
         // L1: portal ScreenCast（流式，daemon 复用会话）。
         if let Some(s) = self.ensure_screencast_session(target, interactive).await {
@@ -286,29 +338,42 @@ impl CaptureDispatcher {
             }
         }
 
-        // L2: portal Screenshot。
-        if self.screenshot.available().await {
-            // 交互先非交互预探测（§13.1 建议 2 / Radian 审查）：已授权/免弹窗
-            // 即时成功、无会话即时 Permission，均不弹窗；黑/无效帧与超时视为
-            // 预探测失败，升级到交互弹窗。预探测受交互预算约束（5s/单次口径），
-            // 不单独吃满 8s×2 超时（否则 ScreenCast 弹窗耗尽 10s 后会被外层
-            // 总预算截断，授权弹窗永不弹出）。
-            if interactive {
-                if let Some(frame) = self
-                    .screenshot_preprobe(portal_screenshot::SCREENSHOT_TIMEOUT_INTERACTIVE)
-                    .await
-                {
-                    self.set_active(Some(ActiveBackend::ScreenshotPortal));
-                    return Ok(frame);
+        // L2: portal Screenshot（PNG）。区域裁剪需原始像素帧，Screenshot 只落
+        // 全屏 PNG、无法裁剪：require_pixels 时跳过。Screenshot 可用却跳过是
+        // 能力缺口而非 portal 故障，返回专用错误——由调用方在原生 X11 会话
+        // 降级 x11，或 Wayland/无 x11 如实报 InvalidParams（而非冒充授权拒绝）。
+        match screenshot_segment(require_pixels, self.screenshot.available().await) {
+            ScreenshotSegment::SkipUnsupported => {
+                return Err(AgentShellError::NotSupported(
+                    "area crop requires ScreenCast or X11 pixels; portal Screenshot (PNG) \
+                     cannot be cropped"
+                        .into(),
+                ));
+            }
+            ScreenshotSegment::Capture => {
+                // 交互先非交互预探测（§13.1 建议 2 / Radian 审查）：已授权/免弹窗
+                // 即时成功、无会话即时 Permission，均不弹窗；黑/无效帧与超时视为
+                // 预探测失败，升级到交互弹窗。预探测受交互预算约束（5s/单次口径），
+                // 不单独吃满 8s×2 超时（否则 ScreenCast 弹窗耗尽 10s 后会被外层
+                // 总预算截断，授权弹窗永不弹出）。
+                if interactive {
+                    if let Some(frame) = self
+                        .screenshot_preprobe(portal_screenshot::SCREENSHOT_TIMEOUT_INTERACTIVE)
+                        .await
+                    {
+                        self.set_active(Some(ActiveBackend::ScreenshotPortal));
+                        return Ok(frame);
+                    }
+                }
+                match self.screenshot.capture(interactive).await {
+                    Ok(path) => {
+                        self.set_active(Some(ActiveBackend::ScreenshotPortal));
+                        return Ok(CapturedFrame::Png(path));
+                    }
+                    Err(e) => tracing::warn!("screenshot portal failed, degrade: {e}"),
                 }
             }
-            match self.screenshot.capture(interactive).await {
-                Ok(path) => {
-                    self.set_active(Some(ActiveBackend::ScreenshotPortal));
-                    return Ok(CapturedFrame::Png(path));
-                }
-                Err(e) => tracing::warn!("screenshot portal failed, degrade: {e}"),
-            }
+            ScreenshotSegment::Unavailable => {}
         }
 
         Err(AgentShellError::BackendUnavailable(
@@ -800,6 +865,29 @@ fn preprobe_frame(path: std::path::PathBuf) -> Option<std::path::PathBuf> {
     }
 }
 
+/// L2 portal Screenshot 段的去向（纯函数决策结果，可单测）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScreenshotSegment {
+    /// Screenshot 可用但被跳过（`require_pixels=true`：PNG 无法裁剪）。
+    SkipUnsupported,
+    /// 尝试 Screenshot 捕获（`require_pixels=false` 且可用）。
+    Capture,
+    /// Screenshot 不可用，继续降级链。
+    Unavailable,
+}
+
+/// `require_pixels` 与 Screenshot 可用性共同决定 L2 段去向（纯函数，可单测）。
+///
+/// `require_pixels=true`（区域裁剪）需要原始像素帧，Screenshot 只落全屏 PNG、
+/// 无法裁剪：可用也须跳过，返回 [`ScreenshotSegment::SkipUnsupported`]（能力缺口）。
+fn screenshot_segment(require_pixels: bool, screenshot_available: bool) -> ScreenshotSegment {
+    match (require_pixels, screenshot_available) {
+        (true, true) => ScreenshotSegment::SkipUnsupported,
+        (false, true) => ScreenshotSegment::Capture,
+        (_, false) => ScreenshotSegment::Unavailable,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -882,6 +970,26 @@ mod tests {
             }
             other => panic!("expected BackendUnavailable, got {other:?}"),
         }
+    }
+
+    /// `require_pixels`（区域裁剪）与 Screenshot 可用性共同决定 L2 段去向：
+    /// require_pixels=true + 可用 → 跳过（SkipUnsupported，PNG 无法裁剪）；
+    /// 不可用 → 继续降级；require_pixels=false + 可用 → 捕获 PNG。
+    #[test]
+    fn screenshot_segment_skips_when_pixels_required() {
+        assert_eq!(
+            screenshot_segment(true, true),
+            ScreenshotSegment::SkipUnsupported
+        );
+        assert_eq!(
+            screenshot_segment(true, false),
+            ScreenshotSegment::Unavailable
+        );
+        assert_eq!(screenshot_segment(false, true), ScreenshotSegment::Capture);
+        assert_eq!(
+            screenshot_segment(false, false),
+            ScreenshotSegment::Unavailable
+        );
     }
 
     /// Wayland 会话判定：任一 env（`WAYLAND_DISPLAY` / `WAYLAND_SOCKET`）存在即真。

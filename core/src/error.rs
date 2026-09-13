@@ -51,6 +51,12 @@ pub enum AgentShellError {
     #[error("Not implemented: {0}")]
     NotImplemented(String),
 
+    /// 请求的能力当前后端不支持（如 portal Screenshot 只落全屏 PNG、无法
+    /// 区域裁剪）。与 [`Self::NotImplemented`] 区分：后端本身可用，只是
+    /// 无法满足本次请求的参数语义，映射到 `InvalidParams` 而非后端错误。
+    #[error("Not supported: {0}")]
+    NotSupported(String),
+
     /// 其它错误（透传底层错误链）。
     #[error(transparent)]
     Other(#[from] Box<dyn std::error::Error + Send + Sync>),
