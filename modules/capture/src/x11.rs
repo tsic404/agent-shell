@@ -1,4 +1,4 @@
-//! X11 原生捕获——MIT-SHM 零拷贝路径（设计文档 §13.1 第三级、§6.4）。
+//! X11 原生捕获——MIT-SHM 优先，失败退化 XGetImage（设计文档 §13.1 第三级、§6.4）。
 //!
 //! X11Generic 会话（或 portal 全部不可用时的 X11 兜底）直用
 //! SHM GetImage：server 端把像素写进共享内存段，客户端免大块
@@ -75,7 +75,7 @@ impl X11Capture {
     }
 }
 
-/// 单次捕获：优先 MIT-SHM，失败回退 GetImage。
+/// 单次捕获：优先 MIT-SHM（memfd fd-passing），失败回退 XGetImage。
 fn capture_with(x: &X11DisplayServer, window: Option<u32>) -> Result<Frame> {
     use x11rb::protocol::shm::{self, ConnectionExt as _};
     use x11rb::protocol::xproto::{ConnectionExt as XProtoExt, Drawable, ImageFormat};
