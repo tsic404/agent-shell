@@ -14,7 +14,11 @@ ROOT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 TARGET_DIR="${1:-$ROOT_DIR/target}"
 BUILD_DIR="$(mktemp -d)"
 VERSION="$(grep -m1 '^version' "$ROOT_DIR/Cargo.toml" | sed 's/.*"\(.*\)"/\1/')"
-ARCH="$(dpkg --print-architecture 2>/dev/null || echo amd64)"
+ARCH="${DEB_HOST_ARCH:-$(dpkg --print-architecture 2>/dev/null || true)}"
+if [ -z "$ARCH" ]; then
+    echo "error: unable to determine build architecture (dpkg missing, DEB_HOST_ARCH unset)" >&2
+    exit 1
+fi
 
 echo "Building deb: agent-shell $VERSION ($ARCH)"
 
