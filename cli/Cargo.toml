@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "agent-shell CLI entry point — pure JSON-RPC client to daemon (§22.2 D1)"
+build = "../build/version.rs"
 
 [[bin]]
 name = "agent-shell"

@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "agent-shell MCP server (rmcp-based, §17.3)"
+build = "../build/version.rs"
 
 [lib]
 name = "agent_shell_mcp"

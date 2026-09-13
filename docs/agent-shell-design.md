@@ -3710,6 +3710,47 @@ strip = true
 | atspi (lib) | 无障碍 | 降级可用 AT-SPI D-Bus 直连 |
 
 系统依赖（非 Rust crate）：`xdg-desktop-portal`（必）、`pipewire`（必）、`systemd`（启用 systemd 组件时）。
+### 20.7 QA 二进制版本/commit 约定
+
+**背景**：真机 QA 目录（如 `/home/uos/agent-shell-test/bin/`）里可能存在未打
+版本标记的二进制，无法区分其来源 commit，存在「旧包冒验新修复」的风险。
+约定从构建侧根治：**每个发布二进制在编译期内嵌 git commit**，真机二进制
+可自报来源。
+
+**实现**：共享构建脚本 `build/version.rs`（workspace 根），四个发布二进制
+crate（cli / daemon / mcp / rootd）在 `Cargo.toml` 以 `build = "../build/version.rs"`
+引用，编译期写入 `AGENT_SHELL_GIT_COMMIT` 常量（7 位短哈希；`git status` 判定
+工作树：干净→裸哈希，脏→`<hash>-dirty`，status 失败→`<hash>-dirty-unknown`；
+无 `.git` 的沙箱构建用 `AGENT_SHELL_GIT_COMMIT=<hash>` 环境变量注入）。commit
+切换触发 build.rs 重跑（`rerun-if-changed` 指向 `HEAD`、common dir 的 `refs/`
+与 `packed-refs`，覆盖 `git gc`/`pack-refs` 后分支前进），产物不残留旧标记。
+
+`-dirty` 在 build.rs 重跑时采样：源码改动不触发重跑，增量构建可能残留上一
+采样结果。QA 发布必须从干净工作树构建（`git status --porcelain` 为空），或由
+打包/发布脚本显式注入 `AGENT_SHELL_GIT_COMMIT`。
+
+**暴露面**（均为 `<crate-version> (<git-commit>)` 形态）：
+
+| 二进制 | 自报方式 |
+|--------|---------|
+| `agent-shell` | `agent-shell --version` |
+| `agent-shell-daemon` | 启动日志 `agent-shell-daemon 0.1.0 (1219cfa) starting` |
+| `agent-shell-mcp` | 启动日志同上 |
+| `agent-shell-rootd` | 启动日志 + `Hello` 对账返回 `version` 字段 |
+
+**QA 校验流程**（每个真机包必做）：
+
+```
+agent-shell --version        # 期望输出 `agent-shell 0.1.0 (<commit>)`
+```
+
+将输出的 `<commit>` 与待验 PR 的合并 commit 前缀比对，不一致即拒绝该包。
+daemon/rootd 侧经 `journalctl --user -u agent-shell-daemon`（或
+`--foreground` 前台 stderr）核对启动日志 commit。
+
+**手动命名约定**（可选）：若需按文件名区分，QA 目录内按
+`agent-shell-<commit>` / `agent-shell-daemon-<commit>` 等前缀命名；
+文件名字面须与 `--version` 输出的 commit 一致。
 
 ## 附录 A：模块依赖图
 

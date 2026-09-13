@@ -7,8 +7,15 @@ use agent_shell_rpc::keys::{Key, KeyCombo, KeyName, ModifierMask};
 use clap::{Args as ClapArgs, Parser, Subcommand};
 
 /// agent-shell——桌面自动化 CLI 入口。
+///
+/// `--version` 输出 `<crate-version> (<git-commit>)`：真机 QA 二进制据此
+/// 回溯构建 commit，防「旧包冒验新修复」（§20.7 QA 二进制版本约定）。
 #[derive(Parser, Debug)]
-#[command(name = "agent-shell", version, about)]
+#[command(
+    name = "agent-shell",
+    version = concat!(env!("CARGO_PKG_VERSION"), " (", env!("AGENT_SHELL_GIT_COMMIT"), ")"),
+    about
+)]
 pub struct Cli {
     /// 输出格式（table | json）
     #[arg(long = "output-format", global = true, default_value = "table")]

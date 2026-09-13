@@ -59,6 +59,12 @@ async fn run(idle_timeout: Duration) {
             std::process::exit(1);
         }
     };
+    // 版本自报：`<crate-version> (<git-commit>)`（§20.7 QA 二进制版本约定）。
+    tracing::info!(
+        "agent-shell-daemon {} ({}) starting",
+        env!("CARGO_PKG_VERSION"),
+        env!("AGENT_SHELL_GIT_COMMIT")
+    );
     // 连接来源说明（§22.2 激活策略）：
     // - 当前唯一形态：CLI/MCP fork/exec 本二进制为瞬态子进程，经 stdio 管道
     //   承载 JSON-RPC；父进程退出 → stdin EOF → 本进程随之退出。

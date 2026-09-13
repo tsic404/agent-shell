@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "agent-shell user-session daemon (persistent connections + JSON-RPC dispatch, §22.2 D1 / §23.2)"
+build = "../build/version.rs"
 
 [[bin]]
 name = "agent-shell-daemon"
