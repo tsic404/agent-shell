@@ -305,7 +305,7 @@ mod tests {
     }
 
     /// `Drawable bad_value`（桌面窗口 id 等非可绘窗口）回吐可读提示，
-    /// 而非只暴露 X11 原始错误码（TSI-3132）。
+    /// 而非只暴露 X11 原始错误码。
     #[test]
     fn drawable_bad_value_maps_to_readable_hint() {
         let mapped = capture_reply_err(x11rb::errors::ReplyError::X11Error(
