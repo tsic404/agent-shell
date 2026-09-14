@@ -1,10 +1,9 @@
 #!/bin/sh
 # build-deb.sh — 构建 agent-shell + agent-shell-rootd deb 包（§20.2 打包）
 #
-# 前置：cargo build --release 已完成（产出 target/release/ 二进制）
-#
 # 用法：./packaging/debian/build-deb.sh [target-dir]
 #
+# 步骤：cargo build --release（自动检测 PipeWire dev 头）+ dpkg-deb 打包。
 # 产物：agent-shell_<version>_<arch>.deb + agent-shell-rootd_<version>_<arch>.deb
 # dash 兼容：不使用 pipefail（Debian /bin/sh = dash 不支持 -o pipefail）
 set -eu
@@ -19,6 +18,17 @@ if [ -z "$ARCH" ]; then
     echo "error: unable to determine build architecture (dpkg missing, DEB_HOST_ARCH unset)" >&2
     exit 1
 fi
+
+# ── 构建 release 二进制 ──
+# portal-screencast（capture 默认 feature）需要 libpipewire-0.3.pc；无 dev 头
+# 发行版（UOS 20 Pro / glibc 2.28）用 --no-default-features 关闭该 feature，
+# 避免 libspa-sys build.rs 因找不到头而 panic。
+FEATURES_FLAGS=""
+if ! pkg-config --exists libpipewire-0.3 2>/dev/null; then
+    FEATURES_FLAGS="--no-default-features"
+    echo "warning: libpipewire-0.3 dev headers not found; building with --no-default-features (portal-screencast disabled)" >&2
+fi
+cargo build --release --manifest-path "$ROOT_DIR/Cargo.toml" --target-dir "$TARGET_DIR" $FEATURES_FLAGS
 
 echo "Building deb: agent-shell $VERSION ($ARCH)"
 

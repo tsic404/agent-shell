@@ -50,13 +50,13 @@ repository = "https://github.com/tsic404/agent-shell"
 agent-shell-core = { path = "core" }
 agent-shell-audio = { path = "components/audio" }
 agent-shell-network = { path = "components/network" }
-agent-shell-backend-dde = { path = "backends/dde" }
-agent-shell-backend-kde = { path = "backends/kde" }
-agent-shell-backend-gnome = { path = "backends/gnome" }
-agent-shell-backend-hyprland = { path = "backends/hyprland" }
-agent-shell-backend-sway = { path = "backends/sway" }
-agent-shell-backend-generic = { path = "backends/generic" }
-agent-shell-backend-tty = { path = "backends/tty" }
+agent-shell-backend-dde = { path = "backends/dde", default-features = false }
+agent-shell-backend-kde = { path = "backends/kde", default-features = false }
+agent-shell-backend-gnome = { path = "backends/gnome", default-features = false }
+agent-shell-backend-hyprland = { path = "backends/hyprland", default-features = false }
+agent-shell-backend-sway = { path = "backends/sway", default-features = false }
+agent-shell-backend-generic = { path = "backends/generic", default-features = false }
+agent-shell-backend-tty = { path = "backends/tty", default-features = false }
 agent-shell-displayserver-wayland = { path = "components/displayserver/wayland" }
 agent-shell-displayserver-x11 = { path = "components/displayserver/x11" }
 agent-shell-compositor-wayland-core = { path = "components/compositor/wayland-core" }
@@ -79,7 +79,7 @@ agent-shell-clipboard = { path = "components/clipboard" }
 agent-shell-input = { path = "components/input" }
 agent-shell-a11y = { path = "components/a11y" }
 agent-shell-mcp = { path = "mcp" }
-agent-shell-capture = { path = "modules/capture" }
+agent-shell-capture = { path = "modules/capture", default-features = false }
 agent-shell-event = { path = "event" }
 which = "7"
 libc = "0.2"
