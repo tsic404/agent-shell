@@ -300,6 +300,7 @@ dependencies = [
  "uuid",
  "wayland-client",
  "wayland-protocols-plasma",
+ "x11rb",
  "zbus",
 ]
 

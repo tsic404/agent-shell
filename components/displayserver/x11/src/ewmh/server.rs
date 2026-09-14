@@ -18,7 +18,7 @@ use x11rb::rust_connection::RustConnection;
 use agent_shell_core::error::{AgentShellError, Result};
 use agent_shell_core::types::Rect;
 
-use super::{moveresize_flags, wm_state_action};
+use super::{active_window_source, moveresize_flags, wm_state_action};
 
 // EWMH 原子集合（批量 intern，§6.2「root window → 批量获取原子」）。
 // 宏调用不支持文档注释：字段清单见 ewmh 模块展开说明（x11rb atom_manager!）。
@@ -378,12 +378,16 @@ impl X11DisplayServer {
     // ───────────────────────── 窗口操作（§6.2） ─────────────────────────
 
     /// `_NET_ACTIVE_WINDOW` ClientMessage：请求聚焦窗口。
+    ///
+    /// `data.l[0]` 置 pager 来源（2）而非 0（unknown）——KWin 5.x 的
+    /// focus-stealing prevention 会拒收/降级来源不明的聚焦请求；`data.l[1]`
+    /// 携带 `CurrentTime`（服务端按「当前时刻」解释）。wmctrl/xdotool 同款。
     pub fn activate_window(&self, window: x11rb::protocol::xproto::Window) -> Result<()> {
         let event = ClientMessageEvent::new(
             32,
             window,
             self.atoms._NET_ACTIVE_WINDOW,
-            [0u32, 0, 0, 0, 0],
+            [active_window_source::PAGER, x11rb::CURRENT_TIME, 0, 0, 0],
         );
         self.send_root_event(
             event,

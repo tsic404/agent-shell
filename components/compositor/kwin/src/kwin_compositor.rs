@@ -9,6 +9,8 @@
 //! 选择逻辑（§7.2 矩阵）：列表/聚焦/最小化/关闭优先协议；移动/缩放/
 //! 最大化协议不支持，始终走 Scripting。
 
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use tokio::sync::Mutex as AsyncMutex;
@@ -54,14 +56,20 @@ pub struct KWinCompositor {
     protocols: Option<KWinProtocols>,
     /// D-Bus / Scripting 补充通道（会话无关，共享）。
     bridge: KWinBridge,
-    /// X11 基础通道（仅 X11 会话为 Some）。窗口枚举走 EWMH（`_NET_CLIENT_LIST`
-    /// 等）而非 Scripting `/Scripting`——部分 KWin 5.x X11 会话不注册该
-    /// 对象路径（TSI-3131），枚举通道必须落在 X11 原生路径上。
-    x11: Option<X11DisplayServer>,
+    /// X11 基础通道（仅 X11 会话为 Some）。窗口枚举/聚焦/移动/工作区/事件
+    /// 走 EWMH（`_NET_CLIENT_LIST`、`_NET_ACTIVE_WINDOW`、
+    /// `_NET_MOVERESIZE_WINDOW`、`_NET_NUMBER_OF_DESKTOPS` 等）而非 Scripting
+    /// `/Scripting`——部分 KWin 5.x X11 会话不注册该对象路径，
+    /// 窗口管理与工作区通道必须落在 X11 原生路径上。`Arc` 供 EWMH 事件线程
+    /// 与同步操作并发共享同一连接（x11rb `RustConnection` 内部互斥 + Condvar，
+    /// 多线程读写安全）。
+    x11: Option<Arc<X11DisplayServer>>,
     /// 探测到的版本（决定脚本 API 形态）。
     version: KWinVersion,
-    /// 长驻事件脚本句柄（懒启动）。
+    /// 长驻事件脚本句柄（懒启动；仅 Wayland 会话使用）。
     event_handle: AsyncMutex<Option<EventScriptHandle>>,
+    /// X11 会话的 EWMH 事件监视器（懒启动；订阅后事件线程常驻）。
+    ewmh_monitor: AsyncMutex<Option<crate::event_ewmh::EwmhEventMonitor>>,
     /// `/Scripting` 探测状态：0=未探测，1=失败（不缓存，
     /// 允许重试），2=成功。原子而非锁——doctor_lines(&self) 同步读取。
     scripting_probe: std::sync::atomic::AtomicU8,
@@ -108,6 +116,7 @@ impl KWinCompositor {
             x11: None,
             version,
             event_handle: AsyncMutex::new(None),
+            ewmh_monitor: AsyncMutex::new(None),
             scripting_probe: std::sync::atomic::AtomicU8::new(PROBE_UNSET),
         })
     }
@@ -126,9 +135,10 @@ impl KWinCompositor {
             wayland_core: None,
             protocols: None,
             bridge,
-            x11: Some(x11),
+            x11: Some(Arc::new(x11)),
             version,
             event_handle: AsyncMutex::new(None),
+            ewmh_monitor: AsyncMutex::new(None),
             scripting_probe: std::sync::atomic::AtomicU8::new(PROBE_UNSET),
         })
     }
@@ -158,6 +168,7 @@ impl KWinCompositor {
                 major: crate::version::KWinMajor::V6,
             },
             event_handle: AsyncMutex::new(None),
+            ewmh_monitor: AsyncMutex::new(None),
             scripting_probe: AtomicU8::new(probe),
         }
     }
@@ -558,6 +569,74 @@ impl KWinCompositor {
         }
     }
 
+    // ───────────────────── X11 EWMH 窗口管理 / 工作区 ─────────────────────
+
+    /// 窗口 ID 字符串 → x11rb Window（u32，十进制）。
+    ///
+    /// EWMH 枚举输出十进制窗口 id，与 Scripting
+    /// `internalId.toString()` 口径一致；此处按十进制回读，保证
+    /// `windows list` → `windows focus/move` 的 id 往返自洽。
+    fn x11_window_id(id: &WindowId) -> agent_shell_core::error::Result<u32> {
+        id.native_id.parse::<u32>().map_err(|_| {
+            AgentShellError::WindowNotFound(format!("invalid window id: {}", id.native_id))
+        })
+    }
+
+    /// `_NET_DESKTOP_NAMES` → 工作区名称列表（NULL 分隔；缺失回空，调用方
+    /// 按索引合成 `Desktop N` 兜底名）。
+    fn x11_desktop_names(x11: &X11DisplayServer) -> Vec<String> {
+        let atoms = x11.atoms();
+        x11.get_property_string(
+            x11.root_window(),
+            atoms._NET_DESKTOP_NAMES,
+            atoms.UTF8_STRING,
+        )
+        .ok()
+        .flatten()
+        .map(|s| {
+            s.split('\0')
+                .filter(|n| !n.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+    }
+
+    /// 由 EWMH 计数/当前索引/名称列表构造 [`WorkspaceInfo`]（纯函数，可单测）。
+    ///
+    /// `native_id` 取 0 基索引——与 `_NET_WM_DESKTOP`（`x11_build_window_info`
+    /// 的 `workspace_id.native_id` 同源）及 `_NET_CURRENT_DESKTOP` 口径一致；
+    /// `number` 为 1 基人类可读编号。
+    fn x11_workspaces(count: u32, current: u32, names: &[String]) -> Vec<WorkspaceInfo> {
+        (0..count)
+            .map(|i| WorkspaceInfo {
+                id: WorkspaceId {
+                    native_id: i.to_string(),
+                    de_type: DesktopEnvironment::KDE,
+                },
+                name: names
+                    .get(i as usize)
+                    .cloned()
+                    .unwrap_or_else(|| format!("Desktop {}", i + 1)),
+                number: i + 1,
+                is_active: i == current,
+                monitor_ids: Vec::new(),
+                window_ids: Vec::new(),
+            })
+            .collect()
+    }
+
+    /// X11 会话的工作区列表：`_NET_NUMBER_OF_DESKTOPS` + `_NET_DESKTOP_NAMES`
+    /// + `_NET_CURRENT_DESKTOP`（EWMH），无需 Scripting。
+    fn x11_list_workspaces(
+        x11: &X11DisplayServer,
+    ) -> agent_shell_core::error::Result<Vec<WorkspaceInfo>> {
+        let count = x11.get_number_of_desktops()?;
+        let current = x11.get_current_desktop().unwrap_or(0);
+        let names = Self::x11_desktop_names(x11);
+        Ok(Self::x11_workspaces(count, current, &names))
+    }
+
     /// 确保长驻事件脚本在跑（幂等；首次 subscribe/subscribe_raw 时加载）。
     ///
     /// 订阅前刷新 /Scripting 探测：启动早期未就绪时由
@@ -584,6 +663,11 @@ impl KWinCompositor {
     pub async fn subscribe_raw(
         &self,
     ) -> agent_shell_core::error::Result<Box<dyn event::RawSource>> {
+        // X11 会话走 EWMH 事件源（PropertyNotify 差分），不依赖 /Scripting；
+        // Wayland 会话走长驻事件脚本。
+        if let Some(x11) = self.x11.as_ref() {
+            return self.subscribe_ewmh_raw(x11).await;
+        }
         // 先确保事件脚本在跑（幂等，内部自带 /Scripting 重试探测），成功后再
         // 取一次性接收端——若先取流后启动脚本，脚本启动失败（5s 探测窗口内
         // /Scripting 未就绪、或 D-Bus 调用失败）时接收端随栈销毁，一次性事件
@@ -597,6 +681,52 @@ impl KWinCompositor {
             SessionKind::Wayland => event::EventSource::KWinWayland,
         };
         Ok(Box::new(crate::event_source::KWinRawSource::new(rx, kind)))
+    }
+
+    /// X11 会话原始事件源：懒启动 EWMH 监视器（幂等），取一次性接收端
+    /// 包装为 [`RawSource`]（与 Scripting `take_raw_event_rx` 同款一次性语义）。
+    async fn subscribe_ewmh_raw(
+        &self,
+        x11: &Arc<X11DisplayServer>,
+    ) -> agent_shell_core::error::Result<Box<dyn event::RawSource>> {
+        let rx = self.ewmh_take_rx(x11).await?.ok_or_else(|| {
+            AgentShellError::BackendUnavailable(
+                "kwin ewmh event stream already subscribed".to_string(),
+            )
+        })?;
+        Ok(Box::new(crate::event_ewmh::EwmhRawSource::new(rx)))
+    }
+
+    /// 懒启动 EWMH 监视器并取一次性接收端（`subscribe`/`subscribe_raw` 共享）。
+    ///
+    /// 监视器幂等启动；接收端仅其一可取走——近似映射流（`EwmhEventStream`）
+    /// 与归一化流（`EwmhRawSource`）互斥，与 Scripting bridge 的一次性队列
+    /// 语义一致。返回 `None` 表示已订阅过。
+    async fn ewmh_take_rx(
+        &self,
+        x11: &Arc<X11DisplayServer>,
+    ) -> agent_shell_core::error::Result<
+        Option<tokio::sync::mpsc::UnboundedReceiver<event::RawEvent>>,
+    > {
+        let mut slot = self.ewmh_monitor.lock().await;
+        if slot.is_none() {
+            *slot = Some(crate::event_ewmh::spawn_ewmh_monitor(x11)?);
+        }
+        Ok(slot.as_mut().and_then(|m| m.take_rx()))
+    }
+
+    /// X11 会话近似事件流：懒启动 EWMH 监视器，取一次性接收端包装为
+    /// core [`EventStream`]（与 Scripting `take_event_stream` 同款一次性语义）。
+    async fn subscribe_ewmh(
+        &self,
+        x11: &Arc<X11DisplayServer>,
+    ) -> agent_shell_core::error::Result<Box<dyn EventStream>> {
+        let rx = self.ewmh_take_rx(x11).await?.ok_or_else(|| {
+            AgentShellError::BackendUnavailable(
+                "kwin ewmh event stream already subscribed".to_string(),
+            )
+        })?;
+        Ok(Box::new(crate::event_ewmh::EwmhEventStream::new(rx)))
     }
 }
 
@@ -743,9 +873,14 @@ impl CompositorComponent for KWinCompositor {
         })
     }
 
-    /// 聚焦：协议 activate 优先（请求发出即成功——wayland 请求无回执），
+    /// 聚焦：X11 会话走 EWMH `_NET_ACTIVE_WINDOW`（ClientMessage 写入 root）；
+    /// Wayland 会话协议 activate 优先（请求发出即成功——wayland 请求无回执），
     /// 未短绑时回退 focus_window.js。
     async fn focus_window(&self, id: &WindowId) -> agent_shell_core::error::Result<()> {
+        if let Some(x11) = self.x11.as_ref() {
+            let window = Self::x11_window_id(id)?;
+            return x11.activate_window(window);
+        }
         if let Some(p) = self.protocols() {
             if let Some(wm) = p.window_mgmt.as_ref() {
                 let qh = p.queue_handle();
@@ -760,13 +895,18 @@ impl CompositorComponent for KWinCompositor {
         Self::check_op(&v).map_err(KWinError::into)
     }
 
-    /// 移动：协议无 set_geometry（§7.2），始终 Scripting。
+    /// 移动：X11 会话走 EWMH `_NET_MOVERESIZE_WINDOW`（只设位置，尺寸字段
+    /// 标志位为 0）；Wayland 会话协议无 set_geometry（§7.2），始终 Scripting。
     async fn move_window(
         &self,
         id: &WindowId,
         x: i32,
         y: i32,
     ) -> agent_shell_core::error::Result<()> {
+        if let Some(x11) = self.x11.as_ref() {
+            let window = Self::x11_window_id(id)?;
+            return x11.move_resize_window(window, Some(x), Some(y), None, None);
+        }
         let v = self
             .query(
                 ScriptTemplate::MoveWindow,
@@ -895,8 +1035,13 @@ impl CompositorComponent for KWinCompositor {
             .ok_or_else(|| AgentShellError::WindowNotFound(id.native_id.clone()))
     }
 
-    /// 工作区列表：list_workspaces.js。
+    /// 工作区列表：X11 会话走 EWMH（`_NET_NUMBER_OF_DESKTOPS` +
+    /// `_NET_DESKTOP_NAMES` + `_NET_CURRENT_DESKTOP`），Wayland 会话走
+    /// list_workspaces.js。
     async fn list_workspaces(&self) -> agent_shell_core::error::Result<Vec<WorkspaceInfo>> {
+        if let Some(x11) = self.x11.as_ref() {
+            return Self::x11_list_workspaces(x11);
+        }
         let v = self.query(ScriptTemplate::ListWorkspaces, &[]).await?;
         let arr = v.as_array().cloned().unwrap_or_default();
         Ok(arr
@@ -994,6 +1139,11 @@ impl CompositorComponent for KWinCompositor {
     /// [`subscribe_raw`](Self::subscribe_raw) 取原始事件源；本方法保留给
     /// 直接消费近似流的调用方（如 DDE deepin-kwin 委托）。
     async fn subscribe(&self) -> agent_shell_core::error::Result<Box<dyn EventStream>> {
+        // X11 会话走 EWMH 近似映射流（`EwmhEventStream`），不依赖 /Scripting；
+        // Wayland 会话走长驻事件脚本。
+        if let Some(x11) = self.x11.as_ref() {
+            return self.subscribe_ewmh(x11).await;
+        }
         // 与 `subscribe_raw` 同款顺序：先确保事件脚本在跑，成功后再取一次性
         // 接收端，避免脚本启动失败时接收端随栈销毁、事件队列永久丢失。
         self.ensure_event_monitor().await?;
@@ -1243,6 +1393,57 @@ mod tests {
             KWinCompositor::x11_window_type_from_atoms(&[999], &atoms),
             Unknown
         );
+    }
+
+    #[test]
+    fn x11_window_id_parses_decimal_and_rejects_non_numeric() {
+        let win = |native_id: &str| WindowId {
+            native_id: native_id.to_string(),
+            de_type: DesktopEnvironment::KDE,
+        };
+        // 十进制往返：EWMH 枚举输出十进制 id，focus/move 按十进制回读。
+        assert_eq!(KWinCompositor::x11_window_id(&win("1234")).unwrap(), 1234);
+        assert_eq!(KWinCompositor::x11_window_id(&win("0")).unwrap(), 0);
+        // 非十进制（hex 前缀 / 空 / 负数）→ WindowNotFound。
+        assert!(matches!(
+            KWinCompositor::x11_window_id(&win("0x1a0")),
+            Err(AgentShellError::WindowNotFound(_))
+        ));
+        assert!(matches!(
+            KWinCompositor::x11_window_id(&win("")),
+            Err(AgentShellError::WindowNotFound(_))
+        ));
+    }
+
+    #[test]
+    fn x11_workspaces_builds_indexed_workspaces() {
+        // _NET_DESKTOP_NAMES 仅提供 2 个名称，第 3 个工作区靠索引合成兜底名。
+        let names = vec!["Web".to_string(), "Code".to_string()];
+        let ws = KWinCompositor::x11_workspaces(3, 1, &names);
+        assert_eq!(ws.len(), 3);
+        // native_id 取 0 基索引（与 _NET_WM_DESKTOP/_NET_CURRENT_DESKTOP 同源）。
+        assert_eq!(ws[0].id.native_id, "0");
+        assert_eq!(ws[0].number, 1);
+        assert_eq!(ws[0].name, "Web");
+        assert!(!ws[0].is_active);
+        assert_eq!(ws[1].id.native_id, "1");
+        assert_eq!(ws[1].number, 2);
+        assert_eq!(ws[1].name, "Code");
+        assert!(ws[1].is_active);
+        // 名称缺失（索引越界）→ 合成 "Desktop N" 兜底。
+        assert_eq!(ws[2].id.native_id, "2");
+        assert_eq!(ws[2].number, 3);
+        assert_eq!(ws[2].name, "Desktop 3");
+        assert!(!ws[2].is_active);
+    }
+
+    #[test]
+    fn x11_workspaces_missing_names_fall_back_to_synthetic() {
+        let ws = KWinCompositor::x11_workspaces(2, 0, &[]);
+        assert_eq!(ws.len(), 2);
+        assert_eq!(ws[0].name, "Desktop 1");
+        assert_eq!(ws[1].name, "Desktop 2");
+        assert!(ws[0].is_active);
     }
 
     /// 懒启动能力声明：事件脚本首次 `subscribe()` 才 load，`capabilities()`

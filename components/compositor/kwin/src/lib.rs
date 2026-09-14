@@ -8,6 +8,7 @@
 //! Scripting（[`dbus_bridge`]，callDBus 回传）为回退——能力够走协议、不够走 Scripting（§7.2）。
 pub mod dbus_bridge;
 pub mod error;
+pub mod event_ewmh;
 pub mod event_script;
 pub mod event_source;
 pub mod scripts;
