@@ -2,7 +2,9 @@
 //! Screenshot → X11 原生，§13），并保留窗口直捕（X11-only）与区域裁剪。
 //!
 //! CLI 传 `--window` 时走 X11 窗口直捕（portal 无法定位 X11 window id）；
-//! 传 `--area` 在 daemon 侧裁剪——CLI 不持有任何显示服务连接。窗口目标
+//! 传 `--area` 走原始像素链（ScreenCast → X11，跳过 portal Screenshot PNG
+//! 段——PNG 无法裁剪）后在 daemon 侧裁剪——CLI 不持有任何显示服务连接。
+//! 窗口目标
 //! 解析与 windows 子命令同口径（`id:` 前缀 / `{uuid}` 花括号均可剥离），
 //! 但直捕仍需要 X11 十进制窗口 id——原生 Wayland `{uuid}` 无对应 X11 id。
 
@@ -10,33 +12,75 @@ use agent_shell_capture::{CaptureDispatcher, CapturedFrame, PixelFormat};
 use agent_shell_core::error::AgentShellError;
 use agent_shell_rpc::{CaptureResult, RpcErrorCode};
 
+/// 截图目标路由（纯函数，可单测）：`--window` → X11 窗口直捕；`--area` →
+/// 原始像素链（跳过 portal Screenshot PNG 段）；其余 → 全链降级。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CaptureRoute {
+    /// X11 窗口直捕（portal 无法定位 X11 window id）。
+    Window,
+    /// 区域裁剪：原始像素链（ScreenCast → X11）。
+    Area,
+    /// 全屏：portal ScreenCast → Screenshot → X11 全链降级。
+    Full,
+}
+
+/// 据 `window`/`area` 参数选择捕获路由（纯函数，可单测）。
+///
+/// `window` 优先于 `area`（窗口直捕后仍可按 `area` 裁剪）；无 `window` 时
+/// `area` 触发原始像素链；两者皆无走全链降级。
+fn capture_route(window: Option<&str>, area: Option<[i32; 4]>) -> CaptureRoute {
+    if window.is_some() {
+        CaptureRoute::Window
+    } else if area.is_some() {
+        CaptureRoute::Area
+    } else {
+        CaptureRoute::Full
+    }
+}
+
 /// 截图并落盘。`window` 为窗口目标（`id:`/`{uuid}` 形式均可，解析后须为
 /// X11 十进制窗口 id；None=root）；`area` 为 X,Y,W,H 裁剪区域（对捕获画面
 /// 坐标空间，先截后裁）。
+///
+/// 区域裁剪需要原始像素帧——portal Screenshot 只落全屏 PNG、无法裁剪，故
+/// `area` 走 [`agent_shell_capture::CaptureDispatcher::capture_pixels`]
+/// （ScreenCast → X11 像素链，跳过 Screenshot PNG 段）。
 pub async fn capture_to_file(
     capture: &CaptureDispatcher,
     window: Option<&str>,
     area: Option<[i32; 4]>,
     path: &str,
 ) -> Result<CaptureResult, (RpcErrorCode, String)> {
-    if let Some(id) = window {
-        // 窗口直捕：portal 无法定位 X11 window id，仅走 X11 路径
-        //（连接由 dispatcher 惰性建立并复用——审查项 #5）。
-        let win = parse_window_id(id)?;
-        let frame = capture.capture_window(win).await.map_err(map_capture_err)?;
-        return write_frame_to_ppm(&frame, area, path);
-    }
-
-    // 全链降级：portal ScreenCast → Screenshot → X11 根窗口。
-    // ScreenCast 需弹窗授权（§21.22），daemon 场景允许交互。
-    let captured = capture
-        .capture(agent_shell_capture::CaptureTarget::Monitor, true)
-        .await
-        .map_err(map_capture_err)?;
-
-    match captured {
-        CapturedFrame::Pixels(frame) => write_frame_to_ppm(&frame, area, path),
-        CapturedFrame::Png(src) => copy_png(&src, area, path),
+    match capture_route(window, area) {
+        CaptureRoute::Window => {
+            // 窗口直捕：portal 无法定位 X11 window id，仅走 X11 路径
+            //（连接由 dispatcher 惰性建立并复用——审查项 #5）。
+            // route==Window ⟺ window.is_some()，此处必然 Some。
+            let win = parse_window_id(window.expect("capture_route Window requires window"))?;
+            let frame = capture.capture_window(win).await.map_err(map_capture_err)?;
+            write_frame_to_ppm(&frame, area, path)
+        }
+        CaptureRoute::Area => {
+            // 区域裁剪需原始像素帧：portal Screenshot 落盘 PNG 无法裁剪，走
+            // ScreenCast → X11 像素链（跳过 Screenshot PNG 段）。
+            let frame = capture
+                .capture_pixels(agent_shell_capture::CaptureTarget::Monitor, true)
+                .await
+                .map_err(map_capture_err)?;
+            write_frame_to_ppm(&frame, area, path)
+        }
+        CaptureRoute::Full => {
+            // 全链降级：portal ScreenCast → Screenshot → X11 根窗口。
+            // ScreenCast 需弹窗授权（§21.22），daemon 场景允许交互。
+            let captured = capture
+                .capture(agent_shell_capture::CaptureTarget::Monitor, true)
+                .await
+                .map_err(map_capture_err)?;
+            match captured {
+                CapturedFrame::Pixels(frame) => write_frame_to_ppm(&frame, None, path),
+                CapturedFrame::Png(src) => copy_png(&src, path),
+            }
+        }
     }
 }
 
@@ -70,12 +114,15 @@ fn parse_window_id(spec: &str) -> Result<u32, (RpcErrorCode, String)> {
 /// capture 组件错误 → RPC 错误码。
 ///
 /// `Permission`（portal AccessDenied / 用户取消 / 无活跃图形会话）归一到
-/// `Denied`，`BackendUnavailable` 保持其码，其余归 `BackendError`——避免把
-/// portal 会话权限问题误报为「后端不可用」（TSI-2877 明确错误码）。
+/// `Denied`，`BackendUnavailable` 保持其码，`NotSupported`（后端可用但无法
+/// 满足请求参数语义，如 portal Screenshot PNG 无法区域裁剪）归 `InvalidParams`，
+/// 其余归 `BackendError`——避免把 portal 会话权限问题误报为「后端不可用」
+/// （TSI-2877 明确错误码）。
 fn map_capture_err(e: AgentShellError) -> (RpcErrorCode, String) {
     match e {
         AgentShellError::Permission(msg) => (RpcErrorCode::Denied, msg),
         AgentShellError::BackendUnavailable(msg) => (RpcErrorCode::BackendUnavailable, msg),
+        AgentShellError::NotSupported(msg) => (RpcErrorCode::InvalidParams, msg),
         other => (RpcErrorCode::BackendError, other.to_string()),
     }
 }
@@ -183,18 +230,10 @@ fn write_frame_to_ppm(
 }
 
 /// portal Screenshot 落盘的 PNG 复制到目标路径并读回尺寸。
-/// `area` 裁剪对 PNG 变体不适用（portal 全屏截取）——显式报错而非静默忽略。
-fn copy_png(
-    src: &std::path::Path,
-    area: Option<[i32; 4]>,
-    path: &str,
-) -> Result<CaptureResult, (RpcErrorCode, String)> {
-    if area.is_some() {
-        return Err((
-            RpcErrorCode::InvalidParams,
-            "area crop not supported on portal Screenshot (PNG) backend".into(),
-        ));
-    }
+///
+/// 区域裁剪不经过此路径——`--area` 走 [`agent_shell_capture::CaptureDispatcher::capture_pixels`]
+/// 像素链，PNG 无法裁剪，故此处无需 area 参数。
+fn copy_png(src: &std::path::Path, path: &str) -> Result<CaptureResult, (RpcErrorCode, String)> {
     let data = std::fs::read(src).map_err(|e| {
         (
             RpcErrorCode::BackendError,
@@ -395,5 +434,59 @@ mod tests {
 
         let (code, _) = map_capture_err(AgentShellError::Capture("capture failed".into()));
         assert_eq!(code, RpcErrorCode::BackendError);
+    }
+
+    #[test]
+    fn capture_route_selects_window_area_or_full() {
+        // window 优先于 area（窗口直捕后仍可按 area 裁剪）。
+        assert_eq!(capture_route(Some("42"), None), CaptureRoute::Window);
+        assert_eq!(
+            capture_route(Some("42"), Some([0, 0, 1, 1])),
+            CaptureRoute::Window
+        );
+        // 仅 area → 原始像素链（跳过 portal Screenshot PNG 段）。
+        assert_eq!(
+            capture_route(None, Some([100, 100, 400, 300])),
+            CaptureRoute::Area
+        );
+        // 无 window/area → 全链降级。
+        assert_eq!(capture_route(None, None), CaptureRoute::Full);
+    }
+
+    #[test]
+    fn map_capture_err_classifies_not_supported_as_invalid_params() {
+        // portal Screenshot 可用但 PNG 无法区域裁剪 → NotSupported → InvalidParams
+        //（能力缺口语义，而非权限/后端错误——Radian 审查回归锚定）。
+        let (code, msg) = map_capture_err(AgentShellError::NotSupported(
+            "area crop requires ScreenCast or X11 pixels".into(),
+        ));
+        assert_eq!(code, RpcErrorCode::InvalidParams);
+        assert!(msg.contains("area crop"), "unexpected msg: {msg}");
+    }
+
+    #[test]
+    fn ppm_writer_crops_to_area() {
+        // 2×2 RGBA 帧，4 像素值各不相同；裁剪 1×1 子区域须只输出该像素。
+        // 区域裁剪是 `--area` 分支的终端步骤（capture_pixels 返回原始帧后据此裁剪）。
+        let mut data = Vec::new();
+        // 行 0: (0,0)=(10,20,30), (1,0)=(40,50,60)
+        data.extend_from_slice(&[10, 20, 30, 255, 40, 50, 60, 255]);
+        // 行 1: (0,1)=(70,80,90), (1,1)=(100,110,120)
+        data.extend_from_slice(&[70, 80, 90, 255, 100, 110, 120, 255]);
+        let frame = agent_shell_capture::Frame {
+            data,
+            width: 2,
+            height: 2,
+            stride: 8,
+            format: PixelFormat::Rgba,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("out.ppm");
+        let r =
+            write_frame_to_ppm(&frame, Some([1, 1, 1, 1]), &path.to_string_lossy()).expect("write");
+        assert_eq!((r.width, r.height), (1, 1));
+        let body = std::fs::read(&path).unwrap();
+        assert_eq!(&body[..11], b"P6\n1 1\n255\n");
+        assert_eq!(&body[11..], &[100, 110, 120], "crop must emit pixel (1,1)");
     }
 }
