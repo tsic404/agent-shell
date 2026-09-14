@@ -149,7 +149,7 @@ impl AgentShellMcpServer {
             // Core 7 tools (§17.3)
             make_tool(
                 "list_windows",
-                "列出所有窗口，含 app_id/title/pid/geometry/workspace",
+                "列出所有窗口，含 app_id/title/pid/geometry/workspace/stacking_order/states/window_type/keep_above",
                 json!({
                     "type": "object",
                     "properties": { "app_id": {"type": "string"}, "workspace": {"type": "integer"} }
