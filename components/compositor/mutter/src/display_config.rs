@@ -1,13 +1,8 @@
 //! org.gnome.Mutter.DisplayConfig（设计文档 §8.4 / §3.5 调研）。
 //!
-//! 接口 `org.gnome.Mutter.DisplayConfig`：
-//! - `GetCurrentState` → `(u serial, a((ssss)a(siiddada{sv})a{sv}) monitors,
-//!   a(iiduba(ssss)a{sv}) logical_monitors, a{sv} properties)`；
-//! - `ApplyMonitorsConfig(u serial, u method, a(iiduba(ssa{sv})) logical_monitors,
-//!   a{sv} properties)`——method: 0=verify, 1=temporary, 2=persistent。
-//!
-//! 本模块只做**读路径**（list_monitors）；Apply 签名原样保留供未来
-//! display 配置任务复用。capabilities.monitor_layout=true 仅代表可读布局。
+//! 接口提供 `GetCurrentState`（读监视器/逻辑监视器状态）与 `ApplyMonitorsConfig`
+//! （method 0=verify/1=temporary/2=persistent）。本模块只做读路径（list_monitors）；
+//! Apply 签名原样保留供未来 display 配置复用，capabilities.monitor_layout=true 仅代表可读。
 
 use serde::{Deserialize, Serialize};
 use zbus::Connection;

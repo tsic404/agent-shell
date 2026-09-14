@@ -53,16 +53,8 @@ impl DdeBackend {
 
     /// 按装配矩阵初始化公共组件实例并返回 [`ComponentRegistry`]（§4.3）。
     ///
-    /// 装配清单（§3.3 DDE 行）：
-    /// - 合成器：DdeCompositor（deepin-kwin 复用 KWin / Treeland / X11 复合装配）
-    /// - 音频：DdeAudio（org.deepin.dde.Audio1）优先，回退 PipeWire/PulseAudio
-    /// - 网络：org.deepin.dde.Network（未来）/ NetworkManager
-    /// - 输入 / 截图 / 无障碍 / 剪贴板：公共探测链
-    /// - 电源：DdePower（Power1 双名），回退 UPower
-    /// - 通知：DdeNotification（双名），回退 freedesktop Notifications
-    /// - 外观：DdeAppearance（双名），回退 PortalAppearance
-    /// - 启动器：DdeLauncher（dde-am），回退 DesktopFileLauncher
-    /// - 系统服务：Systemd + Logind
+    /// 装配清单见 §3.3 DDE 行：合成器 DdeCompositor；音频/电源/通知/外观/启动器
+    /// 走 DE 专有封装优先、公共探测链回退；系统服务固定 Systemd + Logind。
     pub async fn assemble(&self) -> Result<ComponentRegistry> {
         // 1. 合成器：DdeCompositor 复合装配（Wayland/Treeland/X11 自动检测）
         let compositor: Option<Box<dyn CompositorComponent>> = match DdeCompositor::connect().await

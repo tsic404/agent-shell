@@ -1,18 +1,11 @@
 //! Treeland Wayland 协议客户端（设计文档 §10.3 / §10.4 `treeland.rs`）。
 //!
-//! deepin 新一代合成器 **Treeland**（wlroots 系，deepin 25+ 过渡）提供
-//! treeland_* 私有协议族。当前 deepin 25 的 deepin-kwin **未启用** Treeland
-//! （走 KWin 通道）；本模块按设计决策 D9 为未来迁移预留基础通道——
-//! 绑定在共享的 [`WaylandDisplayServer`] 连接上，与 org_kde_* 通道互斥
-//! 探测、不冲突共存。
+//! deepin 25+ 过渡期新合成器 Treeland（wlroots 系）提供 treeland_* 私有协议；
+//! 当前 deepin-kwin 未启用，本模块按决策 D9 为未来迁移预留通道，与 org_kde_*
+//! 互斥探测、不冲突。协议上游 EXPERIMENTAL，接口可能不升 major 即变更。
 //!
-//! 协议状态：上游 EXPERIMENTAL——接口可能在不升 major 的情况下变更，
-//! XML vendored 自 linuxdeepin/treeland-protocols 并随上游跟踪更新。
-//!
-//! 窗口操作语义：treeland_foreign_toplevel_handle_v1 的请求全部为
-//! 「发完即忘」（wayland 请求无回执），与 KWin 协议通道同款乐观发送；
-//! 状态回读依赖 toplevel state/done 事件聚合（T3b 事件任务统一落地，
-//! 本层 inert 不消费事件）。
+//! 窗口请求均为「发完即忘」（wayland 无回执），状态回读依赖 toplevel state/done
+//! 事件聚合（本层 inert 不消费事件）。
 
 use std::collections::HashMap;
 

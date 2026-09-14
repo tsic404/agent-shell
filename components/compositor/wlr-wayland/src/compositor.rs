@@ -1,27 +1,11 @@
 //! `WlrWaylandCompositor`：wlroots 系合成器基类（设计文档 §3.3 / §11）。
 //!
-//! 继承 [`WaylandCompositor`]（组合纯 core 的 [`WaylandDisplayServer`]），
-//! 在其上叠加 **wlr 标准协议**与相关扩展协议绑定：foreign-toplevel-management /
-//! output-management / screencopy / virtual-pointer / ext-workspace /
-//! virtual-keyboard / data-control。
-//!
-//! 自身就是完整实现，可直接装配使用（未知 Wayland compositor 兜底，
-//! §3.3 调用优先级矩阵「WLRWayland」行）；Treeland / Hyprland / Sway
-//! 组合本类型并叠加各自私有协议。
-//!
-//! # 实现策略
-//!
-//! foreign-toplevel-management 是事件驱动协议：合成器推送 `toplevel` /
-//! `title` / `app_id` / `state` / `closed` 事件，客户端聚合后才有窗口列表。
-//! 本实现维护一个 [`ToplevelCache`]（`Arc<Mutex<…>>`），在 roundtrip 时
-//! 填充；窗口操作方法（list/focus/close 等）基于缓存中的 handle 发起请求。
-//!
-//! ext-workspace 同理：`workspace_group` / `workspace` / `name` / `state`
-//! 事件聚合为 [`WorkspaceCache`]。
-//!
-//! 降级策略（§5.4）：foreign-toplevel 缺失 → 窗口操作返回 NotImplemented
-//! （portal/AT-SPI 降级由上层 CaptureComponent/InputComponent 负责，不
-//! 在本合成器范围）；screencopy 缺失 → 截图降级 portal（由调用方处理）。
+//! 继承 [`WaylandCompositor`]（组合 [`WaylandDisplayServer`]），叠加 wlr 标准协议
+//! （foreign-toplevel / screencopy / virtual-pointer / ext-workspace 等），自身即完整
+//! 实现（未知 compositor 兜底），Treeland / Hyprland / Sway 组合本类型叠加各自私有协议。
+//! foreign-toplevel / ext-workspace 是事件驱动协议，roundtrip 时聚合到缓存后才有窗口
+//! 列表；降级（§5.4）：foreign-toplevel 缺失 → NotImplemented，screencopy 缺失 → 截图
+//! 降级 portal。
 
 use std::collections::HashMap;
 use std::sync::Arc;

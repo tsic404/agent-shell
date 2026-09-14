@@ -1,12 +1,9 @@
 //! systemd init 系统组件（设计文档 §21.13「systemd 服务管理」）。
 //!
-//! [`SystemdComponent`] 封装 system bus 上的 `org.freedesktop.systemd1.Manager`
-//! 接口，实现 core 的 [`SystemComponent`] 与 [`DesktopComponent`]。
-//! 不依赖 DE——TTY 后端装配时的必选组件之一。
-//!
-//! zbus system-bus 连接在构造时建立并持有；D-Bus 错误经共享 helper
-//! [`agent_shell_core::error::dbus_error`] 归一化（design/11 §19）：权限类
-//! 错误名 → [`AgentShellError::Permission`]，其余 → [`AgentShellError::DBus`]。
+//! [`SystemdComponent`] 封装 system bus 的 `org.freedesktop.systemd1.Manager`，实现 core
+//! 的 [`SystemComponent`] 与 [`DesktopComponent`]；不依赖 DE，是 TTY 后端必选组件之一。
+//! zbus 连接构造时建立并持有；D-Bus 错误经 [`agent_shell_core::error::dbus_error`]
+//! 归一化（§19）：权限类 → Permission，其余 → DBus。
 
 use agent_shell_core::component::{
     ComponentHealth, ComponentType, DesktopComponent, SystemComponent,

@@ -1,12 +1,8 @@
 //! xdotool/wmctrl 命令封装（设计文档 §11 模块结构表 `commands.rs`，降级层）。
 //!
-//! **仅当原生 EWMH/XTest 路径失败时**兜底使用。CLI 工具为非必需依赖：
-//! [`X11Commands::new`] 用 `which` 探测可执行文件，缺失返回 `None` 字段，
-//! 不阻塞 [`crate::X11Compositor`] 初始化。
-//!
-//! xdotool 自身走 XTest（独立进程 + 独立连接），对扩展版本协商差异容忍度
-//! 更高；wmctrl 走 EWMH ClientMessage。二者覆盖原生路径的同类操作，
-//! 作为原生失败后的最后手段。
+//! **仅当原生 EWMH/XTest 路径失败时**兜底使用；CLI 工具为非必需依赖，[`X11Commands::new`]
+//! 用 `which` 探测、缺失返回 `None` 字段、不阻塞初始化。xdotool 走 XTest（独立进程 +
+//! 独立连接，对扩展版本协商差异更容忍），wmctrl 走 EWMH ClientMessage。
 
 use std::time::Duration;
 

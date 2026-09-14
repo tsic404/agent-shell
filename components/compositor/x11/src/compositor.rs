@@ -1,27 +1,11 @@
 //! [`X11Compositor`]：通用 X11 兜底合成器（设计文档 §3.3 / §11）。
 //!
-//! 组合纯协议层的 [`X11DisplayServer`]（EWMH + ICCCM + XTest + MIT-SHM），
-//! 通过 x11rb 原生协议实现 [`CompositorComponent`] 全部 17 方法。
-//! CLI 工具（[`X11Commands`]，xdotool/wmctrl）仅在原生路径失败时兜底，
-//! 缺失不阻塞初始化。
-//!
-//! 原生协议实现路径（§11 操作表）：
-//!
-//! | 操作 | 实现方式 |
-//! |------|---------|
-//! | 窗口列表 | `_NET_CLIENT_LIST` get_property |
-//! | 聚焦 | `_NET_ACTIVE_WINDOW` ClientMessage |
-//! | 移动/缩放 | `x11rb::configure_window` + `_NET_MOVERESIZE_WINDOW` |
-//! | 最小化 | `_NET_WM_STATE` ClientMessage (_NET_WM_STATE_HIDDEN) |
-//! | 最大化 | `_NET_WM_STATE` ClientMessage (_NET_WM_STATE_MAXIMIZED_VERT/HORZ) |
-//! | 关闭 | `_NET_CLOSE_WINDOW` ClientMessage |
-//! | 工作区列表 | `_NET_NUMBER_OF_DESKTOPS` + `_NET_DESKTOP_NAMES` + `_NET_CURRENT_DESKTOP` |
-//! | 切换工作区 | `_NET_CURRENT_DESKTOP` ClientMessage |
-//! | 移窗口到工作区 | `_NET_WM_DESKTOP` ClientMessage |
-//! | 截图 | MIT-SHM / XGetImage（`capture_window`） |
+//! 组合纯协议层 [`X11DisplayServer`]（EWMH + ICCCM + XTest + MIT-SHM），用 x11rb
+//! 原生协议实现 [`CompositorComponent`] 全部 17 方法；CLI 工具（[`X11Commands`]，
+//! xdotool/wmctrl）仅在原生路径失败时兜底，缺失不阻塞初始化。操作实现表见 §11
+//! （`_NET_CLIENT_LIST` / `_NET_ACTIVE_WINDOW` / configure_window / MIT-SHM 等）。
 //!
 //! 事件流：X11 无合成器级原生事件推送，`capabilities().window_events = false`。
-//! XDamage/XRecord 可选，不属本任务范围。
 
 use async_trait::async_trait;
 

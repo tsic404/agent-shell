@@ -1,16 +1,9 @@
-//! ICCCM 协议操作基础模块（设计文档 §6 / x11-display-server.md §6）。
+//! ICCCM 协议操作基础模块（设计文档 §6）。
 //!
-//! EWMH 覆盖「窗口管理器协议」（`_NET_*`）；ICCCM 是其下层的**客户端与
-//! 窗口管理器之间的基础约定**（`WM_*`）。本模块提供各 X11 会话合成器
-//! （KWin/Mutter/DDE/X11Compositor）共用的 ICCCM 原语，全部操作挂在
-//! [`X11DisplayServer`](crate::X11DisplayServer) 上：
-//!
-//! - `WM_PROTOCOLS` 协商：探测目标窗口支持的 protocol（DELETE/TAKE_FOCUS…）
-//! - `WM_DELETE_WINDOW`：优雅关闭（EWMH `_NET_CLOSE_WINDOW` 之外的客户端协议路径）
-//! - `WM_STATE` / `WM_CHANGE_STATE`：经典（非 EWMH）最小化状态读写
-//!
-//! 原子在连接建立时批量 intern（[`WmProtocolAtoms`]，与 EWMH 同策略 §6.2）；
-//! 其他合成器不直接持有本模块——统一走 `X11DisplayServer` 公开方法。
+//! EWMH 覆盖 `_NET_*` 窗口管理器协议；ICCCM 是其下层的客户端↔WM 基础约定（`WM_*`）。
+//! 本模块提供各 X11 会话合成器共用的 ICCCM 原语（挂在 [`X11DisplayServer`] 上）：
+//! WM_PROTOCOLS 协商、WM_DELETE_WINDOW 优雅关闭、WM_STATE/WM_CHANGE_STATE 经典最小化。
+//! 原子在连接建立时批量 intern（[`WmProtocolAtoms`]，与 EWMH 同策略 §6.2）。
 use agent_shell_core::error::{AgentShellError, Result};
 
 use x11rb::protocol::xproto::ConnectionExt as _;

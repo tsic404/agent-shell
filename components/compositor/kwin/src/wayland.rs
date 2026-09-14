@@ -1,39 +1,11 @@
 //! Wayland 私有协议通道（设计文档 §7.6，`wayland.rs`）。
 //!
-//! 在共享的 [`WaylandDisplayServer`]（同一 `wl_display`）之上绑定 KWin
-//! 私有协议族：
-//!
-//! | 协议 | 接口版本上限 | 用途 |
-//! |------|:----:|------|
-//! | `org_kde_plasma_window_management` | 18（生成绑定上限；运行时要求 ≥12） | 窗口管理（单客户端，短绑 D8） |
-//! | `org_kde_kwin_fake_input` | 5（生成绑定上限） | 输入注入（需 authenticate） |
-//! | `org_kde_plasma_virtual_desktop_management` | 2 | 虚拟桌面 |
-//!
-//! 致命错误——对应字段为 `None`，上层按通道选择矩阵回退 Scripting。
-//! window_management 的 uuid/stacking-order 能力自 v12/v17 起，
-//! fake_input 的 keyboard_key 自 v4 起，运行时按公布版本门控请求。
-//!
-//! # 曝露条件（KWin global 过滤）
-//!
-//! KWin 服务端**始终创建**这三个协议 global（`WaylandServer::start()` 无条件
-//! new `PlasmaWindowManagementInterface`；`FakeInputBackend::initialize()` 无条件
-//! `init`），但 `KWinDisplay::allowInterface`（wayland_server.cpp）按客户端
-//! 过滤 registry 广告：
-//!
-//! - **KWin ≤ 6.7.x**：`window_management` / `fake_input` 在
-//!   `interfacesBlackList` 中，仅当客户端可执行文件匹配某个 .desktop 且其
-//!   `X-KDE-Wayland-Interfaces=` 声明了该接口（KApplicationTrader 按
-//!   Exec 规范路径匹配）才广告；未声明 → registry 不出现（即
-//!   [`BindError::NotPresent`]）。无 .desktop 的裸进程一律被拒。
-//! - **KWin ≥ master（6.8+）**：commit f9bf0ee6 起改为仅按 systemd cgroup
-//!   判定沙箱（app.slice 下 flatpak/snap）才隐藏；普通进程全部可见。
-//! - `virtual_desktop_management` 从不在黑名单中——任何客户端可见。
-//!
-//! 因此「global 缺失」≠「协议不存在」：诊断时优先怀疑过滤而非版本。
-//! 测试/部署侧对策：将启动器 .desktop 声明 `X-KDE-Wayland-Interfaces=`，
-//! 或设 `KWIN_WAYLAND_NO_PERMISSION_CHECKS=1`（仅 ≤6.7.x 生效）。
-//! 绑定策略不变（§7.2 / 决策 D8）：任一协议缺失/版本过低/被占用都不视为
-//! 致命错误——对应字段为 `None`，上层按通道选择矩阵回退 Scripting。
+//! 在共享的 [`WaylandDisplayServer`] 连接上绑定 KWin 私有协议族（窗口管理 / fake_input
+//! / 虚拟桌面，版本上限见 §7.6）。任一协议缺失/版本过低/被占用不致命——对应字段为
+//! `None`，上层按通道选择矩阵回退 Scripting。
+//! 诊断要点：KWin 服务端始终创建这三个 global，但 `KWinDisplay::allowInterface` 会按
+//! 客户端过滤 registry 广告（≤6.7.x 按 .desktop 的 `X-KDE-Wayland-Interfaces=` 声明，6.8+
+//! 仅按沙箱 cgroup）——「global 缺失」≠「协议不存在」，优先怀疑过滤而非版本。
 
 use wayland_client::globals::GlobalList;
 use wayland_client::protocol::wl_registry::WlRegistry;

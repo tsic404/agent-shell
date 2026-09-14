@@ -1,14 +1,9 @@
 //! agent-shell-rootd 入口：system bus 上的 D-Bus 服务（§23.2/§23.4.3）。
 //!
-//! systemd system unit（`agent-shell-rootd.service`）启动；daemon 经
-//! system bus 调用白名单方法，polkit 按 §23.4.2 action 精确授权。
-//!
-//! 运行模式：
-//! 1. **D-Bus 服务**（默认）：注册 `org.agentshell.Rootd` 于 system bus，
-//!    方法经 polkit 校验后分派到 lib `dispatch`。
-//! 2. **pkexec 子命令**（`agent-shell-rootd pkexec <cmd>...`）：
-//!    §23.4.1 通道 3 兜底——polkit action `com.agentshell.pkexec.install-package`
-//!    授权后执行一次性命令。
+//! systemd system unit（`agent-shell-rootd.service`）启动；daemon 经 system bus 调用
+//! 白名单方法，polkit 按 §23.4.2 action 精确授权。运行模式：D-Bus 服务（默认，注册
+//! `org.agentshell.Rootd`、polkit 校验后分派）；或 pkexec 子命令（§23.4.1 通道 3 兜底，
+//! action `com.agentshell.pkexec.install-package` 授权后执行一次性命令）。
 
 use tokio::signal::unix::{signal, SignalKind};
 

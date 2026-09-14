@@ -1,12 +1,9 @@
 //! 窗口缓存（设计文档 §9.5：事件流持续更新，查询优先读缓存）。
 //!
-//! hyprctl `clients -j` 是全量快照；`.socket2.sock` 事件是增量。缓存把
-//! 两者接起来：快照填充 + 增量维护（open/close/focus/fullscreen），
-//! `CompositorComponent` 查询方法在缓存非空时零 IPC 返回。
-//!
-//! 一致性策略：closewindow 事件直接移除条目；openwindow 以最小信息落位
-//! （title/class/workspace 已知，geometry 待下一次快照校准）；`refresh`
-//! 用 clients -j 快照整体替换并去重。
+//! hyprctl `clients -j` 全量快照 + `.socket2.sock` 增量事件结合：快照填充、增量
+//! 维护（open/close/focus/fullscreen），缓存非空时查询零 IPC 返回。一致性策略：
+//! closewindow 移除条目；openwindow 最小信息落位（geometry 待下次快照校准）；
+//! `refresh` 用快照整体替换并去重。
 
 use std::sync::Arc;
 

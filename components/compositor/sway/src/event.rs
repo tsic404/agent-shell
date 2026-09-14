@@ -1,19 +1,10 @@
 //! Sway IPC 事件订阅（`event.rs`）。
 //!
-//! SUBSCRIBE 长连接订阅 `workspace` / `window` 两类事件：sway 对每条
-//! 事件推送一帧 i3 IPC 报文（类型 0x8000..），payload 为
-//! `{"change": "...", ...}` JSON。逐帧映射到统一 [`DesktopEvent`]：
-//!
-//! | sway 事件 | 统一事件 |
-//! |-----------|---------|
-//! | `workspace::init`    | `WorkspaceChanged`（新工作区激活） |
-//! | `workspace::focus`   | `WorkspaceChanged` |
-//! | `workspace::empty`   | `WorkspaceListChanged`（工作区移除） |
-//! | `window::new`        | `WindowOpened` |
-//! | `window::close`      | `WindowClosed` |
-//! | `window::focus`      | `WindowFocused` |
-//! | `window::move`       | `WindowMoved` |
-//! | `window::title`      | `WindowMetadataChanged` |
+//! SUBSCRIBE 长连接订阅 `workspace` / `window` 事件：sway 逐条推送 i3 IPC 帧
+//! （payload 为 `{"change": ...}` JSON），本层按报文头 `reply_type` 逐帧映射到统一
+//! [`DesktopEvent`]（workspace::init/focus → WorkspaceChanged，workspace::empty →
+//! WorkspaceListChanged，window::new/close/focus/move/title → WindowOpened/Closed/
+//! Focused/Moved/MetadataChanged）。读错误即流结束、不重连；未识别事件跳过不阻塞流。
 
 //! 维护 `Arc<RwLock<Vec<WindowInfo>>>`；GET_TREE 全量快照在 `window::new`
 //! / `close` 时刷新（sway 事件载荷只含受影响容器，增量重建树成本高于

@@ -1,12 +1,9 @@
 //! NetworkManager 组件（`org.freedesktop.NetworkManager`，system bus）。
 //!
-//! design/13 §21.3 网络表「跨 DE」行：标准网络管理接口。本实现用 zbus 动态
-//! 代理（非生成宏）：NM 接口面大而稳定，动态调用点少（每能力 1–3 个方法），
-//! 免去 codegen 的编译期负担；错误统一折算
-//! [`AgentShellError::DBus`](agent_shell_core::error::AgentShellError::DBus)。
-//!
-//! 小步探测约定（§21.36.4）：服务名 → 对象路径 → 方法，任何一步缺失返回
-//! 结构化错误；capability 记录实际命中的对象路径供 doctor 输出。
+//! 标准网络管理接口。本实现用 zbus 动态代理（非生成宏）：NM 接口面大而稳定、动态
+//! 调用点少，免去 codegen 编译期负担；错误统一折算
+//! [`AgentShellError::DBus`](agent_shell_core::error::AgentShellError::DBus)。小步探测
+//! 约定（§21.36.4）：服务名 → 对象路径 → 方法，缺失返回结构化错误。
 
 use async_trait::async_trait;
 use zbus::zvariant::{ObjectPath, OwnedObjectPath, Signature, Value};

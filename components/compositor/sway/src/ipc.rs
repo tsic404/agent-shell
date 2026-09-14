@@ -1,13 +1,9 @@
 //! Sway IPC 客户端（i3 兼容协议，`ipc.rs`）。
 //!
-//! Unix domain socket（路径 `$SWAYSOCK`），报文格式为 i3 IPC：
-//! 魔数 `"i3-ipc"` + payload 长度(u32 LE) + 类型(u32 LE) + payload。
-//! 响应同格式回传（类型字段为对应的 REPLY 值，本层不校验一致性以外的内容）。
-//!
-//! 连接纪律（hyprland.md §9.2 hyprctl 封装同款约束）：同步求值型命令
-//! 即开即关——每次 [`SwayIpc::roundtrip`] 新建连接、发送、读完整响应、
-//! 关闭，不在 compositor 主路径上滞留连接。事件订阅是唯一的长连接
-//! （[`crate::event`] 自行持有）。
+//! Unix domain socket（`$SWAYSOCK`），报文为 i3 IPC（魔数 `"i3-ipc"`、长度、类型、
+//! payload）。同步求值型命令「连接即开即关」——每次 [`SwayIpc::roundtrip`] 新建连接、
+//! 读完整响应、关闭，不在主路径滞留连接（与 hyprctl 封装同款约束）；事件订阅是唯一
+//! 的长连接（[`crate::event`] 自行持有）。
 
 use agent_shell_core::error::AgentShellError;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};

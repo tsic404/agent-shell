@@ -1,16 +1,8 @@
-//! 事件流通道（设计文档 §9.3：`.socket2.sock` 长期连接，行协议
-//! `EVENT>>DATA\n`）。
+//! 事件流通道（设计文档 §9.3：`.socket2.sock` 长期连接，行协议 `EVENT>>DATA\n`）。
 //!
-//! 映射（§9.5 四种核心事件 + 全屏广播）：
-//!
-//! | Hyprland 行 | DesktopEvent |
-//! |-------------|--------------|
-//! | `openwindow>>ADDR,WS,CLASS,TITLE` | `WindowOpened`（缓存 upsert） |
-//! | `closewindow>>ADDR` | `WindowClosed`（缓存移除） |
-//! | `activewindowv2>>ADDR` | `WindowFocused` |
-//! | `workspacev2>>WSID,WSNAME` | `WorkspaceChanged` |
-//! | `fullscreen>>0/1` | `FullscreenChanged`（作用于当前焦点窗口） |
-//!
+//! 逐帧映射到统一 DesktopEvent（§9.5 四种核心事件 + 全屏广播）：openwindow →
+//! WindowOpened、closewindow → WindowClosed、activewindowv2 → WindowFocused、
+//! workspacev2 → WorkspaceChanged、fullscreen → FullscreenChanged（作用于焦点窗口）。
 //! 连接断开自动重连（1s 退避）；未识别事件跳过不阻塞流。
 
 use std::sync::Arc;

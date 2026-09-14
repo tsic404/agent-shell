@@ -1,12 +1,8 @@
 //! XTest 扩展输入注入的合成器层封装（设计文档 §11 模块结构表 `xtest.rs`）。
 //!
-//! [`X11DisplayServer`] 已在协议层（§6.3）实现 `fake_key_event` /
-//! `fake_button_event` / `fake_motion_event`；本模块仅提供 thin wrapper：
-//! 预检 XTest 可用性并统一错误归一化为 `AgentShellError::Input`，供
-//! [`crate::X11Compositor`] 的能力报告与降级链使用。
-//!
-//! **注意**（§6.3）：XTest 仅在原生 X11 会话（`XDG_SESSION_TYPE=X11`）下
-//! 可用；XWayland 下被禁用，输入注入应走 libei/EIS（T2a）。
+//! [`X11DisplayServer`] 已在协议层（§6.3）实现 fake_* 事件，本模块仅做 thin wrapper：
+//! 预检 XTest 可用性并统一错误归一化为 `AgentShellError::Input`。注意（§6.3）：
+//! XTest 仅在原生 X11 会话可用，XWayland 下被禁用、输入注入应走 libei/EIS。
 
 use agent_shell_core::error::{AgentShellError, Result};
 use agent_shell_core::types::{KeyCombo, KeyName, MouseButton};

@@ -1,12 +1,9 @@
 //! 外观组件（设计文档 §21.3 外观与壁纸、§21.4 AppearanceComponent）。
 //!
-//! 公共降级路径：
-//! - 壁纸：portal `org.freedesktop.portal.Wallpaper.SetWallpaperURI`
-//! - 配色读取：portal `org.freedesktop.portal.Settings.ReadOne`
-//!   （`org.freedesktop.appearance` → `color-scheme`: 0 no-preference / 1 dark / 2 light）
-//! - 配色写入：无跨 DE portal，按 DE 用 gsettings / plasma-apply-colorscheme /
-//!   org.deepin.dde.Appearance1（backends/ 内 DE 封装负责）；
-//!   GNOME 环境下公共路径可直接 gsettings 写 `org.gnome.desktop.interface color-scheme`。
+//! 公共降级路径：壁纸 portal Wallpaper.SetWallpaperURI；配色读取 portal
+//! Settings.ReadOne（`org.freedesktop.appearance` → `color-scheme`）；配色写入
+//! 无跨 DE portal，按 DE 走 gsettings / plasma-apply-colorscheme /
+//! org.deepin.dde.Appearance1（DE 封装负责），GNOME 公共路径可直接写 gsettings。
 
 use agent_shell_core::component::{
     AppearanceComponent, ComponentHealth, ComponentType, DesktopComponent,

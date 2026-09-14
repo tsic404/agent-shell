@@ -1,17 +1,9 @@
 //! `WaylandCompositor` 抽象基类 trait（设计文档 §3.3 继承层次 / §5）。
 //!
-//! Rust 无实现继承：基类以「supertrait + 组合访问器」表达——所有 Wayland 系
-//! 合成器实现本 trait，即自动满足 `CompositorComponent`，并通过
-//! [`WaylandCompositor::display_server`] 暴露共享的协议通道。
-//!
-//! ```text
-//! CompositorComponent（trait）
-//! └── WaylandCompositor（本层——抽象基类，组合 WaylandDisplayServer）
-//!     ├── WlrWaylandCompositor（components/compositor/wlr-wayland，叠加 wlr 标准协议）
-//!     │   └── TreelandCompositor / HyprlandCompositor / SwayCompositor
-//!     ├── KWinCompositor（org_kde_* 私有协议）
-//!     └── MutterCompositor（D-Bus Eval/Extension）
-//! ```
+//! Rust 无实现继承：基类以「supertrait + 组合访问器」表达——所有 Wayland 系合成器
+//! 实现本 trait 即自动满足 CompositorComponent，并通过
+//! [`WaylandCompositor::display_server`] 暴露共享协议通道。继承树（WlrWayland /
+//! KWin / Mutter / Treeland / Hyprland / Sway）见 §3.3。
 
 use async_trait::async_trait;
 

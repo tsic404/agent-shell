@@ -1,19 +1,10 @@
-//! 桌面环境检测与后端装配入口。
+//! 桌面环境检测与后端装配入口（设计文档 §16.1–§16.3）。
 //!
-//! 对应设计文档 `design/08-detection/README.md` §16.1–§16.3：
-//! 基于 XDG 环境变量 × D-Bus 服务探测的优先级判定链。
-//!
-//! # 判定顺序（§16.1，不可调换）
-//!
-//! 1. `XDG_CURRENT_DESKTOP` 环境变量（首要信号；**DDE 判断必须在 KDE 之前**——
-//!    deepin-kwin 注册 `org.kde.KWin` 但 `XDG_CURRENT_DESKTOP=Deepin`）。
-//! 2. D-Bus 服务名探测兜底（不依赖 WAYLAND_DISPLAY/DISPLAY——SSH 无显示
-//!    会话也能连 session bus 探测；deepin-kwin 与 org.kde.KWin 同名，
-//!    故 DDE 判断必须在 KDE 之前）。
-//! 3. X11 会话：`_NET_SUPPORTING_WM_CHECK` 识别窗口管理器。
-//! 4. 纯终端（TTY）：stdin/stdout 是 tty 且无 WAYLAND_DISPLAY/DISPLAY。
-//!
-//! 全部失败兜底返回 [`DesktopEnvironment::Unknown`]。
+//! 基于 XDG 环境变量 × D-Bus 服务探测的优先级判定链，判定顺序（§16.1，不可调换）：
+//! `XDG_CURRENT_DESKTOP` 环境变量 → D-Bus 服务名兜底（SSH 无显示会话也能连 session
+//! bus）→ X11 `_NET_SUPPORTING_WM_CHECK` → 纯终端（tty 且无 WAYLAND_DISPLAY/DISPLAY）。
+//! **DDE 判断必须在 KDE 之前**——deepin-kwin 注册 `org.kde.KWin` 但
+//! `XDG_CURRENT_DESKTOP=Deepin`。全部失败兜底返回 [`DesktopEnvironment::Unknown`]。
 
 use std::env;
 use std::path::Path;

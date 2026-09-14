@@ -1,15 +1,10 @@
 //! X11 原生捕获——MIT-SHM 优先，失败退化 XGetImage（设计文档 §13.1 第三级、§6.4）。
 //!
-//! X11Generic 会话（或 portal 全部不可用时的 X11 兜底）直用
-//! SHM GetImage：server 端把像素写进共享内存段，客户端免大块
-//! socket 拷贝。SHM 扩展不可用时回退普通 GetImage。
-//!
-//! **X11 兜底门控**（§6.4 / §13.1 第三级）：`DISPLAY` 存在即视为可用候选。
-//! 纯 Wayland 会话的 XWayland 也导出 `DISPLAY`，其 root 窗口在无合成器内容时
-//! 直捕会得到全黑帧——但 portal（ScreenCast/Screenshot）不可用时，X11 兜底是
-//! 唯一可用后端，宁可产出全黑帧也优于直接 `BackendUnavailable`（上层 doctor
-//! 据此报告降级链真实状态）。原生 X11 会话则始终有真实内容。
-//!
+//! X11Generic 会话（或 portal 全不可用时）直用 SHM GetImage：server 把像素写进共享
+//! 内存段、客户端免大块 socket 拷贝；SHM 不可用回退普通 GetImage。**门控**（§6.4/
+//! §13.1）：`DISPLAY` 存在即视为可用候选——纯 Wayland 会话的 XWayland 也导出
+//! `DISPLAY`，无合成器内容时直捕得全黑帧，但 portal 不可用时它是唯一后端，宁可全黑
+//! 也优于直接 BackendUnavailable（doctor 据此报告降级链真实状态）；原生 X11 始终有内容。
 
 use agent_shell_core::error::{AgentShellError, Result};
 use agent_shell_displayserver_x11::X11DisplayServer;

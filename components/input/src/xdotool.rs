@@ -1,12 +1,9 @@
 //! xdotool 后端（设计文档 §12.1「再降级」行）。
 //!
-//! 最后兜底命令封装：XTest 扩展探测失败（或 x11rb 连接异常）但 `xdotool`
-//! 可执行存在时的最后通道。xdotool 自身走 XTest，但独立进程 + 独立连接，
-//! 对扩展版本协商差异容忍度更高。
-//!
-//! `DISPLAY` 存在即由 dispatcher 压入（原生 X11 或 XWayland 会话）。
-//! XWayland 下经 XTest 注入（部分合成器如 KWin 允许），注入失败错误透传给
-//! 调用方——不 panic、不重复降级重放。
+//! 最后兜底命令封装：XTest 探测失败（或 x11rb 连接异常）但 `xdotool` 可执行存在时
+//! 的最后通道。xdotool 自身走 XTest，但独立进程 + 独立连接，对扩展版本协商差异更
+//! 容忍。`DISPLAY` 存在即由 dispatcher 压入；XWayland 下经 XTest 注入（部分合成器
+//! 允许），注入失败透传——不 panic、不重复降级重放。
 
 use std::time::Duration;
 

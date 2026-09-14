@@ -1,20 +1,9 @@
-//! 通用降级链。
+//! 通用降级链（设计文档 §19.1–§19.4）。
 //!
-//! 对应设计文档 `design/11-error-handling/README.md` §19.1–§19.4：
-//! 按顺序尝试步骤，首个成功即返回，全部失败返回最后一步的错误。
-//! 步骤名进入 `tracing` 日志（成功 debug 级、失败 warn 级），doctor 与排障依赖该输出。
-//!
-//! # 典型降级链（§19.2，下游使用范例）
-//!
-//! ```text
-//! 聚焦窗口:  backend.focus_window (DE 原生) → a11y 窗口节点 activate() → input.click(标题栏中心坐标)
-//! 输入文本:  a11y EditableText.setText → input.type_text (libei) → input.type_text (ydotool)
-//! 截图:      portal ScreenCast (PipeWire) → DE 原生截图 (KWin D-Bus) → portal Screenshot → xwd/import (X11)
-//! ```
-//!
-//! # 超时与重试默认值（§19.3/§19.4）
-//!
-//! 供调用方在 FallbackChain 外层包装超时与重试时引用；本模块以常量表形式导出。
+//! 按顺序尝试步骤，首个成功即返回，全部失败返回最后一步的错误；步骤名进入
+//! `tracing` 日志（成功 debug、失败 warn），doctor 与排障依赖该输出。典型降级链
+//! 范例（§19.2）与超时/重试默认值（§19.3/§19.4）以常量表形式导出，供调用方在
+//! FallbackChain 外层包装超时与重试时引用。
 
 use crate::error::{AgentShellError, Result};
 use std::future::Future;
@@ -97,14 +86,7 @@ pub trait FallbackStep<T>: Send + Sync {
 
 /// 通用降级链：按顺序尝试步骤，首个成功即返回，全部失败返回最后错误。
 ///
-/// builder 语义，支持链式追加多个 `.step(...)`：
-///
-/// ```ignore
-/// let chain = FallbackChain::new()
-///     .step("native", || async { backend.focus_window(id).await })
-///     .step("a11y", || async { a11y.activate(id).await });
-/// let win = chain.execute().await?;
-/// ```
+/// builder 语义，支持链式追加多个 `.step(...)`（降级链范例见模块文档 §19.2）。
 pub struct FallbackChain<T> {
     steps: Vec<Box<dyn FallbackStep<T>>>,
 }

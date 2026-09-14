@@ -1,13 +1,8 @@
 //! Hyprland backend 装配器（§4.2–4.3、§3.3 装配矩阵 Hyprland 行）。
 //!
-//! 纯 Wayland 合成器（无 X11 变体）。装配清单：
-//! - 合成器：HyprlandCompositor（wlr 基类 + hyprland_* 私有协议 + hyprctl socket）
-//! - 音频：公共探测链（PipeWire / PulseAudio）
-//! - 网络：NetworkManager
-//! - 输入 / 截图 / 无障碍 / 剪贴板：公共探测链
-//! - 电源：UPower（Hyprland 无 DE 层电源封装）
-//! - 通知 / 外观 / 启动器：portal 三件套
-//! - 系统服务：Systemd + Logind
+//! 纯 Wayland 合成器（无 X11 变体）。装配清单见 §3.3：合成器 HyprlandCompositor
+//! （wlr 基类 + hyprland_* 私有协议 + hyprctl socket），音频/输入/截图/无障碍/剪贴板
+//! 走公共探测链，电源 UPower，通知/外观/启动器 portal 三件套，系统服务 Systemd + Logind。
 
 use agent_shell_a11y::AtSpiComponent;
 use agent_shell_appearance::PortalAppearance;

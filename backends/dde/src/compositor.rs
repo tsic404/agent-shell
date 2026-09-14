@@ -1,17 +1,11 @@
 //! DDE 合成器形态检测：Treeland vs deepin-kwin vs X11（设计文档 §10.4）。
 //!
-//! 检测顺序（§10.4 / §16.1，不可调换）：
+//! 检测顺序（§10.4 / §16.1，不可调换）：Wayland 会话看 registry globals——
+//! `org_kde_plasma_window_management` 在 → deepin-kwin（复用 [`KWinCompositor`]），
+//! `treeland_*` 在 → Treeland，都没有 → 无协议通道；X11 会话走 EWMH + dde-api D-Bus。
 //!
-//! 1. Wayland 会话（`WAYLAND_DISPLAY` 可连）→ 看 registry globals：
-//!    `org_kde_plasma_window_management` 在 → **deepin-kwin**（KWin fork，
-//!    复用 [`KWinCompositor`] 双通道）；`treeland_foreign_toplevel_manager_v1`
-//!    或 `treeland_window_management_v1` 在 → **Treeland**（未来首选通道；
-//!    当前 deepin 25 的 deepin-kwin 未启用）；都没有 → 无协议通道。
-//! 2. X11 会话（`DISPLAY` 存在）→ X11 分支（EWMH + dde-api D-Bus）。
-//!
-//! DDE 下 `XDG_CURRENT_DESKTOP=Deepin` 但 KWin 服务名仍为 `org.kde.KWin`——
-//! DE 判定层（core::de_detection）已保证「先判 DDE 再判 KDE」，本模块只在
-//! 已确认 DDE 之后做**合成器形态**细分。
+//! DDE 下 KWin 服务名仍为 `org.kde.KWin`，DE 判定层已保证「先判 DDE 再判 KDE」，
+//! 本模块只在已确认 DDE 之后做合成器形态细分。
 
 use agent_shell_core::error::AgentShellError;
 use agent_shell_displayserver_wayland::WaylandDisplayServer;
