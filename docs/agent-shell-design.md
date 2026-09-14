@@ -1573,7 +1573,7 @@ list_workspaces():
 
 activate_workspace(id):
   0. X11 会话？
-     → 是：bridge.switch_workspace.js 走 Scripting
+     → 是：EWMH `_NET_CURRENT_DESKTOP` ClientMessage（0 基桌面索引）
   1. Wayland：probe `/Scripting`
      → 可用：bridge.switch_workspace.js 走 Scripting
      → 失败（确证缺失/瞬时不可达）：VirtualDesktopManager.current 写桌面 id
