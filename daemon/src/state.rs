@@ -403,7 +403,7 @@ impl Daemon {
     }
 
     /// doctor 输出行的异步版本：先补齐 `/Scripting` 探测证据再渲染
-    /// （TSI-2486：doctor 路径此前从不触发懒探测，桥接行恒为「未探测」）。
+    /// （doctor 路径此前从不触发懒探测，桥接行恒为「未探测」）。
     pub async fn doctor_lines_async(&self) -> Vec<String> {
         match self.compositor.as_ref() {
             Some(c) => c.doctor_lines_async().await,
@@ -756,7 +756,7 @@ mod tests {
     }
 
     /// 装配成功 → 归一化事件入 daemon ring（验收标准「subscribe 后 replay 返回
-    /// 真实归一化事件」的装配链路覆盖，TSI-3033 审查 #5）。
+    /// 真实归一化事件」的装配链路覆盖）。
     #[tokio::test]
     async fn install_pipeline_feeds_normalized_events_into_ring() {
         let d = Daemon::connect(Duration::from_secs(1)).await;

@@ -70,7 +70,7 @@ impl AtspiBridge {
             .map_err(|e| AgentShellError::BackendUnavailable(format!("NameHasOwner: {e}")))?;
 
         // 无 owner 时查询可激活列表：可激活 → GetAddress 按需启动 a11y bus；
-        // 不可激活 → 提前返回，不触发激活（避免 ~120s 停顿，TSI-3086）。
+        // 不可激活 → 提前返回，不触发激活（避免 ~120s 停顿）。
         let activatable: Vec<zbus::names::OwnedBusName> = if has_owner {
             Vec::new()
         } else {

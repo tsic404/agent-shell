@@ -29,7 +29,7 @@ pub async fn dispatch(daemon: &mut Daemon, req: &Request) -> Response {
     if management {
         if let Some(reason) = check_management_permission(&daemon.caller_id) {
             // 管理面 caller 门禁拒绝与普通权限拒绝同审计语义：deny 必须落痕
-            //（TSI-2513：越权尝试此前零记录）。
+            //（越权尝试此前零记录）。
             if daemon.security.config.security.audit_log {
                 daemon
                     .security
@@ -142,7 +142,7 @@ pub async fn dispatch(daemon: &mut Daemon, req: &Request) -> Response {
     let executed = result.is_ok();
     if let Some(op) = gated_op {
         // 运行期结果审计：`decision=allow` 的执行态独立于门禁判定——
-        // 后端不可用等 handler 失败也留下 allow+false 痕迹（TSI-2659）。
+        // 后端不可用等 handler 失败也留下 allow+false 痕迹。
         daemon
             .security
             .record_execution(&daemon.caller_id, &op, executed);
@@ -330,7 +330,7 @@ fn input_doctor_line(d: &Daemon) -> String {
 
 async fn compositor_doctor_lines(d: &Daemon) -> Vec<String> {
     if d.has_compositor() {
-        // 异步版本先补齐 /Scripting 懒探测，再渲染桥接行（TSI-2486）；
+        // 异步版本先补齐 /Scripting 懒探测，再渲染桥接行；
         // DDE 会话经 DdeCompositor::doctor_lines_async 呈现 deepin-kwin 分支。
         d.doctor_lines_async().await
     } else {
@@ -457,9 +457,9 @@ fn capability_status(lazy: &'static [&'static str], name: &str, enabled: bool) -
 
 async fn info(d: &Daemon) -> RpcResult {
     let detection = agent_shell_core::de_detection::detect_report_for_doctor();
-    // 能力位表逐字段来自合成器声明（TSI-2501/2486 反模式：不得硬编码）。
+    // 能力位表逐字段来自合成器声明（不得硬编码）。
     // capture 组件独立于 compositor（纯 X11 会话仍可截图），native_capture
-    // 由 capture 探针真值决定（与 TSI-2569 的 Treeland window_management:false 同源）。
+    // 由 capture 探针真值决定（与 Treeland window_management:false 同源）。
     let caps = d.compositor_capabilities();
     let lazy = d.lazy_capabilities();
     let status = |name: &str, enabled: bool| capability_status(lazy, name, enabled);
@@ -879,7 +879,7 @@ async fn security_revoke(d: &mut Daemon, req: &Request) -> RpcResult {
 
 /// `security.audit [{agent_id}, {op}, {decision}, {result}]` —— 过滤读回审计日志。
 /// `result` 为可选布尔（`true` = 仅已执行成功，`false` = 仅未执行/失败）；
-/// 省略 = 不按执行态过滤。`--decision allow` 需结合 `result` 判读（TSI-2659：
+/// 省略 = 不按执行态过滤。`--decision allow` 需结合 `result` 判读（
 /// 门禁判定记录恒 `result=false`，执行结果另落一条独立记录）。
 async fn security_audit(d: &mut Daemon, req: &Request) -> RpcResult {
     let params = req.params.as_ref().cloned().unwrap_or_default();
@@ -909,7 +909,7 @@ fn stub_ok(name: &str) -> RpcResult {
 ///
 /// 首次订阅时惰性装配事件归一化管线（`ensure_event_pipeline`）：取 compositor
 /// 原始事件源 → `EventNormalizer` → hub + ring，使持续推送与 `--replay`
-/// 均有真实归一化事件（TSI-3033）。
+/// 均有真实归一化事件。
 async fn events_subscribe(d: &mut Daemon, req: &Request) -> RpcResult {
     let filter = parse_event_filter(req)?;
     // 先惰性装配管线：失败（KWin 脚本启动失败等）返回 BackendUnavailable，
@@ -1825,7 +1825,7 @@ mod tests {
         let v = resp.result.expect("ok");
         let r: InfoResult = serde_json::from_value(v).expect("InfoResult");
 
-        // 能力位表固定 9 行且名称顺序稳定（TSI-2569：不得硬编码）。
+        // 能力位表固定 9 行且名称顺序稳定（不得硬编码）。
         let names: Vec<&str> = r.capabilities.iter().map(|(n, _)| n.as_str()).collect();
         assert_eq!(
             names,
@@ -1956,7 +1956,7 @@ mod tests {
 
     #[tokio::test]
     async fn screenshot_backend_unavailable_audits_allow_result_false() {
-        // TSI-2659 回归锚定：门禁 allow（screenshot.capture=L2 自动放行）但
+        // 门禁 allow（screenshot.capture=L2 自动放行）但
         // handler 失败时，执行结果审计必须落 result=false，绝不能再出现
         // allow+result=true 的失真实记录。`d.capture = None` 在连接后确定性
         // 触发 BackendUnavailable，不依赖宿主是否可达 portal/X11 后端。
@@ -1999,7 +1999,7 @@ mod tests {
 
     #[tokio::test]
     async fn security_audit_filters_by_result() {
-        // TSI-2659：`security.audit` 新增 `result` 过滤键——同一 allow 操作
+        // `security.audit` 新增 `result` 过滤键——同一 allow 操作
         // 现在双记录（门禁 false + 执行结果），按执行态区分只读已执行/未执行。
         let mut d = test_daemon().await;
         let audit_path = std::env::temp_dir().join(format!(
@@ -2045,7 +2045,7 @@ mod tests {
 
     #[tokio::test]
     async fn a11y_query_non_string_role_name_is_invalid_params() {
-        // TSI-2480 QA 回归锚定：类型校验先于后端可用性判定，
+        // 类型校验先于后端可用性判定，
         // headless（无 AT-SPI bus）环境也须返回 InvalidParams。
         let mut d = test_daemon().await;
         for params in [json!({"role": 123}), json!({"name": true})] {
@@ -2090,7 +2090,7 @@ mod tests {
 
     #[tokio::test]
     async fn a11y_query_all_flag_bypasses_empty_filter_gate() {
-        // TSI-2525：`all=true` 是通配查询，不应命中 "requires role and/or
+        // `all=true` 是通配查询，不应命中 "requires role and/or
         // name" 的 InvalidParams gate；headless 环境应进入 locator 路径并
         // 返回 BackendUnavailable（非 InvalidParams）。
         let mut d = test_daemon().await;
@@ -2123,7 +2123,7 @@ mod tests {
 
     #[tokio::test]
     async fn a11y_query_all_with_role_name_is_not_invalid_params() {
-        // TSI-2525：all=true 不再覆盖 role/name——同时提供时仍是合法请求，
+        // all=true 不再覆盖 role/name——同时提供时仍是合法请求，
         // headless 环境应进入 locator 路径返回 BackendUnavailable（非
         // InvalidParams）；role/name 过滤由 locator 层单测锚定。
         let mut d = test_daemon().await;
@@ -2608,7 +2608,7 @@ mod tests {
 
     #[tokio::test]
     async fn management_deny_is_audited() {
-        // TSI-2513 回归锚定：具名 caller 越权调用 security.grant/revoke 被拒后，
+        // 具名 caller 越权调用 security.grant/revoke 被拒后，
         // audit.jsonl 必须至少 1 行 deny（此前管理面拒绝完全无痕）。
         let mut d = test_daemon().await;
         d.caller_id = "agent-x".into();

@@ -376,8 +376,7 @@ impl SecurityManager {
 
     /// 执行结果审计：handler 返回后由 dispatch 层调用，按 RPC 结果回写
     /// `result`（成功 `true`，失败 `false`），使 `decision=allow` 不再与
-    /// 「已执行」划等号——后端不可用等运行期失败同样留下 allow+false 痕迹
-    /// （TSI-2659）。
+    /// 「已执行」划等号——后端不可用等运行期失败同样留下 allow+false 痕迹。
     pub fn record_execution(&self, agent_id: &str, op: &Operation, success: bool) {
         if !self.config.security.audit_log {
             return;

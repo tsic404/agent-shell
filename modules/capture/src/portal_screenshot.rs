@@ -52,7 +52,7 @@ fn screenshot_token(pid: u32, seq: u64) -> String {
 ///
 /// 计数器必须是 `ScreenshotPortal` 字段（daemon 长生命周期内跨调用递增），
 /// 而非 `capture()` 局部变量——否则连续两次 screenshot 首 token 恒为
-/// `{pid}_0`，portal Request 路径仍可能冲突（TSI-2877 审查项 #1）。
+/// `{pid}_0`，portal Request 路径仍可能冲突。
 fn next_token(counter: &AtomicU64, pid: u32) -> String {
     let n = counter.fetch_add(1, Ordering::SeqCst);
     screenshot_token(pid, n)
@@ -110,11 +110,11 @@ impl ScreenshotPortal {
             .ok_or_else(|| AgentShellError::DBus("no unique name on session bus".into()))?;
 
         // §19.3：非交互最多 2 次尝试；交互单次（超时/取消后重试只会二次弹窗）。
-        // 每次生成新 token（TSI-2877 审查项 #1：pid 进程内不变，重试复用同一
+        // 每次生成新 token（pid 进程内不变，重试复用同一
         // token 会致 portal Request 路径冲突）；关键：先在 handle_token 预算的
         // 路径上订阅 Response 信号，再发 Screenshot 调用——否则 portal 对无授权
         // `interactive=false` 请求的即时取消（code=1）可能在订阅建立前就到达，
-        // 被 `wait_for_response` 遗漏而误判为超时（TSI-2971 debug 下订阅延迟
+        // 被 `wait_for_response` 遗漏而误判为超时（debug 下订阅延迟
         // 放大该竞态）。
         let timeout = screenshot_timeout(interactive);
         let attempts = screenshot_attempts(interactive);
@@ -213,7 +213,7 @@ mod tests {
 
     /// 重试 token 必须不同：`seq` 递增 → 不同 token，不同 pid 也隔离。
     /// 若 token 仅由 pid 派生（进程内不变），重试会复用同一 token 致
-    /// portal Request 路径冲突（TSI-2877 审查项 #1）。
+    /// portal Request 路径冲突。
     #[test]
     fn screenshot_token_is_unique_per_sequence() {
         let pid = std::process::id();
@@ -228,7 +228,7 @@ mod tests {
 
     /// 持久计数器跨调用递增：同一个计数器（`ScreenshotPortal` 字段）连续两次
     /// 取号得到不同 token——若计数器是 `capture()` 局部变量（每次重置为 0），
-    /// 两次「首 token」都会是 `{pid}_0`（TSI-2877 审查项 #1）。
+    /// 两次「首 token」都会是 `{pid}_0`。
     #[test]
     fn next_token_persists_counter_across_calls() {
         let counter = AtomicU64::new(0);

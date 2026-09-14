@@ -79,7 +79,7 @@ pub trait Rootd {
 pub async fn connect() -> Option<RootdProxy<'static>> {
     // 方法超时必须大于 rootd 内部 JournalQuery 超时（60s），让 rootd 的
     // 超时错误（而非 daemon 侧 D-Bus 超时）传播回 CLI——daemon 侧先行
-    // 超时会掩盖真实失败原因（TSI-2493）。
+    // 超时会掩盖真实失败原因。
     let conn = zbus::connection::Builder::system()
         .ok()?
         .method_timeout(std::time::Duration::from_secs(90))
@@ -111,8 +111,7 @@ pub async fn connect() -> Option<RootdProxy<'static>> {
 ///
 /// 抽象为可注入的函数指针（§23.4 测试隔离）：生产经 [`connector`] 绑定真实
 /// [`connect`]；测试注入恒 `None` 的失败工厂，使无 rootd 降级路径在所有主机
-/// 确定性可测，而非依赖 rootd 缺席（rootd 常驻主机会误入非降级路径，见
-/// TSI-2968）。
+/// 确定性可测，而非依赖 rootd 缺席（rootd 常驻主机会误入非降级路径）。
 pub type RootdConnector = fn() -> Pin<Box<dyn Future<Output = Option<RootdProxy<'static>>> + Send>>;
 
 /// 生产连接器：真实 system bus 探测。daemon 所有 rootd 特权链路经此注入点，

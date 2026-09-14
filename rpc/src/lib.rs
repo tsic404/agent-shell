@@ -635,22 +635,16 @@ pub struct EventsReplayResult {
     pub events: Vec<Value>,
 }
 
-/// daemon 二进制定位（CLI 与 MCP 共享，TSI-2471）。
+/// daemon 二进制定位（CLI 与 MCP 共享）。
 pub mod daemon_bin {
     /// daemon 二进制名。
     pub const NAME: &str = "agent-shell-daemon";
 
-    /// 定位 daemon 二进制。
+    /// 定位 daemon 二进制（查找顺序：同目录 → workspace target → PATH）。
     ///
-    /// 查找顺序（优先级递减）：
-    /// 1. 同目录下——CLI/MCP 与 daemon 并列安装时命中；
-    /// 2. workspace target 目录——开发构建产物，优先于 PATH，避免
-    ///    `~/.local/bin` 等位置已安装的旧版遮蔽本次构建的新二进制
-    ///    （TSI-2471）；
-    /// 3. PATH——已安装（systemd user unit / 包管理器安装）兜底。
-    ///
-    /// `extra_target_dirs` 由调用方注入（cli 与 mcp 的 workspace 相对
-    /// 层级不同），避免在本模块硬编码 crate 位置。
+    /// workspace target 目录优先于 PATH，避免 `~/.local/bin` 等位置已安装的
+    /// 旧版遮蔽本次构建的新二进制。`extra_target_dirs` 由调用方注入（cli 与
+    /// mcp 的 workspace 相对层级不同），避免在本模块硬编码 crate 位置。
     pub fn find_daemon_binary(extra_target_dirs: &[&str]) -> Result<String, String> {
         let dirs = candidate_dirs(extra_target_dirs);
         for dir in &dirs {
@@ -694,7 +688,7 @@ pub mod daemon_bin {
     mod tests {
         use super::*;
 
-        /// workspace target 目录必须排在 PATH 之前——TSI-2471 核心契约。
+        /// workspace target 目录必须排在 PATH 之前——核心契约。
         /// 比较时跳过调用方自身所在目录（exe_dir，合法的绝对路径且
         /// 优先级更高），仅验证 PATH 兜底段在 target 之后。
         #[test]
@@ -769,7 +763,7 @@ pub mod daemon_bin {
     }
 }
 
-/// 人类可读时长解析（CLI 与 MCP 共享，TSI-3060）。
+/// 人类可读时长解析（CLI 与 MCP 共享）。
 ///
 /// CLI `windows wait --timeout` 与 MCP `wait_for_window` 的 `timeout` 字段
 /// 共用本模块的解析语义，避免两处定义漂移（与 §22.2 协议载荷同源的契约
@@ -862,9 +856,9 @@ pub mod duration {
             assert_eq!(parse_duration("15000").unwrap(), 15_000);
             // 大小写不敏感，前后空白容忍。
             assert_eq!(parse_duration(" 3S ").unwrap(), 3_000);
-            // 数字与单位之间的空白容忍（TSI-3067）。
+            // 数字与单位之间的空白容忍。
             assert_eq!(parse_duration("1 s").unwrap(), 1_000);
-            // 小数秒折算为毫秒（TSI-3067）。
+            // 小数秒折算为毫秒。
             assert_eq!(parse_duration("1.5s").unwrap(), 1_500);
             assert_eq!(parse_duration("0.25s").unwrap(), 250);
             // 长小数按毫秒精度截断，不溢出（审查项）。
@@ -889,7 +883,7 @@ pub mod duration {
 
         #[test]
         fn empty_or_whitespace_input_yields_readable_error() {
-            // TSI-3083：空串/仅空白输入报错串应为可读提示，而非空反引号。
+            // 空串/仅空白输入报错串应为可读提示，而非空反引号。
             for spec in ["", "   ", "\t\n", "  "] {
                 let err = parse_duration(spec).unwrap_err();
                 assert!(!err.contains("``"), "{spec:?} -> {err}");
@@ -899,7 +893,7 @@ pub mod duration {
 
         #[test]
         fn unit_error_trims_leading_whitespace() {
-            // TSI-3067：非法单位提示串不应含前导空白。
+            // 非法单位提示串不应含前导空白。
             let err = parse_duration("1 x").unwrap_err();
             assert!(!err.contains("` x"), "{err}");
             assert!(err.contains("`x`"), "{err}");
@@ -907,7 +901,7 @@ pub mod duration {
 
         #[test]
         fn bare_numeric_error_trims_leading_whitespace() {
-            // TSI-3078：无数字前缀输入（仅空白+单位）报错提示串不应含前导空白。
+            // 无数字前缀输入（仅空白+单位）报错提示串不应含前导空白。
             let err = parse_duration(" s").unwrap_err();
             assert!(!err.contains("` s"), "{err}");
             assert!(err.contains("`s`"), "{err}");
@@ -932,7 +926,7 @@ mod tests {
         );
     }
 
-    /// 回归锚定（TSI-2439）：daemon windows_list 只发 native_id/title/app_id/pid
+    /// daemon windows_list 只发 native_id/title/app_id/pid
     /// 逐项，from_cache 仅在响应外层。WindowEntry 必须能从 daemon 实际发送的
     /// 逐项 JSON 反序列化——逐项 from_cache 字段会导致 missing field 反序列化失败。
     #[test]
@@ -1070,7 +1064,7 @@ mod tests {
         assert_eq!(p.window, None);
     }
 
-    /// 混合版本兼容（TSI-2822）：旧 daemon 发布尔 `capabilities` 值、新
+    /// 混合版本兼容：旧 daemon 发布尔 `capabilities` 值、新
     /// daemon 发 snake_case 字符串，`CapabilityStatus` 两种都收，且新线格式
     /// 字符串往返稳定。
     #[test]

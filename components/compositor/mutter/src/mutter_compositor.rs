@@ -273,7 +273,7 @@ impl MutterCompositor {
 
     /// doctor 输出的异步版本：先补齐 org.gnome.ScreenSaver 在位性懒探测
     /// 再渲染（与 KWin `/Scripting`、DDE 分支的 `doctor_lines_async` 同口径，
-    /// 使 daemon doctor 路径不落空——TSI-2486 同类的懒探测修正）。
+    /// 使 daemon doctor 路径不落空——同类的懒探测修正）。
     pub async fn doctor_lines_async(&self) -> Vec<String> {
         let _ = self.ensure_screensaver_probe().await;
         self.doctor_lines()

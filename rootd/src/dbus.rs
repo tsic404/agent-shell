@@ -135,7 +135,7 @@ fn process_start_time(pid: u32) -> Option<u64> {
     tokens.get(19)?.parse::<u64>().ok()
 }
 
-/// 阻塞命令并发准入闸（TSI-2504）：`call_method` 分派前必须取得许可。
+/// 阻塞命令并发准入闸：`call_method` 分派前必须取得许可。
 /// 上限 [`MAX_CONCURRENT_BLOCKING_COMMANDS`] 远低于 tokio blocking 线程池
 /// 上限，防止调用潮耗尽线程与 spawn 的短生命周期子进程。
 ///
@@ -173,8 +173,8 @@ impl RootdInterface {
         // `dispatch_with_timeout`——同步 dispatch 可能执行阻塞性系统命令
         // （journalctl/systemctl/sysctl/hostnamectl/mount/umount），必须从
         // tokio worker 移出，否则单次长查询会占住 rootd 事件循环，后续调用
-        // 全部排队超时（TSI-2493：全量 journalctl 200s，本应 0.4s 的
-        // --lines=50 排队）。TSI-2504：分派前经 Semaphore 限制并发阻塞命令数。
+        // 全部排队超时（全量 journalctl 200s，本应 0.4s 的
+        // --lines=50 排队）。分派前经 Semaphore 限制并发阻塞命令数。
         dispatch_with_semaphore(method, args, &BLOCKING_SEMAPHORE)
             .await
             .map_err(fdo::Error::Failed)
@@ -184,7 +184,7 @@ impl RootdInterface {
 /// 带超时与事件循环隔离地执行一次 dispatch（§23.4.3 白名单方法）。
 ///
 /// 同步 `dispatch` 可能执行阻塞性系统命令；`spawn_blocking` 将阻塞工作移出
-/// tokio worker，`tokio::time::timeout` 在超时后放弃等待（TSI-2504：随后
+/// tokio worker，`tokio::time::timeout` 在超时后放弃等待（随后
 /// kill 已 spawn 的子进程，杜绝超时后的孤儿进程）。
 /// 独立成 async 纯函数，使「超时 + spawn_blocking 包装」可被 `#[tokio::test]`
 /// 直接断言：把包装改回同步 `dispatch` 会使超时测试失败。
@@ -215,7 +215,7 @@ async fn dispatch_with_timeout_tracked(
         // spawn_blocking join 失败（blocking 线程 panic/中止）。
         Ok(Err(join_err)) => (Err(format!("{method} task join failed: {join_err}")), None),
         // 超时：置取消位后等待 kill 目标就绪——pidfd 可用或分派已结束，
-        // 取代固定 200ms 宽限（TSI-2545）。不产生子进程的方法不等待。
+        // 取代固定 200ms 宽限。不产生子进程的方法不等待。
         Err(_) => {
             slot.cancel();
             let killed = if method_spawns_child(method) {
@@ -232,7 +232,7 @@ async fn dispatch_with_timeout_tracked(
     }
 }
 
-/// 并发准入 + 超时隔离的分派（TSI-2504）。
+/// 并发准入 + 超时隔离的分派。
 ///
 /// 先取得 Semaphore 许可再进入 `dispatch_with_timeout`：许可只限并发
 /// 准入，不消耗命令自身的超时预算——排队等待不因本函数超时而失败。
@@ -248,11 +248,11 @@ async fn dispatch_with_semaphore(
     dispatch_with_timeout(method, args).await
 }
 
-/// 方法是否会产生可被 kill 的子进程（TSI-2545 超时分支等待 kill 目标的
+/// 方法是否会产生可被 kill 的子进程（超时分支等待 kill 目标的
 /// 唯一白名单）。不产生子进程的方法超时后无需等待即可返回。
 ///
 /// 名单来自 lib 层 [`crate::SPAWN_CALLERS`]——与 `dispatch_with_slot` 的 spawn
-/// 分支由同一宏展开派生（TSI-2637），新增产生子进程的方法只需在 lib 层登记
+/// 分支由同一宏展开派生，新增产生子进程的方法只需在 lib 层登记
 /// 一次，不再需要在此手工镜像。
 fn method_spawns_child(method: &str) -> bool {
     crate::SPAWN_CALLERS.contains(&method)
@@ -921,7 +921,7 @@ mod tests {
     }
 
     /// `method_spawns_child` 是超时分支等待 kill 目标的唯一白名单，必须与
-    /// dispatch 中实际产生子进程的方法保持 1:1。TSI-2637 起两者不再各自维护：
+    /// dispatch 中实际产生子进程的方法保持 1:1。两者不再各自维护：
     /// `crate::SPAWN_CALLERS` 与 `dispatch_spawn` 的 match 分支由同一宏展开派生，
     /// 是唯一事实源；本测试的候选全集 = D-Bus 白名单 ∪ `crate::SPAWN_CALLERS`，
     /// 逐个断言 `method_spawns_child` 的分类与单一事实源一致——若有人把
@@ -1027,7 +1027,7 @@ mod tests {
     fn timeout_returns_when_blocking_pool_saturated() {
         // C2 回归：blocking 池饱和时 spawn_blocking 闭包仍在队列、尚未执行，
         // `dispatch_with_slot` 无从走到 `mark_finished`，pidfd 也永不写入——
-        // 超时分支必须仍在 `timeout + 小常数` 内返回，而非无限等待（TSI-2545）。
+        // 超时分支必须仍在 `timeout + 小常数` 内返回，而非无限等待。
         // 用小 blocking 池（4 槽）确定性重现：占满后新分派必然排队到超时之后。
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(1)
@@ -1072,7 +1072,7 @@ mod tests {
 
     /// 用 pidfd 探针确认目标进程已被 reap：`pidfd_send_signal(fd, 0)` 对
     /// 仍存在（含僵尸 Z）的进程返回 0，仅在被 reap、进程彻底消失后才返回
-    /// -1/ESRCH。与 PID 无关，不惧 PID 复用（TSI-2545 C0/C1 独立证据）。
+    /// -1/ESRCH。与 PID 无关，不惧 PID 复用（C0/C1 独立证据）。
     fn pidfd_probe_esrch(fd: &OwnedFd) -> bool {
         let rc = unsafe {
             libc::syscall(
@@ -1101,7 +1101,7 @@ mod tests {
     /// 扫描当前进程（tgid 主线程）的直接子进程，返回其中 `comm == "sleep"`
     /// 的描述列表（含僵尸 Z——其 `/proc/<pid>/comm` 仍可读）。这是与代码
     /// 返回的 pidfd 无关的独立残留证据，防止「返回 Some(pidfd) 但未真正
-    /// 清理」的假通过（TSI-2545 B1/C0/C1）。
+    /// 清理」的假通过（B1/C0/C1）。
     fn sleep_residue_descs() -> Vec<String> {
         let tgid = std::process::id();
         let children_path = format!("/proc/{tgid}/task/{tgid}/children");
@@ -1173,7 +1173,7 @@ mod tests {
 
     /// C1：blocking 池饱和时，排队的闭包在超时窗口内获得释放出的槽后真实
     /// spawn，超时分支仍须 kill 并 reap，`/proc` 树无残留。验证「延迟 spawn」
-    /// 路径（而非闭包从未运行）在饱和池下同样收敛（TSI-2545）。
+    /// 路径（而非闭包从未运行）在饱和池下同样收敛。
     #[test]
     fn timeout_kills_spawned_child_under_saturated_blocking_pool() {
         let _guard = SPAWN_SLEEP_TEST_MUTEX.lock();

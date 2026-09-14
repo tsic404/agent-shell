@@ -23,7 +23,7 @@ pub fn atspi_line() -> String {
 /// a11y bus 地址候选：环境变量 → `$XDG_RUNTIME_DIR/at-spi/bus_0`（现代
 /// at-spi2 标准 socket 名）→ `$XDG_RUNTIME_DIR/at-spi/bus`（旧版兜底）。
 ///
-/// TSI-2486：旧实现只探测 `at-spi/bus`，而实际运行环境（及组件桥接
+/// 旧实现只探测 `at-spi/bus`，而实际运行环境（及组件桥接
 /// `atspi_bridge.rs` 文档）使用 `at-spi/bus_0`，导致 doctor 恒报
 /// 「unavailable (Registry not reachable)」假阴性。
 fn a11y_bus_addresses() -> Vec<String> {

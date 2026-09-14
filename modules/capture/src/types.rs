@@ -2,7 +2,7 @@
 //!
 //! `Frame` / `PixelFormat` / `CaptureTarget` 被 X11 路径（[`crate::x11`]）、
 //! portal Screenshot 与 daemon 直接使用——不能随 `portal-screencast` feature
-//! 一起排除（设计文档 §22.3 D2；TSI-3111）。因此独立成模块，始终编译。
+//! 一起排除（设计文档 §22.3 D2）。因此独立成模块，始终编译。
 
 /// 捕获目标（portal SourceType 位掩码）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

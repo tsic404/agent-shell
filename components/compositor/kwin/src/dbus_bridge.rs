@@ -1,21 +1,10 @@
 //! D-Bus ↔ KWin Scripting 桥接（设计文档 §7.3 / §7.5，`dbus_bridge.rs`）。
 //!
-//! KWin 5.27 与 6 的 `loadScript` 均返回 int32 脚本 id（TSI-2398）；
-//! 实例注册路径因版本而异——V6 `/Scripting/Script<id>`，V5 `/<id>`。
-//! 但 `run` 无返回值——
-//! 结果回传采用策略 B/C 组合：
-//!
-//! 1. agent-shell 在 session bus 注册响应服务 `com.agent_shell.Response`
-//!    （对象路径 `/com/agent_shell/response`）；
-//! 2. 每次查询生成唯一 **请求 id**（UUID），内联脚本执行目标表达式后
-//!    `callDBus(..., "sendResult", JSON.stringify({req: "<id>", result: ...}))`；
-//! 3. 响应服务按 id 投递到对应等待者的 oneshot 通道（并发查询互不串扰）；
-//! 4. `loadScript → run → 等待回传（5s 超时）→ stop`——**stop 必须在
-//!    回传到达或超时之后**：run 仅异步发起，先 stop 会把脚本卸载在
-//!    callDBus 发出之前。
-//!
-//! 长驻事件脚本的推送走**独立事件队列**（[`EventQueue`]，见
-//! [`crate::event_script`]），与一次性查询的按 id 表完全隔离。
+//! KWin 5.27 与 6 的 `loadScript` 均返回 int32 脚本 id，实例注册路径因版本
+//! 而异（V6 `/Scripting/Script<id>`，V5 `/<id>`）；`run` 无返回值，结果经
+//! 响应服务 + 请求 id 回传（策略 B/C，见 §7.5）。长驻事件脚本的推送走独立
+//! 事件队列（[`EventQueue`]，见 [`crate::event_script`]），与一次性查询的
+//! 按 id 表完全隔离。
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -38,7 +27,7 @@ pub const SCRIPT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// org.kde.KWin Scripting 服务常量（§3.5 调研记录）。
 ///
-/// 兼容性注记（TSI-2374）：`Scripting` 单例在 KWin 内部构造完成前不会
+/// 兼容性注记：`Scripting` 单例在 KWin 内部构造完成前不会
 /// 注册 `/Scripting`（upstream `scripting.cpp` 构造尾部才 registerObject）。
 /// 会话早期探测可能返回 UnknownObject/UnknownInterface——这是时序现象，
 /// 不是接口被移除；调用方应重试或降级，而非判定能力缺失。所有
@@ -210,7 +199,7 @@ impl KWinBridge {
     ///
     /// KWin `loadScript(path, pluginName)` 只接受**文件路径**（上游
     /// `Script::run()` 从磁盘读脚本；传内联源码会被当作路径打开，产生
-    /// `FileError: Could not open var windows…`——TSI-2428 根因）。因此
+    /// `FileError: Could not open var windows…`）。因此
     /// 渲染好的脚本体先落盘为 0600 临时文件，run 完成后立即删除。
     async fn run_script_raw(&self, script_name: &str, v6: bool, js: &str) -> Result<String> {
         // 每次查询一个请求 id：内联包装把结果包成 {"req": id, "result": ...}
@@ -219,7 +208,7 @@ impl KWinBridge {
         let rx = self.router.lock().await.register(req_id.clone());
         let wrapped = js.replace(crate::scripts::REQ_ID_TOKEN, &req_id);
 
-        // KWin 只从磁盘读脚本（TSI-2428）：落盘临时文件，run 结束后删除。
+        // KWin 只从磁盘读脚本：落盘临时文件，run 结束后删除。
         // pluginName 用本次请求 UUID——KWin 对已加载的同名插件返回 -1 哨兵，
         // 固定名会在并发/重入查询时互相顶掉（isScriptLoaded 命中旧实例）。
         let staged = match StagedScript::stage(script_name, &wrapped) {
@@ -419,16 +408,14 @@ impl agent_shell_core::EventStream for KWinEventStream {
 /// 引用 iface 常量避免 unused（单一来源契约）。
 const _: &str = RESPONSE_IFACE;
 
-/// 已落盘待执行的 KWin 脚本（TSI-2428）。
+/// 已落盘待执行的 KWin 脚本（设计文档 §7.5）。
 ///
-/// KWin 的 `loadScript(filePath, pluginName)` 只把参数当**路径**——
-/// `Script::run()` 在 compositor 进程内从磁盘读文件，打开失败即回
-/// `org.kde.kwin.Scripting.FileError: Could not open <内容>`。因此
-/// 脚本体必须先写进临时文件；本类型持有该文件直到 Drop 删除，
-/// 保证「run 完成 → 才允许清理」的生命周期由 Rust 所有权表达。
+/// KWin `loadScript(filePath, pluginName)` 只把参数当**路径**——`Script::run()`
+/// 从磁盘读文件，打开失败即回 `FileError: Could not open <内容>`。因此脚本体
+/// 先写临时文件，本类型持有到 Drop 删除，生命周期由 Rust 所有权表达。
 ///
-/// `plugin_name` 每次唯一：KWin 对已加载的同名插件返回 -1 哨兵
-/// （`isScriptLoaded` 命中），固定名会让并发/重入查询互相顶掉。
+/// `plugin_name` 每次唯一：KWin 对同名已加载插件返回 -1 哨兵，固定名会让
+/// 并发/重入查询互相顶掉。
 #[derive(Debug)]
 pub(crate) struct StagedScript {
     file: tempfile::NamedTempFile,
@@ -470,7 +457,7 @@ impl StagedScript {
 mod staged_tests {
     use super::*;
 
-    /// TSI-2428 回归：stage 产物必须是真实存在的文件路径 + 唯一插件名；
+    /// stage 产物必须是真实存在的文件路径 + 唯一插件名；
     /// Drop 后文件被删除（不留脚本体在磁盘上）。
     #[test]
     fn staged_script_roundtrip_and_cleanup() {
@@ -537,7 +524,7 @@ impl<'a> ScriptingProxy<'a> {
         })
     }
 
-    /// 加载已落盘脚本，返回脚本实例的对象路径（TSI-2398 / TSI-2428）。
+    /// 加载已落盘脚本，返回脚本实例的对象路径。
     ///
     /// KWin 签名：`loadScript(filePath, pluginName) -> int32`——第一参是
     /// **文件路径**（上游 `Script::run()` 从磁盘读），第二参是去重插件名
@@ -604,7 +591,7 @@ impl<'a> ScriptInstance<'a> {
 
 /// 供 event_script 复用：在指定连接上落盘并加载脚本，返回
 /// （对象路径, 暂存文件句柄）。句柄必须存活至脚本 stop——KWin 的 run
-/// 是异步读盘，提前删文件会让后续重载失败（TSI-2428）。
+/// 是异步读盘，提前删文件会让后续重载失败。
 pub(crate) async fn load_script_via(
     conn: &Connection,
     js: &str,
@@ -696,7 +683,7 @@ mod tests {
         assert!(router_now.waiters.is_empty());
     }
 
-    /// TSI-2374 回归：完整接口声明的 introspection XML 应被识别。
+    /// 完整接口声明的 introspection XML 应被识别。
     #[test]
     fn probe_matches_full_interface_declaration() {
         let xml = r#"<node>
@@ -710,7 +697,7 @@ mod tests {
         assert!(scripting_interface_advertised(xml));
     }
 
-    /// TSI-2374 回归：无 Scripting 接口的 XML（KWin 启动早期 / 对象缺失）
+    /// 无 Scripting 接口的 XML（KWin 启动早期 / 对象缺失）
     /// 必须判为不可用——旧实现的无条件 ✓ 会掩盖该状态。
     #[test]
     fn probe_rejects_xml_without_scripting_interface() {
@@ -744,7 +731,7 @@ mod tests {
         assert!(!stmt.contains(crate::scripts::REQ_ID_TOKEN));
     }
 
-    /// TSI-2398 回归：KWin 5.27 与 6 的 `loadScript` 都返回 int32 脚本
+    /// KWin 5.27 与 6 的 `loadScript` 都返回 int32 脚本
     /// id，差异仅在实例注册路径——V6 `/Scripting/Script<id>`（此前按
     /// OwnedObjectPath 反序列化直接 SignatureMismatch）、V5 `/<id>`。
     #[test]
@@ -780,7 +767,7 @@ mod tests {
     fn int_reply_deserializes_as_i32_not_object_path() {
         // KWin 5.27 与 6 的 loadScript 回复均为 int32 签名 "i"。按
         // OwnedObjectPath 反序列化必须失败（SignatureMismatch）——这是
-        // TSI-2398 修复前的故障路径；随后按 i32 解析得到脚本 id。
+        // 修复前的故障路径；随后按 i32 解析得到脚本 id。
         let msg = zbus::message::Message::method_call("/Scripting", "loadScript")
             .and_then(|b| b.build(&(42_i32,)))
             .expect("marshal");
@@ -795,7 +782,7 @@ mod tests {
         assert_eq!(script_object_path(id, false), "/42");
     }
 
-    /// TSI-2436 回归：`send_result` 方法必须以 `sendResult`（camelCase）
+    /// `send_result` 方法必须以 `sendResult`（camelCase）
     /// 暴露在 D-Bus 上，与脚本模板 `RESPONSE_METHOD = "sendResult"` 对齐。
     ///
     /// zbus v5 默认将 Rust 方法名 `send_result` 导出为 PascalCase

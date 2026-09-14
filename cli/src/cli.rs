@@ -857,9 +857,8 @@ fn split_at_value(args: &[std::ffi::OsString]) -> bool {
         .any(|w| w[0] == std::ffi::OsStr::new("--at") && !w[1].to_string_lossy().contains(','))
 }
 
-/// 人类可读时长解析——已迁至 `agent-shell-rpc::duration`（CLI 与 MCP 共享，
-/// TSI-3060）。此处 re-export 保持 `value_parser = parse_duration` 与调用点
-/// 不变。
+/// 人类可读时长解析——已迁至 `agent-shell-rpc::duration`（CLI 与 MCP 共享）。
+/// 此处 re-export 保持 `value_parser = parse_duration` 与调用点不变。
 pub use agent_shell_rpc::duration::parse_duration;
 
 #[cfg(test)]
@@ -973,7 +972,7 @@ mod tests {
 
     #[test]
     fn scroll_accepts_negative_numbers_without_double_dash() {
-        // `input scroll -2 0` 不经 `--` 直接传负值（TSI-2915）。
+        // `input scroll -2 0` 不经 `--` 直接传负值。
         let Cli {
             command: Some(Command::Input(InputCommand::Scroll { dx, dy })),
             ..
@@ -1017,7 +1016,7 @@ mod tests {
 
     #[test]
     fn parse_xy_json_error_includes_at_hint() {
-        // 运行时解析失败须给出 --at 100,200 写法示例（TSI-2875 缺口）。
+        // 运行时解析失败须给出 --at 100,200 写法示例。
         for bad in ["bad", "100,abc", "abc,200"] {
             let err = parse_xy_json(bad).unwrap_err();
             assert!(err.contains("--at 100,200"), "{bad}: {err}");

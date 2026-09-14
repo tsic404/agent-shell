@@ -1,24 +1,11 @@
-//! 共享构建脚本：把构建树的 git commit 打进发布二进制。
+//! 共享构建脚本：把构建树的 git commit 打进发布二进制（§20.7 QA 二进制版本约定）。
 //!
-//! 四个发布二进制 crate（cli / daemon / mcp / rootd）通过各自 Cargo.toml 的
-//! `build = "../build/version.rs"` 引用本脚本，从而在编译期获得
-//! `AGENT_SHELL_GIT_COMMIT` 常量（见 §20.7 QA 二进制版本约定）。
+//! commit 解析顺序：`AGENT_SHELL_GIT_COMMIT` 环境变量覆盖 → `git rev-parse
+//! --short=7 HEAD`（干净 `短哈希` / 脏 `<短哈希>-dirty` / status 失败
+//! `-dirty-unknown`）→ `unknown`。`-dirty` 在 build.rs 重跑时采样，QA 发布须
+//! 从干净工作树构建或显式注入环境变量。
 //!
-//! commit 解析顺序：
-//!   1. `AGENT_SHELL_GIT_COMMIT` 环境变量覆盖（无 `.git` 的沙箱构建注入用）；
-//!   2. `git rev-parse --short=7 HEAD`，并按 `git status` 判定干净/脏：
-//!      - 干净（status 成功且无输出）→ 短哈希；
-//!      - 脏（status 成功且有输出）→ `<短哈希>-dirty`；
-//!      - status 本身失败（bare 仓库/权限错误）→ `<短哈希>-dirty-unknown`，
-//!        绝不静默当干净；
-//!   3. `unknown`（无 git 且无覆盖——QA 流程不应落入此分支）。
-//!
-//! `-dirty` 在 build.rs 重跑时采样：源码改动不触发重跑，增量构建可能残留
-//! 上一采样结果。QA 发布必须从干净工作树构建（`git status --porcelain` 为空），
-//! 或由打包/发布脚本显式注入 `AGENT_SHELL_GIT_COMMIT`。
-//!
-//! 目的：真机 QA 二进制自报 commit，`agent-shell --version` 即可回溯来源，
-//! 防「旧包冒验新修复」（TSI-3094）。
+//! 目的：真机 QA 二进制自报 commit，`agent-shell --version` 回溯来源，防「旧包冒验新修复」。
 
 use std::process::Command;
 

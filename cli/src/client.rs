@@ -56,8 +56,7 @@ const RETRY_BACKOFF_MS: u64 = 150;
 const STDERR_TAIL_CAP: usize = 64 * 1024;
 
 /// daemon stderr 尾部缓冲：后台任务持续排空管道，避免 64KB 管道缓冲写满
-/// 后 daemon 同步写阻塞停摆（TSI-2946 审查 #1）；连接提前关闭时取尾部
-/// 透传根因。
+/// 后 daemon 同步写阻塞停摆；连接提前关闭时取尾部透传根因。
 struct StderrTail {
     buf: Mutex<VecDeque<u8>>,
     done: Notify,
@@ -100,7 +99,7 @@ pub struct DaemonClient {
     stdin: tokio::process::ChildStdin,
     reader: BufReader<tokio::process::ChildStdout>,
     /// daemon stderr 尾部缓冲（后台任务持续排空，见 [`spawn_stderr_drain`]）；
-    /// 连接提前关闭时取尾部透传诊断（TSI-2946）。
+    /// 连接提前关闭时取尾部透传诊断。
     stderr_tail: Option<Arc<StderrTail>>,
     next_id: u64,
     /// 「连接提前关闭」时的重建重试次数（`--retry N` 注入）。
@@ -157,7 +156,7 @@ impl DaemonClient {
             .await
             .map_err(|e| format!("daemon read: {e}"))?;
         if n == 0 {
-            // 透传 daemon stderr 诊断（TSI-2946）：`.stderr(piped())` 下锁竞争
+            // 透传 daemon stderr 诊断：`.stderr(piped())` 下锁竞争
             // `daemon already running`、portal 会话失败等早期退出根因原样可见，
             // 而非只报通用「connection closed before responding」。
             let diag = self.drain_stderr().await;
@@ -173,7 +172,7 @@ impl DaemonClient {
         }
         // 半截响应：完整 JSON-RPC 行必以 `\n` 结尾（`to_line` 追加），读到 EOF
         // 仍无换行说明 daemon 在写完一行前退出——归入传输层错误供 `--retry`
-        // 重建连接重试（TSI-2877 审查项 #2）。
+        // 重建连接重试。
         if !line.ends_with('\n') {
             return Err("daemon read: truncated response (EOF before newline)".into());
         }
@@ -290,7 +289,7 @@ impl DaemonClient {
     ///
     /// 订阅响应收到后的 EOF 是正常流结束（daemon 退出或空闲超时）→ exit 0；
     /// 响应收到前的 EOF 是 daemon 启动失败（锁竞争等），错误含 `[daemon: …]`
-    /// 诊断，返回 Err 非零退出（TSI-2946 审查 #2）。真实 I/O 错误亦返回 Err。
+    /// 诊断，返回 Err 非零退出。真实 I/O 错误亦返回 Err。
     pub async fn subscribe(&mut self, filter: Option<String>) -> Result<(), String> {
         let id = self.next_id;
         self.next_id += 1;
@@ -375,8 +374,7 @@ fn is_transport_error(msg: &str) -> bool {
 }
 /// 定位 daemon 二进制（委托 agent-shell-rpc::daemon_bin）。
 ///
-/// workspace target 目录用 `CARGO_MANIFEST_DIR` 拼绝对路径，不依赖 CWD
-/// （TSI-2471 审查 #2）。
+/// workspace target 目录用 `CARGO_MANIFEST_DIR` 拼绝对路径，不依赖 CWD。
 fn find_daemon_binary() -> Result<String, String> {
     // cli/ 上一级是 workspace 根，target/ 在根下。
     let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -578,9 +576,9 @@ fn a11y_query_params(role: Option<&str>, name: Option<&str>, all: bool) -> Value
 mod tests {
     use super::*;
 
-    /// CLI 注入的 target 目录用 CARGO_MANIFEST_DIR 拼绝对路径——CWD 无关
-    /// （TSI-2471 审查 #2）。验证候选目录列表中包含基于
-    /// CARGO_MANIFEST_DIR 的 target/debug 与 target/release 绝对路径。
+    /// CLI 注入的 target 目录用 CARGO_MANIFEST_DIR 拼绝对路径——CWD 无关。
+    /// 验证候选目录列表中包含基于 CARGO_MANIFEST_DIR 的 target/debug 与
+    /// target/release 绝对路径。
     #[test]
     fn target_dirs_are_absolute_via_cargo_manifest_dir() {
         let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -604,7 +602,7 @@ mod tests {
     }
 
     /// `a11y.query` 单条件调用：未提供的条件必须省略键，
-    /// 而非序列化为 JSON `null`（TSI-2480 QA 回归锚定）。
+    /// 而非序列化为 JSON `null`。
     #[test]
     fn a11y_query_params_omits_none_keys() {
         let v = a11y_query_params(Some("pushButton"), None, false);
@@ -643,7 +641,7 @@ mod tests {
     }
 
     /// `is_transport_error` 必须命中写侧/读侧 pipe 传输错误与 EOF——daemon 在
-    /// 请求期间退出时三者同属可重建连接重试的失败模式（TSI-2877 审查项 #1），
+    /// 请求期间退出时三者同属可重建连接重试的失败模式，
     /// 不得命中协议错误（响应 id 不符 / 解析失败）。
     #[test]
     fn is_transport_error_matches_pipe_failures_not_protocol() {
@@ -653,7 +651,7 @@ mod tests {
         assert!(is_transport_error("daemon flush: broken pipe"));
         assert!(is_transport_error("daemon read: broken pipe"));
         // 半截响应：daemon 写出半行后退出（EOF 无换行）→ read_line 归一为
-        // 传输层错误，`--retry` 必须命中（TSI-2877 审查项 #2）。
+        // 传输层错误，`--retry` 必须命中。
         assert!(is_transport_error(
             "daemon read: truncated response (EOF before newline)"
         ));
@@ -667,7 +665,7 @@ mod tests {
 
     /// daemon 在写出响应前退出（锁竞争 `daemon already running` 等）时，
     /// `read_line` 必须把排空的 daemon stderr 拼进错误信息——根因对用户可见，
-    /// 而非只剩通用 `connection closed before responding`（TSI-2946）。
+    /// 而非只剩通用 `connection closed before responding`。
     #[tokio::test]
     async fn read_line_surfaces_daemon_stderr_on_early_exit() {
         let mut child = tokio::process::Command::new("sh")
@@ -699,7 +697,7 @@ mod tests {
 
     /// `subscribe` 在收到订阅响应前 daemon 即退出（锁竞争启动失败）时，
     /// 必须把含 `[daemon: …]` 诊断的错误上抛为 Err（非零退出），而非吞掉
-    /// 伪装成「event stream ended」成功（TSI-2946 审查 #2）。
+    /// 伪装成「event stream ended」成功。
     #[tokio::test]
     async fn subscribe_surfaces_daemon_stderr_when_exits_before_response() {
         let mut child = tokio::process::Command::new("sh")

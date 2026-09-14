@@ -1107,7 +1107,7 @@ mod tests {
     }
 
     /// 无 `_NET_WM_NAME` / `WM_NAME` 的窗口（KWin-Xwayland InputOnly helper 等）
-    /// 应返回空标题而非 `WindowNotFound` 错误（TSI-2446）。
+    /// 应返回空标题而非 `WindowNotFound` 错误。
     #[test]
     fn get_window_name_returns_empty_for_unnamed_window() {
         let Ok(server) = X11DisplayServer::connect() else {

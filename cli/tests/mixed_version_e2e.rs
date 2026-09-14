@@ -1,15 +1,11 @@
-//! 混合版本跨进程 e2e（TSI-2873）：旧 daemon（pre-21c7267 布尔 capabilities）
-//! + 新 CLI。
+//! 混合版本跨进程 e2e：旧 daemon（pre-21c7267 布尔 capabilities）+ 新 CLI。
 //!
-//! 旧 daemon 常驻用户会话、postinst 升级不重启，新 CLI 反序列化旧 daemon 的
-//! 布尔 `capabilities` 时不得硬失败（`CapabilityStatus` 同收布尔与 snake_case
-//! 字符串）。既有 rpc 单测只覆盖进程内反序列化，本测试用真实 `agent-shell`
-//! 二进制连接旧线格式夹具 daemon，端到端验证跨进程路径。
-//!
-//! 夹具选择机制：`DaemonClient::connect` 经 `find_daemon_binary` 定位 daemon，
-//! 查找顺序为「自身所在目录 → target 目录 → PATH」。把真实 `agent-shell` 与
-//! 旧线格式夹具（命名 `agent-shell-daemon`）复制到同一临时目录后运行，
-//! exe_dir 优先命中夹具，从而驱动真实 CLI 走旧布尔反序列化路径。
+//! 旧 daemon postinst 升级不重启，新 CLI 反序列化旧布尔 `capabilities` 不得
+//! 硬失败（`CapabilityStatus` 同收布尔与 snake_case）。本测试用真实二进制连接
+//! 旧线格式夹具 daemon，端到端验证跨进程路径（进程内反序列化已有 rpc 单测）。
+//! 夹具选择：`find_daemon_binary` 按「自身所在目录 → target → PATH」定位，把
+//! 真实 `agent-shell` 与夹具（`agent-shell-daemon`）复制到同一临时目录后运行，
+//! exe_dir 优先命中夹具，驱动真实 CLI 走旧布尔反序列化。
 
 use std::path::PathBuf;
 use std::process::Command;

@@ -249,7 +249,7 @@ mod tests {
         assert_eq!(steps_v(-1), 1);
     }
 
-    /// 回归测试（TSI-2911）：ydotool 失败诊断输出在 stdout 而非 stderr，
+    /// ydotool 失败诊断输出在 stdout 而非 stderr，
     /// 只读 stderr 会得到空错误——failure_detail 必须并入两流。
     #[test]
     fn failure_detail_merges_stdout_and_stderr() {

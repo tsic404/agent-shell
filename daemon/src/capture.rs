@@ -71,7 +71,7 @@ fn parse_window_id(spec: &str) -> Result<u32, (RpcErrorCode, String)> {
 ///
 /// `Permission`（portal AccessDenied / 用户取消 / 无活跃图形会话）归一到
 /// `Denied`，`BackendUnavailable` 保持其码，其余归 `BackendError`——避免把
-/// portal 会话权限问题误报为「后端不可用」（TSI-2877 明确错误码）。
+/// portal 会话权限问题误报为「后端不可用」。
 fn map_capture_err(e: AgentShellError) -> (RpcErrorCode, String) {
     match e {
         AgentShellError::Permission(msg) => (RpcErrorCode::Denied, msg),
