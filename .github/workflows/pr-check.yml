@@ -23,7 +23,7 @@ jobs:
       matrix:
         # default：完整门禁（lint + test + 默认 build）。
         # no-pipewire：不装 libpipewire-0.3-dev，验证 --no-default-features 下
-        # capture/daemon 无需 PipeWire dev 头即可编译（TSI-3111）。
+        # 整个 workspace 无需 PipeWire dev 头即可编译（无 dev 头发行版兜底）。
         profile: [default, no-pipewire]
     steps:
       - uses: actions/checkout@v7
@@ -59,4 +59,4 @@ jobs:
         run: sh packaging/debian/build-deb-arch.test.sh
       - name: Build (Rust, no PipeWire dev headers)
         if: matrix.profile == 'no-pipewire'
-        run: cargo build --release -p agent-shell-capture -p agent-shell-daemon --no-default-features
+        run: cargo build --release --workspace --no-default-features

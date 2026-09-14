@@ -8,20 +8,29 @@ description = "agent-shell top-level: AgentShell struct + detect_and_assemble en
 
 [dependencies]
 agent-shell-core.workspace = true
-agent-shell-backend-kde = { workspace = true, optional = true }
-agent-shell-backend-dde = { workspace = true, optional = true }
-agent-shell-backend-gnome = { workspace = true, optional = true }
-agent-shell-backend-hyprland = { workspace = true, optional = true }
-agent-shell-backend-sway = { workspace = true, optional = true }
-agent-shell-backend-generic.workspace = true
-agent-shell-backend-tty.workspace = true
+agent-shell-backend-kde = { workspace = true, optional = true, default-features = false }
+agent-shell-backend-dde = { workspace = true, optional = true, default-features = false }
+agent-shell-backend-gnome = { workspace = true, optional = true, default-features = false }
+agent-shell-backend-hyprland = { workspace = true, optional = true, default-features = false }
+agent-shell-backend-sway = { workspace = true, optional = true, default-features = false }
+agent-shell-backend-generic = { workspace = true, default-features = false }
+agent-shell-backend-tty = { workspace = true, default-features = false }
 tokio.workspace = true
 tracing.workspace = true
 
 [features]
-default = ["kde", "dde", "gnome", "hyprland", "sway"]
+# portal-screencast 级联到所有后端；无 PipeWire dev 头发行版可 --no-default-features 关闭。
+default = ["kde", "dde", "gnome", "hyprland", "sway", "portal-screencast"]
 kde = ["dep:agent-shell-backend-kde"]
 dde = ["dep:agent-shell-backend-dde"]
 gnome = ["dep:agent-shell-backend-gnome"]
 hyprland = ["dep:agent-shell-backend-hyprland"]
 sway = ["dep:agent-shell-backend-sway"]
+portal-screencast = [
+    "agent-shell-backend-kde/portal-screencast",
+    "agent-shell-backend-dde/portal-screencast",
+    "agent-shell-backend-gnome/portal-screencast",
+    "agent-shell-backend-hyprland/portal-screencast",
+    "agent-shell-backend-sway/portal-screencast",
+    "agent-shell-backend-generic/portal-screencast",
+]

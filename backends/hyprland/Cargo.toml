@@ -16,7 +16,7 @@ agent-shell-launcher.workspace = true
 agent-shell-clipboard.workspace = true
 agent-shell-input.workspace = true
 agent-shell-a11y.workspace = true
-agent-shell-capture.workspace = true
+agent-shell-capture = { workspace = true, default-features = false }
 agent-shell-audio.workspace = true
 agent-shell-network.workspace = true
 agent-shell-systemd.workspace = true
@@ -24,3 +24,8 @@ agent-shell-logind.workspace = true
 async-trait.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+
+[features]
+# 保留 ScreenCast 三级链为默认能力；无 PipeWire dev 头发行版可 --no-default-features 级联关闭。
+default = ["portal-screencast"]
+portal-screencast = ["agent-shell-capture/portal-screencast"]

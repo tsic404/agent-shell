@@ -45,6 +45,24 @@ exit 1
 EOF
 chmod +x "$STUB/dpkg"
 
+# stub cargo：记录参数并验证 --no-default-features（pkg-config stub 失败 → 必须走该 flag）
+cat > "$STUB/cargo" <<'EOF'
+#!/bin/sh
+printf '%s\n' "$@" >> "${CARGO_ARGS_FILE:?}"
+for a in "$@"; do
+    [ "$a" = "--no-default-features" ] && exit 0
+done
+exit 1
+EOF
+chmod +x "$STUB/cargo"
+
+# stub pkg-config：模拟无 PipeWire dev 头，验证 build-deb.sh 走 --no-default-features
+cat > "$STUB/pkg-config" <<'EOF'
+#!/bin/sh
+exit 1
+EOF
+chmod +x "$STUB/pkg-config"
+
 pass=0
 fail=0
 check() {
@@ -57,14 +75,19 @@ check() {
     fi
 }
 
-# ── 用例 1：DEB_HOST_ARCH 被采用 ──
+# ── 用例 1：DEB_HOST_ARCH 被采用；pkg-config stub 失败 → cargo 传 --no-default-features ──
 CAPTURE_FILE="$WORK/capture1"
-export CAPTURE_FILE
+CARGO_ARGS_FILE="$WORK/cargo_args1"
+export CAPTURE_FILE CARGO_ARGS_FILE
 : > "$CAPTURE_FILE"
+: > "$CARGO_ARGS_FILE"
 PATH="$STUB:$PATH" DEB_HOST_ARCH=arm64 sh "$BUILD_SH" "$WORK/target" > "$WORK/out1" 2>&1
 check "DEB_HOST_ARCH=arm64 时 control Architecture 字段" \
     "$(sort -u "$CAPTURE_FILE" | head -n1)" \
     "Architecture: arm64"
+check "无 PipeWire dev 头时 cargo 传入 --no-default-features" \
+    "$(grep -c -- '--no-default-features' "$CARGO_ARGS_FILE")" \
+    "1"
 
 # ── 用例 2：无 dpkg（stub 失败）且未设 DEB_HOST_ARCH → 显式失败 ──
 unset DEB_HOST_ARCH
