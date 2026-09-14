@@ -81,7 +81,7 @@ fn capture_with(x: &X11DisplayServer, window: Option<u32>) -> Result<Frame> {
     use x11rb::protocol::xproto::{ConnectionExt as XProtoExt, Drawable, ImageFormat};
 
     fn cerr(e: x11rb::errors::ReplyError) -> AgentShellError {
-        capture_err(e)
+        capture_reply_err(e)
     }
     fn cerr2(e: x11rb::errors::ConnectionError) -> AgentShellError {
         capture_err(e)
@@ -89,25 +89,23 @@ fn capture_with(x: &X11DisplayServer, window: Option<u32>) -> Result<Frame> {
 
     let conn = x.connection();
     let root = window.unwrap_or_else(|| x.root_window());
+    let drawable = root as Drawable;
 
     // 几何 + 位深决定行步长。X 协议 GetImage 回包无 stride 字段：
     // server 端 bytes_per_line = (width × bits-per-pixel) 按 32 位
     // 扫描线对齐（bitmap-format-scanline-pad），可能大于 width × bpp。
     // 硬编码 width×4 在 depth<32 且 width 非 4 对齐时像素错位。
-    let geo = x
-        .get_window_geometry(root as Drawable)
-        .map_err(capture_err)?;
-    if geo.width <= 0 || geo.height <= 0 {
-        return Err(AgentShellError::Capture(format!(
-            "degenerate geometry {geo:?}"
-        )));
-    }
-    let (w, h) = (geo.width as u32, geo.height as u32);
-    let drawable = root as Drawable;
     let geom = XProtoExt::get_geometry(conn, drawable)
         .map_err(cerr2)?
         .reply()
         .map_err(cerr)?;
+    if geom.width == 0 || geom.height == 0 {
+        return Err(AgentShellError::Capture(format!(
+            "degenerate geometry {}x{}",
+            geom.width, geom.height
+        )));
+    }
+    let (w, h) = (geom.width as u32, geom.height as u32);
     let format = match geom.depth {
         24 | 32 => PixelFormat::Bgrx,
         16 => PixelFormat::Rgb565,
@@ -251,6 +249,21 @@ fn capture_err(e: impl std::fmt::Display) -> AgentShellError {
     AgentShellError::Capture(format!("x11 capture: {e}"))
 }
 
+/// `GetGeometry`/`GetImage` 回包错误 → 可读错误。桌面窗口 id（非可绘窗口）会触发
+/// X11 `Drawable bad_value`：补一句可读提示，而非只回吐原始错误码（TSI-3132）。
+fn capture_reply_err(e: x11rb::errors::ReplyError) -> AgentShellError {
+    if let x11rb::errors::ReplyError::X11Error(x11) = &e {
+        if x11.error_kind == x11rb::protocol::ErrorKind::Drawable {
+            return AgentShellError::Capture(format!(
+                "x11 capture: window id {} is not a drawable window \
+                 (X11 Drawable bad_value); only client windows can be captured",
+                x11.bad_value
+            ));
+        }
+    }
+    capture_err(e)
+}
+
 /// `DISPLAY` 环境变量是否存在（廉价门控；不含可达性探测）。
 ///
 /// 提取为独立函数而非内联 `var_os("DISPLAY").is_some()`：`connect` 与
@@ -283,6 +296,58 @@ mod tests {
     fn display_present_false_without_display_env() {
         if std::env::var_os("DISPLAY").is_none() {
             assert!(!X11Capture::display_present());
+        }
+    }
+
+    /// `Drawable bad_value`（桌面窗口 id 等非可绘窗口）回吐可读提示，
+    /// 而非只暴露 X11 原始错误码（TSI-3132）。
+    #[test]
+    fn drawable_bad_value_maps_to_readable_hint() {
+        let mapped = capture_reply_err(x11rb::errors::ReplyError::X11Error(
+            x11rb::x11_utils::X11Error {
+                error_kind: x11rb::protocol::ErrorKind::Drawable,
+                error_code: 9,
+                sequence: 1,
+                bad_value: 40046342,
+                minor_opcode: 0,
+                major_opcode: 14,
+                extension_name: None,
+                request_name: Some("GetGeometry"),
+            },
+        ));
+        match mapped {
+            AgentShellError::Capture(msg) => {
+                assert!(msg.contains("40046342"), "should name the bad id: {msg}");
+                assert!(
+                    msg.contains("is not a drawable window"),
+                    "should add readable hint: {msg}"
+                );
+            }
+            other => panic!("expected Capture error, got {other:?}"),
+        }
+    }
+
+    /// 非 Drawable 类 X11 错误保持原样回吐，不做改写。
+    #[test]
+    fn non_drawable_error_falls_through() {
+        let mapped = capture_reply_err(x11rb::errors::ReplyError::X11Error(
+            x11rb::x11_utils::X11Error {
+                error_kind: x11rb::protocol::ErrorKind::Window,
+                error_code: 3,
+                sequence: 1,
+                bad_value: 42,
+                minor_opcode: 0,
+                major_opcode: 14,
+                extension_name: None,
+                request_name: Some("GetGeometry"),
+            },
+        ));
+        match mapped {
+            AgentShellError::Capture(msg) => assert!(
+                !msg.contains("is not a drawable window"),
+                "non-Drawable error must not be rewritten: {msg}"
+            ),
+            other => panic!("expected Capture error, got {other:?}"),
         }
     }
 }
