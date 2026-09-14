@@ -3,7 +3,8 @@
 #
 # 用法：./packaging/debian/build-deb.sh [target-dir]
 #
-# 步骤：cargo build --release（自动检测 PipeWire dev 头）+ dpkg-deb 打包。
+# 步骤：release 二进制缺失时 cargo build --release（自动检测 PipeWire dev 头），
+#      已存在（含交叉编译预构建）则跳过；随后 dpkg-deb 打包。
 # 产物：agent-shell_<version>_<arch>.deb + agent-shell-rootd_<version>_<arch>.deb
 # dash 兼容：不使用 pipefail（Debian /bin/sh = dash 不支持 -o pipefail）
 set -eu
@@ -11,7 +12,14 @@ set -eu
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 TARGET_DIR="${1:-$ROOT_DIR/target}"
+# 规范化为绝对路径：cargo 在 $ROOT_DIR 子 shell 内执行，install_bin/cp 在调用方
+# cwd 执行，相对 --target-dir 会在两处按不同基准解析（审查反馈）。
+case "$TARGET_DIR" in
+    /*) ;;
+    *) TARGET_DIR="$(pwd)/$TARGET_DIR" ;;
+esac
 BUILD_DIR="$(mktemp -d)"
+trap 'rm -rf "$BUILD_DIR"' EXIT
 VERSION="$(grep -m1 '^version' "$ROOT_DIR/Cargo.toml" | sed 's/.*"\(.*\)"/\1/')"
 ARCH="${DEB_HOST_ARCH:-$(dpkg --print-architecture 2>/dev/null || true)}"
 if [ -z "$ARCH" ]; then
@@ -19,16 +27,29 @@ if [ -z "$ARCH" ]; then
     exit 1
 fi
 
-# ── 构建 release 二进制 ──
-# portal-screencast（capture 默认 feature）需要 libpipewire-0.3.pc；无 dev 头
-# 发行版（UOS 20 Pro / glibc 2.28）用 --no-default-features 关闭该 feature，
-# 避免 libspa-sys build.rs 因找不到头而 panic。
-FEATURES_FLAGS=""
-if ! pkg-config --exists libpipewire-0.3 2>/dev/null; then
-    FEATURES_FLAGS="--no-default-features"
-    echo "warning: libpipewire-0.3 dev headers not found; building with --no-default-features (portal-screencast disabled)" >&2
+# ── 构建 release 二进制（已存在则跳过，保留交叉编译预构建路径）──
+# portal-screencast（capture 默认 feature）需能编译 libspa-sys 0.10.1。其
+# type-info.c 无条件引用 spa_type_param_bitorder（0.3.37 引入）、
+# spa_type_audio_iec958_codec（0.3.34 引入）等符号；旧 pipewire（UOS 20 /
+# bullseye 0.3.19）有 .pc 但头缺这些符号，`--exists` 探不到，须按版本门槛判旧。
+# 不满足时回退 --no-default-features，capture 走 Screenshot/X11 降级链。
+NEED_BUILD=0
+for bin in agent-shell-daemon agent-shell agent-shell-mcp agent-shell-rootd; do
+    if [ ! -x "$TARGET_DIR/release/$bin" ]; then
+        NEED_BUILD=1
+        break
+    fi
+done
+if [ "$NEED_BUILD" = "1" ]; then
+    FEATURES_FLAGS=""
+    if ! pkg-config --atleast-version=0.3.37 libpipewire-0.3 2>/dev/null; then
+        FEATURES_FLAGS="--no-default-features"
+        echo "warning: libpipewire-0.3 < 0.3.37 (or missing); building with --no-default-features (portal-screencast disabled)" >&2
+    fi
+    (cd "$ROOT_DIR" && cargo build --release --target-dir "$TARGET_DIR" $FEATURES_FLAGS)
+else
+    echo "release binaries already present; skipping cargo build"
 fi
-cargo build --release --manifest-path "$ROOT_DIR/Cargo.toml" --target-dir "$TARGET_DIR" $FEATURES_FLAGS
 
 echo "Building deb: agent-shell $VERSION ($ARCH)"
 
@@ -105,6 +126,5 @@ dpkg-deb --build --root-owner-group "$PKG2" \
 echo "Built:"
 echo "  $BUILD_DIR/agent-shell_${VERSION}_${ARCH}.deb"
 echo "  $BUILD_DIR/agent-shell-rootd_${VERSION}_${ARCH}.deb"
-cp "$BUILD_DIR"/agent-shell*.deb "$TARGET_DIR/" 2>/dev/null || true
+cp "$BUILD_DIR"/agent-shell*.deb "$TARGET_DIR/"
 echo "Copied to $TARGET_DIR/"
-rm -rf "$BUILD_DIR"

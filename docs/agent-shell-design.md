@@ -3677,11 +3677,13 @@ strip = true
 - Flatpak: 沙箱内运行，依赖 portal 接口
 ```
 
-`build-deb.sh` 在 `cargo build --release` 前自动检测 `libpipewire-0.3.pc`
-（`pkg-config --exists libpipewire-0.3`）：无 dev 头发行版（UOS 20 Pro /
-glibc 2.28）自动改用 `--no-default-features` 关闭 `portal-screencast`，无需
-手动指定即可编译。手动 `cargo build --release --workspace` 仍需 dev 头，或显式
-`--no-default-features`（§20.6）。
+`build-deb.sh` 在 `cargo build --release` 前检测 `libpipewire-0.3` 版本门槛
+（`pkg-config --atleast-version=0.3.37`）：libspa-sys 0.10.1 的 `type-info.c`
+无条件引用 `spa_type_param_bitorder`（0.3.37 引入）、`spa_type_audio_iec958_codec`
+（0.3.34 引入）等符号，旧 pipewire（UOS 20 / bullseye 0.3.19）有 `.pc` 但头缺
+这些符号，`--exists` 探不到，须按版本门槛判旧并回退 `--no-default-features` 关闭
+`portal-screencast`，无需手动指定即可编译。手动 `cargo build --release --workspace`
+仍需满足门槛的 dev 头，或显式 `--no-default-features`（§20.6）。
 
 ### 20.3 权限模型
 
