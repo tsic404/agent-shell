@@ -1041,7 +1041,7 @@ const JOB_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(
 
 /// 轮询 `job.status` 直到 `done=true`，返回 `success`。
 ///
-/// 供 `pkg --wait`（TSI-2558）复用。超时 300s 返回错误。
+/// 供 `pkg --wait` 复用。超时 300s 返回错误。
 pub async fn wait_for_job(client: &mut DaemonClient, job_id: &str) -> Result<bool, String> {
     wait_for_job_impl(client, job_id, JOB_POLL_TIMEOUT, JOB_POLL_INTERVAL).await
 }

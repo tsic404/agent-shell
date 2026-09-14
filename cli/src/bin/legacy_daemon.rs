@@ -1,15 +1,11 @@
-//! 混合版本跨进程 e2e 夹具：模拟 pre-21c7267 旧 daemon 的 `info.show`
-//! 线格式（TSI-2873）。
+//! 混合版本跨进程 e2e 夹具：模拟 pre-21c7267 旧 daemon 的 `info.show` 线格式。
 //!
-//! 旧 daemon 的 `InfoResult.capabilities` 是 `Vec<(String, bool)>`（布尔），
-//! 新线格式是 snake_case 字符串。daemon 常驻用户会话、postinst 升级不重启，
-//! 新 CLI 反序列化旧 daemon 的布尔时不得硬失败——本夹具以真实进程边界
-//! 复现该旧线格式，供 `cli/tests/mixed_version_e2e.rs` 用真实 `agent-shell`
-//! 二进制连接后验证。
+//! 旧 daemon 的 `InfoResult.capabilities` 是布尔对，新线格式是 snake_case 字符串；
+//! postinst 升级不重启 daemon，新 CLI 反序列化旧布尔不得硬失败。本夹具以真实进程
+//! 边界复现旧线格式（见 `cli/tests/mixed_version_e2e.rs`）。
 //!
-//! 夹具协议：从 stdin 逐行读 JSON-RPC 请求，对 `info.show` 回旧布尔格式
-//! 响应，其余方法回 method-not-found；EOF 或读错误即退出。CLI 以同名
-//! 二进制（`agent-shell-daemon`）经 stdio 拉起本夹具，无参数。
+//! 协议：从 stdin 逐行读 JSON-RPC，对 `info.show` 回旧布尔格式，其余回
+//! method-not-found；EOF/读错误即退出。CLI 以同名二进制经 stdio 拉起。
 
 use std::io::{BufRead, Write};
 

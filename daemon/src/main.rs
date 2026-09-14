@@ -46,7 +46,7 @@ fn main() {
 /// 解析 daemon 命令行参数，返回空闲超时秒数（默认 30min）。
 ///
 /// 未知参数、缺失值或不可解析的值统一走 `Err`，由调用方以 exit 2 报错——
-/// 与 `unknown arg` 行为一致。TSI-3103：不可解析值不得静默回退默认 1800。
+/// 与 `unknown arg` 行为一致。不可解析值不得静默回退默认 1800。
 fn parse_idle_timeout(mut args: impl Iterator<Item = String>) -> Result<u64, String> {
     let mut idle_secs: u64 = 30 * 60;
     while let Some(a) = args.next() {

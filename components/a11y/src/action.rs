@@ -2,7 +2,7 @@
 //!
 //! click 优先 AT-SPI Action 接口（`DoAction(0)`，实测 GTK/Qt 的动作名
 //! 均为 "Click"/"press"）；元素无 Action 能力时降级为中心坐标点击，
-//! 经 [`PointerInput`] trait 注入——与 TSI-2315 输入子系统之间以 trait
+//! 经 [`PointerInput`] trait 注入——与输入子系统之间以 trait
 //! 依赖解耦（设计 §14.4「以 trait 依赖而非硬编码实例」）。
 
 use crate::atspi_bridge::AtspiBridge;
@@ -11,7 +11,7 @@ use agent_shell_core::error::{AgentShellError, Result};
 use agent_shell_core::types::MouseButton;
 use async_trait::async_trait;
 
-/// 指针注入抽象（TSI-2315 InputDispatcher 实现此 trait 后接入）。
+/// 指针注入抽象（InputDispatcher 实现此 trait 后接入）。
 #[async_trait]
 pub trait PointerInput: Send + Sync {
     /// 移动指针到屏幕绝对坐标。
@@ -22,7 +22,7 @@ pub trait PointerInput: Send + Sync {
 
 /// 无输入后端的占位实现：坐标降级路径显式报错而非静默丢弃。
 ///
-/// 输入子系统（TSI-2315）装配完成后由真实 dispatcher 替换。
+/// 输入子系统装配完成后由真实 dispatcher 替换。
 pub struct NoPointerInput;
 
 #[async_trait]

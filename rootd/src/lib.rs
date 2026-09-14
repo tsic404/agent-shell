@@ -27,17 +27,14 @@ use std::time::Duration;
 /// 只返回 job id 不阻塞执行，30s 对其是无实际约束的兜底。
 pub const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// 并发阻塞命令的准入上限（TSI-2504）。
+/// 并发阻塞命令的准入上限（§23.4.3 白名单）。
 ///
 /// D-Bus 服务层用 [`tokio::sync::Semaphore`] 限制同时运行、经 `spawn_blocking`
-/// 执行并受 [`COMMAND_TIMEOUT`] 约束的**同步阻塞命令**数（journalctl/
-/// sysctl/hostnamectl/mount/umount，及 systemd D-Bus 调用）：16 路并发足以
-/// 覆盖正常负载，且远低于 tokio 默认 512 个 blocking 线程的上限——防止
-/// 恶意或失控的调用潮耗尽线程池与 spawn 的短生命周期子进程。
-///
-/// 注意：Package* 类方法只注册 job 即返回，真实包管理器进程在
-/// `spawn_package_job` 的独立线程中异步执行，不占用 blocking 线程池，
-/// 也不受本闸约束。
+/// 执行并受 [`COMMAND_TIMEOUT`] 约束的同步阻塞命令数（journalctl/sysctl/
+/// hostnamectl/mount/umount 等）：16 路并发覆盖正常负载，远低于 tokio 默认
+/// 512 个 blocking 线程上限，防止调用潮耗尽线程池。Package* 方法只注册 job
+/// 即返回，真实包管理器进程在 `spawn_package_job` 独立线程异步执行，不占
+/// blocking 线程池、不受本闸约束。
 pub const MAX_CONCURRENT_BLOCKING_COMMANDS: usize = 16;
 
 /// `JournalQuery` 专项超时（秒）。
@@ -55,16 +52,14 @@ pub const MAX_JOURNAL_LINES: u64 = 10000;
 /// `JournalQuery` 默认时间上界（无 `since`/`until`/`boot` 时强制）。
 pub const DEFAULT_JOURNAL_SINCE: &str = "-24h";
 
-/// 单个阻塞分派的命令跟踪槽（TSI-2545）。
+/// 单个阻塞分派的命令跟踪槽。
 ///
-/// `dispatch_with_slot` 在阻塞线程内执行；`spawn_blocking` + `timeout` 超时后
-/// 该线程被 detach，异步包装层无法再接触其中的局部变量。本结构把取消意图
-/// 与子进程 pidfd 放进跨线程共享状态：包装层超时后置取消位并等待 kill 目标，
-/// 阻塞线程在 `Command::spawn` 前后各检查一次取消位——spawn 前检查跳过延迟
-/// 的 spawn，spawn 后检查在包装层来不及 kill 时自行清理并 reap。
-/// [`tokio::sync::Notify`] 让等待以「pidfd 可用」或「分派结束」为准，取代
-/// 固定 200ms 宽限启发式；异步等待不阻塞 tokio 工作线程（TSI-2504 事件
-/// 循环隔离的延续）。
+/// `spawn_blocking` + `timeout` 超时后阻塞线程被 detach，包装层无法再接触其
+/// 局部变量。本结构把取消意图与子进程 pidfd 放进跨线程共享状态：包装层超时
+/// 后置取消位并等待 kill 目标，阻塞线程在 `Command::spawn` 前后各查一次取消位
+/// （spawn 前跳过、spawn 后自清理 reap）。[`tokio::sync::Notify`] 让等待以
+/// 「pidfd 可用」或「分派结束」为准，取代固定 200ms 宽限（事件循环隔离的延续，
+/// 详见 [`dispatch_with_timeout`]）。
 pub(crate) struct CommandSlot {
     /// 包装层超时后置位；阻塞线程据此跳过 spawn 或 spawn 后自清理。
     cancelled: AtomicBool,
@@ -92,7 +87,7 @@ impl CommandSlot {
         // 与 `mark_finished`/`store_pidfd` 同理：置 finished 并 notify_one，
         // 使 `wait_for_kill_target` 在分派闭包尚未开始执行（blocking 池饱和，
         // 闭包仍在队列，`dispatch_with_slot` 无从走到 `mark_finished`）时立即
-        // 返回 None，包装层随即返回超时错误——封住无界等待（TSI-2545 C2）。
+        // 返回 None，包装层随即返回超时错误——封住无界等待（C2）。
         self.finished.store(true, Ordering::Release);
         self.state_changed.notify_one();
     }
@@ -143,20 +138,17 @@ impl CommandSlot {
     }
 }
 
-/// 执行系统命令（rootd 以 root 运行）。失败时返回错误描述。
-/// 薄代理职责：校验后的参数直接转发给系统工具，不做额外业务逻辑。
+/// 执行系统命令（rootd 以 root 运行），失败返回错误描述。薄代理：校验后的参数
+/// 直接转发给系统工具，不做额外业务逻辑。
 ///
-/// 同步阻塞实现——调用方（D-Bus 服务层）负责经 `spawn_blocking` +
-/// `tokio::time::timeout` 包装，本函数自身不含超时，便于单测。
-///
-/// 子进程句柄经 [`Command`](std::process::Command) 的 `spawn()` 取得后立即
-/// 克隆为 pidfd 写入 `slot`——超时后的 kill 据此以无 PID 复用竞态的方式
-/// 精确作用于本函数产生的进程（TSI-2504/TSI-2545）。spawn 前后双重检查
-/// 取消位：spawn 前取消则跳过，spawn 后取消则自行 kill 并 reap。
+/// 同步阻塞实现，不含超时（调用方经 `spawn_blocking` + `tokio::time::timeout`
+/// 包装）。子进程句柄经 `spawn()` 取得后立即克隆为 pidfd 写入 `slot`——超时后
+/// kill 据此以无 PID 复用竞态的方式精确作用于本进程。spawn 前后双重检查取消位：
+/// spawn 前取消则跳过，spawn 后取消则自行 kill 并 reap。
 fn run_command(cmd: impl AsRef<Path>, args: &[&str], slot: &CommandSlot) -> Result<String, String> {
     let cmd_path = cmd.as_ref();
     let cmd_name = cmd_path.display().to_string();
-    // spawn 前检查：包装层已超时置取消位 → 直接跳过，不留孤儿（TSI-2545）。
+    // spawn 前检查：包装层已超时置取消位 → 直接跳过，不留孤儿。
     if slot.is_cancelled() {
         return Err(format!("{cmd_name} cancelled before spawn"));
     }
@@ -170,7 +162,7 @@ fn run_command(cmd: impl AsRef<Path>, args: &[&str], slot: &CommandSlot) -> Resu
         slot.store_pidfd(pidfd);
     }
     // spawn 后复查：取消若恰发生在 spawn 与复查之间，且包装层的轮询已耗尽，
-    // 本线程自行 kill 并 reap，杜绝延迟 spawn 孤儿（TSI-2545）。
+    // 本线程自行 kill 并 reap，杜绝延迟 spawn 孤儿。
     if slot.is_cancelled() {
         if let Some(pidfd) = slot.take_pidfd() {
             kill_via_pidfd(&pidfd);
@@ -195,13 +187,12 @@ fn run_command(cmd: impl AsRef<Path>, args: &[&str], slot: &CommandSlot) -> Resu
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
-// ───────────────────── hostname 写回 seam（TSI-2695） ─────────────────────
+// ───────────────────── hostname 写回 seam ─────────────────────
 //
 // 仅 hostname 写回路径可注入：`hostname_set`（HostnameSet 分派）与测试夹具
 // `HostnameGuard::restore` 的 hostnamectl 写回经此分派；其余 `run_command`
-// 调用点（journalctl/sysctl/mount/umount）保持直连真实 spawn（TSI-2695
-// 约束：seam 不扩散，`CommandSlot` 取消/pidfd 跟踪契约与 `validate_hostname`
-// 语义不变）。
+// 调用点（journalctl/sysctl/mount/umount）保持直连真实 spawn（约束：seam
+// 不扩散，`CommandSlot` 取消/pidfd 跟踪契约与 `validate_hostname` 语义不变）。
 
 /// hostname 写回命令执行器（可注入 seam，供单测替换真实进程 spawn）。
 type HostnameCommandRunner = fn(&str, &[&str], &CommandSlot) -> Result<String, String>;
@@ -246,7 +237,7 @@ fn child_pidfd(child: &mut std::process::Child) -> std::io::Result<OwnedFd> {
     Ok(unsafe { OwnedFd::from_raw_fd(fd as i32) })
 }
 
-/// 通过 pidfd 向目标进程发送 SIGKILL（TSI-2504 超时后终结子进程）。
+/// 通过 pidfd 向目标进程发送 SIGKILL（超时后终结子进程）。
 ///
 /// pidfd 引用进程本体，不因 PID 复用错杀；`ESRCH` 表示进程已自然退出，
 /// 属预期竞态，静默忽略。其余错误以 warn 记录——rootd 以 root 运行，
@@ -366,7 +357,7 @@ static JOBS: Mutex<Option<HashMap<String, JobState>>> = Mutex::new(None);
 /// `job_drain_done` 淘汰已完成 job 后，`job_status` 查询活动注册表
 /// 未命中时回落到此缓存——查询方（CLI `wait_for_job` 轮询、`job status`
 /// 人工查询）在 drain 后仍能读到确定正确的最终状态，而非 `{"found":false}`
-/// （否则完成快的 job 会被误报为「未找到」，见 TSI-2561 审查 #1）。
+/// （否则完成快的 job 会被误报为「未找到」）。
 /// 缓存仅追加最近一批完成项，完成即定稿、不可变；大小受
 /// [`COMPLETED_JOBS_MAX`] 上界约束。
 static COMPLETED_JOBS: Mutex<Vec<JobState>> = Mutex::new(Vec::new());
@@ -519,7 +510,7 @@ pub fn dispatch(method: &str, args: &[Value]) -> RootResult {
     dispatch_with_slot(method, args, &CommandSlot::new())
 }
 
-/// 产生子进程的方法集合：单一事实源（TSI-2637）。
+/// 产生子进程的方法集合：单一事实源。
 ///
 /// `SPAWN_CALLERS` 与 `dispatch_spawn` 由同一宏展开派生——新增产生子进程的
 /// 方法只需在此登记一次，dbus 层 `method_spawns_child` 据此分类、等价性测试
@@ -550,17 +541,14 @@ spawn_callers!(
     "TestSpawnSleep" => test_spawn_sleep,
 );
 
-/// 分派一个 rootd 方法调用，并允许跟踪产生的子进程（TSI-2504/TSI-2545）。
+/// 分派一个 rootd 方法调用，并允许跟踪产生的子进程。
 ///
-/// 产生子进程的方法（journalctl/sysctl/hostnamectl/mount/umount）将子进程
-/// pidfd 写入 `slot`，供调用方在超时后 kill。其余方法忽略 slot。分派结束
-/// （正常或异常）后置位 `CommandSlot::finished`，使超时分支的 kill 目标等待
-/// 可据此结束，不再依赖固定宽限时长。非白名单方法一律拒绝——rootd 的安全
-/// 模型是「默认拒绝 + 显式白名单」。
+/// 产生子进程的方法（journalctl/sysctl/hostnamectl/mount/umount）把 pidfd 写入
+/// `slot` 供超时后 kill，其余方法忽略 slot；分派结束后置位 `CommandSlot::finished`
+/// 使超时等待可据此结束。非白名单方法一律拒绝（默认拒绝 + 显式白名单）。
 ///
-/// **polkit 前置**：调用方（D-Bus 服务层）必须在调用本函数**之前**经
-/// `polkit_action_for` 获取 action id 并完成 polkit 授权校验。本函数
-/// 不重复 polkit 校验——它是薄代理的业务逻辑层，授权是传输层职责。
+/// **polkit 前置**：调用方须先经 `polkit_action_for` 完成授权校验再调本函数
+/// （授权是传输层职责，见 §23.4.3）。
 pub(crate) fn dispatch_with_slot(method: &str, args: &[Value], slot: &CommandSlot) -> RootResult {
     // spawn 集合（`SPAWN_CALLERS` 单一事实源）单独分派；命中即返回。
     if let Some(result) = dispatch_spawn(method, args, slot) {
@@ -1288,13 +1276,11 @@ fn process_kill(args: &[Value]) -> RootResult {
 // 实际执行走 mount(2) 系统调用或 `mount` 命令。
 /// 解析 `mount`/`umount` 可执行文件绝对路径，成功后进程内缓存。
 ///
-/// rootd 以 root 运行，`PATH` 与用户 shell 可能不同（systemd system unit
-/// 默认不继承用户环境），故不硬编码绝对路径：经 `which` 按当前 `PATH`
-/// 探测，命中即缓存（`OnceLock`）。缓存的是绝对路径而非内容；rootd 是
-/// 系统级单例，进程生命周期内 `PATH` 与挂载布局稳定，二进制被替换后
-/// 同一路径仍有效。失败不缓存——若启动时二进制暂缺（如 /usr 后挂载），
-/// 后续调用可自愈；命中后每次调用不再触发 PATH 扫描，消除原有每次调用
-/// 两条 ENOENT execve 尝试（TSI-2616）。
+/// rootd 以 root 运行，`PATH` 与用户 shell 可能不同，故不硬编码绝对路径：
+/// 经 `which` 按当前 `PATH` 探测，命中即缓存（`OnceLock`）。rootd 是系统级
+/// 单例，进程内 `PATH` 与挂载布局稳定，缓存绝对路径始终有效。失败不缓存——
+/// 若启动时二进制暂缺（如 /usr 后挂载），后续调用可自愈；命中后不再触发
+/// PATH 扫描。
 fn mount_bin(name: &str) -> Result<&'static Path, String> {
     static MOUNT_BIN: OnceLock<PathBuf> = OnceLock::new();
     static UMOUNT_BIN: OnceLock<PathBuf> = OnceLock::new();
@@ -2090,7 +2076,7 @@ mod tests {
         );
     }
 
-    // ── hostname 写回 seam（TSI-2695） ──
+    // ── hostname 写回 seam ──
 
     /// 记录经 seam 分派的 hostname 写回调用（进程级全局，测试串行）。
     static HOSTNAME_CALL_LOG: parking_lot::Mutex<Vec<(String, Vec<String>)>> =
@@ -2228,7 +2214,7 @@ mod tests {
         assert!(r.is_err(), "mock 失败必须上抛");
     }
 
-    // ── 主机名快照/恢复（TSI-2630：共享容器 /etc/hostname 漂移） ──
+    // ── 主机名快照/恢复（共享容器 /etc/hostname 漂移） ──
 
     /// 读取 hostnamed 报告的静态/瞬时主机名；hostnamed 不可用时回落到
     /// `/etc/hostname` 与内核 hostname。共享容器内二者都是跨 run 可变的
@@ -2455,7 +2441,7 @@ mod tests {
         assert!(dispatch("SetToken", &[json!("")]).is_err());
     }
 
-    // ── CommandSlot 取消/等待语义（TSI-2545） ──
+    // ── CommandSlot 取消/等待语义 ──
 
     #[test]
     fn run_command_skips_spawn_when_cancelled() {
@@ -2509,7 +2495,7 @@ mod tests {
     #[allow(clippy::await_holding_lock)]
     async fn command_slot_wait_wakes_on_late_store() {
         let _guard = SPAWN_SLEEP_TEST_MUTEX.lock();
-        // 漏通知死等。这是 `wait_for_kill_target` 的核心契约（TSI-2545）。
+        // 漏通知死等。这是 `wait_for_kill_target` 的核心契约。
         let slot = Arc::new(CommandSlot::new());
         let writer = Arc::clone(&slot);
         let worker = std::thread::spawn(move || {

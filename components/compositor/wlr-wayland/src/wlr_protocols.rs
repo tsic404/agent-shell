@@ -89,7 +89,7 @@ mod tests {
             protocol_versions::VIRTUAL_POINTER_MAX,
             wayland_protocols_wlr::virtual_pointer::v1::client::zwlr_virtual_pointer_manager_v1::ZwlrVirtualPointerManagerV1::interface().version
         );
-        // TSI-2350：新增三个协议字段的绑定区间同样不得越界。
+        // 新增三个协议字段的绑定区间同样不得越界。
         assert!(
             protocol_versions::EXT_WORKSPACE.0 >= 1
                 && protocol_versions::EXT_WORKSPACE.1

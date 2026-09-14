@@ -346,7 +346,7 @@ mod tests {
 
     #[tokio::test]
     async fn find_elements_without_filter_enumerates_full_tree() {
-        // TSI-2525：--all 依赖 (None, None) 真正遍历全树，而非短路返回空。
+        // --all 依赖 (None, None) 真正遍历全树，而非短路返回空。
         let locator = fake_locator();
         let root = element_at("/root", "frame", "win");
         let found = locator.find_elements(&root, None, None).await;
@@ -382,7 +382,7 @@ mod tests {
 
     #[tokio::test]
     async fn locate_caps_results_globally_across_windows() {
-        // TSI-2525：MAX_SEARCH_RESULTS 是整次查询硬上限，跨窗口累加不可 N×。
+        // MAX_SEARCH_RESULTS 是整次查询硬上限，跨窗口累加不可 N×。
         let mut windows = Vec::new();
         let mut roots = std::collections::HashMap::new();
         let mut children = std::collections::HashMap::new();

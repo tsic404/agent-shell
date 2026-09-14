@@ -1,4 +1,4 @@
-//! 验收自测（issue TSI-2320 验收标准）。
+//! 验收自测。
 //!
 //! 仅在具备 systemd + logind 的真机/容器上运行：
 //! `cargo test -p agent-shell-systemd -p agent-shell-logind -- --nocapture`

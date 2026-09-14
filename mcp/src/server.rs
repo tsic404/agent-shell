@@ -395,7 +395,7 @@ impl AgentShellMcpServer {
 
     /// wait_for_window 的 `timeout`（人类可读时长）与 `timeout_ms`（毫秒）
     /// 二选一解析，缺省 15000ms。二者同时给出报错；`timeout` 复用 CLI
-    /// `--timeout` 的 `agent_shell_rpc::duration::parse_duration` 语义（TSI-3060）。
+    /// `--timeout` 的 `agent_shell_rpc::duration::parse_duration` 语义。
     fn resolve_timeout_ms(args: &Value) -> Result<u64, String> {
         let timeout = args.get("timeout");
         let timeout_ms = args.get("timeout_ms");
@@ -536,9 +536,8 @@ fn resolve_target(args: &Value, windows: &[Value]) -> Option<String> {
 
 /// 定位 daemon 二进制（委托 agent-shell-rpc::daemon_bin）。
 ///
-/// workspace target 目录用 `CARGO_MANIFEST_DIR` 拼绝对路径，不依赖 CWD
-/// （TSI-2471 审查 #2）。MCP server 在 mcp/ 子 crate，向上一级是
-/// workspace 根，target/ 在根下。
+/// workspace target 目录用 `CARGO_MANIFEST_DIR` 拼绝对路径，不依赖 CWD。
+/// MCP server 在 mcp/ 子 crate，向上一级是 workspace 根，target/ 在根下。
 fn find_daemon_binary() -> Result<String, String> {
     let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -760,9 +759,9 @@ mod tests {
     fn test_map_tool_unknown() {
         assert!(AgentShellMcpServer::map_tool("unknown", &Value::Null).is_none());
     }
-    /// MCP 注入的 target 目录用 CARGO_MANIFEST_DIR 拼绝对路径——CWD 无关
-    /// （TSI-2471 审查 #2）。验证候选目录列表中包含基于
-    /// CARGO_MANIFEST_DIR 的 target/debug 与 target/release 绝对路径。
+    /// MCP 注入的 target 目录用 CARGO_MANIFEST_DIR 拼绝对路径——CWD 无关。
+    /// 验证候选目录列表中包含基于 CARGO_MANIFEST_DIR 的 target/debug 与
+    /// target/release 绝对路径。
     #[test]
     fn test_target_dirs_are_absolute_via_cargo_manifest_dir() {
         let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))

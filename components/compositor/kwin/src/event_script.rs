@@ -22,7 +22,7 @@ use crate::error::Result;
 use crate::scripts::{ScriptTemplate, RESPONSE_IFACE, RESPONSE_PATH, RESPONSE_SERVICE};
 
 /// `/Scripting` 就绪探测的重试参数：KWin 启动早期 `Scripting` 单例可能
-/// 尚未注册对象（TSI-2374：UnknownObject/UnknownInterface 是时序现象），
+/// 尚未注册对象（UnknownObject/UnknownInterface 是时序现象），
 /// 以固定间隔重试至多 [`SCRIPT_TIMEOUT`]。
 const PROBE_INTERVAL: Duration = Duration::from_millis(200);
 const START_GRACE: Duration = Duration::from_millis(300);
@@ -34,7 +34,7 @@ pub struct EventScriptHandle {
     object_path: String,
     /// 是否仍在运行。
     running: Arc<Mutex<bool>>,
-    /// 脚本体暂存文件（TSI-2428）：KWin run 是异步读盘，句柄存活期间
+    /// 脚本体暂存文件：KWin run 是异步读盘，句柄存活期间
     /// 必须保留文件；Drop（或 stop 后）才删除。
     staged: Option<crate::dbus_bridge::StagedScript>,
 }
@@ -67,7 +67,7 @@ pub async fn ensure_event_script(bridge: &KWinBridge, v6: bool) -> Result<EventS
 /// 底层启动入口：确认 /Scripting 可达 → loadScript + run，不 stop；
 /// 返回句柄供后续 stop。
 async fn start_event_script(conn: &Connection, js: &str, v6: bool) -> Result<EventScriptHandle> {
-    // 先探测再加载（TSI-2374）：KWin 启动早期 Scripting 单例尚未注册
+    // 先探测再加载：KWin 启动早期 Scripting 单例尚未注册
     // /Scripting 时 load_script_via 会直接失败——以固定间隔重试探测至
     // SCRIPT_TIMEOUT 覆盖该窗口；探测通过即 loadScript/run 的目标必然存在。
     let deadline = tokio::time::Instant::now() + SCRIPT_TIMEOUT;
@@ -81,7 +81,7 @@ async fn start_event_script(conn: &Connection, js: &str, v6: bool) -> Result<Eve
             Err(e) => return Err(e),
         }
     }
-    // TSI-2428：loadScript 走落盘文件——staged 必须随句柄存活（KWin run
+    // loadScript 走落盘文件——staged 必须随句柄存活（KWin run
     // 是异步读盘，提前 Drop 会删掉脚本体）。
     let (path, staged) = crate::dbus_bridge::load_script_via(conn, js, v6).await?;
     let script = crate::dbus_bridge::ScriptInstance::new(conn, &path).await?;
@@ -99,8 +99,8 @@ async fn start_event_script(conn: &Connection, js: &str, v6: bool) -> Result<Eve
 }
 
 impl EventScriptHandle {
-    /// 停止并卸载长驻脚本（组件关闭时调用；幂等）。同时释放暂存文件
-    /// （TSI-2428）——stop 之后 KWin 不会再读盘。
+    /// 停止并卸载长驻脚本（组件关闭时调用；幂等）。同时释放暂存文件——
+    /// stop 之后 KWin 不会再读盘。
     pub async fn stop(&mut self, conn: &Connection) -> Result<()> {
         let mut running = self.running.lock().await;
         if !*running {

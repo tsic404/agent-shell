@@ -231,7 +231,7 @@ impl ScreenCastCapture {
                 Ok(v) => v,
                 Err(e @ AgentShellError::Timeout(_)) => {
                     // KDE 后端在 PipeWire 目标解析失败时不会发送 Response
-                    // （见 TSI-2481：`Stream error: target not found`），
+                    // （`Stream error: target not found`），
                     // 超时是 agent-shell 的预期兜底——提示操作者查 portal 日志。
                     tracing::warn!(
                         "ScreenCast Start: portal Response never arrived (check PipeWire state and \

@@ -22,7 +22,7 @@ pub struct AuditEntry {
     pub decision: String,
     /// 操作是否已执行（`true` = 执行成功，`false` = 未执行或执行失败）。
     /// 门禁判定记录恒为 `false`；`allow` 的执行结果由 dispatch 层在
-    /// handler 返回后追加一条独立记录回写（TSI-2659）。
+    /// handler 返回后追加一条独立记录回写。
     pub result: bool,
 }
 
@@ -99,7 +99,7 @@ impl AuditLogger {
 
     /// 按 `agent_id` / `op` / `decision` / `result` 过滤（空串 / `None` =
     /// 不限制该维度）。`result` 区分执行态——同一 `allow` 操作会先落一条
-    /// 门禁判定记录（`result=false`），执行后再追加一条结果记录（TSI-2659），
+    /// 门禁判定记录（`result=false`），执行后再追加一条结果记录，
     /// 只关心「已执行成功」须同时给 `decision=allow` + `result=Some(true)`。
     pub fn query(
         &self,

@@ -688,7 +688,7 @@ async fn confirm_override_returns_confirmation_required() {
 
 #[tokio::test]
 async fn allow_command_records_execution_outcome() {
-    // TSI-2659 回归锚定：router 门禁放行后须在命令返回后落执行结果审计——
+    // router 门禁放行后须在命令返回后落执行结果审计——
     // 门禁判定记录 result=false + 执行结果记录 result=true，二者独立有序。
     let audit_path = std::env::temp_dir().join(format!(
         "agent-shell-router-audit-{}.jsonl",
@@ -736,7 +736,7 @@ async fn allow_command_records_execution_outcome() {
 
 #[tokio::test]
 async fn allow_command_failure_still_records_execution_outcome() {
-    // TSI-2659 复审：`?` 提前返回不得绕过执行结果审计——失败路径同样落
+    // `?` 提前返回不得绕过执行结果审计——失败路径同样落
     // 门禁 allow+false + 执行结果 false 两条记录，与 daemon 侧契约一致。
     let audit_path = std::env::temp_dir().join(format!(
         "agent-shell-router-audit-fail-{}.jsonl",
@@ -782,7 +782,7 @@ async fn allow_command_failure_still_records_execution_outcome() {
 
 #[tokio::test]
 async fn injected_caller_id_propagates_to_security_gate_and_audit() {
-    // TSI-2515 回归锚定：caller_id 经 `Executor::new` 注入后，门禁判定与执行
+    // caller_id 经 `Executor::new` 注入后，门禁判定与执行
     // 审计均携带该身份而非硬编码 `"*"`——router 未来持真实会话身份时，
     // 白名单按 agent 匹配而非 `"*"` 通配兜底。
     let audit_path = std::env::temp_dir().join(format!(

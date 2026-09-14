@@ -350,7 +350,7 @@ pub trait AppearanceComponent: DesktopComponent {
 
 /// 输入组件接口（components/input，libei → ydotool → XTest 降级链）。
 ///
-/// T2 任务（TSI-2315）实现注入方法；此处仅定义契约形状。
+/// T2 任务实现注入方法；此处仅定义契约形状。
 #[async_trait]
 pub trait InputComponent: DesktopComponent {
     /// 当前激活的输入后端名。
@@ -359,7 +359,7 @@ pub trait InputComponent: DesktopComponent {
 
 /// 截图组件接口（components/capture，ScreenCast → Screenshot portal → X11 降级链）。
 ///
-/// T2 任务（TSI-2316）实现捕获路径；此处仅定义契约形状。
+/// T2 任务实现捕获路径；此处仅定义契约形状。
 #[async_trait]
 pub trait CaptureComponent: DesktopComponent {
     /// 当前激活的捕获后端名。
@@ -368,7 +368,7 @@ pub trait CaptureComponent: DesktopComponent {
 
 /// 无障碍组件接口（components/a11y，AT-SPI）。
 ///
-/// T2 任务（TSI-2317）实现树模型与语义定位；此处仅定义契约形状。
+/// T2 任务实现树模型与语义定位；此处仅定义契约形状。
 #[async_trait]
 pub trait A11yComponent: DesktopComponent {
     /// AT-SPI Registry 是否可达。

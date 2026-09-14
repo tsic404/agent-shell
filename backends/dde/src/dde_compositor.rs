@@ -137,8 +137,8 @@ impl DdeCompositor {
     }
 
     /// doctor 输出的异步版本：deepin-kwin 分支先补齐 `/Scripting` 探测
-    /// 证据再渲染（TSI-2486 同款假阴性修复；TSI-2501 将 DDE 后端与
-    /// daemon doctor 的 async 契约对齐）。
+    /// 证据再渲染（假阴性修复；将 DDE 后端与 daemon doctor 的 async
+    /// 契约对齐）。
     pub async fn doctor_lines_async(&self) -> Vec<String> {
         let mut lines = Vec::new();
         lines.push(format!(

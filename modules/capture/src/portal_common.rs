@@ -332,7 +332,7 @@ mod tests {
         }
     }
 
-    /// `attempts == 0` 归一到 1 次尝试，返回错误而非 panic（TSI-2877 审查项 #2）。
+    /// `attempts == 0` 归一到 1 次尝试，返回错误而非 panic。
     #[tokio::test]
     async fn retry_transient_zero_attempts_returns_error_not_panic() {
         use std::sync::atomic::{AtomicUsize, Ordering};

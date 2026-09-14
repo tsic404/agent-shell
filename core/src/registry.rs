@@ -48,7 +48,7 @@ impl From<DesktopEnvironment> for BackendKind {
             DesktopEnvironment::Tty => Self::Tty,
             // 已识别但未实现专用装配器的 DE 统一走通用兜底（保守按 X11 处理）。
             // 会话类型感知的兜底请用 `with_session_fallback`——de_detection 任务
-            // （TSI-2322）落地后由 detect_backend 直接构造，不再经过本 trait。
+            // 落地后由 detect_backend 直接构造，不再经过本 trait。
             _ => Self::X11Generic,
         }
     }

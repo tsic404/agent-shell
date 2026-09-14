@@ -543,7 +543,7 @@ mod tests {
             .is_err());
     }
 
-    /// TSI-2445 回归：模板 `"%ID%"` 外层引号 + `js_string` 二次引号 →
+    /// 模板 `"%ID%"` 外层引号 + `js_string` 二次引号 →
     /// `""uuid""` JS 解析错误 → callDBus 永不发出 → 5s 超时。
     /// 修复后 String 参数只出现一次引号（由 js_string 统一负责）。
     #[test]
@@ -560,7 +560,7 @@ mod tests {
         );
     }
 
-    /// TSI-2445 回归：%WS% 同样受双重引号影响——v6 桌面 id 为字符串。
+    /// %WS% 同样受双重引号影响——v6 桌面 id 为字符串。
     #[test]
     fn workspace_arg_not_double_quoted_v6() {
         let script = render_v6(ScriptTemplate::SwitchWorkspace, &[("WS", json!("desk-42"))]);
@@ -574,7 +574,7 @@ mod tests {
         );
     }
 
-    /// TSI-2445 回归：v5 `parseInt("%WS%")` 同样被双重引号影响。
+    /// v5 `parseInt("%WS%")` 同样被双重引号影响。
     #[test]
     fn workspace_arg_not_double_quoted_v5() {
         let script = ScriptTemplate::SwitchWorkspace
@@ -590,7 +590,7 @@ mod tests {
         );
     }
 
-    /// TSI-2445 回归：KWin 6 loadScript 上下文无 `Qt` 全局对象，
+    /// KWin 6 loadScript 上下文无 `Qt` 全局对象，
     /// `Qt.rect(...)` 报 `Qt is not defined` → 脚本异常 → 5s 超时。
     /// 修复后用纯 JS 对象 `{x, y, width, height}` 赋值 frameGeometry，
     /// KWin 6 注册了 QJSValue→RectF 转换器读取这四个属性。
@@ -642,7 +642,7 @@ mod tests {
         );
     }
 
-    /// TSI-2445 回归：KWin 6 `XdgToplevelWindow` 无 `close()` 方法，
+    /// KWin 6 `XdgToplevelWindow` 无 `close()` 方法，
     /// 报 `Property 'close' is not a function` → 5s 超时。
     /// KWin 6 `Window` 基类的 `public Q_SLOTS` 中是 `closeWindow()`。
     #[test]

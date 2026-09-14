@@ -61,12 +61,12 @@ pub struct KWinCompositor {
     version: KWinVersion,
     /// 长驻事件脚本句柄（懒启动）。
     event_handle: AsyncMutex<Option<EventScriptHandle>>,
-    /// `/Scripting` 探测状态（TSI-2374）：0=未探测，1=失败（不缓存，
+    /// `/Scripting` 探测状态：0=未探测，1=失败（不缓存，
     /// 允许重试），2=成功。原子而非锁——doctor_lines(&self) 同步读取。
     scripting_probe: std::sync::atomic::AtomicU8,
 }
 
-/// `scripting_probe` 状态值（TSI-2374）。
+/// `scripting_probe` 状态值。
 const PROBE_UNSET: u8 = 0;
 const PROBE_FAIL: u8 = 1;
 const PROBE_OK: u8 = 2;
@@ -132,19 +132,13 @@ impl KWinCompositor {
         })
     }
 
-    /// 测试注入点（TSI-2502/TSI-2505）：跨 crate 测试需绕过真实显示
-    /// 服务器/版本探测路径构造最小实例。给定桥接连接与 `/Scripting`
-    /// 探测初值：`None`=未探测，`Some(false)`=最近失败，`Some(true)`=
-    /// 已确认可用。
+    /// 测试注入点：跨 crate 测试绕过真实显示服务器/版本探测，构造最小实例。
+    /// `probe` 表达 `/Scripting` 三态初值：`None`=未探测，`Some(false)`=最近失败，
+    /// `Some(true)`=已确认可用；生产构造路径（`new_wayland` / `new_x11`）不受影响。
     ///
-    /// 生产构造路径（`new_wayland` / `new_x11`）不受影响；本构造函数
-    /// 不触碰 `ensure_scripting_probe` 的真实探测逻辑。
-    ///
-    /// 权衡：`#[doc(hidden)]` 只隐藏文档、不隐藏符号，release 构建中下游
-    /// crate 仍可调用本测试构造器。采纳该模式是因为 DDE 组件的集成测试
-    /// 需要从 crate 外注入最小 KWin 实例（`Option<bool>` 表达三态探测），
-    /// 而 `#[cfg(test)]` 注入点对下游 crate 不可见；风险仅限误用构造器，
-    /// 不触及真实探测/构造路径。
+    /// `#[doc(hidden)]` 只隐藏文档不隐藏符号——DDE 集成测试需从 crate 外注入
+    /// 最小实例（`Option<bool>` 表达三态），`#[cfg(test)]` 注入点对下游 crate
+    /// 不可见；风险仅限误用构造器，不触及真实探测/构造路径。
     #[doc(hidden)]
     pub fn for_test(bridge: KWinBridge, probe: Option<bool>) -> Self {
         use std::sync::atomic::AtomicU8;
@@ -219,7 +213,7 @@ impl KWinCompositor {
                 v => format!("v{v}"),
             }
         ));
-        // 桥接就绪以 /Scripting 探测为证据（TSI-2374）——不再无条件打 ✓。
+        // 桥接就绪以 /Scripting 探测为证据——不再无条件打 ✓。
         lines.push(match self.scripting_probe_ok() {
             Some(true) => "✓ D-Bus 桥接 : callDBus ready (14 templates, req-id routed; \
                            /Scripting introspected)"
@@ -257,7 +251,7 @@ impl KWinCompositor {
     /// doctor 输出的异步版本：在渲染桥接行前触发一次 `/Scripting` 探测
     /// （懒探测缓存，成功后升级为确认态）。
     ///
-    /// TSI-2486：doctor 路径从不调用 [`Self::ensure_scripting_probe`]，
+    /// doctor 路径从不调用 [`Self::ensure_scripting_probe`]，
     /// 导致 D-Bus 桥接行恒为「未探测」——尽管 `org.kde.KWin` 的
     /// `/Scripting` 实际可达。同步版本 [`Self::doctor_lines`] 保留给
     /// 内部状态渲染；daemon doctor 走本方法补齐证据后渲染。
@@ -268,7 +262,7 @@ impl KWinCompositor {
         self.doctor_lines()
     }
 
-    /// 探测并缓存 `/Scripting` 可用性（TSI-2374）。
+    /// 探测并缓存 `/Scripting` 可用性。
     ///
     /// doctor 与降级链的证据来源：成功后 `doctor_lines` 的桥接行升级为
     /// 确认态；失败写入 PROBE_FAIL（doctor 显示「未就绪」而非「未探测」），
@@ -399,7 +393,7 @@ impl KWinCompositor {
     }
     /// 确保长驻事件脚本在跑（幂等；首次 subscribe/subscribe_raw 时加载）。
     ///
-    /// 订阅前刷新 /Scripting 探测（TSI-2374）：启动早期未就绪时由
+    /// 订阅前刷新 /Scripting 探测：启动早期未就绪时由
     /// `spawn_event_script` 内部的重试探测兜底，这里只做缓存预热。
     async fn ensure_event_monitor(&self) -> Result<()> {
         let _ = self.ensure_scripting_probe().await;
@@ -822,7 +816,7 @@ impl CompositorComponent for KWinCompositor {
     }
 }
 
-/// 测试与诊断：通道组合摘要 + `/Scripting` 探测三态迁移（TSI-2502）。
+/// 测试与诊断：通道组合摘要 + `/Scripting` 探测三态迁移。
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -947,7 +941,7 @@ mod tests {
     }
 
     /// 懒启动能力声明：事件脚本首次 `subscribe()` 才 load，`capabilities()`
-    /// 的 `window_events`/`workspace_events` false 非永久不可用（TSI-2822）。
+    /// 的 `window_events`/`workspace_events` false 非永久不可用。
     #[tokio::test]
     async fn lazy_capabilities_lists_event_streams() {
         let bus = TestBus::start().await;
@@ -972,7 +966,7 @@ mod tests {
         assert!(has_ready_bridge(&lines));
     }
 
-    /// TSI-2486 回归守卫：`Some(false)`（PROBE_FAIL）必须重试，不能把
+    /// `Some(false)`（PROBE_FAIL）必须重试，不能把
     /// 一次性失败固化为永不重试的假阴性。
     #[tokio::test]
     async fn failed_probe_is_retried_and_becomes_ok() {
@@ -1019,7 +1013,7 @@ mod tests {
     }
 
     /// doctor 事件脚本行如实标注为「未加载（懒启动）」，不再以「T3b 待办」
-    /// 呈现（T3b 归一化管线已装配，见 TSI-3033）。
+    /// 呈现（T3b 归一化管线已装配）。
     #[tokio::test]
     async fn doctor_event_script_line_marks_unloaded() {
         let bus = TestBus::start().await;

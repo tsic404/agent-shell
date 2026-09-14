@@ -232,7 +232,7 @@ impl HyprlandCompositor {
 }
 
 /// 事件流 doctor 行：事件任务在跑（`subscribe()` 已触发）报 connected，
-/// 否则如实标注为可选（T3b 待办）而非「未接线」缺口（TSI-2912）。
+/// 否则如实标注为可选（T3b 待办）而非「未接线」缺口。
 fn event_stream_doctor_line(events_running: bool) -> String {
     if events_running {
         "✓ 事件流        : connected (openwindow, closewindow, activewindow, workspacev2)"
@@ -723,7 +723,7 @@ mod tests {
     }
 
     /// 事件流 doctor 行如实标注为可选（T3b 待办），而非以「未接线」呈现为
-    /// 待修复缺口（TSI-2912）。
+    /// 待修复缺口。
     #[test]
     fn event_stream_doctor_line_marks_optional_when_not_running() {
         let line = event_stream_doctor_line(false);
