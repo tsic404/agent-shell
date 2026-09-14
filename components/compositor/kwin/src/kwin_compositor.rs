@@ -25,11 +25,12 @@ use agent_shell_core::component::{
 };
 use agent_shell_core::error::AgentShellError;
 use agent_shell_core::types::{
-    MonitorId, MonitorInfo, Rect, WindowId, WindowInfo, WindowState, WorkspaceId, WorkspaceInfo,
+    MonitorId, MonitorInfo, Rect, WindowId, WindowInfo, WindowState, WindowType, WorkspaceId,
+    WorkspaceInfo,
 };
 use agent_shell_core::{DesktopEnvironment, EventStream};
 use agent_shell_displayserver_wayland::WaylandDisplayServer;
-use agent_shell_displayserver_x11::X11DisplayServer;
+use agent_shell_displayserver_x11::{EwmhAtoms, X11DisplayServer};
 
 /// KWin 会话类型（构造时确定，决定基础通道形态）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -53,9 +54,9 @@ pub struct KWinCompositor {
     protocols: Option<KWinProtocols>,
     /// D-Bus / Scripting 补充通道（会话无关，共享）。
     bridge: KWinBridge,
-    /// X11 基础通道（仅 X11 会话为 Some；EWMH/ICCCM/XTest 操作由 T1g CLI
-    /// 与输入组件经此通道路由，本组件保留引用以维持会话生命周期）。
-    #[allow(dead_code)]
+    /// X11 基础通道（仅 X11 会话为 Some）。窗口枚举走 EWMH（`_NET_CLIENT_LIST`
+    /// 等）而非 Scripting `/Scripting`——部分 KWin 5.x X11 会话不注册该
+    /// 对象路径（TSI-3131），枚举通道必须落在 X11 原生路径上。
     x11: Option<X11DisplayServer>,
     /// 探测到的版本（决定脚本 API 形态）。
     version: KWinVersion,
@@ -397,6 +398,172 @@ impl KWinCompositor {
             )))
         }
     }
+
+    // ───────────────────────── X11 EWMH 枚举 ─────────────────────────
+
+    /// `_NET_CLIENT_LIST_STACKING`（缺失回退 `_NET_CLIENT_LIST`）。
+    ///
+    /// KWin 是 EWMH 合规 WM，两条列表都返回受管顶层窗口；`_STACKING` 额外给
+    /// 层叠顺序（从底到顶），故优先。
+    fn x11_stacking_list(
+        &self,
+        x11: &X11DisplayServer,
+    ) -> agent_shell_core::error::Result<Vec<u32>> {
+        let stacking = x11.get_client_list_stacking()?;
+        Ok(if stacking.is_empty() {
+            x11.get_client_list()?
+        } else {
+            stacking
+        })
+    }
+
+    /// X11 会话的窗口列表。窗口 id 输出十进制字符串——与 Scripting
+    /// `internalId.toString()` 及 `screenshot --window` 的十进制解析口径一致，
+    /// 保证 `windows list` 结果可直接喂给窗口直捕。
+    ///
+    /// 单窗查询失败（BadWindow：枚举中途窗口销毁）跳过而非中止整条列表——
+    /// 与 Wayland 分支 `filter_map` 口径一致；列表读取失败仍经 `?` 传播。
+    fn x11_list_windows(
+        &self,
+        x11: &X11DisplayServer,
+    ) -> agent_shell_core::error::Result<Vec<WindowInfo>> {
+        let windows = self.x11_stacking_list(x11)?;
+        // stacking order：从底到顶，索引越大越靠上。
+        Ok(windows
+            .iter()
+            .enumerate()
+            .filter_map(|(i, &w)| Self::x11_build_window_info(x11, w, i as u32).ok())
+            .collect())
+    }
+
+    /// EWMH 单窗信息 → core `WindowInfo`（十进制 id + KDE 标签）。
+    fn x11_build_window_info(
+        x11: &X11DisplayServer,
+        window: u32,
+        stacking_order: u32,
+    ) -> agent_shell_core::error::Result<WindowInfo> {
+        let title = x11.get_window_name(window)?;
+        let app_id = x11.get_wm_class(window)?.unwrap_or_else(|| title.clone());
+        let pid = x11.get_window_pid(window)?.unwrap_or(0);
+        let geometry = x11.get_window_geometry(window)?;
+        let desktop = x11.get_window_desktop(window)?;
+        let states_atoms = x11.get_window_states(window)?;
+        let states = Self::x11_states_from_atoms(&states_atoms, x11.atoms());
+
+        let workspace_id = desktop.and_then(|d| {
+            if d == u32::MAX {
+                None // 所有工作区可见
+            } else {
+                Some(WorkspaceId {
+                    native_id: d.to_string(),
+                    de_type: DesktopEnvironment::KDE,
+                })
+            }
+        });
+
+        Ok(WindowInfo {
+            id: WindowId {
+                native_id: format!("{window}"),
+                de_type: DesktopEnvironment::KDE,
+            },
+            title,
+            app_id,
+            pid,
+            geometry,
+            // X11 GetGeometry 返回内容几何（坐标相对 frame 窗口，非根坐标）；
+            // 含装饰的外框需 `_NET_FRAME_EXTENTS` + 坐标平移，本层不计算，
+            // 置 default（全零）表示未知——不得把内容几何误报为外框。
+            frame_geometry: Rect::default(),
+            states,
+            workspace_id,
+            monitor_id: None,
+            stacking_order,
+            desktop_file: None, // EWMH 无 desktop file 属性
+            window_type: Self::x11_window_type(x11, window),
+            icon_geometry: None,
+            keep_above: states_atoms.contains(&x11.atoms()._NET_WM_STATE_ABOVE),
+        })
+    }
+
+    /// EWMH `_NET_WM_STATE` 原子列表 → [`WindowState`] 归一化（纯函数，可单测）。
+    fn x11_states_from_atoms(atoms: &[u32], ewmh: &EwmhAtoms) -> Vec<WindowState> {
+        let mut states = Vec::new();
+        if atoms.contains(&ewmh._NET_WM_STATE_HIDDEN) {
+            states.push(WindowState::Minimized);
+        }
+        if atoms.contains(&ewmh._NET_WM_STATE_MAXIMIZED_VERT)
+            || atoms.contains(&ewmh._NET_WM_STATE_MAXIMIZED_HORZ)
+        {
+            states.push(WindowState::Maximized);
+        }
+        if atoms.contains(&ewmh._NET_WM_STATE_FULLSCREEN) {
+            states.push(WindowState::FullScreen);
+        }
+        if states.is_empty() {
+            states.push(WindowState::Normal);
+        }
+        states
+    }
+
+    /// `_NET_WM_WINDOW_TYPE` 属性读取 + [`Self::x11_window_type_from_atoms`] 归一化。
+    ///
+    /// 读取用 type=0（AnyPropertyType）——`_NET_WM_WINDOW_TYPE` 属性类型为
+    /// ATOM，零值让 x11rb 不校验实际类型直接取回。读取失败（BadWindow：窗口
+    /// 已销毁）回 `Unknown`，与 Scripting `parse_window_type` 对缺失/无法解析
+    /// 的回退一致；缺失属性（空列表）仍归 `Normal`（EWMH：未声明类型的顶层
+    /// 窗口视为普通窗口）。
+    fn x11_window_type(x11: &X11DisplayServer, window: u32) -> WindowType {
+        let atoms = x11.atoms();
+        let list = match x11.get_property_u32(window, atoms._NET_WM_WINDOW_TYPE, 0) {
+            Ok(list) => list,
+            Err(_) => return WindowType::Unknown,
+        };
+        Self::x11_window_type_from_atoms(&list, atoms)
+    }
+
+    /// `_NET_WM_WINDOW_TYPE` 原子列表 → [`WindowType`] 归一化（纯函数，可单测）。
+    ///
+    /// 属性缺失（空列表）归 `Normal`（EWMH：未声明窗口类型的顶层窗口视为
+    /// 普通窗口）；属性存在但类型未识别归 `Unknown`。Utility/Notification
+    /// 映射与 Scripting `parse_window_type` 对齐，保证同一 KWin 会话 X11/Wayland
+    /// 回报一致的 window_type。
+    fn x11_window_type_from_atoms(list: &[u32], atoms: &EwmhAtoms) -> WindowType {
+        for a in list {
+            if *a == atoms._NET_WM_WINDOW_TYPE_NORMAL {
+                return WindowType::Normal;
+            }
+            if *a == atoms._NET_WM_WINDOW_TYPE_DIALOG {
+                return WindowType::Dialog;
+            }
+            if *a == atoms._NET_WM_WINDOW_TYPE_DOCK {
+                return WindowType::Dock;
+            }
+            if *a == atoms._NET_WM_WINDOW_TYPE_DESKTOP {
+                return WindowType::Desktop;
+            }
+            if *a == atoms._NET_WM_WINDOW_TYPE_MENU {
+                return WindowType::DropdownMenu;
+            }
+            if *a == atoms._NET_WM_WINDOW_TYPE_TOOLTIP {
+                return WindowType::Tooltip;
+            }
+            if *a == atoms._NET_WM_WINDOW_TYPE_SPLASH {
+                return WindowType::Splash;
+            }
+            if *a == atoms._NET_WM_WINDOW_TYPE_UTILITY {
+                return WindowType::Utility;
+            }
+            if *a == atoms._NET_WM_WINDOW_TYPE_NOTIFICATION {
+                return WindowType::Notification;
+            }
+        }
+        if list.is_empty() {
+            WindowType::Normal
+        } else {
+            WindowType::Unknown
+        }
+    }
+
     /// 确保长驻事件脚本在跑（幂等；首次 subscribe/subscribe_raw 时加载）。
     ///
     /// 订阅前刷新 /Scripting 探测（TSI-2374）：启动早期未就绪时由
@@ -535,13 +702,19 @@ impl CompositorComponent for KWinCompositor {
         &["window_events", "workspace_events"]
     }
 
-    /// 窗口列表：始终走 list_windows.js（一次 callDBus 批量取全量详情）。
+    /// 窗口列表：X11 会话走 EWMH（`_NET_CLIENT_LIST_STACKING`），Wayland
+    /// 会话走 list_windows.js（一次 callDBus 批量取全量详情）。
     ///
-    /// 协议 stacking-order 仅提供 uuid 列表，逐窗 get_window_by_uuid 仍需
-    /// 事件聚合才能取属性（本层 inert 不消费事件）——T3b 前纯协议路径
-    /// 无法给出 WindowInfo，故不在此付 roundtrip 开销。window_mgmt 短绑
-    /// 状态只影响 focus/minimize/close 走协议还是 Scripting。
+    /// X11 分支优先于 Scripting——部分 KWin 5.x X11 会话不注册 `/Scripting`
+    /// （TSI-3131），且 EWMH 无需事件聚合即可给出完整 `WindowInfo`。
+    /// Wayland 下协议 stacking-order 仅提供 uuid 列表，逐窗 get_window_by_uuid
+    /// 仍需事件聚合才能取属性（本层 inert 不消费事件）——T3b 前纯协议路径
+    /// 无法给出 WindowInfo，故仍走 Scripting。window_mgmt 短绑状态只影响
+    /// focus/minimize/close 走协议还是 Scripting。
     async fn list_windows(&self) -> agent_shell_core::error::Result<Vec<WindowInfo>> {
+        if let Some(x11) = self.x11.as_ref() {
+            return self.x11_list_windows(x11);
+        }
         let v = self.query(ScriptTemplate::ListWindows, &[]).await?;
         let arr = v.as_array().cloned().unwrap_or_default();
         Ok(arr
@@ -551,8 +724,23 @@ impl CompositorComponent for KWinCompositor {
             .collect())
     }
 
-    /// 当前活动窗口（可能为空——桌面无焦点）。
+    /// 当前活动窗口（可能为空——桌面无焦点）。X11 会话走 `_NET_ACTIVE_WINDOW`，
+    /// Wayland 会话走 get_active_window.js。
     async fn get_active_window(&self) -> agent_shell_core::error::Result<Option<WindowInfo>> {
+        if let Some(x11) = self.x11.as_ref() {
+            let Some(w) = x11.get_active_window()? else {
+                return Ok(None);
+            };
+            // 活动窗口的 stacking_order 从 `_NET_CLIENT_LIST_STACKING` 查索引，
+            // 保持「越大越靠上」契约（与 list_windows 索引口径一致）；不在表内
+            // （枚举竞态）置 0。
+            let order = self
+                .x11_stacking_list(x11)?
+                .iter()
+                .position(|&x| x == w)
+                .unwrap_or(0) as u32;
+            return Ok(Some(Self::x11_build_window_info(x11, w, order)?));
+        }
         let v = self.query(ScriptTemplate::GetActiveWindow, &[]).await?;
         Ok(if v.is_null() {
             None
@@ -943,6 +1131,123 @@ mod tests {
         assert_ne!(
             format!("{:?}", SessionKind::Wayland),
             format!("{:?}", SessionKind::X11)
+        );
+    }
+
+    /// 手工构造的 EWMH 原子集（固定值，供纯函数单测；`atom_manager!` 无 Default）。
+    fn test_ewmh_atoms() -> EwmhAtoms {
+        EwmhAtoms {
+            _NET_CLIENT_LIST: 1,
+            _NET_CLIENT_LIST_STACKING: 2,
+            _NET_ACTIVE_WINDOW: 3,
+            _NET_CURRENT_DESKTOP: 4,
+            _NET_NUMBER_OF_DESKTOPS: 5,
+            _NET_DESKTOP_NAMES: 6,
+            _NET_DESKTOP_GEOMETRY: 7,
+            _NET_DESKTOP_VIEWPORT: 8,
+            _NET_WORKAREA: 9,
+            _NET_SUPPORTED: 10,
+            _NET_SUPPORTING_WM_CHECK: 11,
+            _NET_CLOSE_WINDOW: 12,
+            _NET_MOVERESIZE_WINDOW: 13,
+            _NET_WM_NAME: 14,
+            _NET_WM_STATE: 15,
+            _NET_WM_STATE_MAXIMIZED_VERT: 16,
+            _NET_WM_STATE_MAXIMIZED_HORZ: 17,
+            _NET_WM_STATE_HIDDEN: 18,
+            _NET_WM_STATE_FULLSCREEN: 19,
+            _NET_WM_STATE_ABOVE: 20,
+            _NET_WM_DESKTOP: 21,
+            _NET_WM_WINDOW_TYPE: 22,
+            _NET_WM_WINDOW_TYPE_NORMAL: 23,
+            _NET_WM_WINDOW_TYPE_DIALOG: 24,
+            _NET_WM_WINDOW_TYPE_DOCK: 25,
+            _NET_WM_WINDOW_TYPE_DESKTOP: 26,
+            _NET_WM_WINDOW_TYPE_MENU: 27,
+            _NET_WM_WINDOW_TYPE_TOOLTIP: 28,
+            _NET_WM_WINDOW_TYPE_SPLASH: 29,
+            _NET_WM_WINDOW_TYPE_UTILITY: 30,
+            _NET_WM_WINDOW_TYPE_NOTIFICATION: 31,
+            _NET_WM_PID: 32,
+            UTF8_STRING: 33,
+            WM_CLASS: 100,
+        }
+    }
+
+    #[test]
+    fn x11_states_from_atoms_maps_ewmh_states() {
+        let atoms = test_ewmh_atoms();
+        assert_eq!(
+            KWinCompositor::x11_states_from_atoms(&[18], &atoms),
+            vec![WindowState::Minimized]
+        );
+        assert_eq!(
+            KWinCompositor::x11_states_from_atoms(&[17], &atoms),
+            vec![WindowState::Maximized]
+        );
+        assert_eq!(
+            KWinCompositor::x11_states_from_atoms(&[19], &atoms),
+            vec![WindowState::FullScreen]
+        );
+        // 空状态 → Normal（无 _NET_WM_STATE 的普通窗口）。
+        assert_eq!(
+            KWinCompositor::x11_states_from_atoms(&[], &atoms),
+            vec![WindowState::Normal]
+        );
+        // 多状态共存：minimized + maximized 两个都保留。
+        let multi = KWinCompositor::x11_states_from_atoms(&[18, 16], &atoms);
+        assert!(multi.contains(&WindowState::Minimized));
+        assert!(multi.contains(&WindowState::Maximized));
+    }
+
+    #[test]
+    fn x11_window_type_from_atoms_maps_known_and_unknown() {
+        use WindowType::*;
+        let atoms = test_ewmh_atoms();
+        assert_eq!(
+            KWinCompositor::x11_window_type_from_atoms(&[23], &atoms),
+            Normal
+        );
+        assert_eq!(
+            KWinCompositor::x11_window_type_from_atoms(&[24], &atoms),
+            Dialog
+        );
+        assert_eq!(
+            KWinCompositor::x11_window_type_from_atoms(&[25], &atoms),
+            Dock
+        );
+        assert_eq!(
+            KWinCompositor::x11_window_type_from_atoms(&[26], &atoms),
+            Desktop
+        );
+        assert_eq!(
+            KWinCompositor::x11_window_type_from_atoms(&[27], &atoms),
+            DropdownMenu
+        );
+        assert_eq!(
+            KWinCompositor::x11_window_type_from_atoms(&[28], &atoms),
+            Tooltip
+        );
+        assert_eq!(
+            KWinCompositor::x11_window_type_from_atoms(&[29], &atoms),
+            Splash
+        );
+        assert_eq!(
+            KWinCompositor::x11_window_type_from_atoms(&[30], &atoms),
+            Utility
+        );
+        assert_eq!(
+            KWinCompositor::x11_window_type_from_atoms(&[31], &atoms),
+            Notification
+        );
+        // 属性缺失（空列表）→ Normal；属性存在但类型未识别 → Unknown。
+        assert_eq!(
+            KWinCompositor::x11_window_type_from_atoms(&[], &atoms),
+            Normal
+        );
+        assert_eq!(
+            KWinCompositor::x11_window_type_from_atoms(&[999], &atoms),
+            Unknown
         );
     }
 

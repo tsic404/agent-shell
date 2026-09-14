@@ -1514,6 +1514,9 @@ impl KWinProtocols {
 
 ```
 list_windows():
+  0. X11 会话？
+     → 是：EWMH `_NET_CLIENT_LIST_STACKING`（缺失回退 `_NET_CLIENT_LIST`，
+            十进制窗口 id；KWin 5.x 部分 X11 会话不注册 /Scripting，见 TSI-3131）
   1. wayland.window_mgmt 绑定成功？
      → 是：get_stacking_order() 走协议
      → 否：bridge.list_windows.js 走 Scripting

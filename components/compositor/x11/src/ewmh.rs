@@ -47,9 +47,9 @@ pub fn supported_atoms(ds: &X11DisplayServer) -> Result<Vec<u32>> {
 ///
 /// doctor 分母：`_NET_SUPPORTED` 返回的是 WM 声称支持的原子列表，
 /// 分母为本 crate 实际查询的 EWMH 原子总数——两者比值反映 EWMH 覆盖度。
-/// 设计文档 §6.6 示例写 12/12（核心 _NET_WM），本 crate 实际 intern 33 个。
+/// 设计文档 §6.6 示例写 12/12（核心 _NET_WM），本 crate 实际 intern 34 个。
 pub fn ewmh_atom_count() -> usize {
-    33
+    34
 }
 
 /// `_NET_WM_WINDOW_TYPE` 原子列表 → [`WindowType`] 归一化。

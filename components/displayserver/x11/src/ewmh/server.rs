@@ -53,6 +53,8 @@ atom_manager! {
         _NET_WM_WINDOW_TYPE_MENU,
         _NET_WM_WINDOW_TYPE_TOOLTIP,
         _NET_WM_WINDOW_TYPE_SPLASH,
+        _NET_WM_WINDOW_TYPE_UTILITY,
+        _NET_WM_WINDOW_TYPE_NOTIFICATION,
         _NET_WM_PID,
         UTF8_STRING,
         WM_CLASS,
