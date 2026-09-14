@@ -1539,6 +1539,11 @@ list_workspaces():
      → 是：EWMH `_NET_NUMBER_OF_DESKTOPS` + `_NET_DESKTOP_NAMES` + `_NET_CURRENT_DESKTOP`
   1. Wayland：bridge.list_workspaces.js 走 Scripting
 
+activate_workspace(id):
+  0. X11 会话？
+     → 是：EWMH `_NET_CURRENT_DESKTOP` ClientMessage（0 基桌面索引）
+  1. Wayland：bridge.switch_workspace.js 走 Scripting
+
 subscribe()/subscribe_raw():
   0. X11 会话？
      → 是：EWMH PropertyNotify 差分（_NET_CLIENT_LIST* + _NET_ACTIVE_WINDOW），
