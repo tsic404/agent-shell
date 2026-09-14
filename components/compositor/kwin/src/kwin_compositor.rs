@@ -873,13 +873,21 @@ impl CompositorComponent for KWinCompositor {
         })
     }
 
-    /// 聚焦：X11 会话走 EWMH `_NET_ACTIVE_WINDOW`（ClientMessage 写入 root）；
-    /// Wayland 会话协议 activate 优先（请求发出即成功——wayland 请求无回执），
-    /// 未短绑时回退 focus_window.js。
+    /// 聚焦：X11 会话走 EWMH `_NET_ACTIVE_WINDOW`（ClientMessage 写入 root +
+    /// 回读确认——EWMH 无回执，WM 忽略请求时 send 仍成功）；Wayland 会话协议
+    /// activate 优先（请求发出即成功——wayland 请求无回执），未短绑时回退
+    /// focus_window.js。
     async fn focus_window(&self, id: &WindowId) -> agent_shell_core::error::Result<()> {
         if let Some(x11) = self.x11.as_ref() {
             let window = Self::x11_window_id(id)?;
-            return x11.activate_window(window);
+            // 确认轮询含同步 sleep（最长 500ms），走 spawn_blocking 避免阻塞
+            // tokio worker（§19 审查项：同步段不得占执行器线程）。
+            let x11 = Arc::clone(x11);
+            return tokio::task::spawn_blocking(move || x11.activate_window_confirmed(window))
+                .await
+                .map_err(|e| {
+                    AgentShellError::Other(format!("kwin focus blocking task join: {e}").into())
+                })?;
         }
         if let Some(p) = self.protocols() {
             if let Some(wm) = p.window_mgmt.as_ref() {
