@@ -249,8 +249,9 @@ fn capture_err(e: impl std::fmt::Display) -> AgentShellError {
     AgentShellError::Capture(format!("x11 capture: {e}"))
 }
 
-/// `GetGeometry`/`GetImage` 回包错误 → 可读错误。桌面窗口 id（非可绘窗口）会触发
-/// X11 `Drawable bad_value`：补一句可读提示，而非只回吐原始错误码（TSI-3132）。
+/// `GetGeometry`/`GetImage` 回包错误 → 可读错误，而非只回吐原始 `X11Error` 结构。
+/// `Drawable`（桌面窗口 id 等非可绘窗口）补可读提示；其余 X11 错误补一句上下文
+/// （bad_value + 错误类型 + 请求名）。
 fn capture_reply_err(e: x11rb::errors::ReplyError) -> AgentShellError {
     if let x11rb::errors::ReplyError::X11Error(x11) = &e {
         if x11.error_kind == x11rb::protocol::ErrorKind::Drawable {
@@ -260,6 +261,15 @@ fn capture_reply_err(e: x11rb::errors::ReplyError) -> AgentShellError {
                 x11.bad_value
             ));
         }
+        // 非 Drawable 类 X11 错误（Match/Window/Value…）补一句可读上下文。
+        // bad_value 仅在 Window/Drawable 下才是窗口 ID，故此处用通用标签
+        // `bad_value`（X11Error 原始字段名），而非误导性的 `window id`。
+        return capture_err(format!(
+            "bad_value {} ({:?}); request {}",
+            x11.bad_value,
+            x11.error_kind,
+            x11.request_name.unwrap_or("<unknown>")
+        ));
     }
     capture_err(e)
 }
@@ -327,9 +337,10 @@ mod tests {
         }
     }
 
-    /// 非 Drawable 类 X11 错误保持原样回吐，不做改写。
+    /// 非 Drawable 类 X11 错误（如 Window）也补一句可读上下文：通用 `bad_value`
+    /// 标签（bad_value 仅在 Window/Drawable 下才是窗口 ID）+ 错误类型 + 请求名。
     #[test]
-    fn non_drawable_error_falls_through() {
+    fn non_drawable_error_adds_context() {
         let mapped = capture_reply_err(x11rb::errors::ReplyError::X11Error(
             x11rb::x11_utils::X11Error {
                 error_kind: x11rb::protocol::ErrorKind::Window,
@@ -343,10 +354,57 @@ mod tests {
             },
         ));
         match mapped {
-            AgentShellError::Capture(msg) => assert!(
-                !msg.contains("is not a drawable window"),
-                "non-Drawable error must not be rewritten: {msg}"
-            ),
+            AgentShellError::Capture(msg) => {
+                assert!(
+                    msg.contains("bad_value 42"),
+                    "should label the bad value: {msg}"
+                );
+                assert!(msg.contains("Window"), "should name the error kind: {msg}");
+                assert!(
+                    msg.contains("GetGeometry"),
+                    "should name the request: {msg}"
+                );
+                assert!(
+                    !msg.contains("is not a drawable window"),
+                    "non-Drawable error must not use the Drawable hint: {msg}"
+                );
+                assert!(
+                    !msg.contains("window id"),
+                    "non-Drawable error must not claim a window id: {msg}"
+                );
+            }
+            other => panic!("expected Capture error, got {other:?}"),
+        }
+    }
+
+    /// `request_name: None` 时回退为 `<unknown>`；用 `Match` kind（Xvfb 无合成器
+    /// 截子窗口场景）覆盖回退文案，同时验证错误类型名不被吞。
+    #[test]
+    fn non_drawable_error_without_request_name_falls_back() {
+        let mapped = capture_reply_err(x11rb::errors::ReplyError::X11Error(
+            x11rb::x11_utils::X11Error {
+                error_kind: x11rb::protocol::ErrorKind::Match,
+                error_code: 8,
+                sequence: 1,
+                bad_value: 7,
+                minor_opcode: 0,
+                major_opcode: 14,
+                extension_name: None,
+                request_name: None,
+            },
+        ));
+        match mapped {
+            AgentShellError::Capture(msg) => {
+                assert!(
+                    msg.contains("bad_value 7"),
+                    "should label the bad value: {msg}"
+                );
+                assert!(msg.contains("Match"), "should name the error kind: {msg}");
+                assert!(
+                    msg.contains("request <unknown>"),
+                    "should fall back on missing request name: {msg}"
+                );
+            }
             other => panic!("expected Capture error, got {other:?}"),
         }
     }
