@@ -534,23 +534,33 @@ async fn windows_list(d: &mut Daemon, req: &Request) -> RpcResult {
         .iter()
         .filter(|w| filter_matches(w, matcher.as_ref()))
         .collect();
-    let items: Vec<Value> = filtered
-        .iter()
-        .map(|w| {
-            json!({
-                "native_id": w.id.native_id,
-                "title": w.title,
-                "app_id": w.app_id,
-                "pid": w.pid,
-                "x": w.geometry.x,
-                "y": w.geometry.y,
-                "width": w.geometry.width,
-                "height": w.geometry.height,
-                "workspace": w.workspace_id.as_ref().map(|ws| &ws.native_id),
-            })
-        })
-        .collect();
+    let items: Vec<Value> = filtered.iter().map(|w| window_entry_json(w)).collect();
     Ok(json!({ "windows": items, "from_cache": from_cache }))
+}
+
+/// `windows.list` 逐项投影：core [`WindowInfo`] → 协议 JSON。
+///
+/// 既有 9 字段（native_id/title/app_id/pid/x/y/width/height/workspace）之外
+/// 增补 stacking_order/states/window_type/keep_above，值形状与 `windows info`
+/// （`serde_json::to_value(&WindowInfo)`）一致——states/window_type 为
+/// PascalCase 串，避免批量消费方（`windows wait`、事件回放、外部脚本）
+/// 逐窗回查。抽为纯函数以脱离合成器单测投影契约。
+fn window_entry_json(w: &WindowInfo) -> Value {
+    json!({
+        "native_id": w.id.native_id,
+        "title": w.title,
+        "app_id": w.app_id,
+        "pid": w.pid,
+        "x": w.geometry.x,
+        "y": w.geometry.y,
+        "width": w.geometry.width,
+        "height": w.geometry.height,
+        "workspace": w.workspace_id.as_ref().map(|ws| &ws.native_id),
+        "stacking_order": w.stacking_order,
+        "states": w.states,
+        "window_type": w.window_type,
+        "keep_above": w.keep_above,
+    })
 }
 
 /// `windows.list` 过滤谓词：app_id 精确命中，或标题按给定模式命中。
@@ -1599,6 +1609,58 @@ mod tests {
             icon_geometry: None,
             keep_above: false,
         }
+    }
+
+    #[test]
+    fn window_entry_json_projects_nine_legacy_and_four_new_fields() {
+        use agent_shell_core::types::{
+            DesktopEnvironment, Rect, WindowId, WindowState, WindowType,
+        };
+        let w = WindowInfo {
+            id: WindowId {
+                native_id: "{e6f8-4a2c}".into(),
+                de_type: DesktopEnvironment::KDE,
+            },
+            title: "Editor".into(),
+            app_id: "org.kde.kate".into(),
+            pid: 4242,
+            geometry: Rect {
+                x: 10,
+                y: 20,
+                width: 800,
+                height: 600,
+            },
+            frame_geometry: Rect::default(),
+            states: vec![WindowState::Maximized, WindowState::FullScreen],
+            workspace_id: Some(agent_shell_core::types::WorkspaceId {
+                native_id: "1".into(),
+                de_type: DesktopEnvironment::KDE,
+            }),
+            monitor_id: None,
+            stacking_order: 3,
+            desktop_file: None,
+            window_type: WindowType::Dialog,
+            icon_geometry: None,
+            keep_above: true,
+        };
+        let v = window_entry_json(&w);
+
+        // 既有 9 字段保持原样。
+        assert_eq!(v["native_id"], "{e6f8-4a2c}");
+        assert_eq!(v["title"], "Editor");
+        assert_eq!(v["app_id"], "org.kde.kate");
+        assert_eq!(v["pid"], 4242);
+        assert_eq!(v["x"], 10);
+        assert_eq!(v["y"], 20);
+        assert_eq!(v["width"], 800);
+        assert_eq!(v["height"], 600);
+        assert_eq!(v["workspace"], "1");
+
+        // 新增 4 字段：值形状与 `windows info` 一致（states/window_type PascalCase）。
+        assert_eq!(v["stacking_order"], 3);
+        assert_eq!(v["states"], json!(["Maximized", "FullScreen"]));
+        assert_eq!(v["window_type"], "Dialog");
+        assert_eq!(v["keep_above"], true);
     }
 
     #[test]

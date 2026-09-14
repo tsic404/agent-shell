@@ -1201,6 +1201,10 @@ mod tests {
             width: None,
             height: None,
             workspace: None,
+            stacking_order: 0,
+            states: vec![],
+            window_type: "Normal".into(),
+            keep_above: false,
         }
     }
 }

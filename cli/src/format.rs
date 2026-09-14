@@ -42,6 +42,10 @@ pub fn windows_entries_json(wins: &[WindowEntry]) -> String {
                 "width": w.width,
                 "height": w.height,
                 "workspace": w.workspace,
+                "stacking_order": w.stacking_order,
+                "states": w.states,
+                "window_type": w.window_type,
+                "keep_above": w.keep_above,
             })
         })
         .collect();
@@ -72,6 +76,10 @@ mod tests {
             width: None,
             height: None,
             workspace: None,
+            stacking_order: 0,
+            states: vec![],
+            window_type: "Normal".into(),
+            keep_above: false,
         }
     }
 
@@ -104,6 +112,17 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&j).expect("valid json");
         assert_eq!(v[0]["id"], "abc-123");
         assert_eq!(v[0]["title"], "Editor — main.rs");
+    }
+
+    #[test]
+    fn json_includes_stacking_and_type_fields() {
+        // 新增字段恒在 JSON 输出中（后向兼容：旧 daemon 时落默认值）。
+        let j = windows_entries_json(&[sample("abc-123", "Editor")]);
+        let v: serde_json::Value = serde_json::from_str(&j).expect("valid json");
+        assert_eq!(v[0]["stacking_order"], 0);
+        assert_eq!(v[0]["states"], serde_json::json!([]));
+        assert_eq!(v[0]["window_type"], "Normal");
+        assert_eq!(v[0]["keep_above"], false);
     }
 
     #[test]

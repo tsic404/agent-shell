@@ -385,6 +385,10 @@ pub enum RpcErrorCode {
 ///
 /// `from_cache` 是查询结果级别的属性（整批命中缓存与否），不在逐项条目中
 /// 重复——由响应外层的 `from_cache` 字段携带，避免逐项冗余与契约漂移。
+///
+/// `stacking_order`/`states`/`window_type`/`keep_above` 为后增字段，均带
+/// `#[serde(default)]`：新 CLI 反序列化旧 daemon 的 9 字段条目时不得硬失败
+/// （daemon 常驻会话、postinst 升级不重启，混合版本同传一线上）。
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct WindowEntry {
     pub native_id: String,
@@ -403,6 +407,18 @@ pub struct WindowEntry {
     /// 工作区标识（§17.2 要求 windows.list 含 workspace）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace: Option<String>,
+    /// 层叠顺序（z-order，越大越靠上）。
+    #[serde(default)]
+    pub stacking_order: u32,
+    /// 窗口状态集合（多状态可共存；PascalCase 串，与 `windows info` 对齐）。
+    #[serde(default)]
+    pub states: Vec<String>,
+    /// 窗口类型（EWMH 归一化；PascalCase 串，与 `windows info` 对齐）。
+    #[serde(default)]
+    pub window_type: String,
+    /// 是否置顶（keep-above）。
+    #[serde(default)]
+    pub keep_above: bool,
 }
 
 /// windows.op 参数。
@@ -930,6 +946,56 @@ mod tests {
         let w: WindowEntry = serde_json::from_value(item).expect("de");
         assert_eq!(w.native_id, "0x1200009");
         assert_eq!(w.pid, 4242);
+    }
+
+    /// 旧 daemon 9 字段条目（无新增字段）反序列化：新字段落默认值，不硬失败。
+    #[test]
+    fn window_entry_defaults_new_fields_when_absent() {
+        let item = json!({
+            "native_id": "0x1200009",
+            "title": "Editor — main.rs",
+            "app_id": "org.kde.kate",
+            "pid": 4242,
+            "x": 0,
+            "y": 0,
+            "width": 800,
+            "height": 600,
+            "workspace": null
+        });
+        let w: WindowEntry = serde_json::from_value(item).expect("de");
+        assert_eq!(w.stacking_order, 0);
+        assert_eq!(w.states, Vec::<String>::new());
+        assert_eq!(w.window_type, "");
+        assert!(!w.keep_above);
+    }
+
+    /// 新 daemon 条目携带 4 个新增字段，反序列化后逐字段保留（值形状与
+    /// `windows info` 一致：states/window_type 为 PascalCase 串）。
+    #[test]
+    fn window_entry_deserializes_new_fields() {
+        let item = json!({
+            "native_id": "0x1200009",
+            "title": "Editor — main.rs",
+            "app_id": "org.kde.kate",
+            "pid": 4242,
+            "x": 10,
+            "y": 20,
+            "width": 800,
+            "height": 600,
+            "workspace": "1",
+            "stacking_order": 3,
+            "states": ["Maximized", "FullScreen"],
+            "window_type": "Normal",
+            "keep_above": true
+        });
+        let w: WindowEntry = serde_json::from_value(item).expect("de");
+        assert_eq!(w.stacking_order, 3);
+        assert_eq!(
+            w.states,
+            vec!["Maximized".to_string(), "FullScreen".to_string()]
+        );
+        assert_eq!(w.window_type, "Normal");
+        assert!(w.keep_above);
     }
 
     /// 响应外层 from_cache 仍可解析——它是查询结果级别字段，不属于逐项条目。
