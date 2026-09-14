@@ -1,18 +1,9 @@
 //! hyprland_* 私有协议生成绑定（设计文档 §9.4，`wayland.rs` 的协议层）。
 //!
-//! XML 取自上游 `hyprwm/hyprland-protocols`（MIT，vendored 于 `protocols/`），
-//! 经 `wayland-scanner` 过程宏在编译期生成客户端绑定——与
-//! `wayland-protocols-wlr` 对官方协议的处理方式一致，但 hyprland 协议未
-//! 收录进任何 wayland-protocols-* crate，只能本地生成。
-//!
-//! 绑定设计文档 §9.4 点名的四个通道：
-//!
-//! | 接口 | 版本 | 用途 |
-//! |------|:----:|------|
-//! | `hyprland_toplevel_export_manager_v1` | 2 | 窗口级内容捕获 |
-//! | `hyprland_focus_grab_manager_v1` | 1 | 输入焦点白名单限制 |
-//! | `hyprland_global_shortcuts_manager_v1` | 1 | 全局快捷键注册 |
-//! | `hyprland_toplevel_mapping_manager_v1` | 1 | toplevel → 窗口地址映射 |
+//! XML vendored 自 `hyprwm/hyprland-protocols`（MIT，`protocols/`），经
+//! `wayland-scanner` 过程宏编译期生成客户端绑定；hyprland 协议未收录进任何
+//! wayland-protocols-* crate，只能本地生成。绑定 §9.4 点名的四个通道：
+//! toplevel_export（窗口捕获）/ focus_grab / global_shortcuts / toplevel_mapping。
 
 #[allow(
     dead_code,

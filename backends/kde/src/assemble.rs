@@ -54,16 +54,10 @@ impl KdeBackend {
 
     /// 按装配矩阵初始化公共组件实例并返回 [`ComponentRegistry`]（§4.3）。
     ///
-    /// 装配清单（§3.3 KDE 行）：
-    /// - 合成器：KWin（Wayland org_kde_* / X11 EWMH+Scripting）
-    /// - 音频：PipeWire / PulseAudio 探测
-    /// - 网络：NetworkManager
-    /// - 输入 / 截图 / 无障碍 / 剪贴板：公共探测链
-    /// - 电源：KdePowerDevil 优先，回退 UPower
-    /// - 通知：freedesktop Notifications（KDE 即其实现）
-    /// - 外观：KdeAppearance（plasma-apply-* CLI）
-    /// - 启动器：KdeLauncher（.desktop + gio）
-    /// - 系统服务：Systemd + Logind
+    /// 装配清单见 §3.3 KDE 行：合成器 KWin（Wayland org_kde_* / X11 EWMH+Scripting）；
+    /// 音频/输入/截图/无障碍/剪贴板走公共探测链；电源 KdePowerDevil 优先回退 UPower；
+    /// 通知 freedesktop、外观 plasma-apply-* CLI、启动器 .desktop + gio；
+    /// 系统服务 Systemd + Logind。
     pub async fn assemble(&self) -> Result<ComponentRegistry> {
         // 1. 合成器：KWin（Wayland 优先，回退 X11）
         let compositor: Option<Box<dyn CompositorComponent>> = match self.session {

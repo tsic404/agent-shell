@@ -1,12 +1,9 @@
 //! DDE 版本探测与 20/25 服务名路由（设计文档 §10.4 `version.rs`、§21.36）。
 //!
-//! 探测策略（§21.36.4）：**不把版本假设写死**——按能力逐个探测服务名，
-//! 先试 DDE25 主名 `org.deepin.dde.*`，失败退 DDE20 名
-//! `com.deepin.daemon.*`。[`DdeVersion`] 只做两件事：
-//!
-//! 1. 汇总各服务族的探测命中结果，给出整体归类（Dde25 / Dde20 / Mixed /
-//!    Unknown）供 doctor 输出；
-//! 2. 为「DDE25 主名 + DDE20 别名并存」的服务族提供统一的候选名序。
+//! 探测策略（§21.36.4）：不把版本假设写死——按能力逐个探测服务名，先试 DDE25
+//! 主名 `org.deepin.dde.*`、失败退 DDE20 名 `com.deepin.daemon.*`。[`DdeVersion`]
+//! 汇总各服务族命中结果给出整体归类（Dde25/Dde20/Mixed/Unknown）供 doctor 输出，
+//! 并为「DDE25 主名 + DDE20 别名并存」的服务族提供统一候选名序。
 
 use serde::{Deserialize, Serialize};
 

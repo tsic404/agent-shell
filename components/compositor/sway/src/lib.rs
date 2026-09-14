@@ -1,17 +1,10 @@
-//! SwayCompositor（`mod.rs`，设计 02-architecture §3.2–§4.3 / fallback.md §11.1）。
+//! SwayCompositor（设计 §3.3 继承层次、§11.1 兜底）。
 //!
-//! 继承层次：`CompositorComponent → WaylandCompositor → WlrWaylandCompositor
-//! → SwayCompositor`——wlr 标准协议的绑定与操作全部复用基类
-//! [`WlrWaylandCompositor`]（本 crate 不重复绑定任何 wlr global），
-//! 叠加 Sway IPC 补充通道：
-//!
-//! - 窗口列表 / 几何查询：GET_TREE（hyprctl clients -j 的对位物）
-//! - dispatch 操作：聚焦/移动/缩放/关闭/最大化（RUN_COMMAND）
-//! - 工作区：GET_WORKSPACES 列举 + RUN_COMMAND 切换
-//! - 监视器：GET_OUTPUTS
-//! - 事件流：SUBSCRIBE 长连接（[`crate::event`]，事件驱动窗口缓存）
-//!
-//! 非 Sway 会话下 IPC 连接失败返回 [`AgentShellError::BackendUnavailable`]。
+//! 继承层次：CompositorComponent → WaylandCompositor → WlrWaylandCompositor →
+//! SwayCompositor——wlr 标准协议全部复用基类 [`WlrWaylandCompositor`]，本 crate 只
+//! 叠加 Sway IPC：窗口列表/几何（GET_TREE）、dispatch（RUN_COMMAND）、工作区
+//! （GET_WORKSPACES）、监视器（GET_OUTPUTS）、事件流（SUBSCRIBE 长连接，
+//! [`crate::event`]）。非 Sway 会话 IPC 连接失败返回 BackendUnavailable。
 
 mod event;
 mod ipc;

@@ -1,12 +1,8 @@
 //! 应用启动器组件（设计文档 §21.3 应用启动、§21.4 LauncherComponent）。
 //!
-//! 公共路径：
-//! - `.desktop` 解析：扫描 `/usr/share/applications/` + `~/.local/share/applications/`
-//!   （§21.3 跨 DE 通用），`list_installed_apps` 至少覆盖系统目录全量。
-//! - 启动：`gio launch <desktop-file>`（GLib ≥2.76 支持 `--activation-token`，
-//!   Wayland 聚焦走 XDG activation，§21.28/§21.36）。
-//! - URI：portal `org.freedesktop.portal.OpenURI.OpenURI`（KDE/GNOME/DDE ✓）；
-//!   portal 不可达时回退 `gio open` / `xdg-open`。
+//! 公共路径：`.desktop` 解析（扫 `/usr/share/applications/` + `~/.local/share/applications/`）；
+//! 启动 `gio launch`（GLib ≥2.76 支持 activation-token，Wayland 走 XDG activation）；
+//! URI 走 portal OpenURI，不可达回退 `gio open` / `xdg-open`。
 
 use agent_shell_core::component::{
     ComponentHealth, ComponentType, DesktopComponent, LauncherComponent,

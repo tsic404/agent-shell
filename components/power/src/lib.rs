@@ -1,14 +1,10 @@
 //! 电源组件（设计文档 §21.3 电源与会话、§21.4 PowerComponent）。
 //!
-//! 公共封装：`org.freedesktop.login1`（system bus，挂起/休眠/关机）
-//! 与 `org.freedesktop.UPower`（system bus，电池状态）。
-//!
-//! DE 专有封装（KdePowerDevil / DdePower / GnomePower）位于 `backends/`，
-//! 通过 [`DePriorityRouter`] 按「DE 封装优先 → 公共降级」路由。
-//!
-//! 安全分级（§21.21）：`lock_screen`/`suspend`/`hibernate`/`power_off` 属 L4——
-//! 调用方必须先取得用户确认；D-Bus 层再经 polkit 授权
-//! （login1 `interactive=true` 触发 polkit 交互授权）。
+//! 公共封装：`org.freedesktop.login1`（挂起/休眠/关机）与 `org.freedesktop.UPower`
+//! （电池状态）。DE 专有封装（KdePowerDevil/DdePower/GnomePower）位于 backends/，
+//! 经 [`DePriorityRouter`] 按「DE 封装优先 → 公共降级」路由。安全分级（§21.21）：
+//! lock/suspend/hibernate/power_off 属 L4——调用方须先取得用户确认，D-Bus 层再经
+//! polkit 授权。
 
 pub mod router;
 use agent_shell_core::component::{

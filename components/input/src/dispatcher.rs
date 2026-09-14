@@ -1,23 +1,11 @@
 //! `InputService` trait 与 `InputDispatcher`（设计文档 §12.2）。
 //!
-//! 降级链构造顺序（§12.1/§12.2）：
-//! libei（Wayland 首选，非 X11 会话压入）→ ydotool（跨 DE 保底，需
-//! `ydotool` 可执行且 `/dev/uinput` 存在）→ XTest（仅原生 X11，连接成功
-//! 才压入）→ xdotool（`DISPLAY` 存在即压入：原生 X11 或 XWayland 会话，
-//! 且可执行存在）。随后取第一个
-//! `is_available() == true` 的后端为 `active`；全部不可用则 `active = None`
-//! （调用返回错误，不 panic）。
-//!
-//! **操作期降级**（§12.2）：libei 的 `is_available` 仅验证 portal 在场、
-//! 不建立会话（授权弹窗延迟到首次注入），因此构造期选中 libei 不保证注入
-//! 成功。dispatcher 先经 `ensure_ready` 建立通道并校验所需能力——libei 会话
-//! 建立失败（`AccessDenied: Invalid session`）或能力缺失（门户仅授权 pointer
-//! 而缺 keyboard/scroll 等）即摘除并回落下一候选（ydotool/xdotool），且不重复
-//! 弹窗重试同一后端；通道就绪后注入一次，注入期错误直接返回调用方、不降级
-//! 重放（避免已注入部分事件后回落造成的重复键击/点击/文本）。
-//!
-//! 超时/重试（§19）：input 注入超时 1s、重试 3 次——由各后端的命令执行层
-//! 统一施加（[`super::ydotool`] / [`super::xdotool`]），dispatcher 不重复包装。
+//! 降级链构造顺序（§12.1/§12.2）：libei（Wayland 首选）→ ydotool（需 /dev/uinput）→
+//! XTest（仅原生 X11）→ xdotool（`DISPLAY` 存在即压入）；取第一个 `is_available()` 者
+//! 为 active，全不可用则 active=None（返回错误、不 panic）。
+//! **操作期降级**：libei 的 is_available 仅验证 portal 在场、会话延迟到首次注入
+//! （`ensure_ready`），建立失败或能力缺失即摘除回落且不重复弹窗；注入期错误直接返回、
+//! 不降级重放。超时/重试（§19）由各后端命令执行层统一施加。
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;

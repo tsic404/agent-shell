@@ -436,13 +436,11 @@ impl EventHub {
 
     /// 发布事件到所有订阅者（异步：高优先级事件保证送达）。
     ///
-    /// 背压策略（对应设计文档 §18.4「丢弃低优先级事件」）：
-    /// - `High` 事件：通道满时等待空闲槽位，保证窗口开关/聚焦等关键事件必达；
-    /// - `Medium`/`Low` 事件：通道满时 `try_send` 失败即丢弃，不阻塞发布者。
+    /// 背压（§18.4「丢弃低优先级事件」）：`High` 通道满时等待空闲槽位（关键事件必达）；
+    /// `Medium`/`Low` 通道满时 `try_send` 失败即丢弃，不阻塞发布者。
     ///
-    /// 并发契约：锁内仅快照订阅者（clone `(Sender, EventFilter)`），立即释放锁后
-    /// 在锁外遍历投递——消费者回调中调用 `unsubscribe` 不会与发布者互等死锁，
-    /// 单个慢订阅者也不会阻塞其他订阅者的投递或订阅管理。
+    /// 并发契约：锁内仅快照订阅者（clone `(Sender, EventFilter)`）、锁外遍历投递——
+    /// 消费者回调中 `unsubscribe` 不会与发布者互等死锁，慢订阅者也不阻塞他人。
     pub async fn publish(&self, event: DesktopEvent) {
         // 快照：锁内 clone，出作用域即释放锁；投递全程无锁。
         let snapshot: Vec<(mpsc::Sender<DesktopEvent>, EventFilter)> = self

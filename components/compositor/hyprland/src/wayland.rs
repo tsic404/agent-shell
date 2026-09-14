@@ -1,21 +1,10 @@
-//! Wayland 协议通道（设计文档 §9.4）：wlr 标准协议（基类已绑）+
-//! hyprland_* 私有协议客户端。
+//! Wayland 协议通道（设计文档 §9.4）：wlr 标准协议（基类已绑）+ hyprland_* 私有协议。
 //!
-//! 在共享的 [`WlrWaylandCompositor`] 基类连接之上绑定 Hyprland 私有协议
-//! 族（XML vendored 自 `hyprwm/hyprland-protocols`，经 wayland-scanner
-//! 生成，见 [`crate::protocol_gen`]）：
-//!
-//! | 协议 | 版本 | 用途 |
-//! |------|:----:|------|
-//! | `hyprland_toplevel_export_manager_v1` | 2 | 窗口级内容捕获 |
-//! | `hyprland_focus_grab_manager_v1` | 1 | 输入焦点白名单限制 |
-//! | `hyprland_global_shortcuts_manager_v1` | 1 | 全局快捷键注册 |
-//! | `hyprland_toplevel_mapping_manager_v1` | 1 | toplevel → 窗口地址映射 |
-//!
-//! 绑定策略与 wlr 基类一致：任一私有协议缺失/版本过低不致命——字段为
-//! `None` 并记入 `bind_failures`（doctor 报告），能力按 §9.5 选择矩阵
-//! 回退 hyprctl。事件在本层不消费（inert dispatch）；窗口管理走基类的
-//! wlr-foreign-toplevel，本模块只负责私有通道的存在性与生命周期。
+//! 在共享的 [`WlrWaylandCompositor`] 基类连接上绑定 Hyprland 私有协议族（XML
+//! vendored 自 `hyprwm/hyprland-protocols`，经 wayland-scanner 生成，见
+//! [`crate::protocol_gen`]）。绑定策略与 wlr 基类一致：任一私有协议缺失/版本过低
+//! 不致命——字段为 `None` 并记入 `bind_failures`（doctor 报告），能力按 §9.5
+//! 选择矩阵回退 hyprctl；事件本层不消费（inert dispatch）。
 
 use wayland_client::protocol::wl_registry::WlRegistry;
 use wayland_client::{Connection, Dispatch, QueueHandle};

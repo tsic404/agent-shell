@@ -133,15 +133,12 @@ impl EventHub {
 
     /// 发布事件到所有订阅者（fan-out）。
     ///
-    /// 并发契约：锁内仅快照订阅者（clone `(Sender, EventFilter)`），立即释放锁后
-    /// 在锁外投递——消费者在处理回调中调用 [`EventHub::unsubscribe`] 不会与
-    /// 发布者互等死锁。
+    /// 并发契约：锁内仅快照订阅者（clone `(Sender, EventFilter)`）、锁外投递——
+    /// 消费者回调中 [`EventHub::unsubscribe`] 不会与发布者互等死锁。
     ///
-    /// 背压策略（审查问题 3 修复）：
-    /// - `High` 事件：每个匹配订阅者并发 `tokio::spawn` 投递，单次等待上限
-    ///   [`HIGH_SEND_TIMEOUT`]——停滞订阅者超时后降级丢弃并告警计数，
-    ///   不阻塞发布者，也不队头阻塞其他订阅者的任何优先级投递；
-    /// - `Medium`/`Low` 事件：通道满即丢弃（try_send），不阻塞发布者。
+    /// 背压策略：`High` 事件每个匹配订阅者并发 `tokio::spawn` 投递、单次等待上限
+    /// [`HIGH_SEND_TIMEOUT`]，停滞订阅者超时降级丢弃并告警计数；发布者等待全部投递
+    /// 任务完成、可能因停滞订阅者被阻塞至超时。`Medium`/`Low` 通道满即丢弃（try_send）。
     pub async fn publish(&self, event: DesktopEvent) {
         let snapshot: Vec<(mpsc::Sender<DesktopEvent>, EventFilter)> =
             self.inner.subscribers.lock().values().cloned().collect();

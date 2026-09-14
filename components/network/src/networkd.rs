@@ -1,13 +1,9 @@
 //! systemd-networkd 只读降级组件。
 //!
-//! design/02 §4.2：`org.freedesktop.NetworkManager` 不在位且环境为
-//! networkd-only（服务器/最小安装/TTY）时，网络管理降级为**只读状态查询**；
-//! 写操作（连接/断开 WiFi）明确返回 `Unavailable`，不 panic、不静默成功
-//! （§21 验收「无 NM 环境降级到只读或明确 Unavailable」）。
-//!
-//! 数据源：
-//! - `networkctl` CLI（若在位）——仅用于 health 探测与链路枚举的旁证；
-//! - `/run/systemd/netif/state` 与 `/sys/class/net`——无外部依赖的直读通道。
+//! NM 不在位且环境为 networkd-only（服务器/最小安装/TTY）时，网络管理降级为只读
+//! 状态查询；写操作明确返回 Unavailable，不 panic、不静默成功（§21 验收）。数据源：
+//! `networkctl` CLI（health/链路枚举旁证）与 `/run/systemd/netif/state`、`/sys/class/net`
+//! 直读通道。
 
 use std::path::PathBuf;
 

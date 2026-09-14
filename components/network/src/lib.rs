@@ -1,17 +1,9 @@
 //! 网络组件 crate（设计文档 §21 `components/network/`）。
 //!
-//! 提供 [`NetworkComponent`](agent_shell_core::component::NetworkComponent)
-//! 的公共实现与探测装配：
-//!
-//! - [`networkmanager::NetworkManagerComponent`]：`org.freedesktop.NetworkManager`
-//!   （system bus）标准 D-Bus 接口——跨 DE 首选。
-//! - [`networkd::SystemdNetworkdComponent`]：`systemd-networkd` 环境的只读降级
-//!   （状态查询 + 明确 Unavailable 写操作），不 panic（§21 验收）。
-//! - [`detect()`]：探测顺序 `org.freedesktop.NetworkManager` 在位 → NM，
-//!   否则 networkd-only → 只读组件，否则 None。
-//!
-//! DDE 专有封装（DDE25 dde-network-core + NM / DDE20 `com.deepin.daemon.Network`）
-//! 归属 backend 装配层；两版差异见设计文档 §21.36.1。
+//! 提供 [`NetworkComponent`](agent_shell_core::component::NetworkComponent) 的公共实现
+//! 与探测装配：networkmanager（system bus 标准 D-Bus，跨 DE 首选）、networkd（只读
+//! 降级、写操作明确 Unavailable）、[`detect()`]（NM 在位 → NM，否则 networkd-only →
+//! 只读，否则 None）。DDE 专有封装归属 backend 装配层，版本差异见 §21.36.1。
 
 pub mod networkd;
 pub mod networkmanager;

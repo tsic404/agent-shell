@@ -1,18 +1,10 @@
 //! GNOME Shell Extension 安装/启用/状态管理（§8.1「安装流程落盘后启用」）。
 //!
-//! `extension.js` 与 `metadata.json` 由本 crate 内嵌交付（`include_str!`
-//! 单一事实来源），本模块负责把它们落盘到用户扩展目录、标记 user-enabled、
-//! 查询与卸载。安装是用户级操作（无 root）：
-//!
-//! - 落盘：`<data-home>/gnome-shell/extensions/agent-shell-bridge@tsic.top/`
-//!   （`$XDG_DATA_HOME` 优先，回退 `$HOME/.local/share`）；打包形态还会
-//!   部署到 `/usr/share/gnome-shell/extensions/`（系统级），两处均视为已安装。
-//! - 启用：`gnome-extensions enable`（canonical，含 shell 刷新通知），
-//!   缺失时 dconf 兜底写 `org/gnome/shell/enabled-extensions`。
-//!
-//! 纯路径/文件/解析辅助为可单测的纯函数（不依赖真实 GNOME 会话）；启用/
-//! 状态查询经外部命令（`gnome-extensions` / `dconf`），仅在有 GNOME 会话的
-//! 主机上产生真值，CI/无 GNOME 环境如实报 `false`。
+//! `extension.js` 与 `metadata.json` 由本 crate 内嵌交付，本模块负责落盘到用户扩展
+//! 目录（`$XDG_DATA_HOME` 优先，回退 `$HOME/.local/share`；打包形态另有系统级
+//! `/usr/share/...`）、标记 user-enabled、查询与卸载。启用走 `gnome-extensions enable`
+//! （缺失时 dconf 兜底）。纯路径/解析辅助为可单测纯函数；启用/状态查询经外部命令，
+//! 仅在真实 GNOME 会话产生真值，CI 环境如实报 false。
 
 use crate::error::EXTENSION_ID;
 use crate::extension::{EXTENSION_JS, EXTENSION_METADATA};

@@ -1,12 +1,9 @@
 //! hyprctl socket IPC 通道（设计文档 §9.2）。
 //!
-//! Hyprland 同步求值：每个请求「连接即开即关」——写完命令立即 shutdown
-//! 写端再读完整响应，绝不复用长连接（长连不关会让 compositor 等待 EOF
-//! 而阻塞整个会话）。
-//!
-//! 响应形态：`-j` 后缀命令返回 JSON；`dispatch ...`/`/keyword` 返回 `ok`
-//! 纯文本。[`Hyprctl::request`] 只负责 JSON 形态，非 JSON 应答经
-//! [`Hyprctl::request_raw`]。
+//! 同步求值：每个请求「连接即开即关」——写完命令立即 shutdown 写端再读完整响应，
+//! 绝不复用长连接（长连不关会让 compositor 等 EOF 阻塞整个会话）。`-j` 后缀返回
+//! JSON，`dispatch ...`/`/keyword` 返回 `ok` 纯文本；[`Hyprctl::request`] 只负责
+//! JSON 形态，非 JSON 应答经 [`Hyprctl::request_raw`]。
 
 use std::path::{Path, PathBuf};
 

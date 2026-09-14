@@ -1,12 +1,9 @@
 //! org.gnome.Shell.Eval 路径（设计文档 §8.1 路径 A / §8.2，GNOME <47）。
 //!
-//! Eval 即 `gdbus call -e -d org.gnome.Shell -o /org/gnome/Shell
-//! -m org.gnome.Shell.Eval '<js>'`：在 Shell 进程内执行 JS，返回
-//! `(success: bool, result: s)`——result 是 `JSON.stringify(...)` 的
-//! 字符串（外层再包一层引号，zbus 反序列化后即裸 JSON 文本）。
-//!
-//! 限制：GNOME 41+ 默认禁用（unsafe-mode），47+ 收紧为不可开启；
-//! 本模块不代改用户设置，探测失败由上层降级到 Extension。
+//! Eval 在 Shell 进程内执行 JS，返回 `(success: bool, result: s)`，result 是
+//! `JSON.stringify(...)` 字符串（zbus 反序列化后即裸 JSON 文本）。限制：GNOME 41+
+//! 默认禁用（unsafe-mode）、47+ 收紧为不可开启；本模块不改用户设置，探测失败由
+//! 上层降级到 Extension。
 
 use serde_json::Value;
 use zbus::Connection;

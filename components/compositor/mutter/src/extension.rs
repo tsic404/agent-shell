@@ -1,12 +1,9 @@
 //! Shell Extension 路径（设计文档 §8.1 路径 B / §8.4，GNOME 47+ 推荐）。
 //!
-//! GNOME Shell Extension `agent-shell-bridge@tsic.top` 在 session bus
-//! 注册 `org.gnome.Shell.AgentShell` 接口（XML 定义见 §8.1）。Rust 端
-//! 只做客户端：调用方法、订阅信号。extension.js 本体由本 crate 内嵌
-//! 常量交付（单一事实来源），安装流程落盘后启用。
-//!
-//! 信号语义：`WindowOpened(s info)` / `WindowClosed(u window_id)` /
-//! `ActiveWindowChanged(s info)`——info 为与 ListWindows 单窗相同的 JSON。
+//! Extension `agent-shell-bridge@tsic.top` 在 session bus 注册
+//! `org.gnome.Shell.AgentShell` 接口，Rust 端只做客户端（调方法、订阅信号）；
+//! extension.js 由本 crate 内嵌交付（单一事实来源）。信号语义见 §8.1：
+//! WindowOpened / WindowClosed / ActiveWindowChanged，info 为单窗 JSON。
 
 use serde_json::Value;
 use zbus::{Connection, MessageStream};

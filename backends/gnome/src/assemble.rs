@@ -47,17 +47,11 @@ impl GnomeBackend {
         Self { session }
     }
 
-    /// 装配清单（§3.3 GNOME 行）：
-    /// - 合成器：MutterCompositor（D-Bus Eval/Extension，两会话均用；
-    ///   Wayland 会话额外组合 WaylandDisplayServer 基类通道）
-    /// - 音频：公共探测链（GNOME 无 DE 层音量 D-Bus，§3.5）
-    /// - 网络：NetworkManager
-    /// - 输入 / 截图 / 无障碍 / 剪贴板：公共探测链
-    /// - 电源：GnomePower（gsd.Power），回退 UPower
-    /// - 通知：freedesktop Notifications
-    /// - 外观：GnomeAppearance（gsettings）
-    /// - 启动器：GnomeLauncher（.desktop + gio）
-    /// - 系统服务：Systemd + Logind
+    /// 装配清单见 §3.3 GNOME 行：合成器 MutterCompositor（Eval/Extension 双路径，
+    /// Wayland 额外组合 WaylandDisplayServer）；音频/输入/截图/无障碍/剪贴板走
+    /// 公共探测链（GNOME 无 DE 层音量 D-Bus，§3.5）；网络 NetworkManager；
+    /// 电源 GnomePower（gsd.Power）回退 UPower；通知 freedesktop；外观 gsettings；
+    /// 启动器 .desktop + gio；系统服务 Systemd + Logind。
     pub async fn assemble(&self) -> Result<ComponentRegistry> {
         // 1. 合成器：MutterCompositor（Eval/Extension 双路径；Wayland 会话
         //    额外组合 WaylandDisplayServer 基类通道，落地 WaylandCompositor

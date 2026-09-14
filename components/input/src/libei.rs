@@ -1,21 +1,10 @@
 //! libei/EIS 后端（设计文档 §12.3）。
 //!
-//! 通过 `xdg-desktop-portal.RemoteDesktop` 获取 EIS 连接 fd，再用纯 Rust
-//! EI 客户端实现 [`reis`] 建立 EI 协议连接并注入：
-//!
-//! ```text
-//! 1. portal.CreateSession        → session handle
-//! 2. portal.SelectDevices        → KEYBOARD | POINTER
-//! 3. portal.Start                → 用户确认弹窗（常驻 daemon 持有，见 §21.22）
-//! 4. portal.ConnectToEIS         → socket fd
-//! 5. reis ei handshake           → EI 协议连接（Sender 角色）
-//! 6. seat.bind + device 注入     → 键盘/指针事件
-//! ```
-//!
-//! 会话授权弹窗意味着：本后端的 `new()` 只做「session bus + portal 服务
-//! 存在」的轻探测；完整会话建立延迟到首次注入（`ensure_connected`），且
-//! 连接由实例持有、跨调用复用——与 §21.22 PortalSessionManager「daemon
-//! 持有会话、避免 CLI 瞬态进程反复弹窗」的原则一致。
+//! 通过 `xdg-desktop-portal.RemoteDesktop` 获取 EIS fd，再用纯 Rust EI 客户端建立
+//! 协议连接并注入（CreateSession → SelectDevices → Start 弹窗 → ConnectToEIS → 注入）。
+//! 会话授权弹窗意味着 `new()` 只做轻探测；完整会话建立延迟到首次注入
+//! （`ensure_connected`）且连接由实例持有复用——与 §21.22「daemon 持有会话、避免
+//! CLI 瞬态进程反复弹窗」一致。
 
 use std::collections::HashMap;
 use std::sync::Arc;

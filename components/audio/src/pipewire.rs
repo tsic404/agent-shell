@@ -1,14 +1,9 @@
-//! PipeWire 音频服务器（wpctl CLI 通道）。
+//! PipeWire 音频服务器（wpctl CLI 通道，design §21.3「跨 DE CLI」行）。
 //!
 //! PipeWire 自身无公共 D-Bus 控制接口；会话管理（音量/默认设备）由 WirePlumber
-//! 承担，其稳定控制面是 `wpctl` CLI（design/13 §21.3「跨 DE CLI」行）。
-//!
-//! 通道选择：`get_volume` 等查询走 `wpctl get-volume` / `wpctl status`；
-//! 写操作走 `wpctl set-volume @DEFAULT_AUDIO_SINK@ <v>`。全部命令在
-//! `PIPEWIRE_RUNTIME_DIR`/XDG 运行时缺失时返回结构化 [`BackendUnavailable`]，
-//! 不 panic（§21 验收：降级明确）。
-//!
-//! [`BackendUnavailable`]: agent_shell_core::error::AgentShellError::BackendUnavailable
+//! 承担，稳定控制面是 `wpctl` CLI。查询走 `wpctl get-volume` / `wpctl status`，
+//! 写操作走 `wpctl set-volume @DEFAULT_AUDIO_SINK@ <v>`。运行时环境缺失时返回
+//! 结构化 BackendUnavailable，不 panic（§21 验收：降级明确）。
 
 use std::sync::atomic::{AtomicU8, Ordering};
 

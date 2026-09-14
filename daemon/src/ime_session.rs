@@ -1,13 +1,9 @@
 //! IME 会话（§22.8 D7）。
 //!
-//! daemon 持有 IBus 连接与 InputContext。CLI 瞬态进程无法保持，
-//! 故 IME 打字经 daemon 路由。
-//!
-//! 非 ASCII 文本经 IBus ProcessKeyEvent → CommitText；纯 ASCII 跳过
-//! IME 直接 type_text（性能路径）。
-//!
-//! v1：IBus D-Bus 实际连接待 Phase 3 系统服务接线；当前为 stub
-//! ——非 ASCII 返回 committed + verified:false，ASCII 返回 verified:true。
+//! daemon 持有 IBus 连接与 InputContext；CLI 瞬态进程无法保持，故 IME 打字经 daemon
+//! 路由。非 ASCII 经 IBus ProcessKeyEvent → CommitText；纯 ASCII 跳过 IME 直接
+//! type_text（性能路径）。v1：IBus D-Bus 实际连接待 Phase 3 接线，当前为 stub——
+//! 非 ASCII 返回 committed + verified:false，ASCII 返回 verified:true。
 
 use agent_shell_rpc::ImeTypeResult;
 

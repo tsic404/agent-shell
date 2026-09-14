@@ -1,21 +1,11 @@
 //! treeland_* 私有协议生成绑定（设计文档 §10.3，`treeland.rs` 的协议层）。
 //!
-//! XML 取自上游 `linuxdeepin/treeland-protocols`（MIT，vendored 于
-//! `protocols/`），经 `wayland-scanner` 过程宏在编译期生成客户端绑定——
-//! 与 `wayland-protocols-plasma`/`wayland-protocols-wlr` 对官方协议的
-//! 处理方式一致，但 treeland 协议未收录进这两个 crate，只能本地生成。
+//! XML vendored 自 `linuxdeepin/treeland-protocols`（MIT，`protocols/`），经
+//! `wayland-scanner` 过程宏编译期生成客户端绑定；treeland 协议未收录进任何
+//! wayland-protocols-* crate，只能本地生成。
 //!
-//! ⚠️ 上游声明（XML description 原文）：treeland 协议为 **EXPERIMENTAL**，
-//! 接口名/请求/事件可能在不升 major version 的情况下变更。本模块只绑定
-//! 设计文档 §10.3 点名的两个通道：
-//!
-//! | 接口 | 版本 | 用途 |
-//! |------|:----:|------|
-//! | `treeland_foreign_toplevel_manager_v1` | 2 | 窗口管理：activate / close / set(unset)_maximized / set(unset)_minimized / set_fullscreen / set_rectangle |
-//! | `treeland_window_management_v1` | 1 | 桌面状态：normal / show / preview_show |
-//!
-//! 生成代码的请求方法**不带 QueueHandle**（scanner 0.31 风格：请求无
-//! 回执事件时不要求句柄）；事件消费由 `treeland.rs` 的派发状态实现。
+//! 上游声明协议为 EXPERIMENTAL（接口可能不升 major 就变更），故只绑定 §10.3
+//! 点名的两个通道；生成请求不带 QueueHandle，事件由 `treeland.rs` 派发状态消费。
 
 #[allow(
     dead_code,

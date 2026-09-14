@@ -1,13 +1,9 @@
 //! 剪贴板组件（设计文档 §21.3 剪贴板、§21.4 ClipboardComponent）。
 //!
-//! 路由（§3.1 剪贴板行）：Wayland 会话 → `wl-copy`/`wl-paste`；
-//! X11 会话 → `xclip -selection clipboard`（`xsel -b` 备选）。
-//!
-//! portal `org.freedesktop.portal.Clipboard` 为会话绑定流式接口
-//! （RequestClipboard → fd），KDE/GNOME ✓、DDE/Hyprland ✗，适合常驻
-//! 同步场景；本组件的按需读写走 CLI 工具路径，portal 通道由后续
-//! 常驻同步任务接入。DDE `org.deepin.dde.Clipboard1` 是历史记录管理器，
-//! 非标准内容通道，不在此使用。
+//! 路由（§3.1 剪贴板行）：Wayland → `wl-copy`/`wl-paste`；X11 → `xclip`（`xsel -b`
+//! 备选）。portal Clipboard 为会话绑定流式接口（KDE/GNOME ✓、DDE/Hyprland ✗），
+//! 适合常驻同步场景；本组件按需读写走 CLI，portal 由后续常驻同步任务接入。
+//! DDE `org.deepin.dde.Clipboard1` 是历史记录管理器、非内容通道，不在此使用。
 
 use agent_shell_core::component::{
     ClipboardComponent, ComponentHealth, ComponentType, DesktopComponent,

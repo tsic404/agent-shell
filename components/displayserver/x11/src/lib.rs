@@ -1,12 +1,8 @@
 //! X11 显示服务器协议层（设计文档 §6）。
 //!
-//! [`X11DisplayServer`] 提供 x11rb 连接管理、EWMH 原子缓存（[`ewmh`]）、
-//! ICCCM 协议操作（[`icccm`]：`WM_PROTOCOLS`/`WM_DELETE_WINDOW`/`WM_STATE`）
-//! 与 `_NET_WM` 协议操作。不实现 `CompositorComponent`——各 X11 会话合成器
-//! （KWin/Mutter/DDE/通用兜底）在其上追加 D-Bus 接口。
-//!
-//! XTest 注意（§6.3）：仅在原生 X11 会话（`XDG_SESSION_TYPE=X11`）下可用；
-//! XWayland 下被禁用，输入注入应走 libei/EIS（T2a）。
+//! [`X11DisplayServer`] 提供 x11rb 连接管理、EWMH 原子缓存（[`ewmh`]）、ICCCM 协议
+//! 操作（[`icccm`]）与 `_NET_WM` 操作；不实现 CompositorComponent——各 X11 会话合成器
+//! 在其上追加 D-Bus 接口。XTest 注意（§6.3）：仅原生 X11 可用，XWayland 下禁用。
 pub mod ewmh;
 pub mod icccm;
 

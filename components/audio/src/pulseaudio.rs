@@ -1,15 +1,9 @@
 //! PulseAudio 协议音频服务器（`org.pulseaudio.Server` D-Bus + pactl CLI 双通道）。
 //!
-//! design/13 §21.3 音频表「跨 DE」两行：
-//!
-//! - D-Bus：session bus `org.pulseaudio.Server`，路径 `/org/pulseaudio/server_lookup1`
-//!   定位连接——该接口只暴露连接查找与少量查询；音量写入方法
-//!   (`SetSinkVolumeIndex`) 需要核心协议连接，普通总线客户端不可达。
-//! - CLI：`pactl`（`@DEFAULT_SINK@` 别名）是唯一跨 PipeWire-pulse / 原生
-//!   PulseAudio 都稳定的写路径（design/13 §21.36.4「不假定单一通道」）。
-//!
-//! 因此实现为：**读走 D-Bus 属性探测 + pactl 查询，写走 pactl**。D-Bus 服务在
-//! 与 §21.7 路由示例的降级语义一致。
+//! D-Bus 接口只暴露连接查找与少量查询，音量写入（SetSinkVolumeIndex）需核心协议
+//! 连接、普通总线客户端不可达；`pactl`（`@DEFAULT_SINK@` 别名）是跨 PipeWire-pulse /
+//! 原生 PulseAudio 都稳定的写路径（design §21.36.4「不假定单一通道」）。故实现为
+//! **读走 D-Bus 属性探测 + pactl 查询，写走 pactl**，与 §21.7 降级语义一致。
 
 use std::sync::atomic::{AtomicU8, Ordering};
 

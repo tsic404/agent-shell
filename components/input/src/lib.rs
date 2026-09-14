@@ -1,17 +1,9 @@
 //! 输入组件（设计文档 §12 输入子系统、§3.1 输入服务行）。
 //!
-//! [`InputDispatcher`] 按降级链探测并选择注入后端：
-//!
-//! ```text
-//! 首选 libei   ──► libei (EIS)  ──► compositor (Wayland 原生)
-//! 降级 ydotool ──► ydotool      ──► /dev/uinput ──► 内核
-//! X11 原生     ──► XTest 扩展   ──► x11rb::xtest_fake_input（仅原生 X11 会话）
-//! 再降级       ──► xdotool      ──► XTest（仅保底）
-//! ```
-//!
-//! 装配（§4.2）：`let input = InputComponentHandle::detect(de).await?;`
-//! 结果放入 `ComponentRegistry.input`。TTY 环境探测不到任何后端时
-//! dispatcher `active = None`，对外方法返回 `BackendUnavailable` 错误而非 panic。
+//! [`InputDispatcher`] 按降级链探测并选择注入后端：首选 libei（EIS）→ ydotool
+//! （/dev/uinput）→ XTest（仅原生 X11）→ xdotool（保底），降级链见 §12.1。装配
+//! （§4.2）结果放入 `ComponentRegistry.input`；TTY 环境探测不到任何后端时
+//! `active = None`，对外方法返回 BackendUnavailable 而非 panic。
 mod dispatcher;
 pub(crate) mod keymap;
 mod libei;

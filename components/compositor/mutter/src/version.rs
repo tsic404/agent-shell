@@ -1,12 +1,8 @@
 //! GNOME Shell 版本探测（设计文档 §8.4 `version.rs`）。
 //!
-//! 探测路径：`org.gnome.Shell` 根对象的 `ShellVersion` 只读属性（§3.5：
-//! 版本稳定，与 Eval 无关、始终可读）。解析失败时回退环境变量
-//! `GNOME_SHELL_VERSION`（测试注入用），再失败按 47+ 处理——47+ 是
-//! 当前主流，Extension 路径是推荐生产路径。
-//!
-//! 版本边界（§8.1）：GNOME 47 起 Eval 默认禁用（unsafe-mode 收紧），
-//! 47 以下 Eval 可用但可能被 gsettings `developer-tools` 关闭。
+//! 探测 `org.gnome.Shell` 根对象的 `ShellVersion` 只读属性（§3.5：始终可读），解析
+//! 失败回退环境变量 `GNOME_SHELL_VERSION`（测试注入用），再失败按 47+ 处理（当前
+//! 主流、Extension 为推荐生产路径）。版本边界（§8.1）：47 起 Eval 默认禁用。
 
 use serde::{Deserialize, Serialize};
 use zbus::Connection;
