@@ -1491,9 +1491,10 @@ pub struct KWinCompositor {
     wayland_core: Option<WaylandDisplayServer>,  // 基类协议通道（仅 Wayland 会话为 Some）
     protocols: Option<KWinProtocols>,            // org_kde_* 私有协议通道（叠加在基类之上）
     bridge: KWinBridge,                          // D-Bus / Scripting 补充通道（会话无关，共享）
-    x11: Option<X11DisplayServer>,               // X11 基础通道（仅 X11 会话为 Some）
+    x11: Option<Arc<X11DisplayServer>>,          // X11 基础通道（仅 X11 会话为 Some；Arc 供 EWMH 事件线程共享连接）
     version: KWinVersion,
-    event_handle: AsyncMutex<Option<EventScriptHandle>>,  // 长驻事件脚本句柄（懒启动）
+    event_handle: AsyncMutex<Option<EventScriptHandle>>,  // 长驻事件脚本句柄（懒启动；仅 Wayland 会话）
+    ewmh_monitor: AsyncMutex<Option<EwmhEventMonitor>>,   // X11 EWMH 事件监视器（懒启动）
     scripting_probe: AtomicU8,                   // /Scripting 探测状态：0=未探测 1=失败 2=成功
 }
 
@@ -1522,12 +1523,27 @@ list_windows():
      → 否：bridge.list_windows.js 走 Scripting
 
 focus_window(id):
+  0. X11 会话？
+     → 是：EWMH `_NET_ACTIVE_WINDOW` ClientMessage（十进制窗口 id，见 TSI-3131）
   1. wayland.window_mgmt 绑定成功？
      → 是：activate(uuid) 走协议
      → 否：bridge.focus_window.js 走 Scripting
 
 move_window(id, x, y):
-  → 协议不支持 set_geometry，直接走 bridge.move_window.js
+  0. X11 会话？
+     → 是：EWMH `_NET_MOVERESIZE_WINDOW`（只设 X/Y，尺寸标志位 0）
+  1. 协议不支持 set_geometry，走 bridge.move_window.js
+
+list_workspaces():
+  0. X11 会话？
+     → 是：EWMH `_NET_NUMBER_OF_DESKTOPS` + `_NET_DESKTOP_NAMES` + `_NET_CURRENT_DESKTOP`
+  1. Wayland：bridge.list_workspaces.js 走 Scripting
+
+subscribe()/subscribe_raw():
+  0. X11 会话？
+     → 是：EWMH PropertyNotify 差分（_NET_CLIENT_LIST* + _NET_ACTIVE_WINDOW），
+            独立线程阻塞读事件，产出 windowOpened/windowClosed/windowFocused
+  1. Wayland：event_monitor.js 走 Scripting
 
 input.send_key(combo):
   → wayland.fake_input 绑定成功？authenticate() → fake_keyboard_key()
@@ -1554,7 +1570,7 @@ input.send_key(combo):
 | KWinBridge（loadScript/callDBus） | 同 | 同 | ✅ 共享 |
 | 预置 JS 脚本 | 同 | 同 | ✅ 共享 |
 | KWin 版本探测 | 同 | 同 | ✅ 共享 |
-| 事件订阅（event_monitor.js） | 同 | 同 | ✅ 共享 |
+| 事件订阅 | event_monitor.js（Scripting） | EWMH PropertyNotify（基础） | 各走各路 |
 | org.kde.KWin D-Bus 服务 | 同 | 同 | ✅ 共享 |
 | 窗口管理 | org_kde_* 协议（基础） | EWMH（基础） | 各走各路 |
 | 输入注入 | fake_input 协议（基础） | XTest（基础） | 各走各路 |

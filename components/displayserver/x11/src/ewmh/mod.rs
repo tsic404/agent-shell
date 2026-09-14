@@ -23,6 +23,13 @@ pub mod wm_state_action {
     pub const TOGGLE: u32 = 2;
 }
 
+/// `_NET_ACTIVE_WINDOW` 来源指示（`data.l[0]`，EWMH）。
+pub mod active_window_source {
+    /// 窗口管理工具（pager/toolbar）来源——KWin focus-stealing prevention
+    /// 信任此来源；source=0（unknown）会被拒收或降级。
+    pub const PAGER: u32 = 2;
+}
+
 pub mod server;
 
 #[cfg(test)]
@@ -54,6 +61,13 @@ mod tests {
         assert_eq!(wm_state_action::REMOVE, 0);
         assert_eq!(wm_state_action::ADD, 1);
         assert_eq!(wm_state_action::TOGGLE, 2);
+    }
+
+    #[test]
+    fn active_window_source_pager_is_two() {
+        // EWMH source indication：2=pager（窗口管理工具），0=unknown 会被
+        // KWin focus-stealing prevention 拒收——聚焦请求必须声明 2。
+        assert_eq!(active_window_source::PAGER, 2);
     }
 
     #[test]
