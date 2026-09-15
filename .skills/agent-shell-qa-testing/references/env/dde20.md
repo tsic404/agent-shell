@@ -28,8 +28,8 @@
 ## 关键验证命令
 
 ```bash
-# 服务名：以 com.deepin.daemon.* 为主（约 25 项），少量 org.deepin.dde.* 兼容存在（约 2 项）
-busctl --user list | grep -cE 'com.deepin.daemon'    # 预期 25（主）
+# 服务名：以 com.deepin.daemon.* 为主（约 24~25 项），少量 org.deepin.dde.* 兼容存在（约 2 项）
+busctl --user list | grep -cE 'com.deepin.daemon'    # 预期 24~25（主）
 busctl --user list | grep -cE 'org.deepin.dde'       # 预期 2（兼容）
 busctl --user list | grep -E 'com.deepin.daemon' | head -10
 # 音频 Sink（与 DDE25 一致）
