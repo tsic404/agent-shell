@@ -11,8 +11,8 @@ use std::time::Instant;
 
 use agent_shell_core::services::{AccessibilityChange, PowerState};
 use agent_shell_core::types::{
-    KeyCombo, MonitorInfo, MouseButton, Rect, WindowId, WindowInfo, WindowState, WorkspaceId,
-    WorkspaceInfo,
+    DesktopEnvironment, KeyCombo, MonitorInfo, MouseButton, Rect, WindowId, WindowInfo,
+    WindowState, WorkspaceId, WorkspaceInfo,
 };
 
 // ───────────────────────── 事件优先级 ─────────────────────────
@@ -90,6 +90,28 @@ pub enum EventSource {
     Portal,
     /// 电源
     Power,
+}
+
+impl EventSource {
+    /// 事件源对应的桌面环境标签（`WindowId.de_type`）。
+    ///
+    /// 窗口事件源必然对应具体 DE：KWin 双通道标 KDE（deepin-kwin 复用
+    /// org_kde 协议同口径）；X11Generic 亦标 KDE——它仅由 DDE X11 会话发出，
+    /// 复用 KWin EWMH 桥、窗口 ID 打 KDE 标签。非窗口源（AT-SPI/输入/
+    /// Portal/电源）无窗口语义，返回 `Unknown`。
+    pub fn de_type(&self) -> DesktopEnvironment {
+        match self {
+            Self::KWinWayland | Self::KWinX11 | Self::X11Generic => DesktopEnvironment::KDE,
+            Self::MutterShell | Self::MutterEval | Self::MutterExtension => {
+                DesktopEnvironment::GNOME
+            }
+            Self::Hyprland => DesktopEnvironment::Hyprland,
+            Self::Treeland => DesktopEnvironment::DDE,
+            Self::Sway => DesktopEnvironment::Sway,
+            Self::WlrWayland => DesktopEnvironment::WLRWayland,
+            Self::AtSpi | Self::Input | Self::Portal | Self::Power => DesktopEnvironment::Unknown,
+        }
+    }
 }
 
 // ───────────────────────── 统一桌面事件 ─────────────────────────

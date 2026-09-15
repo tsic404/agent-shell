@@ -277,21 +277,64 @@ async fn hub_does_not_deliver_unsubscribed_categories() {
 
 /// §18.3：各 DE 的 open/close/focus 语义不同但语义一致。
 /// 同步路径（无 resolver）丢弃需 WindowInfo 的事件；close/power 正常映射。
+/// close 事件的 `de_type` 由事件源推导，与同批 open 事件的 resolver 路径一致。
 #[test]
 fn normalize_maps_close_semantics_across_des() {
     let mut merger = MoveMerger::default();
-    for raw in [
-        RawEvent::KWinWindowRemoved { id: "42".into() },
-        RawEvent::HyprlandCloseWindow {
-            address: "42".into(),
-        },
-        RawEvent::SwayWindowClose { id: "42".into() },
+    for (raw, source, expected_de) in [
+        (
+            RawEvent::KWinWindowRemoved { id: "42".into() },
+            EventSource::KWinX11,
+            DesktopEnvironment::KDE,
+        ),
+        (
+            RawEvent::HyprlandCloseWindow {
+                address: "42".into(),
+            },
+            EventSource::Hyprland,
+            DesktopEnvironment::Hyprland,
+        ),
+        (
+            RawEvent::SwayWindowClose { id: "42".into() },
+            EventSource::Sway,
+            DesktopEnvironment::Sway,
+        ),
     ] {
-        let evt = event::normalize::normalize("t", EventSource::Portal, raw.clone(), &mut merger);
+        let evt = event::normalize::normalize("t", source, raw.clone(), &mut merger);
         match evt {
-            Some(DesktopEvent::WindowClosed { id, .. }) => assert_eq!(id.native_id, "42"),
+            Some(DesktopEvent::WindowClosed { id, .. }) => {
+                assert_eq!(id.native_id, "42");
+                assert_eq!(id.de_type, expected_de);
+            }
             other => panic!("{raw:?} → {other:?}"),
         }
+    }
+}
+
+/// `EventSource` → `DesktopEnvironment` 全量映射：窗口源对应具体 DE，
+/// 非窗口源（AT-SPI/输入/Portal/电源）无窗口语义 → `Unknown`。
+/// X11Generic 仅由 DDE X11 会话发出（复用 KWin EWMH 桥），标 KDE。
+#[test]
+fn event_source_de_type_mapping() {
+    use EventSource::*;
+    let cases = [
+        (KWinWayland, DesktopEnvironment::KDE),
+        (KWinX11, DesktopEnvironment::KDE),
+        (X11Generic, DesktopEnvironment::KDE),
+        (MutterShell, DesktopEnvironment::GNOME),
+        (MutterEval, DesktopEnvironment::GNOME),
+        (MutterExtension, DesktopEnvironment::GNOME),
+        (Hyprland, DesktopEnvironment::Hyprland),
+        (Treeland, DesktopEnvironment::DDE),
+        (Sway, DesktopEnvironment::Sway),
+        (WlrWayland, DesktopEnvironment::WLRWayland),
+        (AtSpi, DesktopEnvironment::Unknown),
+        (Input, DesktopEnvironment::Unknown),
+        (Portal, DesktopEnvironment::Unknown),
+        (Power, DesktopEnvironment::Unknown),
+    ];
+    for (source, expected) in cases {
+        assert_eq!(source.de_type(), expected, "{source:?}");
     }
 }
 

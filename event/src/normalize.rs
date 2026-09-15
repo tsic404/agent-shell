@@ -56,7 +56,7 @@ pub fn normalize(
         RawEvent::KWinWindowRemoved { id }
         | RawEvent::HyprlandCloseWindow { address: id }
         | RawEvent::SwayWindowClose { id } => DesktopEvent::WindowClosed {
-            id: win_id(&id),
+            id: win_id(&id, &source),
             source,
             occurred_at: now,
         },
@@ -163,15 +163,14 @@ pub async fn normalize_with_resolver(
     Some(evt)
 }
 
-/// 由原生 id 构造 [`WindowId`](agent_shell_core::types::WindowId)。
+/// 由原生 id 与事件源构造 [`WindowId`](agent_shell_core::types::WindowId)。
 ///
-/// DE 类型未知（协议层尚未判定），以 `Unknown` 占位（审查建议 5）：
-/// `WindowId` 的跨 DE 去重键在此路径退化为「原生 id 单维度」，仅在同一
-/// backend 会话内唯一；resolver 路径产出的 open/focus/move 事件携带真实
-/// DE 标识，不受影响。
-fn win_id(native: &str) -> agent_shell_core::types::WindowId {
+/// `de_type` 由 [`EventSource::de_type`] 推导，与事件源一致：窗口关闭事件
+/// 无法经 resolver 回查（窗口已消失），但事件源已标识其 DE，无需 `Unknown`
+/// 占位——否则 `WindowClosed` 的 `de_type` 会与同批 `WindowOpened` 不一致。
+fn win_id(native: &str, source: &EventSource) -> agent_shell_core::types::WindowId {
     agent_shell_core::types::WindowId {
         native_id: native.to_string(),
-        de_type: agent_shell_core::types::DesktopEnvironment::Unknown,
+        de_type: source.de_type(),
     }
 }
