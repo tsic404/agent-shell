@@ -396,11 +396,11 @@ impl X11DisplayServer {
         )
     }
 
-    /// 聚焦确认轮询间隔：EWMH ClientMessage 无回执，WM 异步更新
-    /// `_NET_ACTIVE_WINDOW`，回读需留出事件循环处理时间。
-    const FOCUS_CONFIRM_POLL_INTERVAL: Duration = Duration::from_millis(10);
-    /// 聚焦确认总超时：超过仍未匹配目标窗口视为 WM 忽略/拒收请求。
-    const FOCUS_CONFIRM_TIMEOUT: Duration = Duration::from_millis(500);
+    /// EWMH 回读确认轮询间隔：ClientMessage 无回执，WM 异步更新 ground truth
+    /// 属性（`_NET_ACTIVE_WINDOW` / `_NET_WM_STATE`），回读需留出事件循环处理时间。
+    const EWMH_CONFIRM_POLL_INTERVAL: Duration = Duration::from_millis(10);
+    /// EWMH 回读确认总超时：超过仍未观测到目标状态视为 WM 忽略/拒收请求。
+    const EWMH_CONFIRM_TIMEOUT: Duration = Duration::from_millis(500);
 
     /// `_NET_ACTIVE_WINDOW` 聚焦请求 + 回读确认。
     ///
@@ -410,11 +410,11 @@ impl X11DisplayServer {
     /// 供 `windows focus` 区分「请求发出」与「聚焦已生效」，被忽略时返回
     /// [`AgentShellError::Timeout`]（而非 fire-and-forget 的 exit 0）。
     ///
-    /// 本方法是同步轮询（内部 `thread::sleep`），最长阻塞 [`Self::FOCUS_CONFIRM_TIMEOUT`]；
+    /// 本方法是同步轮询（内部 `thread::sleep`），最长阻塞 [`Self::EWMH_CONFIRM_TIMEOUT`]；
     /// async 调用方须用 `tokio::task::spawn_blocking` 包裹，避免占死 tokio worker。
     pub fn activate_window_confirmed(&self, window: x11rb::protocol::xproto::Window) -> Result<()> {
         self.activate_window(window)?;
-        let deadline = Instant::now() + Self::FOCUS_CONFIRM_TIMEOUT;
+        let deadline = Instant::now() + Self::EWMH_CONFIRM_TIMEOUT;
         loop {
             if self.get_active_window()? == Some(window) {
                 return Ok(());
@@ -424,7 +424,7 @@ impl X11DisplayServer {
                     "focus not confirmed: WM did not set _NET_ACTIVE_WINDOW to {window:#x} (ignored or denied)"
                 )));
             }
-            std::thread::sleep(Self::FOCUS_CONFIRM_POLL_INTERVAL);
+            std::thread::sleep(Self::EWMH_CONFIRM_POLL_INTERVAL);
         }
     }
 
@@ -481,13 +481,36 @@ impl X11DisplayServer {
         )
     }
 
-    /// 还原最小化：清除 HIDDEN + 最大化状态后激活。
+    /// 还原最小化：清除 HIDDEN（回读确认后）再激活。
+    ///
+    /// 还原语义是「取消 `_NET_WM_STATE_HIDDEN`」，其 ground truth 是 `_NET_WM_STATE`
+    /// 不再含 HIDDEN——而非激活请求的 `_NET_ACTIVE_WINDOW`。故确认轮询针对
+    /// HIDDEN 移除，不对末尾的 [`Self::activate_window`] 回读：激活可被
+    /// focus-stealing prevention 拒收（还原语义不要求聚焦），把它误报为还原失败
+    /// 会产生比静默更干扰的 500ms 超时。
+    ///
+    /// 本方法是同步轮询（内部 `thread::sleep`），最长阻塞 [`Self::EWMH_CONFIRM_TIMEOUT`]；
+    /// async 调用方须用 `tokio::task::spawn_blocking` 包裹，避免占死 tokio worker。
     pub fn unminimize_window(&self, window: x11rb::protocol::xproto::Window) -> Result<()> {
         self.toggle_wm_state(
             window,
             wm_state_action::REMOVE,
             self.atoms._NET_WM_STATE_HIDDEN,
         )?;
+        let deadline = Instant::now() + Self::EWMH_CONFIRM_TIMEOUT;
+        loop {
+            let states = self.get_window_states(window)?;
+            if !states.contains(&self.atoms._NET_WM_STATE_HIDDEN) {
+                break;
+            }
+            if Instant::now() >= deadline {
+                return Err(AgentShellError::Timeout(format!(
+                    "unminimize not confirmed: WM did not remove _NET_WM_STATE_HIDDEN from {window:#x} (ignored)"
+                )));
+            }
+            std::thread::sleep(Self::EWMH_CONFIRM_POLL_INTERVAL);
+        }
+        // 还原已生效后激活：fire-and-forget（无回读，理由见方法文档）。
         self.activate_window(window)
     }
 
@@ -1226,6 +1249,63 @@ mod tests {
         let err = server
             .activate_window_confirmed(win)
             .expect_err("unmapped window cannot be focused; expect timeout error");
+        assert!(
+            matches!(err, AgentShellError::Timeout(_)),
+            "expected Timeout, got: {err:?}"
+        );
+
+        server.conn.destroy_window(win).unwrap();
+        let _ = server.conn.flush();
+    }
+
+    /// EWMH 还原无回执：窗口仍带 `_NET_WM_STATE_HIDDEN`（WM 未移除）时，
+    /// `unminimize_window` 不得 fire-and-forget 返回 Ok，而应在轮询超时后给出
+    /// 明确错误。测试手动在窗口上写 HIDDEN 属性模拟「已最小化」，无 WM 监听
+    /// REMOVE 请求 → HIDDEN 持续存在，确定性走超时分支。
+    #[test]
+    fn unminimize_window_times_out_without_wm_removing_hidden() {
+        use x11rb::protocol::xproto::PropMode;
+        use x11rb::wrapper::ConnectionExt as _;
+
+        let Ok(server) = X11DisplayServer::connect() else {
+            eprintln!("skipped: no X11 display available");
+            return;
+        };
+
+        let win = server.conn.generate_id().unwrap();
+        server
+            .conn
+            .create_window(
+                24,
+                win,
+                server.root_window(),
+                0,
+                0,
+                16,
+                16,
+                0,
+                x11rb::protocol::xproto::WindowClass::INPUT_OUTPUT,
+                0,
+                &Default::default(),
+            )
+            .unwrap();
+        // 模拟 WM 已将窗口标记为 HIDDEN（最小化）。
+        server
+            .conn
+            .change_property32(
+                PropMode::REPLACE,
+                win,
+                server.atoms()._NET_WM_STATE,
+                x11rb::protocol::xproto::AtomEnum::ATOM,
+                &[server.atoms()._NET_WM_STATE_HIDDEN],
+            )
+            .unwrap();
+        let _ = server.conn.flush();
+        server.sync().unwrap();
+
+        let err = server
+            .unminimize_window(win)
+            .expect_err("no WM to remove HIDDEN; expect timeout error");
         assert!(
             matches!(err, AgentShellError::Timeout(_)),
             "expected Timeout, got: {err:?}"
