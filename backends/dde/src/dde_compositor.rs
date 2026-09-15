@@ -421,7 +421,7 @@ impl CompositorComponent for DdeCompositor {
         match &self.compositor {
             Compositor::DeepinKwin(k) => k.subscribe().await,
             Compositor::Treeland { .. } => Err(AgentShellError::NotImplemented(
-                "treeland event stream lands with TSI-2314 (T3b events)".into(),
+                "treeland event stream lands with T3b events".into(),
             )),
             Compositor::X11(k) => k.subscribe().await,
         }
@@ -430,7 +430,7 @@ impl CompositorComponent for DdeCompositor {
 
 fn treeland_pending() -> AgentShellError {
     AgentShellError::NotImplemented(
-        "treeland window ops need toplevel event aggregation (TSI-2314/T3b); \
+        "treeland window ops need toplevel event aggregation (T3b); \
          raw protocol channel ready in backends/dde/src/treeland.rs"
             .into(),
     )
