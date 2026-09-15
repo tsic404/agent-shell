@@ -18,6 +18,7 @@ use tokio::sync::Mutex as AsyncMutex;
 use crate::dbus_bridge::KWinBridge;
 use crate::error::{KWinError, Result};
 use crate::event_script::EventScriptHandle;
+use crate::native::KWinNative;
 use crate::scripts::ScriptTemplate;
 use crate::version::{self, KWinVersion};
 use crate::wayland::{FakeInput, KWinProtocols, WindowManagement};
@@ -53,9 +54,15 @@ pub struct KWinCompositor {
     /// 基类协议通道（仅 Wayland 会话为 Some；私有协议叠加其上）。
     wayland_core: Option<WaylandDisplayServer>,
     /// org_kde_* 私有协议通道（仅 Wayland 会话为 Some，叠加在基类之上）。
-    protocols: Option<KWinProtocols>,
+    /// `Arc` 供 `list_windows` 的 stacking order roundtrip 经 `spawn_blocking`
+    /// 移入阻塞线程（§19：同步段不得占 tokio worker）。
+    protocols: Option<Arc<KWinProtocols>>,
     /// D-Bus / Scripting 补充通道（会话无关，共享）。
     bridge: KWinBridge,
+    /// KWin 原生 D-Bus 通道（`org.kde.KWin` `/KWin` + `/VirtualDesktopManager`，
+    /// 会话无关）。Wayland 会话在 `/Scripting` 未注册时窗口/工作区枚举改走
+    /// 本通道 + wl_registry stacking order（见 `list_windows` / `list_workspaces`）。
+    native: KWinNative,
     /// X11 基础通道（仅 X11 会话为 Some）。窗口枚举/聚焦/移动/工作区/事件
     /// 走 EWMH（`_NET_CLIENT_LIST`、`_NET_ACTIVE_WINDOW`、
     /// `_NET_MOVERESIZE_WINDOW`、`_NET_NUMBER_OF_DESKTOPS` 等）而非 Scripting
@@ -74,6 +81,10 @@ pub struct KWinCompositor {
     event_registration: std::sync::Mutex<Option<std::result::Result<(), String>>>,
     /// X11 会话的 EWMH 事件监视器（懒启动；订阅后事件线程常驻）。
     ewmh_monitor: AsyncMutex<Option<crate::event_ewmh::EwmhEventMonitor>>,
+    /// Wayland 会话的原生事件监视器（懒启动；`/Scripting` 未注册时
+    /// `subscribe`/`subscribe_raw` 改走 org_kde_plasma_window_management
+    /// 协议事件）。
+    wayland_monitor: AsyncMutex<Option<crate::event_native::WaylandEventMonitor>>,
     /// `/Scripting` 探测状态：0=未探测，1=失败（不缓存，
     /// 允许重试），2=成功。原子而非锁——doctor_lines(&self) 同步读取。
     scripting_probe: std::sync::atomic::AtomicU8,
@@ -87,7 +98,7 @@ const PROBE_OK: u8 = 2;
 impl KWinCompositor {
     /// org_kde_* 私有协议通道引用（含派发队列）。
     fn protocols(&self) -> Option<&KWinProtocols> {
-        self.protocols.as_ref()
+        self.protocols.as_ref().map(|p| p.as_ref())
     }
     /// WaylandCompositor 基类通道（§3.3：Wayland 系合成器共享的纯 core 层）。
     ///
@@ -107,6 +118,7 @@ impl KWinCompositor {
             WaylandDisplayServer::connect().map_err(|e| KWinError::Scripting(e.to_string()))?;
         let protocols = KWinProtocols::probe(&wl)?;
         let bridge = KWinBridge::connect().await?;
+        let native = KWinNative::new(bridge.connection().clone()).await?;
         let version = version::detect_version(bridge.connection())
             .await
             .unwrap_or_else(|_| KWinVersion {
@@ -115,13 +127,15 @@ impl KWinCompositor {
             });
         Ok(Self {
             wayland_core: Some(wl),
-            protocols: Some(protocols),
+            protocols: Some(Arc::new(protocols)),
             bridge,
+            native,
             x11: None,
             version,
             event_registration: std::sync::Mutex::new(None),
             event_handle: AsyncMutex::new(None),
             ewmh_monitor: AsyncMutex::new(None),
+            wayland_monitor: AsyncMutex::new(None),
             scripting_probe: std::sync::atomic::AtomicU8::new(PROBE_UNSET),
         })
     }
@@ -130,6 +144,7 @@ impl KWinCompositor {
     pub async fn new_x11() -> Result<Self> {
         let x11 = X11DisplayServer::connect().map_err(|e| KWinError::Scripting(e.to_string()))?;
         let bridge = KWinBridge::connect().await?;
+        let native = KWinNative::new(bridge.connection().clone()).await?;
         let version = version::detect_version(bridge.connection())
             .await
             .unwrap_or_else(|_| KWinVersion {
@@ -140,11 +155,13 @@ impl KWinCompositor {
             wayland_core: None,
             protocols: None,
             bridge,
+            native,
             x11: Some(Arc::new(x11)),
             version,
             event_registration: std::sync::Mutex::new(None),
             event_handle: AsyncMutex::new(None),
             ewmh_monitor: AsyncMutex::new(None),
+            wayland_monitor: AsyncMutex::new(None),
             scripting_probe: std::sync::atomic::AtomicU8::new(PROBE_UNSET),
         })
     }
@@ -157,17 +174,24 @@ impl KWinCompositor {
     /// 最小实例（`Option<bool>` 表达三态），`#[cfg(test)]` 注入点对下游 crate
     /// 不可见；风险仅限误用构造器，不触及真实探测/构造路径。
     #[doc(hidden)]
-    pub fn for_test(bridge: KWinBridge, probe: Option<bool>) -> Self {
+    pub async fn for_test(bridge: KWinBridge, probe: Option<bool>) -> Self {
         use std::sync::atomic::AtomicU8;
         let probe = match probe {
             Some(true) => PROBE_OK,
             Some(false) => PROBE_FAIL,
             None => PROBE_UNSET,
         };
+        // 测试注入点不触碰真实显示服务器；native 通道仅测试时可能不可达，
+        // 但必须可构造——用 bridge 的既有连接建 proxy（org.kde.KWin 不可达
+        // 时 lazy 报错，构造本身不失败）。
+        let native = KWinNative::new(bridge.connection().clone())
+            .await
+            .expect("KWinNative proxy on private bus must build");
         Self {
             wayland_core: None,
             protocols: None,
             bridge,
+            native,
             x11: None,
             version: KWinVersion {
                 full: "6.1.4".into(),
@@ -176,6 +200,7 @@ impl KWinCompositor {
             event_registration: std::sync::Mutex::new(None),
             event_handle: AsyncMutex::new(None),
             ewmh_monitor: AsyncMutex::new(None),
+            wayland_monitor: AsyncMutex::new(None),
             scripting_probe: AtomicU8::new(probe),
         }
     }
@@ -237,8 +262,11 @@ impl KWinCompositor {
             Some(true) => "✓ D-Bus 桥接 : callDBus ready (14 templates, req-id routed; \
                            /Scripting introspected)"
                 .to_string(),
-            Some(false) => "⚠ D-Bus 桥接 : /Scripting 未就绪（KWin 启动早期或不可达；\
-                            Scripting 调用将按需重试，Wayland 协议通道不受影响）"
+            // 探测失败不归因具体形态——可能是 /Scripting 未注册（KWin 5.x
+            // Wayland）、KWin 启动早期时序、或 org.kde.KWin 不可达；窗口/工作区
+            // 枚举改走会话原生通道（Wayland: org.kde.KWin + wl_registry；X11: EWMH）。
+            Some(false) => "⚠ D-Bus 桥接 : /Scripting 未就绪（不可达/未注册/启动早期）；\
+                            窗口/工作区走会话原生通道，Scripting 按需重试"
                 .to_string(),
             None => "⚠ D-Bus 桥接 : 未探测（调用 ensure_scripting_probe 后更新）".to_string(),
         });
@@ -687,9 +715,12 @@ impl KWinCompositor {
         &self,
     ) -> agent_shell_core::error::Result<Box<dyn event::RawSource>> {
         // X11 会话走 EWMH 事件源（PropertyNotify 差分），不依赖 /Scripting；
-        // Wayland 会话走长驻事件脚本。
+        // Wayland 会话优先长驻事件脚本，/Scripting 未注册走原生协议事件。
         if let Some(x11) = self.x11.as_ref() {
             return self.subscribe_ewmh_raw(x11).await;
+        }
+        if self.ensure_scripting_probe().await.is_err() {
+            return self.subscribe_wayland_native_raw().await;
         }
         // 先确保事件脚本在跑（幂等，内部自带 /Scripting 重试探测），成功后再
         // 取一次性接收端——若先取流后启动脚本，脚本启动失败（5s 探测窗口内
@@ -750,6 +781,124 @@ impl KWinCompositor {
             )
         })?;
         Ok(Box::new(crate::event_ewmh::EwmhEventStream::new(rx)))
+    }
+
+    /// 懒启动 Wayland 原生事件监视器并取一次性接收端（`subscribe`/
+    /// `subscribe_raw` 共享）。`/Scripting` 未注册时的事件通道兜底：
+    /// window_mgmt 协议事件线程常驻，接收端仅其一可取走。
+    async fn wayland_take_rx(
+        &self,
+    ) -> agent_shell_core::error::Result<
+        Option<tokio::sync::mpsc::UnboundedReceiver<event::RawEvent>>,
+    > {
+        let wl = self.wayland_core.as_ref().ok_or_else(|| {
+            AgentShellError::BackendUnavailable("no wayland display (X11 session)".to_string())
+        })?;
+        let mut slot = self.wayland_monitor.lock().await;
+        if slot.is_none() {
+            *slot = Some(crate::event_native::spawn_wayland_monitor(
+                wl.connection(),
+                wl.globals(),
+            )?);
+        }
+        Ok(slot.as_mut().and_then(|m| m.take_rx()))
+    }
+
+    /// Wayland 会话原始事件源（原生协议事件）：懒启动监视器，取一次性接收端。
+    async fn subscribe_wayland_native_raw(
+        &self,
+    ) -> agent_shell_core::error::Result<Box<dyn event::RawSource>> {
+        let rx = self.wayland_take_rx().await?.ok_or_else(|| {
+            AgentShellError::BackendUnavailable(
+                "kwin native event stream already subscribed".to_string(),
+            )
+        })?;
+        Ok(Box::new(crate::event_native::WaylandRawSource::new(rx)))
+    }
+
+    /// Wayland 会话近似事件流（原生协议事件）：懒启动监视器，取一次性接收端。
+    async fn subscribe_wayland_native(
+        &self,
+    ) -> agent_shell_core::error::Result<Box<dyn EventStream>> {
+        let rx = self.wayland_take_rx().await?.ok_or_else(|| {
+            AgentShellError::BackendUnavailable(
+                "kwin native event stream already subscribed".to_string(),
+            )
+        })?;
+        Ok(Box::new(crate::event_native::WaylandEventStream::new(rx)))
+    }
+
+    /// Scripting `list_windows.js`：一次 callDBus 批量取全量详情。
+    async fn list_windows_scripting(&self) -> agent_shell_core::error::Result<Vec<WindowInfo>> {
+        let v = self.query(ScriptTemplate::ListWindows, &[]).await?;
+        let arr = v.as_array().cloned().unwrap_or_default();
+        Ok(arr
+            .iter()
+            .enumerate()
+            .filter_map(|(i, w)| Self::parse_window(w, i as u32))
+            .collect())
+    }
+
+    /// 原生通道窗口列表：wl_registry stacking order 枚举 uuid → `getWindowInfo`
+    /// 逐窗回读（stacking order 从底到顶，索引越大越靠上，与 Scripting 口径一致）。
+    async fn list_windows_native(&self) -> agent_shell_core::error::Result<Vec<WindowInfo>> {
+        let protocols = self.protocols.clone().ok_or_else(|| {
+            AgentShellError::BackendUnavailable(
+                "no wayland protocol channel (X11 session uses EWMH)".to_string(),
+            )
+        })?;
+        // stacking order 的 roundtrip 是同步阻塞调用——经 spawn_blocking 移出
+        // tokio worker（§19 审查项：同步段不得占执行器线程）。
+        let uuids = tokio::task::spawn_blocking(move || protocols.stacking_order_uuids())
+            .await
+            .map_err(|e| {
+                AgentShellError::Other(
+                    format!("kwin stacking order blocking task join: {e}").into(),
+                )
+            })??;
+        let uuids = uuids.ok_or_else(|| {
+            AgentShellError::BackendUnavailable(
+                "window_mgmt unbound or no stacking order snapshot (no enumeration)".to_string(),
+            )
+        })?;
+        let mut windows = Vec::with_capacity(uuids.len());
+        for (i, uuid) in uuids.iter().enumerate() {
+            let map = self.native.window_info(uuid).await?;
+            if let Some(w) = crate::native::parse_window(&map, i as u32) {
+                windows.push(w);
+            }
+        }
+        Ok(windows)
+    }
+
+    /// Scripting `list_workspaces.js`：一次 callDBus 批量取全量工作区。
+    async fn list_workspaces_scripting(
+        &self,
+    ) -> agent_shell_core::error::Result<Vec<WorkspaceInfo>> {
+        let v = self.query(ScriptTemplate::ListWorkspaces, &[]).await?;
+        let arr = v.as_array().cloned().unwrap_or_default();
+        Ok(arr
+            .iter()
+            .map(|d| WorkspaceInfo {
+                id: WorkspaceId {
+                    native_id: d
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                    de_type: DesktopEnvironment::KDE,
+                },
+                name: d
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                number: d.get("number").and_then(Value::as_u64).unwrap_or(0) as u32,
+                is_active: d.get("isActive").and_then(Value::as_bool).unwrap_or(false),
+                monitor_ids: Vec::new(),
+                window_ids: Vec::new(),
+            })
+            .collect())
     }
 }
 
@@ -849,26 +998,30 @@ impl CompositorComponent for KWinCompositor {
         &["window_events", "workspace_events"]
     }
 
-    /// 窗口列表：X11 会话走 EWMH（`_NET_CLIENT_LIST_STACKING`），Wayland
-    /// 会话走 list_windows.js（一次 callDBus 批量取全量详情）。
+    /// 窗口列表：X11 会话走 EWMH（`_NET_CLIENT_LIST_STACKING`）；Wayland 会话
+    /// 优先 Scripting `list_windows.js`，`/Scripting` 未注册（KWin 5.x Wayland
+    /// 实测）时降级原生通道——`org_kde_plasma_window_management` 的
+    /// `get_stacking_order`（wl_registry 枚举 uuid）→ `org.kde.KWin`
+    /// `getWindowInfo(uuid)` 逐窗回读详情。
     ///
     /// X11 分支优先于 Scripting——部分 KWin 5.x X11 会话不注册 `/Scripting`
     /// 且 EWMH 无需事件聚合即可给出完整 `WindowInfo`。
-    /// Wayland 下协议 stacking-order 仅提供 uuid 列表，逐窗 get_window_by_uuid
-    /// 仍需事件聚合才能取属性（本层 inert 不消费事件）——T3b 前纯协议路径
-    /// 无法给出 WindowInfo，故仍走 Scripting。window_mgmt 短绑状态只影响
-    /// focus/minimize/close 走协议还是 Scripting。
     async fn list_windows(&self) -> agent_shell_core::error::Result<Vec<WindowInfo>> {
         if let Some(x11) = self.x11.as_ref() {
             return self.x11_list_windows(x11);
         }
-        let v = self.query(ScriptTemplate::ListWindows, &[]).await?;
-        let arr = v.as_array().cloned().unwrap_or_default();
-        Ok(arr
-            .iter()
-            .enumerate()
-            .filter_map(|(i, w)| Self::parse_window(w, i as u32))
-            .collect())
+        // Wayland：先探测 /Scripting——可用走 Scripting（KDE 主流路径），不可用
+        // （/Scripting 未注册）走原生 D-Bus + wl_registry 枚举兜底。
+        let scripting_ok = self.ensure_scripting_probe().await.is_ok();
+        if scripting_ok {
+            return self.list_windows_scripting().await;
+        }
+        match self.list_windows_native().await {
+            Ok(windows) => Ok(windows),
+            // 原生通道不可用（window_mgmt 未绑定 / getWindowInfo 不可达）时最后
+            // 回退 Scripting——启动早期 /Scripting 未注册属时序现象，可自愈。
+            Err(_) => self.list_windows_scripting().await,
+        }
     }
 
     /// 当前活动窗口（可能为空——桌面无焦点）。X11 会话走 `_NET_ACTIVE_WINDOW`，
@@ -1067,41 +1220,33 @@ impl CompositorComponent for KWinCompositor {
     }
 
     /// 工作区列表：X11 会话走 EWMH（`_NET_NUMBER_OF_DESKTOPS` +
-    /// `_NET_DESKTOP_NAMES` + `_NET_CURRENT_DESKTOP`），Wayland 会话走
-    /// list_workspaces.js。
+    /// `_NET_DESKTOP_NAMES` + `_NET_CURRENT_DESKTOP`）；Wayland 会话优先
+    /// list_workspaces.js，`/Scripting` 未注册时走 `org.kde.KWin.VirtualDesktopManager`
+    /// 的 `desktops` + `current` 属性。
     async fn list_workspaces(&self) -> agent_shell_core::error::Result<Vec<WorkspaceInfo>> {
         if let Some(x11) = self.x11.as_ref() {
             return Self::x11_list_workspaces(x11);
         }
-        let v = self.query(ScriptTemplate::ListWorkspaces, &[]).await?;
-        let arr = v.as_array().cloned().unwrap_or_default();
-        Ok(arr
-            .iter()
-            .map(|d| WorkspaceInfo {
-                id: WorkspaceId {
-                    native_id: d
-                        .get("id")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .to_string(),
-                    de_type: DesktopEnvironment::KDE,
-                },
-                name: d
-                    .get("name")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string(),
-                number: d.get("number").and_then(Value::as_u64).unwrap_or(0) as u32,
-                is_active: d.get("isActive").and_then(Value::as_bool).unwrap_or(false),
-                monitor_ids: Vec::new(),
-                window_ids: Vec::new(),
-            })
-            .collect())
+        // Wayland：Scripting 可用走 Scripting；不可用走 VirtualDesktopManager。
+        if self.ensure_scripting_probe().await.is_ok() {
+            return self.list_workspaces_scripting().await;
+        }
+        match self.native.workspaces().await {
+            Ok(ws) => Ok(ws),
+            Err(_) => self.list_workspaces_scripting().await,
+        }
     }
 
-    /// 激活工作区：switch_workspace.js（协议 vd_mgmt 的 request_activate 需要
-    /// 先有桌面对象缓存，T3b 事件任务补全后切换为协议优先）。
+    /// 激活工作区：switch_workspace.js 优先；`/Scripting` 未注册（Wayland）时
+    /// 走 `VirtualDesktopManager.current` 属性（写桌面 id）。
     async fn activate_workspace(&self, id: &WorkspaceId) -> agent_shell_core::error::Result<()> {
+        if self.x11.is_none() && self.ensure_scripting_probe().await.is_err() {
+            return self
+                .native
+                .set_current_desktop(&id.native_id)
+                .await
+                .map_err(KWinError::into);
+        }
         let v = self
             .query(
                 ScriptTemplate::SwitchWorkspace,
@@ -1171,9 +1316,12 @@ impl CompositorComponent for KWinCompositor {
     /// 直接消费近似流的调用方（如 DDE deepin-kwin 委托）。
     async fn subscribe(&self) -> agent_shell_core::error::Result<Box<dyn EventStream>> {
         // X11 会话走 EWMH 近似映射流（`EwmhEventStream`），不依赖 /Scripting；
-        // Wayland 会话走长驻事件脚本。
+        // Wayland 会话优先长驻事件脚本，/Scripting 未注册走原生协议事件。
         if let Some(x11) = self.x11.as_ref() {
             return self.subscribe_ewmh(x11).await;
+        }
+        if self.ensure_scripting_probe().await.is_err() {
+            return self.subscribe_wayland_native().await;
         }
         // 与 `subscribe_raw` 同款顺序：先确保事件脚本在跑，成功后再取一次性
         // 接收端，避免脚本启动失败时接收端随栈销毁、事件队列永久丢失。
@@ -1485,7 +1633,7 @@ mod tests {
     #[tokio::test]
     async fn lazy_capabilities_lists_event_streams() {
         let bus = TestBus::start().await;
-        let comp = KWinCompositor::for_test(bridge(&bus).await, None);
+        let comp = KWinCompositor::for_test(bridge(&bus).await, None).await;
         assert_eq!(
             comp.lazy_capabilities(),
             &["window_events", "workspace_events"]
@@ -1497,7 +1645,7 @@ mod tests {
     async fn unset_probe_triggers_probe_and_becomes_ok() {
         let bus = TestBus::start().await;
         let _kwin = spawn_fake_kwin(&bus).await;
-        let comp = KWinCompositor::for_test(bridge(&bus).await, None);
+        let comp = KWinCompositor::for_test(bridge(&bus).await, None).await;
 
         assert_eq!(comp.scripting_probe_ok(), None);
         let lines = comp.doctor_lines_async().await;
@@ -1512,7 +1660,7 @@ mod tests {
     async fn failed_probe_is_retried_and_becomes_ok() {
         let bus = TestBus::start().await;
         // 先建桥（无 org.kde.KWin 服务），在桥接上探测一次失败。
-        let comp = KWinCompositor::for_test(bridge(&bus).await, None);
+        let comp = KWinCompositor::for_test(bridge(&bus).await, None).await;
         let _ = comp.ensure_scripting_probe().await;
         assert_eq!(comp.scripting_probe_ok(), Some(false));
 
@@ -1530,7 +1678,7 @@ mod tests {
         let bus = TestBus::start().await;
         // 不注册 org.kde.KWin：若短路失败，doctor_lines_async 会重测并
         // 把 PROBE_OK 覆写为 PROBE_FAIL。
-        let comp = KWinCompositor::for_test(bridge(&bus).await, Some(true));
+        let comp = KWinCompositor::for_test(bridge(&bus).await, Some(true)).await;
 
         let lines = comp.doctor_lines_async().await;
 
@@ -1543,7 +1691,7 @@ mod tests {
     #[tokio::test]
     async fn failed_probe_remains_failed_when_still_unreachable() {
         let bus = TestBus::start().await;
-        let comp = KWinCompositor::for_test(bridge(&bus).await, Some(false));
+        let comp = KWinCompositor::for_test(bridge(&bus).await, Some(false)).await;
 
         let lines = comp.doctor_lines_async().await;
 
@@ -1557,7 +1705,7 @@ mod tests {
     #[tokio::test]
     async fn doctor_event_script_line_marks_unloaded() {
         let bus = TestBus::start().await;
-        let comp = KWinCompositor::for_test(bridge(&bus).await, None);
+        let comp = KWinCompositor::for_test(bridge(&bus).await, None).await;
         let lines = comp.doctor_lines();
         assert!(
             lines
