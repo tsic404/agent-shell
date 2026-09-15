@@ -437,7 +437,10 @@ mod tests {
 
     impl Drop for TestBus {
         fn drop(&mut self) {
-            let _ = self._child.kill();
+            // `kill()` 发 SIGKILL，跳过 dbus-daemon 正常退出路径，其 /tmp/dbus-*
+            // socket 不 unlink、累积 stale 文件；SIGTERM 让其自行清理。
+            // SAFETY: `_child.id()` 是存活的子进程 PID，发 SIGTERM 无内存安全风险。
+            unsafe { libc::kill(self._child.id() as i32, libc::SIGTERM) };
             let _ = self._child.wait();
         }
     }
