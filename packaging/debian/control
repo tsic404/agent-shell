@@ -3,7 +3,7 @@ Section: utils
 Priority: optional
 Maintainer: Agent Shell <agent-shell@example.com>
 # libpipewire-0.3-dev：portal-screencast feature（默认）所需；--no-default-features
-# 构建可省略（无 dev 头发行版如 UOS 20 / DDE 20，TSI-3111）。
+# 构建可省略（无 dev 头发行版如 UOS 20 / DDE 20）。
 Build-Depends: cargo, libpipewire-0.3-dev | libpipewire-dev, pkg-config, libsystemd-dev
 Standards-Version: 4.6.0
 

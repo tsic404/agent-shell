@@ -1,5 +1,5 @@
 #!/bin/sh
-# build-deb-arch.test.sh — 验证 build-deb.sh 架构检测（TSI-3106）
+# build-deb-arch.test.sh — 验证 build-deb.sh 架构检测
 #
 # 覆盖两条契约：
 #   1) DEB_HOST_ARCH 设置时，包 control 的 Architecture: 字段采用该架构
