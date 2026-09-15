@@ -207,8 +207,8 @@ fn run_event_loop(x11: Arc<X11DisplayServer>, tx: mpsc::UnboundedSender<RawEvent
                 Err(_) => break,
             };
             if cur != prev_active {
-                // 与 event_monitor.js 一致：仅在存在焦点窗口时推送（activeWindowChanged
-                // 的 `if (w)` 守卫），失去焦点不产出事件。
+                // 与 event_monitor.js 一致：仅在存在焦点窗口时推送（激活信号
+                // 回调里的 `if (w)` 守卫），失去焦点不产出事件。
                 if let Some(w) = cur {
                     let _ = tx.send(RawEvent::KWinActiveWindowChanged {
                         id: Some(w.to_string()),

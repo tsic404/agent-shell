@@ -56,7 +56,7 @@ impl EventScriptHandle {
     }
 }
 
-/// 启动长驻 `event_monitor.js`：订阅 windowAdded/Removed/activeWindowChanged。
+/// 启动长驻 `event_monitor.js`：订阅窗口增/删/激活信号（信号名随 KWin 5/6 分派）。
 ///
 /// 幂等：已有运行中的实例先停止再启动（handle 换新）。
 pub async fn ensure_event_script(bridge: &KWinBridge, v6: bool) -> Result<EventScriptHandle> {
