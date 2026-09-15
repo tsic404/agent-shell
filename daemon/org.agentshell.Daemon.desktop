@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=agent-shell daemon
+Comment=agent-shell user-session daemon (KWin private Wayland interface entitlement)
+Exec=/usr/bin/agent-shell-daemon
+Terminal=false
+NoDisplay=true
+X-KDE-Wayland-Interfaces=org_kde_plasma_window_management,org_kde_kwin_fake_input,org_kde_plasma_virtual_desktop_management

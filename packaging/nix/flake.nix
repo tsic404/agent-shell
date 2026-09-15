@@ -56,6 +56,11 @@
               --replace-fail '/usr/bin/agent-shell-daemon' "$out/bin/agent-shell-daemon"
             install -Dm644 daemon/agent-shell-daemon.service \
               $out/lib/systemd/user/agent-shell-daemon.service
+            # KWin 私有 Wayland 接口授权（§7.6：desktop 的 Exec 须指向实际 daemon 二进制）
+            substituteInPlace daemon/org.agentshell.Daemon.desktop \
+              --replace-fail '/usr/bin/agent-shell-daemon' "$out/bin/agent-shell-daemon"
+            install -Dm644 daemon/org.agentshell.Daemon.desktop \
+              $out/share/applications/org.agentshell.Daemon.desktop
             # udev rules for ydotool /dev/uinput（§20.3 权限模型）
             install -Dm644 packaging/debian/60-agent-shell-uinput.rules \
               $out/lib/udev/rules.d/60-agent-shell-uinput.rules
