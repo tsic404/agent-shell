@@ -166,6 +166,8 @@ async fn serve_connection(mut daemon: Daemon, idle_timeout: Duration) {
     if let Some(capture) = daemon.capture.as_ref() {
         capture.shutdown().await;
     }
+    // 卸载长驻事件脚本（避免瞬态 daemon 退出后 event_monitor 实例堆积）。
+    daemon.shutdown().await;
 }
 
 async fn write_line(out: &Arc<tokio::sync::Mutex<tokio::io::Stdout>>, line: String) {

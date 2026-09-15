@@ -678,6 +678,20 @@ impl KWinCompositor {
         Ok(())
     }
 
+    /// 卸载长驻事件脚本并清空句柄（daemon 退出前调用）。清理 KWin 侧残留的
+    /// `event_monitor` 实例——瞬态 daemon 退出时若不卸载，脚本实例在 KWin
+    /// 内永驻堆积，下次会话再加载新实例会让每条真实事件被重复投递 N 次。
+    ///
+    /// 无论 stop 成败都清空句柄（`take` 语义）；失败向上返回，由调用方记录，
+    /// 不在此处吞掉。
+    pub async fn shutdown_event_script(&self) -> crate::error::Result<()> {
+        let mut handle = self.event_handle.lock().await;
+        match handle.take() {
+            Some(mut h) => h.stop(self.bridge.connection()).await,
+            None => Ok(()),
+        }
+    }
+
     /// 订阅原始事件流（§18.2）：确保事件脚本在跑，返回其 [`RawSource`]
     /// 适配器，交由 daemon 的 `EventNormalizer` 归一化后 fan-out + 入 ring。
     ///
