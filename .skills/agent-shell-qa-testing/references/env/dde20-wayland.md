@@ -59,7 +59,7 @@ qdbus org.kde.KWin /KWin supportInformation 2>/dev/null | grep -i "KWin version"
 ```bash
 # DDE 20 走 com.deepin.daemon.* 旧名（非 org.deepin.dde.*）
 busctl --user list | grep -E 'com.deepin.daemon' | head -10
-gdbus introspect --session --dest com.deepin.dde.Audio1 --object-path /com/deepin/dde/Audio1 2>&1 | head -5
+gdbus introspect --session --dest com.deepin.daemon.Audio --object-path /com/deepin/daemon/Audio 2>&1 | head -5
 ```
 
 ## 版本兼容断言
