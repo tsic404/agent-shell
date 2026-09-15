@@ -250,6 +250,10 @@ fn flush_err(e: rustix::io::Errno) -> AgentShellError {
     AgentShellError::Input(format!("libei flush: {e}"))
 }
 
+/// RemoteDesktop portal 的设备类型位掩码（`AvailableDeviceTypes` 同款编码）。
+const KEYBOARD_DEVICE_TYPE: u32 = 1 << 0;
+const POINTER_DEVICE_TYPE: u32 = 1 << 1;
+
 /// 探测失败若为「portal 在场但缺 ConnectToEIS」返回诊断消息，否则 None。
 ///
 /// 仅此一类失败是首选后端探测的可诊断根因（portal 在但能力缺失）。无
@@ -298,27 +302,28 @@ fn xml_advertises_connect_to_eis(xml: &str) -> bool {
 /// portal CreateSession → SelectDevices → Start → ConnectToEIS 全流程，
 /// 返回 EIS socket fd。
 ///
-/// 响应式 portal 调用按 handle_token 规范监听
-/// `/org/freedesktop/portal/desktop/request/<sender>/<token>` 对象路径上的
-/// `Response` 信号；Start 步骤触发用户确认弹窗——调用方必须是持有本实例的
-/// 常驻 daemon（§21.22），CLI 瞬态进程不应走到这里。
+/// 每步使用独立 `handle_token`——portal Request 路径由
+/// `/org/freedesktop/portal/desktop/request/<sender>/<token>` 计算，复用同一
+/// token 会让多个请求的 Response 落在同一路径（后端只认首个请求），
+/// `await_response` 会读到 CreateSession 而非 Start 的应答，ConnectToEIS
+/// 时便会话尚未 STARTED（`AccessDenied: Invalid session`）。
+///
+/// 真正的 session_handle 由 CreateSession 的 Response 信号 results 里的
+/// `session_handle`（规范误用 `s` 类型）返回，不自行拼路径。Start 步骤触发
+/// 用户确认弹窗——调用方必须是持有本实例的常驻 daemon（§21.22）。
 async fn portal_connect_to_eis(bus: &zbus::Connection) -> Result<zbus::zvariant::OwnedFd> {
     use zbus::zvariant::{ObjectPath, Value};
 
-    let unique = bus
+    let sender_part = bus
         .unique_name()
-        .expect("session bus connection always has a unique name");
-    // sender 部分：":1.42" → "1_42"（handle_token 路径编码规则）。
-    let sender_part = unique.trim_start_matches(':').replace('.', "_");
-    let token = format!("agent_shell_input_{}", std::process::id());
-    let request_path = ObjectPath::try_from(format!(
-        "/org/freedesktop/portal/desktop/request/{sender_part}/{token}"
-    ))
-    .map_err(|e| AgentShellError::DBus(format!("request path: {e}")))?;
-    let session_path = ObjectPath::try_from(format!(
-        "/org/freedesktop/portal/desktop/session/{sender_part}/{token}"
-    ))
-    .map_err(|e| AgentShellError::DBus(format!("session path: {e}")))?;
+        .map(|n| encode_sender_part(n.as_str()))
+        .ok_or_else(|| AgentShellError::DBus("no unique name on session bus".into()))?;
+    let pid = std::process::id();
+    let req_prefix = "/org/freedesktop/portal/desktop/request/";
+    let create_token = format!("agent_shell_input_create_{pid}");
+    let select_token = format!("agent_shell_input_select_{pid}");
+    let start_token = format!("agent_shell_input_start_{pid}");
+    let session_token = format!("agent_shell_input_session_{pid}");
 
     let rd = zbus::Proxy::new(
         bus,
@@ -329,14 +334,119 @@ async fn portal_connect_to_eis(bus: &zbus::Connection) -> Result<zbus::zvariant:
     .await
     .map_err(|e| AgentShellError::DBus(format!("RemoteDesktop proxy: {e}")))?;
 
-    let options: HashMap<&str, Value> = [
-        ("handle_token", Value::from(token.as_str())),
-        ("session_handle_token", Value::from(token.as_str())),
-    ]
-    .into_iter()
-    .collect();
+    // 1. CreateSession：方法返回 Request 对象路径；session_handle 在其
+    //    Response 信号 results["session_handle"]（s）里。
+    let create_path = request_path(req_prefix, &sender_part, &create_token)?;
+    let mut create_stream = subscribe_response(bus, &create_path).await?;
+    let mut options: HashMap<&str, Value> = HashMap::new();
+    options.insert("handle_token", Value::from(create_token.as_str()));
+    options.insert("session_handle_token", Value::from(session_token.as_str()));
+    let create_request: zbus::zvariant::OwnedObjectPath = rd
+        .call("CreateSession", &(&options,))
+        .await
+        .map_err(portal_err)?;
+    let create_results = await_response(
+        &mut create_stream,
+        bus,
+        create_path.as_str(),
+        create_request.as_str(),
+        "CreateSession",
+    )
+    .await?;
+    let session_handle = create_results
+        .get("session_handle")
+        .and_then(|v| v.downcast_ref::<&str>().ok())
+        .ok_or_else(|| {
+            AgentShellError::DBus(
+                "RemoteDesktop: no session_handle in CreateSession response".into(),
+            )
+        })?;
+    let session_path: ObjectPath<'static> = ObjectPath::try_from(session_handle.to_owned())
+        .map_err(|e| AgentShellError::DBus(format!("bad session_handle: {e}")))?
+        .into_owned();
 
-    // 订阅 Start 的 Response 信号后再发请求（避免竞态）。
+    // 2. SelectDevices：types = KEYBOARD | POINTER。
+    let select_path = request_path(req_prefix, &sender_part, &select_token)?;
+    let mut select_stream = subscribe_response(bus, &select_path).await?;
+    let mut options: HashMap<&str, Value> = HashMap::new();
+    options.insert("handle_token", Value::from(select_token.as_str()));
+    options.insert(
+        "types",
+        Value::from(KEYBOARD_DEVICE_TYPE | POINTER_DEVICE_TYPE),
+    );
+    let select_request: zbus::zvariant::OwnedObjectPath = rd
+        .call::<_, (&ObjectPath<'_>, HashMap<&str, Value>), zbus::zvariant::OwnedObjectPath>(
+            "SelectDevices",
+            &(&session_path, options),
+        )
+        .await
+        .map_err(portal_err)?;
+    let _ = await_response(
+        &mut select_stream,
+        bus,
+        select_path.as_str(),
+        select_request.as_str(),
+        "SelectDevices",
+    )
+    .await?;
+
+    // 3. Start：触发用户确认弹窗。
+    let start_path = request_path(req_prefix, &sender_part, &start_token)?;
+    let mut start_stream = subscribe_response(bus, &start_path).await?;
+    let mut options: HashMap<&str, Value> = HashMap::new();
+    options.insert("handle_token", Value::from(start_token.as_str()));
+    let start_request: zbus::zvariant::OwnedObjectPath = rd
+        .call::<_, (&ObjectPath<'_>, &str, HashMap<&str, Value>), zbus::zvariant::OwnedObjectPath>(
+            "Start",
+            &(&session_path, "", options),
+        )
+        .await
+        .map_err(portal_err)?;
+    let _ = await_response(
+        &mut start_stream,
+        bus,
+        start_path.as_str(),
+        start_request.as_str(),
+        "Start",
+    )
+    .await?;
+
+    // 4. ConnectToEIS → fd（h）。
+    let fd: zbus::zvariant::OwnedFd = rd
+        .call(
+            "ConnectToEIS",
+            &(&session_path, HashMap::<&str, Value>::new()),
+        )
+        .await
+        .map_err(portal_err)?;
+    Ok(fd)
+}
+
+/// 将 D-Bus unique name 编码为 portal 路径的 sender 段。
+///
+/// `":1.42"` → `"1_42"`——xdg-desktop-portal handle_token 路径编码规则：
+/// 去掉前导 `':'`，将 `'.'` 替换为 `'_'`。
+fn encode_sender_part(unique_name: &str) -> String {
+    unique_name.trim_start_matches(':').replace('.', "_")
+}
+
+/// 预算 portal Request 对象路径（`/org/freedesktop/portal/desktop/request/<sender>/<token>`）。
+fn request_path(
+    req_prefix: &str,
+    sender_part: &str,
+    token: &str,
+) -> Result<zbus::zvariant::ObjectPath<'static>> {
+    zbus::zvariant::ObjectPath::try_from(format!("{req_prefix}{sender_part}/{token}"))
+        .map_err(|e| AgentShellError::DBus(format!("request path: {e}")))
+        .map(|p| p.into_owned())
+}
+
+/// 在发送 portal 调用**之前**订阅指定 Request 路径上的 `Response` 信号，
+/// 避免后端在订阅前就回复导致信号丢失（竞态）。
+async fn subscribe_response(
+    bus: &zbus::Connection,
+    request_path: &zbus::zvariant::ObjectPath<'_>,
+) -> Result<zbus::MessageStream> {
     let rule = zbus::MatchRule::builder()
         .msg_type(zbus::message::Type::Signal)
         .interface("org.freedesktop.portal.Request")
@@ -346,77 +456,72 @@ async fn portal_connect_to_eis(bus: &zbus::Connection) -> Result<zbus::zvariant:
         .path(request_path.clone())
         .map_err(|e| AgentShellError::DBus(format!("match rule path: {e}")))?
         .build();
-    let mut signal_stream = zbus::MessageStream::for_match_rule(rule, bus, Some(4))
+    zbus::MessageStream::for_match_rule(rule, bus, Some(4))
         .await
-        .map_err(|e| AgentShellError::DBus(format!("signal stream: {e}")))?;
-
-    // 1–2. CreateSession / SelectDevices(KEYBOARD|POINTER)。
-    rd.call_method("CreateSession", &(&options,))
-        .await
-        .map_err(portal_err)?;
-    rd.call_method("SelectDevices", &(&session_path, &options))
-        .await
-        .map_err(portal_err)?;
-
-    // 3. Start（触发用户确认弹窗）并等待 Response(u==0)。
-    rd.call_method("Start", &(&session_path, "", &options))
-        .await
-        .map_err(portal_err)?;
-    let response_code = wait_response(&mut signal_stream).await?;
-    drop(signal_stream);
-    if response_code != 0 {
-        return Err(AgentShellError::Permission(format!(
-            "portal RemoteDesktop authorization refused (code {response_code})"
-        )));
-    }
-
-    // 4. ConnectToEIS → fd（响应体 a{sa{sv}}(h)：fd 数组取第一个）。
-    let msg = rd
-        .call_method("ConnectToEIS", &(&session_path, &options))
-        .await
-        .map_err(portal_err)?;
-    let mut fields: Vec<zbus::zvariant::Value<'static>> = msg
-        .body()
-        .deserialize::<zbus::zvariant::OwnedStructure>()
-        .map_err(|e| AgentShellError::DBus(format!("ConnectToEIS body: {e}")))?
-        .0
-        .into_fields();
-    for field in fields.drain(..).rev() {
-        // 签名 a{sa{sv}}(h)：结构体最后一个字段是 fd 数组。
-        if let Ok(arr) = field.downcast::<zbus::zvariant::Array<'_>>() {
-            for item in arr.iter() {
-                if let Ok(fd) = item.downcast_ref::<zbus::zvariant::Fd<'_>>() {
-                    // Fd<'_> 借用消息体；dup 成自有 fd。
-                    if let Ok(owned) = fd.try_to_owned() {
-                        return Ok(zbus::zvariant::OwnedFd::from(owned));
-                    }
-                }
-            }
-        }
-    }
-    Err(AgentShellError::DBus(
-        "ConnectToEIS: no fd in response body".into(),
-    ))
+        .map_err(|e| AgentShellError::DBus(format!("signal stream: {e}")))
 }
 
-/// 从订阅流中读出 Request.Response 的第一个参数（响应码）。
-async fn wait_response(stream: &mut zbus::MessageStream) -> Result<u32> {
-    // 弹窗等待放宽到 30s：用户确认不可预期。
-    let deadline = tokio::time::Instant::now() + INPUT_TIMEOUT * 30;
-    // Response 信号首条即为 Start 请求的应答（订阅在请求前建立）。
-    {
-        let msg = tokio::time::timeout_at(deadline, stream.next())
-            .await
-            .map_err(|_| {
-                AgentShellError::Timeout("portal RemoteDesktop response timed out".into())
-            })?
-            .ok_or_else(|| AgentShellError::DBus("portal signal stream ended".to_string()))?
-            .map_err(|e| AgentShellError::DBus(format!("signal read: {e}")))?;
-        let body = msg.body();
-        let (code, _): (u32, zbus::zvariant::OwnedValue) = body
-            .deserialize()
-            .map_err(|e| AgentShellError::DBus(format!("Response body: {e}")))?;
-        Ok(code)
+/// 解析 `Request.Response` 信号体 `(ua{sv})` → (response code, results vardict)。
+fn parse_response_body(
+    msg: &zbus::Message,
+) -> Result<(u32, HashMap<String, zbus::zvariant::OwnedValue>)> {
+    msg.body()
+        .deserialize()
+        .map_err(|e| AgentShellError::DBus(format!("Response body: {e}")))
+}
+
+/// 消费预订阅的流，读取一条 `Response` 信号并解析 `(ua{sv})`，返回 results；
+/// 响应码非 0 归一为 `Permission`。弹窗等待放宽到 30s（用户确认不可预期）。
+async fn drain_response(
+    stream: &mut zbus::MessageStream,
+    step: &str,
+) -> Result<HashMap<String, zbus::zvariant::OwnedValue>> {
+    let msg = tokio::time::timeout(INPUT_TIMEOUT * 30, stream.next())
+        .await
+        .map_err(|_| {
+            AgentShellError::Timeout(format!("portal {step} Response timed out after 30s"))
+        })?
+        .ok_or_else(|| AgentShellError::DBus("portal signal stream ended".to_string()))?
+        .map_err(|e| AgentShellError::DBus(format!("signal read: {e}")))?;
+    let (code, results) = parse_response_body(&msg)?;
+    if code != 0 {
+        return Err(AgentShellError::Permission(format!(
+            "portal RemoteDesktop {step} authorization refused (code {code})"
+        )));
+    }
+    Ok(results)
+}
+
+/// 在方法返回后订阅 `returned_path` 上的 Response（路径失配兜底，存在竞态）。
+async fn wait_response_on_path(
+    bus: &zbus::Connection,
+    returned_path: &str,
+    step: &str,
+) -> Result<HashMap<String, zbus::zvariant::OwnedValue>> {
+    let path = zbus::zvariant::ObjectPath::try_from(returned_path)
+        .map_err(|e| AgentShellError::DBus(format!("request path: {e}")))?;
+    let mut stream = subscribe_response(bus, &path).await?;
+    drain_response(&mut stream, step).await
+}
+
+/// 等待 `Response` 并返回 results：返回路径与预算路径一致时消费预订阅流，
+/// 失配时改在返回路径上重建订阅（非默认路径）。
+async fn await_response(
+    stream: &mut zbus::MessageStream,
+    bus: &zbus::Connection,
+    predicted: &str,
+    returned: &str,
+    step: &str,
+) -> Result<HashMap<String, zbus::zvariant::OwnedValue>> {
+    if predicted == returned {
+        drain_response(stream, step).await
+    } else {
+        tracing::warn!(
+            expected = %predicted,
+            got = returned,
+            "portal request path mismatch; re-subscribing on returned path"
+        );
+        wait_response_on_path(bus, returned, step).await
     }
 }
 
@@ -607,5 +712,62 @@ mod tests {
   </interface>
 </node>"#;
         assert!(!xml_advertises_connect_to_eis(xml));
+    }
+
+    #[test]
+    fn encode_sender_part_strips_colon_and_dots() {
+        // ":1.42" → "1_42"——portal handle_token 路径编码规则。
+        assert_eq!(encode_sender_part(":1.42"), "1_42");
+        assert_eq!(encode_sender_part(":1.99"), "1_99");
+        assert_eq!(encode_sender_part(":1.0"), "1_0");
+    }
+
+    #[test]
+    fn request_path_encodes_sender_and_token() {
+        let p = request_path(
+            "/org/freedesktop/portal/desktop/request/",
+            "1_42",
+            "agent_shell_input_create_123",
+        )
+        .expect("valid request path");
+        assert_eq!(
+            p.as_str(),
+            "/org/freedesktop/portal/desktop/request/1_42/agent_shell_input_create_123"
+        );
+    }
+
+    #[test]
+    fn parse_response_body_decodes_portal_vardict() {
+        // 规范签名 `(ua{sv})`：旧代码按 `(uv)` 反序列化会报 Signature mismatch
+        // （got '(ua{sv})', expected '(uv)'），此测试锚定 `(ua{sv})` 解析路径，
+        // 防止 TC-201/202/204 的根因回退。
+        let mut results = HashMap::<&str, zbus::zvariant::Value>::new();
+        results.insert(
+            "session_handle",
+            zbus::zvariant::Value::from("/org/freedesktop/portal/desktop/session/1_42/tok"),
+        );
+        results.insert("devices", zbus::zvariant::Value::from(3u32));
+        let body = (0u32, results);
+        let msg = zbus::Message::signal(
+            "/org/freedesktop/portal/desktop/request/1_42/tok",
+            "org.freedesktop.portal.Request",
+            "Response",
+        )
+        .expect("signal builder")
+        .build(&body)
+        .expect("build (ua{sv}) message");
+
+        let (code, parsed) = parse_response_body(&msg).expect("parse (ua{sv})");
+        assert_eq!(code, 0);
+        let handle = parsed
+            .get("session_handle")
+            .and_then(|v| v.downcast_ref::<&str>().ok())
+            .expect("session_handle present");
+        assert_eq!(handle, "/org/freedesktop/portal/desktop/session/1_42/tok");
+        let devices = parsed
+            .get("devices")
+            .and_then(|v| v.downcast_ref::<u32>().ok())
+            .expect("devices present");
+        assert_eq!(devices, 3);
     }
 }
