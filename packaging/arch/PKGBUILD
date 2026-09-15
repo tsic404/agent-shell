@@ -9,7 +9,7 @@ arch=('x86_64' 'aarch64')
 url="https://github.com/tsic404/agent-shell"
 license=('MIT')
 # pipewire：portal-screencast feature（默认）所需；--no-default-features 构建可省略
-# （无 dev 头发行版，TSI-3111）。
+# （无 dev 头发行版）。
 makedepends=('cargo' 'pipewire' 'systemd' 'polkit')
 source=("agent-shell::git+$url")
 sha256sums=('SKIP')
