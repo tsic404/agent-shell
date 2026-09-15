@@ -103,6 +103,12 @@ impl CompositorBackend {
 }
 /// DDE 合成器形态 → 事件源标签（§18.1 映射；deepin-kwin 复用 org_kde
 /// 协议，与 KWinWayland 同源，不得误标 Treeland）。
+///
+/// `CompositorKind::X11 → EventSource::X11Generic` 是生产代码唯一构造点
+/// （测试在 `event/tests/events.rs` 另有直接构造）：该变体 `de_type()` 恒为
+/// KDE，正确性依赖「仅 DDE X11 会话发出」这一前提。通用 X11 兜底 backend
+/// （`backends/generic`）无原生窗口事件流，若接入事件流须新增独立事件源，
+/// 不得复用 `X11Generic`。
 fn dde_event_source(kind: CompositorKind) -> event::EventSource {
     match kind {
         CompositorKind::DeepinKwin => event::EventSource::KWinWayland,
