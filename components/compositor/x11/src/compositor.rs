@@ -376,9 +376,19 @@ impl CompositorComponent for X11Compositor {
 
     async fn unminimize_window(&self, id: &WindowId) -> Result<()> {
         let window = Self::parse_window_id(id)?;
-        // EWMH 无 unminimize 消息：清除 HIDDEN + 激活
-        match self.display.unminimize_window(window) {
+        // EWMH 无 unminimize 消息：清除 HIDDEN（回读确认 HIDDEN 已移除）+ 激活。
+        // 确认轮询是同步 sleep，走 spawn_blocking 避免阻塞 tokio worker（§19 审查项）。
+        let display = Arc::clone(&self.display);
+        let r = tokio::task::spawn_blocking(move || display.unminimize_window(window))
+            .await
+            .map_err(|e| {
+                AgentShellError::Other(format!("x11 unminimize blocking task join: {e}").into())
+            })?;
+        match r {
             Ok(()) => Ok(()),
+            // WM 忽略 HIDDEN 移除（Timeout）是真实失败——CLI 兜底同样无回读，
+            // 回退会把错误吞回 exit 0，故直接上抛（与 focus_window 同口径）。
+            Err(e @ AgentShellError::Timeout(_)) => Err(e),
             Err(e) => {
                 tracing::warn!(error = %e, "EWMH unminimize failed; trying CLI fallback");
                 self.cmd()?.activate_window(&id.native_id).await

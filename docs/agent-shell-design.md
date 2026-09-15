@@ -2232,6 +2232,7 @@ pub struct X11DisplayServer {
 | 聚焦 | `_NET_ACTIVE_WINDOW` ClientMessage + 回读确认 | EWMH |
 | 移动/缩放 | `x11rb::configure_window` + `_NET_MOVERESIZE_WINDOW` | X11 core + EWMH |
 | 最小化 | `_NET_WM_STATE` ClientMessage (_NET_WM_STATE_HIDDEN) | EWMH |
+| 还原 | `_NET_WM_STATE` ClientMessage (REMOVE _NET_WM_STATE_HIDDEN) + 回读确认 | EWMH |
 | 最大化 | `_NET_WM_STATE` ClientMessage (_NET_WM_STATE_MAXIMIZED_VERT/HORZ) | EWMH |
 | 关闭 | `_NET_CLOSE_WINDOW` ClientMessage | EWMH |
 | 获取窗口信息 | `GetGeometry` + `_NET_WM_NAME` + `WM_CLASS` + `_NET_WM_PID` | X11 core + EWMH |
@@ -3601,6 +3602,7 @@ impl<T> FallbackChain<T> {
 | portal ScreenCast 会话 | 10s | 1 | 2000ms |
 | 输入注入 (fake_input/XTest) | 1s | 3 | 100ms ×2 |
 | EWMH 聚焦回读确认 | 500ms | 0 | 10ms 轮询 |
+| EWMH 还原回读确认 | 500ms | 0 | 10ms 轮询 |
 | 截图 (portal→X11) | 8s | 2 | 1500ms |
 | 截图（交互，弹授权窗） | 5s | 1 | — |
 
