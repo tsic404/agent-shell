@@ -24,6 +24,10 @@ use agent_shell_notification::FreedesktopNotification;
 use agent_shell_power::UPowerComponent;
 
 /// X11 通用兜底 backend（§3.3 X11Generic 行：无 DE，EWMH/XTest 原生）。
+///
+/// 本 backend 的 `X11Compositor` 无原生窗口事件流（`window_events = false`）。
+/// 若未来接入事件流，须新增独立事件源：`EventSource::X11Generic` 保留给
+/// DDE X11 会话（其 `de_type()` 恒为 KDE），复用会误标本兜底会话的窗口 DE。
 pub struct X11Backend;
 
 impl Default for X11Backend {

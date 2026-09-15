@@ -80,7 +80,12 @@ pub enum EventSource {
     Sway,
     /// WLR Wayland
     WlrWayland,
-    /// X11 通用
+    /// DDE X11 会话事件（复用 KWin EWMH 桥，窗口 ID 打 KDE 标签）。
+    ///
+    /// 生产代码中仅由 `daemon/src/state.rs` 的 `dde_event_source` 构造（测试
+    /// 在 `event/tests/events.rs` 另有直接构造）；通用 X11 兜底 backend
+    /// （`backends/generic` 的 `X11Backend`）无原生窗口事件流，若未来接入
+    /// 事件流须新增独立事件源，不得复用本变体（`de_type()` 恒为 KDE）。
     X11Generic,
     /// AT-SPI 无障碍
     AtSpi,
@@ -96,9 +101,12 @@ impl EventSource {
     /// 事件源对应的桌面环境标签（`WindowId.de_type`）。
     ///
     /// 窗口事件源必然对应具体 DE：KWin 双通道标 KDE（deepin-kwin 复用
-    /// org_kde 协议同口径）；X11Generic 亦标 KDE——它仅由 DDE X11 会话发出，
-    /// 复用 KWin EWMH 桥、窗口 ID 打 KDE 标签。非窗口源（AT-SPI/输入/
-    /// Portal/电源）无窗口语义，返回 `Unknown`。
+    /// org_kde 协议同口径）；X11Generic 亦标 KDE——它仅由 DDE X11 会话发出
+    /// （生产代码中 `daemon/src/state.rs` 的 `dde_event_source` 为唯一构造点，
+    /// 复用 KWin EWMH 桥、窗口 ID 打 KDE 标签；测试另有直接构造）。通用 X11
+    /// 兜底 backend 无原生窗口事件流，若未来接入事件流须新增独立事件源，
+    /// 勿复用本变体。非窗口源（AT-SPI/输入/Portal/电源）无窗口语义，
+    /// 返回 `Unknown`。
     pub fn de_type(&self) -> DesktopEnvironment {
         match self {
             Self::KWinWayland | Self::KWinX11 | Self::X11Generic => DesktopEnvironment::KDE,
