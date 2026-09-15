@@ -13,6 +13,8 @@
 //!   DBus daemon `GetConnectionUnixProcessID` 解析 PID。
 //! - 状态集是 `(u32, u32)` 位图，位索引即 `AtspiStateType` 枚举值。
 
+use std::future::Future;
+
 use crate::tree::{ApplicationNode, AtspiRole, AtspiState, ElementNode, WindowNode};
 use agent_shell_core::error::{AgentShellError, Result};
 use agent_shell_core::types::Rect;
@@ -28,10 +30,14 @@ pub const BUS_SERVICE: &str = "org.a11y.Bus";
 const COORD_TYPE_SCREEN: u32 = 0;
 /// 语义遍历最大深度保护（深层 Web 树可达数十层）。
 pub const MAX_TRAVERSE_DEPTH: u8 = 24;
-/// session bus 方法调用超时：GetAddress 触发懒激活时，在无 AT-SPI 的隔离
-/// 会话（dbus-run-session）里避免挂满 dbus-daemon 默认激活超时 ~120s
-/// （对齐 §19 超时表 D-Bus 5s）。
+/// session bus 普通方法调用超时（`NameHasOwner`/`ListActivatableNames`
+/// 预检），对齐 §19 D-Bus 5s。
 const SESSION_CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+/// `GetAddress` 懒激活超时例外：首次调用会启动私有 a11y bus（dbus-daemon +
+/// registryd），真实会话里需数秒、加载中的会话更久，普通 5s 会在激活完成前
+/// 中止调用、留下 stale socket（Connection refused）。放宽到 30s，仍远低于
+/// dbus-daemon 激活超时 ~120s。
+const GET_ADDRESS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// AT-SPI D-Bus 桥接。
 ///
@@ -52,7 +58,6 @@ impl AtspiBridge {
     pub async fn connect() -> Result<Self> {
         let session = zbus::connection::Builder::session()
             .map_err(|e| AgentShellError::BackendUnavailable(format!("session bus: {e}")))?
-            .method_timeout(SESSION_CALL_TIMEOUT)
             .build()
             .await
             .map_err(|e| AgentShellError::BackendUnavailable(format!("session bus: {e}")))?;
@@ -60,23 +65,27 @@ impl AtspiBridge {
         let dbus = zbus::fdo::DBusProxy::new(&session)
             .await
             .map_err(|e| AgentShellError::BackendUnavailable(format!("DBusProxy: {e}")))?;
-        let has_owner = dbus
-            .name_has_owner(
-                BUS_SERVICE.try_into().map_err(|e| {
-                    AgentShellError::BackendUnavailable(format!("bad bus name: {e}"))
-                })?,
-            )
-            .await
-            .map_err(|e| AgentShellError::BackendUnavailable(format!("NameHasOwner: {e}")))?;
+        let bus_name = BUS_SERVICE
+            .try_into()
+            .map_err(|e| AgentShellError::BackendUnavailable(format!("bad bus name: {e}")))?;
+        let has_owner = call_bounded(
+            dbus.name_has_owner(bus_name),
+            SESSION_CALL_TIMEOUT,
+            "NameHasOwner",
+        )
+        .await?;
 
         // 无 owner 时查询可激活列表：可激活 → GetAddress 按需启动 a11y bus；
         // 不可激活 → 提前返回，不触发激活（避免 ~120s 停顿）。
         let activatable: Vec<zbus::names::OwnedBusName> = if has_owner {
             Vec::new()
         } else {
-            dbus.list_activatable_names().await.map_err(|e| {
-                AgentShellError::BackendUnavailable(format!("ListActivatableNames: {e}"))
-            })?
+            call_bounded(
+                dbus.list_activatable_names(),
+                SESSION_CALL_TIMEOUT,
+                "ListActivatableNames",
+            )
+            .await?
         };
         if !should_probe_address(has_owner, &activatable) {
             return Err(AgentShellError::BackendUnavailable(
@@ -88,9 +97,12 @@ impl AtspiBridge {
             .await
             .map_err(|e| AgentShellError::BackendUnavailable(format!("org.a11y.Bus: {e}")))?;
         // 返回签名是 s（实测 busctl），不是 v
-        let address: String =
-            Self::err(bus.call("GetAddress", &()).await, "org.a11y.Bus.GetAddress")
-                .map_err(|e| AgentShellError::BackendUnavailable(e.to_string()))?;
+        let address: String = call_bounded(
+            bus.call("GetAddress", &()),
+            GET_ADDRESS_TIMEOUT,
+            "org.a11y.Bus.GetAddress",
+        )
+        .await?;
 
         let conn = zbus::connection::Builder::address(address.as_str())
             .map_err(|e| AgentShellError::BackendUnavailable(format!("a11y bus addr: {e}")))?
@@ -436,6 +448,25 @@ impl AtspiBridge {
     }
 }
 
+/// 有界 D-Bus 方法调用：超时或总线错误统一归一为 [`AgentShellError::BackendUnavailable`]。
+///
+/// zbus 5 只在连接级提供 `method_timeout`，无法对单个调用设独立超时；而
+/// `GetAddress` 懒激活需 30s、预检只需 5s，故逐调用用 tokio 超时包裹。
+async fn call_bounded<F, T, E>(
+    fut: F,
+    timeout: std::time::Duration,
+    what: &'static str,
+) -> Result<T>
+where
+    F: Future<Output = std::result::Result<T, E>>,
+    E: std::fmt::Display,
+{
+    tokio::time::timeout(timeout, fut)
+        .await
+        .map_err(|_| AgentShellError::BackendUnavailable(format!("{what} timed out")))?
+        .map_err(|e| AgentShellError::BackendUnavailable(format!("{what}: {e}")))
+}
+
 /// 判定是否应调用 `GetAddress` 继续装配（纯函数，无 I/O）。
 ///
 /// 三态（单测覆盖）：
@@ -470,6 +501,16 @@ mod tests {
     fn constants_match_atspi_headers() {
         assert_eq!(REGISTRY_SERVICE, "org.a11y.atspi.Registry");
         assert_eq!(ROOT_PATH, "/org/a11y/atspi/accessible/root");
+    }
+
+    #[test]
+    fn timeout_constants_anchor_atspi_activation_contract() {
+        // 预检沿用 §19 D-Bus 5s；GetAddress 懒激活例外放宽到 30s，须严格大于
+        // 预检且远低于 dbus-daemon 激活超时 ~120s——两者同取 5s 会过早中止
+        // 激活（回归）。
+        assert_eq!(SESSION_CALL_TIMEOUT, std::time::Duration::from_secs(5));
+        assert_eq!(GET_ADDRESS_TIMEOUT, std::time::Duration::from_secs(30));
+        assert!(GET_ADDRESS_TIMEOUT > SESSION_CALL_TIMEOUT);
     }
 
     #[test]
