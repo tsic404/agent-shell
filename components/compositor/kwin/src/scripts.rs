@@ -357,15 +357,23 @@ impl Compat {
                 // REQ_ID_TOKEN 且长驻脚本不经 token 替换，推送会被按查询
                 // 路由而静默丢弃。
                 let push = push_event("payload");
+                // 两版均无 activeWindowChanged 信号：KWin 6 为 windowAdded/
+                // windowRemoved/windowActivated，KWin 5 为 clientAdded/clientRemoved/
+                // clientActivated。用错信号名时 .connect 抛错会中止整个脚本装配，
+                // 前两行绑定一并失效，loadScript/run 却静默返回成功。
+                let (added, removed, activated) = if self.v6 {
+                    ("windowAdded", "windowRemoved", "windowActivated")
+                } else {
+                    ("clientAdded", "clientRemoved", "clientActivated")
+                };
                 format!(
                     "function __push(payload) {{\n{push}\n}}\n\
                      function __wid(w) {{\n\
                      \x20   return w.internalId !== undefined ? w.internalId.toString() : String(w.id);\n\
                      }}\n\
-                     workspace.windowAdded.connect(function(w) {{ __push({{ event: \"windowOpened\", id: __wid(w) }}); }});\n\
-                     workspace.windowRemoved.connect(function(w) {{ __push({{ event: \"windowClosed\", id: __wid(w) }}); }});\n\
-                     workspace.activeWindowChanged.connect(function() {{\n\
-                     \x20   var w = workspace.activeWindow;\n\
+                     workspace.{added}.connect(function(w) {{ __push({{ event: \"windowOpened\", id: __wid(w) }}); }});\n\
+                     workspace.{removed}.connect(function(w) {{ __push({{ event: \"windowClosed\", id: __wid(w) }}); }});\n\
+                     workspace.{activated}.connect(function(w) {{\n\
                      \x20   if (w) __push({{ event: \"windowFocused\", id: __wid(w) }});\n\
                      }});\n"
                 )
@@ -500,13 +508,22 @@ mod tests {
     }
 
     #[test]
-    fn event_monitor_never_sends_final_result_but_registers_signals() {
-        let script = render_v6(ScriptTemplate::EventMonitor, &[]);
-        assert!(script.contains("workspace.windowAdded.connect"));
-        assert!(script.contains("workspace.windowRemoved.connect"));
-        assert!(script.contains("workspace.activeWindowChanged.connect"));
+    fn event_monitor_registers_version_correct_signals_without_final_result() {
+        let v6 = render_v6(ScriptTemplate::EventMonitor, &[]);
+        assert!(v6.contains("workspace.windowAdded.connect"));
+        assert!(v6.contains("workspace.windowRemoved.connect"));
+        assert!(v6.contains("workspace.windowActivated.connect"));
+        // 两版都没有 activeWindowChanged——用错会 .connect 抛错零注册。
+        assert!(!v6.contains("activeWindowChanged"));
+
+        let v5 = ScriptTemplate::EventMonitor.render(false, &[]).unwrap();
+        assert!(v5.contains("workspace.clientAdded.connect"));
+        assert!(v5.contains("workspace.clientRemoved.connect"));
+        assert!(v5.contains("workspace.clientActivated.connect"));
+        assert!(!v5.contains("activeWindowChanged"));
+
         // 长驻脚本没有一次性结果回传语句。
-        assert!(!script.contains("JSON.stringify(result)"));
+        assert!(!v6.contains("JSON.stringify(result)"));
     }
 
     #[test]

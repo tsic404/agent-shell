@@ -1413,8 +1413,7 @@ workspace.windowAdded.connect(function(w) {
 workspace.windowRemoved.connect(function(w) {
     callDBus(..., JSON.stringify({ event: "windowClosed", id: w.internalId.toString() }));
 });
-workspace.activeWindowChanged.connect(function() {
-    var w = workspace.activeWindow;
+workspace.windowActivated.connect(function(w) {
     if (w) callDBus(..., JSON.stringify({ event: "windowFocused", id: w.internalId.toString() }));
 });
 ```
