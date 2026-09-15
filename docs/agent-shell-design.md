@@ -1124,6 +1124,7 @@ impl X11DisplayServer {
     }
     pub fn get_client_list(&self) -> Result<Vec<x11rb::protocol::xproto::Window>> { /* _NET_CLIENT_LIST */ }
     pub fn activate_window(&self, window: u32) -> Result<()> { /* _NET_ACTIVE_WINDOW */ }
+    pub fn activate_window_confirmed(&self, window: u32) -> Result<()> { /* 回读确认（无回执时区分 WM 忽略） */ }
     pub fn close_window(&self, window: u32) -> Result<()> { /* _NET_CLOSE_WINDOW */ }
     pub fn move_resize_window(
         &self,
@@ -1524,7 +1525,9 @@ list_windows():
 
 focus_window(id):
   0. X11 会话？
-     → 是：EWMH `_NET_ACTIVE_WINDOW` ClientMessage（十进制窗口 id，见 TSI-3131）
+     → 是：EWMH `_NET_ACTIVE_WINDOW` ClientMessage + 回读确认（十进制窗口 id；
+            EWMH 无回执，WM 忽略请求时 send 仍成功，轮询 `_NET_ACTIVE_WINDOW`
+            超时即返回明确错误，见 TSI-3131）
   1. wayland.window_mgmt 绑定成功？
      → 是：activate(uuid) 走协议
      → 否：bridge.focus_window.js 走 Scripting
@@ -2226,7 +2229,7 @@ pub struct X11DisplayServer {
 | 操作 | 实现方式 | 协议 |
 |------|---------|------|
 | 窗口列表 | `_NET_CLIENT_LIST` get_property | EWMH |
-| 聚焦 | `_NET_ACTIVE_WINDOW` ClientMessage | EWMH |
+| 聚焦 | `_NET_ACTIVE_WINDOW` ClientMessage + 回读确认 | EWMH |
 | 移动/缩放 | `x11rb::configure_window` + `_NET_MOVERESIZE_WINDOW` | X11 core + EWMH |
 | 最小化 | `_NET_WM_STATE` ClientMessage (_NET_WM_STATE_HIDDEN) | EWMH |
 | 最大化 | `_NET_WM_STATE` ClientMessage (_NET_WM_STATE_MAXIMIZED_VERT/HORZ) | EWMH |
@@ -3597,6 +3600,7 @@ impl<T> FallbackChain<T> {
 | hyprctl socket 请求 | 2s | 2 | 200ms ×2 |
 | portal ScreenCast 会话 | 10s | 1 | 2000ms |
 | 输入注入 (fake_input/XTest) | 1s | 3 | 100ms ×2 |
+| EWMH 聚焦回读确认 | 500ms | 0 | 10ms 轮询 |
 | 截图 (portal→X11) | 8s | 2 | 1500ms |
 | 截图（交互，弹授权窗） | 5s | 1 | — |
 

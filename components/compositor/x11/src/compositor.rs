@@ -7,6 +7,8 @@
 //!
 //! 事件流：X11 无合成器级原生事件推送，`capabilities().window_events = false`。
 
+use std::sync::Arc;
+
 use async_trait::async_trait;
 
 use agent_shell_core::component::{
@@ -29,8 +31,9 @@ use crate::ewmh;
 /// 全部窗口操作走原生 x11rb；仅当原生失败才落到 `cmd`（xdotool/wmctrl），
 /// 且 CLI 缺失不阻塞初始化。
 pub struct X11Compositor {
-    /// 协议通道基础（EWMH/ICCCM/XTest/MIT-SHM）。
-    display: X11DisplayServer,
+    /// 协议通道基础（EWMH/ICCCM/XTest/MIT-SHM）。`Arc` 供 `focus_window`
+    /// 的确认轮询经 `spawn_blocking` 跨线程借用（`RustConnection` 不可 Clone）。
+    display: Arc<X11DisplayServer>,
     /// CLI 保底（xdotool/wmctrl；`None` 表示两者均未安装）。
     cmd: Option<X11Commands>,
 }
@@ -54,7 +57,7 @@ impl X11Compositor {
     /// X server 不可达返回 `BackendUnavailable`；CLI 工具缺失只记入
     /// `cmd` 字段（`None` 或部分可用），不报错。
     pub fn new() -> Result<Self> {
-        let display = X11DisplayServer::connect()?;
+        let display = Arc::new(X11DisplayServer::connect()?);
         let cmd = X11Commands::new();
         let cmd = if cmd.is_usable() { Some(cmd) } else { None };
         Ok(Self { display, cmd })
@@ -64,7 +67,10 @@ impl X11Compositor {
     pub fn with_display_server(display: X11DisplayServer) -> Self {
         let cmd = X11Commands::new();
         let cmd = if cmd.is_usable() { Some(cmd) } else { None };
-        Self { display, cmd }
+        Self {
+            display: Arc::new(display),
+            cmd,
+        }
     }
 
     /// 协议通道引用（doctor 与子模块复用）。
@@ -300,11 +306,21 @@ impl CompositorComponent for X11Compositor {
 
     async fn focus_window(&self, id: &WindowId) -> Result<()> {
         let window = Self::parse_window_id(id)?;
-        // 原生 EWMH _NET_ACTIVE_WINDOW
-        match self.display.activate_window(window) {
+        // 原生 EWMH `_NET_ACTIVE_WINDOW` + 回读确认。确认轮询是同步 sleep，
+        // 走 spawn_blocking 避免阻塞 tokio worker（§19 审查项）。
+        let display = Arc::clone(&self.display);
+        let r = tokio::task::spawn_blocking(move || display.activate_window_confirmed(window))
+            .await
+            .map_err(|e| {
+                AgentShellError::Other(format!("x11 focus blocking task join: {e}").into())
+            })?;
+        match r {
             Ok(()) => Ok(()),
+            // WM 忽略/拒收（Timeout）是本 PR 要暴露的错误——CLI 兜底同样是无
+            // 回读的 fire-and-forget EWMH，回退会把错误吞回 exit 0，故直接上抛。
+            Err(e @ AgentShellError::Timeout(_)) => Err(e),
             Err(e) => {
-                // 降级 CLI
+                // 原生发送/读回失败（非超时）才降级 CLI。
                 tracing::warn!(error = %e, "EWMH activate failed; trying CLI fallback");
                 self.cmd()?.activate_window(&id.native_id).await
             }

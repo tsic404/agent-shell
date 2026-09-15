@@ -3,6 +3,7 @@
 //! 对应设计文档 §6：连接、EWMH 窗口操作、XTest 注入、截图与监视器几何。
 
 use std::os::fd::AsRawFd as _;
+use std::time::{Duration, Instant};
 
 use x11rb::atom_manager;
 use x11rb::connection::{Connection as _, RequestConnection as _};
@@ -393,6 +394,38 @@ impl X11DisplayServer {
             event,
             EventMask::SUBSTRUCTURE_REDIRECT | EventMask::SUBSTRUCTURE_NOTIFY,
         )
+    }
+
+    /// 聚焦确认轮询间隔：EWMH ClientMessage 无回执，WM 异步更新
+    /// `_NET_ACTIVE_WINDOW`，回读需留出事件循环处理时间。
+    const FOCUS_CONFIRM_POLL_INTERVAL: Duration = Duration::from_millis(10);
+    /// 聚焦确认总超时：超过仍未匹配目标窗口视为 WM 忽略/拒收请求。
+    const FOCUS_CONFIRM_TIMEOUT: Duration = Duration::from_millis(500);
+
+    /// `_NET_ACTIVE_WINDOW` 聚焦请求 + 回读确认。
+    ///
+    /// [`Self::activate_window`] 是 fire-and-forget（EWMH ClientMessage 无回执），
+    /// WM 忽略请求或 focus-stealing prevention 拒收时 send 仍成功，聚焦却未发生。
+    /// 本方法发送后轮询 [`Self::get_active_window`] 直至目标窗口获得焦点或超时——
+    /// 供 `windows focus` 区分「请求发出」与「聚焦已生效」，被忽略时返回
+    /// [`AgentShellError::Timeout`]（而非 fire-and-forget 的 exit 0）。
+    ///
+    /// 本方法是同步轮询（内部 `thread::sleep`），最长阻塞 [`Self::FOCUS_CONFIRM_TIMEOUT`]；
+    /// async 调用方须用 `tokio::task::spawn_blocking` 包裹，避免占死 tokio worker。
+    pub fn activate_window_confirmed(&self, window: x11rb::protocol::xproto::Window) -> Result<()> {
+        self.activate_window(window)?;
+        let deadline = Instant::now() + Self::FOCUS_CONFIRM_TIMEOUT;
+        loop {
+            if self.get_active_window()? == Some(window) {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(AgentShellError::Timeout(format!(
+                    "focus not confirmed: WM did not set _NET_ACTIVE_WINDOW to {window:#x} (ignored or denied)"
+                )));
+            }
+            std::thread::sleep(Self::FOCUS_CONFIRM_POLL_INTERVAL);
+        }
     }
 
     /// `_NET_CLOSE_WINDOW` ClientMessage：礼貌关闭窗口。
@@ -1158,5 +1191,47 @@ mod tests {
         // 无显示环境：两条路径都应返回结构化错误而非 panic（降级链契约）。
         let server = X11DisplayServer::connect_to(Some(":999")).unwrap_err();
         assert!(matches!(server, AgentShellError::BackendUnavailable(_)));
+    }
+
+    /// EWMH 聚焦无回执：WM 未把 `_NET_ACTIVE_WINDOW` 置为目标窗口时，
+    /// `activate_window_confirmed` 不得 fire-and-forget 返回 Ok，而应在
+    /// 轮询超时后给出明确错误（未映射窗口任何 WM 都不会聚焦，确定性走超时分支）。
+    #[test]
+    fn activate_window_confirmed_times_out_without_wm_grant() {
+        let Ok(server) = X11DisplayServer::connect() else {
+            eprintln!("skipped: no X11 display available");
+            return;
+        };
+
+        let win = server.conn.generate_id().unwrap();
+        server
+            .conn
+            .create_window(
+                24,
+                win,
+                server.root_window(),
+                0,
+                0,
+                16,
+                16,
+                0,
+                x11rb::protocol::xproto::WindowClass::INPUT_OUTPUT,
+                0,
+                &Default::default(),
+            )
+            .unwrap();
+        let _ = server.conn.flush();
+        server.sync().unwrap();
+
+        let err = server
+            .activate_window_confirmed(win)
+            .expect_err("unmapped window cannot be focused; expect timeout error");
+        assert!(
+            matches!(err, AgentShellError::Timeout(_)),
+            "expected Timeout, got: {err:?}"
+        );
+
+        server.conn.destroy_window(win).unwrap();
+        let _ = server.conn.flush();
     }
 }
