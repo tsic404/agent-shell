@@ -360,7 +360,9 @@ impl Compat {
                 // 两版均无 activeWindowChanged 信号：KWin 6 为 windowAdded/
                 // windowRemoved/windowActivated，KWin 5 为 clientAdded/clientRemoved/
                 // clientActivated。用错信号名时 .connect 抛错会中止整个脚本装配，
-                // 前两行绑定一并失效，loadScript/run 却静默返回成功。
+                // loadScript/run 却静默返回成功——因此把三个 connect 包进
+                // try/catch，成功推 __ready__、失败推 __error__，让 Rust 侧
+                // spawn_event_monitor 能以可见诊断替代 journalctl 排查。
                 let (added, removed, activated) = if self.v6 {
                     ("windowAdded", "windowRemoved", "windowActivated")
                 } else {
@@ -371,11 +373,16 @@ impl Compat {
                      function __wid(w) {{\n\
                      \x20   return w.internalId !== undefined ? w.internalId.toString() : String(w.id);\n\
                      }}\n\
-                     workspace.{added}.connect(function(w) {{ __push({{ event: \"windowOpened\", id: __wid(w) }}); }});\n\
-                     workspace.{removed}.connect(function(w) {{ __push({{ event: \"windowClosed\", id: __wid(w) }}); }});\n\
-                     workspace.{activated}.connect(function(w) {{\n\
-                     \x20   if (w) __push({{ event: \"windowFocused\", id: __wid(w) }});\n\
-                     }});\n"
+                     try {{\n\
+                     \x20   workspace.{added}.connect(function(w) {{ __push({{ event: \"windowOpened\", id: __wid(w) }}); }});\n\
+                     \x20   workspace.{removed}.connect(function(w) {{ __push({{ event: \"windowClosed\", id: __wid(w) }}); }});\n\
+                     \x20   workspace.{activated}.connect(function(w) {{\n\
+                     \x20       if (w) __push({{ event: \"windowFocused\", id: __wid(w) }});\n\
+                     \x20   }});\n\
+                     \x20   __push({{ event: \"__ready__\" }});\n\
+                     }} catch (e) {{\n\
+                     \x20   __push({{ event: \"__error__\", error: String(e) }});\n\
+                     }}\n"
                 )
             }
         }
@@ -541,6 +548,25 @@ mod tests {
         let query = render_v6(ScriptTemplate::ListWindows, &[]);
         assert!(query.contains("req:"));
         assert!(query.contains(REQ_ID_TOKEN));
+    }
+
+    /// 信号注册成功/失败必须在脚本内可见标记：try/catch 包住三个 connect，
+    /// 成功推 `__ready__`、异常推 `__error__`（携带异常文本）——这是
+    /// spawn_event_monitor 判定「订阅成功但零事件」的依据。
+    #[test]
+    fn event_monitor_reports_registration_markers() {
+        let v6 = render_v6(ScriptTemplate::EventMonitor, &[]);
+        assert!(v6.contains("try {"));
+        assert!(v6.contains("} catch (e)"));
+        assert!(v6.contains(r#"{ event: "__ready__" }"#));
+        assert!(v6.contains(r#"{ event: "__error__", error: String(e) }"#));
+        // 标记经 __push 推送，与普通事件共用同一 sendResult 通道。
+        assert!(v6.matches("__push").count() >= 4);
+
+        // v5 同样具备注册标记（clientAdded/clientRemoved/clientActivated）。
+        let v5 = ScriptTemplate::EventMonitor.render(false, &[]).unwrap();
+        assert!(v5.contains(r#"{ event: "__ready__" }"#));
+        assert!(v5.contains(r#"{ event: "__error__", error: String(e) }"#));
     }
 
     #[test]

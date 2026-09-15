@@ -111,6 +111,17 @@ impl ResponseRouter {
 
 type SharedRouter = Arc<Mutex<ResponseRouter>>;
 
+/// 事件脚本信号注册验证结果：`event_monitor.js` 的 `__ready__`/`__error__`
+/// 标记经 [`ResponseService::send_result`] 路由至此，供
+/// [`crate::event_script::spawn_event_monitor`] 判定信号是否真实接线。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RegistrationOutcome {
+    /// 三个信号全部 `connect` 成功。
+    Ready,
+    /// 某个 `connect` 抛错，脚本装配中止（携带异常文本）。
+    Failed(String),
+}
+
 /// D-Bus ↔ KWin Scripting 桥接（补充通道入口）。
 pub struct KWinBridge {
     /// session bus 连接（Scripting 调用与响应服务共用，保活句柄）。
@@ -119,6 +130,9 @@ pub struct KWinBridge {
     router: SharedRouter,
     /// 事件推送接收端（subscribe 时取走；Some=未订阅）。
     event_rx: Mutex<Option<mpsc::UnboundedReceiver<Value>>>,
+    /// 事件脚本信号注册标记的接收通道（spawn_event_monitor 验证用；
+    /// 标记先到即被响应服务消费，后续 subscribe 重新 prepare 覆盖）。
+    registration: Arc<Mutex<Option<oneshot::Sender<RegistrationOutcome>>>>,
 }
 
 impl KWinBridge {
@@ -140,10 +154,14 @@ impl KWinBridge {
         // 不进按 id 路由表（事件没有请求 id，见 🔴1）。接收端由桥接持有，
         // subscribe() 时取走；未订阅前的事件在 channel 缓存不丢失。
         let (event_tx, event_rx) = mpsc::unbounded_channel();
+        // 信号注册标记通道：spawn_event_monitor 在 run 前 prepare，响应服务
+        // 收到 __ready__/__error__ 标记时消费并投递，事件队列保持纯净。
+        let registration = Arc::new(Mutex::new(None::<oneshot::Sender<RegistrationOutcome>>));
 
         let service = ResponseService {
             router: Arc::clone(&router),
             events: event_tx,
+            registration: Arc::clone(&registration),
         };
         // 在既有连接上挂载响应服务 + 申请 well-known 总线名——单一连接，
         // 保活即保活服务（无需第二个连接句柄）。
@@ -164,6 +182,7 @@ impl KWinBridge {
             conn,
             router,
             event_rx: Mutex::new(Some(event_rx)),
+            registration,
         })
     }
 
@@ -303,16 +322,28 @@ impl KWinBridge {
     pub(crate) async fn take_raw_event_rx(&self) -> Option<mpsc::UnboundedReceiver<Value>> {
         self.event_rx.lock().await.take()
     }
+
+    /// 预备事件脚本信号注册验证：注册等待 `__ready__`/`__error__` 标记的
+    /// 接收端。必须在脚本 `run` 之前调用——标记先于 `run` 返回到达时由
+    /// 响应服务路由至此而非事件队列。后续 prepare 会覆盖前次未消费的通道。
+    pub(crate) async fn prepare_registration(&self) -> oneshot::Receiver<RegistrationOutcome> {
+        let (tx, rx) = oneshot::channel();
+        *self.registration.lock().await = Some(tx);
+        rx
+    }
 }
 
 /// `com.agent_shell.Response` 响应服务（§7.3 策略 B，升级版）。
 ///
 /// `sendResult(payload)` 的 payload 约定：
 /// - 一次性查询：`{"req": "<uuid>", "result": <json>}` → 按 req 路由；
-/// - 事件推送（无 req 字段）：整条 JSON 进事件队列。
+/// - 事件推送（无 req 字段）：整条 JSON 进事件队列；
+/// - 信号注册标记：`{"event": "__ready__"}` / `{"event": "__error__", ...}`
+///   → 路由到注册通道（不污染事件队列）。
 struct ResponseService {
     router: SharedRouter,
     events: mpsc::UnboundedSender<Value>,
+    registration: Arc<Mutex<Option<oneshot::Sender<RegistrationOutcome>>>>,
 }
 #[zbus::interface(name = "com.agent_shell.Response")]
 impl ResponseService {
@@ -334,10 +365,35 @@ impl ResponseService {
                     tracing::debug!(req = req_id, "no waiter for response (late/duplicate)");
                 }
             }
-            // 无请求 id → 事件推送（event_monitor.js）。
-            None => {
-                let _ = self.events.send(value);
-            }
+            // 无请求 id → 信号注册标记单独路由，其余走事件队列。
+            None => match value.get("event").and_then(Value::as_str) {
+                Some("__ready__") => {
+                    self.deliver_registration(RegistrationOutcome::Ready).await;
+                }
+                Some("__error__") => {
+                    let msg = value
+                        .get("error")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown signal connect error")
+                        .to_string();
+                    self.deliver_registration(RegistrationOutcome::Failed(msg))
+                        .await;
+                }
+                _ => {
+                    let _ = self.events.send(value);
+                }
+            },
+        }
+    }
+}
+
+impl ResponseService {
+    /// 投递注册标记到等待者；无等待者（迟到标记）仅记录不阻塞事件流。
+    async fn deliver_registration(&self, outcome: RegistrationOutcome) {
+        if let Some(tx) = self.registration.lock().await.take() {
+            let _ = tx.send(outcome);
+        } else {
+            tracing::debug!("event script registration marker with no waiter (late)");
         }
     }
 }
@@ -349,6 +405,7 @@ impl ResponseService {
         Self {
             router: Arc::new(Mutex::new(ResponseRouter::default())),
             events,
+            registration: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -634,6 +691,7 @@ mod tests {
         let service = ResponseService {
             router: Arc::clone(&router),
             events: event_tx,
+            registration: Arc::new(Mutex::new(None)),
         };
 
         // 1) 用真实模板渲染出 event_monitor.js 的推送语句。
@@ -664,6 +722,7 @@ mod tests {
         let service = ResponseService {
             router: Arc::clone(&router),
             events: event_tx,
+            registration: Arc::new(Mutex::new(None)),
         };
 
         // 注册一个等待者（模拟进行中的一次性查询）。
@@ -681,6 +740,48 @@ mod tests {
         // 事件队列必须为空（查询回传不污染事件流）。
         let router_now = router.lock().await;
         assert!(router_now.waiters.is_empty());
+    }
+
+    /// 信号注册标记（__ready__ / __error__）必须路由到注册通道而非事件
+    /// 队列——否则验证等待者永远等不到，且标记会污染下游事件流。
+    #[tokio::test]
+    async fn registration_markers_route_to_registration_channel_not_events() {
+        let router: SharedRouter = Arc::new(Mutex::new(ResponseRouter::default()));
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let registration = Arc::new(Mutex::new(None::<oneshot::Sender<RegistrationOutcome>>));
+        let service = ResponseService {
+            router: Arc::clone(&router),
+            events: event_tx,
+            registration: Arc::clone(&registration),
+        };
+
+        // __ready__ → 注册通道 Ready。
+        let (tx, rx) = oneshot::channel();
+        *registration.lock().await = Some(tx);
+        service
+            .send_result(r#"{"event": "__ready__"}"#.to_string())
+            .await;
+        assert_eq!(
+            rx.await.expect("ready delivered"),
+            RegistrationOutcome::Ready
+        );
+
+        // __error__ → 注册通道 Failed(msg)。
+        let (tx, rx) = oneshot::channel();
+        *registration.lock().await = Some(tx);
+        service
+            .send_result(r#"{"event": "__error__", "error": "boom"}"#.to_string())
+            .await;
+        assert_eq!(
+            rx.await.expect("error delivered"),
+            RegistrationOutcome::Failed("boom".to_string())
+        );
+
+        // 两次标记都不得进事件队列。
+        assert!(
+            event_rx.try_recv().is_err(),
+            "markers must skip event queue"
+        );
     }
 
     /// 完整接口声明的 introspection XML 应被识别。
