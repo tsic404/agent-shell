@@ -68,6 +68,10 @@ pub struct KWinCompositor {
     version: KWinVersion,
     /// 长驻事件脚本句柄（懒启动；仅 Wayland 会话使用）。
     event_handle: AsyncMutex<Option<EventScriptHandle>>,
+    /// 事件脚本信号注册状态（doctor_lines 同步读取）：None=未加载，
+    /// `Some(Ok(()))`=注册成功，`Some(Err(msg))`=最近一次注册失败诊断。
+    /// 独立 std Mutex 而非 AsyncMutex——doctor_lines(&self) 同步渲染。
+    event_registration: std::sync::Mutex<Option<std::result::Result<(), String>>>,
     /// X11 会话的 EWMH 事件监视器（懒启动；订阅后事件线程常驻）。
     ewmh_monitor: AsyncMutex<Option<crate::event_ewmh::EwmhEventMonitor>>,
     /// `/Scripting` 探测状态：0=未探测，1=失败（不缓存，
@@ -115,6 +119,7 @@ impl KWinCompositor {
             bridge,
             x11: None,
             version,
+            event_registration: std::sync::Mutex::new(None),
             event_handle: AsyncMutex::new(None),
             ewmh_monitor: AsyncMutex::new(None),
             scripting_probe: std::sync::atomic::AtomicU8::new(PROBE_UNSET),
@@ -137,6 +142,7 @@ impl KWinCompositor {
             bridge,
             x11: Some(Arc::new(x11)),
             version,
+            event_registration: std::sync::Mutex::new(None),
             event_handle: AsyncMutex::new(None),
             ewmh_monitor: AsyncMutex::new(None),
             scripting_probe: std::sync::atomic::AtomicU8::new(PROBE_UNSET),
@@ -167,6 +173,7 @@ impl KWinCompositor {
                 full: "6.1.4".into(),
                 major: crate::version::KWinMajor::V6,
             },
+            event_registration: std::sync::Mutex::new(None),
             event_handle: AsyncMutex::new(None),
             ewmh_monitor: AsyncMutex::new(None),
             scripting_probe: AtomicU8::new(probe),
@@ -246,16 +253,22 @@ impl KWinCompositor {
                 ),
             }
         }
-        // 事件脚本是懒启动（subscribe 时才 load），未启动前如实报告。
-        let event_loaded = self
-            .event_handle
+        // 事件脚本是懒启动（subscribe 时才 load），未启动前如实报告；
+        // 启动后以信号注册结果为准（成功 / 失败诊断），而非仅「loaded」。
+        let event_status = self
+            .event_registration
             .try_lock()
-            .map(|h| h.is_some())
-            .unwrap_or(false);
-        lines.push(if event_loaded {
-            "✓ 事件脚本    : loaded (workspace.windowAdded OK)".to_string()
-        } else {
-            "⚠ 事件脚本    : 未加载（懒启动，首次 events subscribe 时装配）".to_string()
+            .map(|s| s.clone())
+            .unwrap_or(None);
+        lines.push(match event_status {
+            Some(Ok(())) => {
+                "✓ 事件脚本    : signals registered (windowAdded/windowRemoved/windowActivated OK)"
+                    .to_string()
+            }
+            Some(Err(msg)) => {
+                format!("✗ 事件脚本    : signal registration failed: {msg}")
+            }
+            None => "⚠ 事件脚本    : 未加载（懒启动，首次 events subscribe 时装配）".to_string(),
         });
         lines
     }
@@ -647,10 +660,20 @@ impl KWinCompositor {
         if handle.is_none() {
             // 幂等启动；句柄（含 StagedScript 暂存文件）原样保存在组件内
             // 直到 stop/drop——不得重建副本，否则暂存文件被提前 Drop 删除。
-            *handle = Some(
-                crate::event_script::spawn_event_monitor(&self.bridge, self.version.is_v6())
-                    .await?,
-            );
+            // spawn_event_monitor 内部校验信号注册：成功才落句柄；失败记录
+            // 诊断供 doctor 可见，句柄保持 None 使下次 subscribe 可重试。
+            match crate::event_script::spawn_event_monitor(&self.bridge, self.version.is_v6()).await
+            {
+                Ok(h) => {
+                    *handle = Some(h);
+                    *self.event_registration.lock().expect("not poisoned") = Some(Ok(()));
+                }
+                Err(e) => {
+                    *self.event_registration.lock().expect("not poisoned") =
+                        Some(Err(e.to_string()));
+                    return Err(e);
+                }
+            }
         }
         Ok(())
     }

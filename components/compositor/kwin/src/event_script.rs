@@ -17,8 +17,8 @@ use std::time::Duration;
 use tokio::sync::Mutex;
 use zbus::Connection;
 
-use crate::dbus_bridge::{KWinBridge, SCRIPT_TIMEOUT};
-use crate::error::Result;
+use crate::dbus_bridge::{KWinBridge, RegistrationOutcome, SCRIPT_TIMEOUT};
+use crate::error::{KWinError, Result};
 use crate::scripts::{ScriptTemplate, RESPONSE_IFACE, RESPONSE_PATH, RESPONSE_SERVICE};
 
 /// `/Scripting` 就绪探测的重试参数：KWin 启动早期 `Scripting` 单例可能
@@ -124,14 +124,41 @@ impl EventScriptHandle {
 ///
 /// 事件推送进入 bridge 的独立事件队列（`KWinBridge::take_event_stream`），
 /// 与一次性查询完全隔离；本模块只负责脚本生命周期。
+///
+/// 启动后**校验信号实际注册成功**：脚本在三个 `connect` 全部成功后推送
+/// `__ready__`、任一抛错推送 `__error__`；两者都未在时限内到达则判为
+/// 「脚本已加载但零注册」。失败时卸载脚本并返回可见错误，使
+/// `events subscribe` 直接暴露问题而不必查 journalctl。
 pub async fn spawn_event_monitor(bridge: &KWinBridge, v6: bool) -> Result<EventScriptHandle> {
-    let handle = ensure_event_script(bridge, v6).await?;
-    // 冒烟验证：脚本注册后短窗口内应能收到首条推送（无窗口变化则超时属正常）。
-    let _ = tokio::time::timeout(SCRIPT_TIMEOUT, async {
-        tokio::time::sleep(Duration::from_millis(100)).await
-    })
-    .await;
-    Ok(handle)
+    // 注册验证通道必须在 run 之前 prepare——脚本可能先于 run 返回发出标记，
+    // 由响应服务路由至此而非事件队列。
+    let registered = bridge.prepare_registration().await;
+    let mut handle = ensure_event_script(bridge, v6).await?;
+
+    match tokio::time::timeout(SCRIPT_TIMEOUT, registered).await {
+        Ok(Ok(RegistrationOutcome::Ready)) => Ok(handle),
+        Ok(Ok(RegistrationOutcome::Failed(msg))) => {
+            let _ = handle.stop(bridge.connection()).await;
+            Err(KWinError::Scripting(format!(
+                "event script signal registration failed: {msg}"
+            )))
+        }
+        Ok(Err(_)) => {
+            let _ = handle.stop(bridge.connection()).await;
+            Err(KWinError::Scripting(
+                "event script registration waiter dropped".to_string(),
+            ))
+        }
+        Err(_) => {
+            let _ = handle.stop(bridge.connection()).await;
+            Err(KWinError::Scripting(format!(
+                "event script loaded but signal registration not confirmed within {}s \
+                 (a workspace signal .connect likely threw; check event_monitor.js \
+                 signal names for this KWin version)",
+                SCRIPT_TIMEOUT.as_secs()
+            )))
+        }
+    }
 }
 
 // 引用常量避免 unused 警告（脚本模板与响应服务契约保持单一来源）。
