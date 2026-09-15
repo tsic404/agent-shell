@@ -1469,6 +1469,18 @@ KWin 提供完整的私有 Wayland 协议栈，**仅 Wayland 会话可用**，�
 **「需要时短绑」策略**——绑定成功则用协议做窗口管理（首选），绑定失败（任务栏已占用）回退
 Scripting（补充通道）。实现时确认 KWin 6.7 上任务栏与第三方可共存。
 
+**KWin 接口授权过滤**：KWin ≤6.7.x 将 `org_kde_plasma_window_management`、
+`org_kde_kwin_fake_input`（不含 `vd_mgmt`）列入 `interfacesBlackList`，仅向 `.desktop` 文件
+`X-KDE-Wayland-Interfaces` 声明了对应接口的客户端通告 registry global（值**逗号分隔**，非分号）。
+未声明 → doctor 报 `1/3 globals bound (vd_mgmt bound)`、`window_mgmt`/`fake_input` 缺失、
+`events` 脚本不装配——这不是协议不存在，也不是 `--hide-non-desktop-effects`/插件禁用。
+agent-shell 通过随包安装 `daemon/org.agentshell.Daemon.desktop`（`Exec` 用绝对路径匹配 daemon
+二进制，`NoDisplay=true`）授权三接口——arch/deb 装 `/usr/share/applications/`（`Exec=/usr/bin/agent-shell-daemon`），
+Nix 装 `$out/share/applications/` 并经 `substituteInPlace` 把 `Exec` 替换为 `$out/bin/agent-shell-daemon`；
+安装后重跑 `agent-shell doctor` 应恢复 `3/3 globals bound`。
+`Exec` 路径须与实际运行的 `agent-shell-daemon` 二进制一致（dev 用 `target/release/...` 时需相应
+同名 desktop 或 `KWIN_WAYLAND_NO_PERMISSION_CHECKS=1` 绕过）。KWin 6.8+ 该过滤改为按沙箱 cgroup。
+
 ### 7.7 实现设计
 
 **模块结构**（`components/compositor/kwin/src/`）：
