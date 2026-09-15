@@ -3596,6 +3596,7 @@ impl<T> FallbackChain<T> {
 | 操作 | 默认超时 | 重试次数 | 重试间隔(退避) |
 |------|---------|---------|--------------|
 | D-Bus 调用（窗口查询） | 5s | 2 | 500ms ×2 |
+| AT-SPI a11y bus 懒激活 (GetAddress) | 30s | 0 | — |
 | KWin Scripting run_script | 5s | 1 | 1000ms |
 | hyprctl socket 请求 | 2s | 2 | 200ms ×2 |
 | portal ScreenCast 会话 | 10s | 1 | 2000ms |
