@@ -2291,7 +2291,7 @@ mod tests {
     /// ignored 测试，前后抓取主机名断言无漂移。托管 CI 无 systemd-hostnamed，
     /// 默认忽略本测试，仅保留单元测试。
     #[test]
-    #[ignore = "requires root/hostnamed; live snapshot/restore fixture (TSI-2630)"]
+    #[ignore = "requires root/hostnamed; live snapshot/restore fixture"]
     fn hostname_set_snapshot_and_restore_live() {
         let _guard = HOSTNAME_TEST_MUTEX.lock();
         // 非 root 无法写回主机名：跳过而非假失败。真实验证需以 root 运行

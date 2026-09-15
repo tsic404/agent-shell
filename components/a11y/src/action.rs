@@ -29,13 +29,13 @@ pub struct NoPointerInput;
 impl PointerInput for NoPointerInput {
     async fn mouse_move(&self, _x: i32, _y: i32) -> Result<()> {
         Err(AgentShellError::NotImplemented(
-            "pointer input backend not assembled (TSI-2315)".into(),
+            "pointer input backend not assembled".into(),
         ))
     }
 
     async fn mouse_click(&self, _button: MouseButton) -> Result<()> {
         Err(AgentShellError::NotImplemented(
-            "pointer input backend not assembled (TSI-2315)".into(),
+            "pointer input backend not assembled".into(),
         ))
     }
 }

@@ -305,7 +305,7 @@ impl ToplevelRegistry {
     pub fn lookup(&self, identifier: u32) -> Result<&TreelandForeignToplevelHandleV1> {
         let _ = identifier;
         Err(AgentShellError::NotImplemented(
-            "treeland toplevel event aggregation lands with TSI-2314 (T3b events)".into(),
+            "treeland toplevel event aggregation lands with T3b events".into(),
         ))
     }
 }

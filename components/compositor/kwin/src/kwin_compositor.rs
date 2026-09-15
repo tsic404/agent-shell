@@ -830,7 +830,7 @@ impl CompositorComponent for KWinCompositor {
     /// 会话走 list_windows.js（一次 callDBus 批量取全量详情）。
     ///
     /// X11 分支优先于 Scripting——部分 KWin 5.x X11 会话不注册 `/Scripting`
-    /// （TSI-3131），且 EWMH 无需事件聚合即可给出完整 `WindowInfo`。
+    /// 且 EWMH 无需事件聚合即可给出完整 `WindowInfo`。
     /// Wayland 下协议 stacking-order 仅提供 uuid 列表，逐窗 get_window_by_uuid
     /// 仍需事件聚合才能取属性（本层 inert 不消费事件）——T3b 前纯协议路径
     /// 无法给出 WindowInfo，故仍走 Scripting。window_mgmt 短绑状态只影响
