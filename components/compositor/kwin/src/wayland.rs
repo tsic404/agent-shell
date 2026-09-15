@@ -43,10 +43,19 @@ pub mod min_versions {
     pub const VIRTUAL_DESKTOP_MAX: u32 = 2;
 }
 
-/// 本 crate 的 registry 派发状态：不消费任何协议事件
-/// （窗口状态推送走 event_monitor.js 长驻脚本，§7.2「事件订阅」行）。
-#[derive(Debug)]
-pub struct KWinWaylandState;
+/// 本 crate 的 registry 派发状态。
+///
+/// `stacking` 仅在 v17 `get_stacking_order` 的 roundtrip 窗口内为 `Some`；
+/// `uuid_changed` 缓存 v12-16 `stacking_order_uuid_changed` 事件的最近一次
+/// uuid 列表（bind 时与栈序变化时各推送一次）。窗口状态推送走 event_monitor.js
+/// 长驻脚本或 `event_native` 原生事件源（§7.2「事件订阅」行）。
+#[derive(Debug, Default)]
+pub struct KWinWaylandState {
+    /// v17 `get_stacking_order` 回包收集槽（roundtrip 窗口内 Some）。
+    stacking: Option<Vec<String>>,
+    /// v12-16 `stacking_order_uuid_changed` 的最近一次 uuid 列表。
+    uuid_changed: Option<Vec<String>>,
+}
 
 macro_rules! inert_dispatch {
     ($ty:ty) => {
@@ -64,12 +73,56 @@ macro_rules! inert_dispatch {
     };
 }
 
-inert_dispatch!(OrgKdePlasmaWindowManagement);
 inert_dispatch!(OrgKdePlasmaWindow);
-inert_dispatch!(OrgKdePlasmaStackingOrder);
 inert_dispatch!(OrgKdeKwinFakeInput);
 inert_dispatch!(OrgKdePlasmaVirtualDesktopManagement);
 inert_dispatch!(OrgKdePlasmaVirtualDesktop);
+
+/// `org_kde_plasma_window_management` 事件：v12-16 的 `stacking_order_uuid_changed`
+/// 缓存 uuid 列表（`;` 分隔），供 `stacking_order_uuids` 在 v17 以下枚举窗口。
+/// 其余事件（show_desktop_changed / window_with_uuid / v17 stacking_order_changed_2）
+/// 本层不消费——v17 栈序经 `get_stacking_order` 请求主动拉取。
+impl Dispatch<OrgKdePlasmaWindowManagement, ()> for KWinWaylandState {
+    fn event(
+        state: &mut Self,
+        _manager: &OrgKdePlasmaWindowManagement,
+        event: <OrgKdePlasmaWindowManagement as wayland_client::Proxy>::Event,
+        _udata: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+        use wayland_protocols_plasma::plasma_window_management::client::org_kde_plasma_window_management::Event;
+        if let Event::StackingOrderUuidChanged { uuids } = event {
+            state.uuid_changed = Some(split_uuid_list(&uuids));
+        }
+    }
+}
+
+/// `org_kde_plasma_stacking_order` 回包：`window(uuid)` × N → `done`。
+///
+/// 仅在 [`KWinProtocols::stacking_order_uuids`] 发起的 roundtrip 期间
+/// 填充 `state.stacking`——其余时刻该字段为 `None`，事件本可忽略。
+impl Dispatch<OrgKdePlasmaStackingOrder, ()> for KWinWaylandState {
+    fn event(
+        state: &mut Self,
+        _: &OrgKdePlasmaStackingOrder,
+        event: <OrgKdePlasmaStackingOrder as wayland_client::Proxy>::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        use wayland_protocols_plasma::plasma_window_management::client::org_kde_plasma_stacking_order::Event;
+        match event {
+            Event::Window { uuid } => {
+                if let Some(stacking) = state.stacking.as_mut() {
+                    stacking.push(uuid);
+                }
+            }
+            Event::Done => {}
+            _ => {}
+        }
+    }
+}
 
 impl Dispatch<WlRegistry, wayland_client::globals::GlobalListContents> for KWinWaylandState {
     fn event(
@@ -94,6 +147,10 @@ pub struct KWinProtocols {
     /// 基类通道持有（`wayland_core` 字段）——本结构只叠加 org_kde_*
     /// 绑定，不拥有连接。
     queue: std::sync::Mutex<wayland_client::EventQueue<KWinWaylandState>>,
+    /// 持久派发状态：缓存 v12-16 `stacking_order_uuid_changed` 的 uuid 列表，
+    /// 供 `stacking_order_uuids` 在每次 roundtrip 间复用（bind 时只推一次，
+    /// 丢失即无法在 v17 以下枚举窗口）。
+    state: std::sync::Mutex<KWinWaylandState>,
     /// 窗口管理（**仅一个客户端可绑定**——短绑失败即回退 Scripting，D8）。
     pub window_mgmt: Option<WindowManagement>,
     /// 假输入注入（authenticate 后可用）。
@@ -127,6 +184,7 @@ impl KWinProtocols {
 
         Ok(Self {
             queue: std::sync::Mutex::new(queue),
+            state: std::sync::Mutex::new(KWinWaylandState::default()),
             window_mgmt,
             fake_input,
             vd_mgmt,
@@ -140,11 +198,17 @@ impl KWinProtocols {
     }
 
     /// 冲刷请求队列（发出 set_state/close 等"发完即忘"的请求后调用）。
+    ///
+    /// 用持久 state 派发——roundtrip 顺带把 v12-16 的 `stacking_order_uuid_changed`
+    /// 缓存进 state.uuid_changed（后续 `stacking_order_uuids` 复用）。
+    /// 锁序：先 `state` 后 `queue`（与 `stacking_order_uuids` 一致的全局约定，
+    /// 两处均跨阻塞 roundtrip 持锁，顺序不一即 AB-BA 死锁）。
     pub fn flush_queue(&self) -> Result<()> {
+        let mut state = self.state.lock().expect("protocol state poisoned");
         self.queue
             .lock()
             .expect("protocol queue poisoned")
-            .roundtrip(&mut KWinWaylandState)
+            .roundtrip(&mut state)
             .map_err(|e| KWinError::Scripting(format!("protocol roundtrip: {e}")))?;
         Ok(())
     }
@@ -160,6 +224,61 @@ impl KWinProtocols {
             + usize::from(self.fake_input.is_some())
             + usize::from(self.vd_mgmt.is_some())
     }
+
+    /// 枚举当前窗口 uuid 列表（栈底 → 栈顶）。
+    ///
+    /// 按 window_mgmt 公布版本分派：
+    /// - v17+：`get_stacking_order` 请求 → roundtrip 收 `window(uuid)` × N + `done`；
+    /// - v12-16：kwin 5.27 在 bind_resource 时推送 `stacking_order_uuid_changed`
+    ///   （`;` 分隔 uuid 串），bind 后的 roundtrip 收集进 `state.uuid_changed` 缓存。
+    ///
+    /// window_mgmt 未绑定返回 `None`，上层回退 Scripting。roundtrip 是阻塞调用——
+    /// 调用方（list_windows）在 async 上下文经 `spawn_blocking` 包裹，避免占用
+    /// tokio worker（§19 审查项）。
+    pub fn stacking_order_uuids(&self) -> Result<Option<Vec<String>>> {
+        let wm = match self.window_mgmt.as_ref() {
+            Some(wm) => wm,
+            None => return Ok(None),
+        };
+        // 锁序约定：先 `state` 后 `queue`，与 `flush_queue` 一致——两处均跨
+        // 阻塞 roundtrip 持锁，顺序不一致会构成 AB-BA 死锁（queue→state vs
+        // state→queue）。
+        let mut state = self.state.lock().expect("protocol state poisoned");
+        let mut queue = self.queue.lock().expect("protocol queue poisoned");
+
+        if wm.advertised_version >= 17 {
+            let qh = queue.handle();
+            let order = match wm.request_stacking_order(&qh) {
+                Some(order) => order,
+                None => return Ok(None),
+            };
+            state.stacking = Some(Vec::new());
+            queue
+                .roundtrip(&mut state)
+                .map_err(|e| KWinError::Scripting(format!("stacking order roundtrip: {e}")))?;
+            // order 代理在 roundtrip 收尾（done 为 destructor）后失效；保持到
+            // 函数结束避免提前销毁。
+            drop(order);
+            return Ok(state.stacking.take());
+        }
+
+        // v12-16：bind 已推送 stacking_order_uuid_changed；roundtrip 把事件
+        // 派发进 state.uuid_changed（首次调用时 bind 事件仍在 socket 缓冲，
+        // 后续调用复用缓存——栈序变化会再推事件刷新）。
+        queue
+            .roundtrip(&mut state)
+            .map_err(|e| KWinError::Scripting(format!("stacking order roundtrip: {e}")))?;
+        Ok(state.uuid_changed.clone())
+    }
+}
+
+/// `stacking_order_uuid_changed` 的 `;` 分隔 uuid 串 → `Vec<String>`（空段跳过）。
+fn split_uuid_list(uuids: &str) -> Vec<String> {
+    uuids
+        .split(';')
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 /// 在共享连接上创建派发队列（私有协议事件本层不消费）。
@@ -290,42 +409,16 @@ impl WindowManagement {
         });
     }
 
-    /// 读取 stacking order（协议 v17+；旧版本返回 None 由上层回退 Scripting）。
-    pub fn get_stacking_order_uuids(
+    /// 发起 stacking order 请求（协议 v17+；旧版本返回 None）。uuid 回包由
+    /// [`KWinProtocols::stacking_order_uuids`] 的 roundtrip 收集，不在此处读。
+    pub fn request_stacking_order(
         &self,
         qh: &QueueHandle<KWinWaylandState>,
-    ) -> Option<StackingOrderReader> {
+    ) -> Option<OrgKdePlasmaStackingOrder> {
         if self.advertised_version < 17 {
             return None;
         }
-        Some(StackingOrderReader {
-            order: self.manager.get_stacking_order(qh, ()),
-            uuids: Vec::new(),
-            done: false,
-        })
-    }
-}
-
-/// stacking order 对象的一次性读取器（v17+：Window{uuid} * N → Done）。
-///
-/// 事件在 roundtrip 时填充 `uuids`；调用方持有 reader 直到 `done()`。
-#[derive(Debug)]
-pub struct StackingOrderReader {
-    #[allow(dead_code)]
-    order: OrgKdePlasmaStackingOrder,
-    uuids: Vec<String>,
-    done: bool,
-}
-
-impl StackingOrderReader {
-    /// 已收集的窗口 uuid 列表（栈底 → 栈顶）。
-    pub fn uuids(&self) -> &[String] {
-        &self.uuids
-    }
-
-    /// 服务器是否已发完列表。
-    pub fn done(&self) -> bool {
-        self.done
+        Some(self.manager.get_stacking_order(qh, ()))
     }
 }
 
@@ -508,5 +601,22 @@ mod tests {
         let s = BindFailureKind::VersionTooLow.describe("org_kde_kwin_fake_input");
         assert!(s.contains("below runtime minimum"), "got: {s}");
         assert!(!s.contains(".desktop"), "got: {s}");
+    }
+
+    /// v12-16 `stacking_order_uuid_changed` 的 `;` 分隔 uuid 串解析（bind 时
+    /// kwin 5.27 推一次、栈序变化再推；空段跳过——旧实现用 get_stacking_order
+    /// 在 v16 下恒 None，正是 TC-001/505/101 未修复的根因）。
+    #[test]
+    fn split_uuid_list_parses_semicolon_separated() {
+        assert_eq!(
+            split_uuid_list("a;b;c"),
+            vec!["a".to_string(), "b".to_string(), "c".to_string()]
+        );
+        assert_eq!(split_uuid_list(""), Vec::<String>::new());
+        assert_eq!(
+            split_uuid_list(";a;;b;"),
+            vec!["a".to_string(), "b".to_string()]
+        );
+        assert_eq!(split_uuid_list("single"), vec!["single".to_string()]);
     }
 }

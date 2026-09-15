@@ -586,7 +586,7 @@ mod tests {
 
         // 最小 KWin 实例：/Scripting 探测初值 None——只有走
         // doctor_lines_async 才会触发懒探测并把桥接行升级为「就绪」。
-        let kwin = KWinCompositor::for_test(bridge_on(&bus).await, None);
+        let kwin = KWinCompositor::for_test(bridge_on(&bus).await, None).await;
         let v = DdeVersion::from_probes([("display".into(), "org.deepin.dde.Display1".into())]);
         let c = DdeCompositor::with_parts(Compositor::DeepinKwin(Box::new(kwin)), v);
 
@@ -625,7 +625,7 @@ mod tests {
         // A1：X11 分支持有真实 `KWinCompositor`（`new_x11` 的 EWMH/ICCCM +
         // D-Bus 桥）。离线用 `for_test` 注入最小实例——`protocols=None` 等价
         // X11 会话，doctor 必须经 KWin 委托渲染并重命名服务行。
-        let kwin = KWinCompositor::for_test(bridge_on(&bus).await, None);
+        let kwin = KWinCompositor::for_test(bridge_on(&bus).await, None).await;
         let c = DdeCompositor::with_parts(Compositor::X11(Box::new(kwin)), DdeVersion::default());
 
         let lines = c.doctor_lines_async().await;
