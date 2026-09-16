@@ -143,7 +143,12 @@ const MERGE_WINDOW_MS: u64 = 5;
 /// 去重时钟：生产取桥接接收毫秒，测试注入假时钟以确定性覆盖边界。
 type DedupClock = Arc<dyn Fn() -> u64 + Send + Sync>;
 
-struct EventDeduper {
+/// 共享去重句柄：由合成器组件（[`crate::KWinCompositor`]）持有，桥接克隆
+/// 同一实例，使判重状态生命周期与合成器一致而非与单条连接一致。当前无桥接
+/// 重建路径，句柄为前瞻性持有。
+pub(crate) type EventDeduperHandle = Arc<Mutex<EventDeduper>>;
+
+pub(crate) struct EventDeduper {
     /// (event, id) → 窗口内的去重状态。
     seen: HashMap<(String, String), DedupBucket>,
     clock: DedupClock,
@@ -164,6 +169,11 @@ struct DedupBucket {
 impl EventDeduper {
     fn new() -> Self {
         Self::with_clock(Arc::new(receipt_ms))
+    }
+
+    /// 新建组件级共享句柄（生产构造路径：合成器持有、桥接克隆）。
+    pub(crate) fn new_shared() -> EventDeduperHandle {
+        Arc::new(Mutex::new(Self::new()))
     }
 
     fn with_clock(clock: DedupClock) -> Self {
@@ -279,13 +289,19 @@ pub struct KWinBridge {
     /// 事件脚本信号注册标记的接收通道（spawn_event_monitor 验证用；
     /// 标记先到即被响应服务消费，后续 subscribe 重新 prepare 覆盖）。
     registration: Arc<Mutex<Option<oneshot::Sender<RegistrationOutcome>>>>,
+    /// 事件去重句柄（组件级共享；桥接重建时由合成器复用同一实例）。
+    dedup: EventDeduperHandle,
 }
 
 impl KWinBridge {
-    /// 建桥：连接 session bus 并注册 `com.agent_shell.Response` 响应服务。
+    /// 建桥：连接 session bus 并注册 `com.agent_shell.Response` 响应服务，
+    /// 同时创建**独立**的事件去重句柄。
     ///
     /// 总线不可达或服务名被占即失败——补充通道整体不可用时上层应报
     /// BackendUnavailable（Wayland 协议通道不受影响）。
+    ///
+    /// 每次调用都新建去重句柄，不保证跨重建去重；组件级装配（`KWinCompositor`）
+    /// 应经 [`connect_with_dedup`] 注入组件持有的共享句柄。
     pub async fn connect() -> Result<Self> {
         let conn = zbus::Connection::session()
             .await
@@ -293,8 +309,29 @@ impl KWinBridge {
         Self::with_connection(conn).await
     }
 
-    /// 基于既有 session bus 连接建桥（KdeBackend 共享 dbus 句柄场景）。
+    /// 组件级装配：注入组件持有的共享去重句柄建桥，使判重状态的生命周期与
+    /// 合成器（组件）一致而非与单条连接一致。
+    ///
+    /// 当前代码无桥接重建路径（`KWinBridge` 仅在 `new_wayland`/`new_x11`
+    /// 各构造一次，`ensure_event_pipeline` 重试复用同一桥接）：本入口为未来
+    /// 桥接重建的前瞻性接线点——届时复用本句柄判重历史即不归零。
+    pub(crate) async fn connect_with_dedup(dedup: EventDeduperHandle) -> Result<Self> {
+        let conn = zbus::Connection::session()
+            .await
+            .map_err(|e| KWinError::Scripting(format!("session bus connect: {e}")))?;
+        Self::with_dedup(conn, dedup).await
+    }
+
+    /// 基于既有 session bus 连接建桥（KdeBackend 共享 dbus 句柄场景），
+    /// 创建**独立**的事件去重句柄——不保证跨重建去重；组件级装配应经
+    /// [`with_dedup`] 注入组件持有的共享句柄。
     pub async fn with_connection(conn: Connection) -> Result<Self> {
+        Self::with_dedup(conn, EventDeduper::new_shared()).await
+    }
+
+    /// 基于既有连接建桥，注入组件级共享去重句柄（组件级装配路径；与
+    /// [`connect_with_dedup`] 同语义，仅连接来源不同）。
+    pub(crate) async fn with_dedup(conn: Connection, dedup: EventDeduperHandle) -> Result<Self> {
         let router = Arc::new(Mutex::new(ResponseRouter::default()));
         // 事件推送队列：event_monitor.js 的每次 sendResult 进这里，
         // 不进按 id 路由表（事件没有请求 id，见 🔴1）。接收端由桥接持有，
@@ -308,7 +345,7 @@ impl KWinBridge {
             router: Arc::clone(&router),
             events: event_tx,
             registration: Arc::clone(&registration),
-            dedup: Arc::new(Mutex::new(EventDeduper::new())),
+            dedup: Arc::clone(&dedup),
         };
         // 在既有连接上挂载响应服务 + 申请 well-known 总线名——单一连接，
         // 保活即保活服务（无需第二个连接句柄）。
@@ -330,7 +367,13 @@ impl KWinBridge {
             router,
             event_rx: Mutex::new(Some(event_rx)),
             registration,
+            dedup,
         })
+    }
+
+    /// 共享去重句柄（`for_test` 同步组件字段，及未来桥接重建路径复用）。
+    pub(crate) fn dedup(&self) -> EventDeduperHandle {
+        Arc::clone(&self.dedup)
     }
 
     /// 底层连接（版本探测等复用）。
@@ -491,7 +534,7 @@ struct ResponseService {
     router: SharedRouter,
     events: mpsc::UnboundedSender<Value>,
     registration: Arc<Mutex<Option<oneshot::Sender<RegistrationOutcome>>>>,
-    dedup: Arc<Mutex<EventDeduper>>,
+    dedup: EventDeduperHandle,
 }
 #[zbus::interface(name = "com.agent_shell.Response")]
 impl ResponseService {
@@ -564,7 +607,7 @@ impl ResponseService {
             router: Arc::new(Mutex::new(ResponseRouter::default())),
             events,
             registration: Arc::new(Mutex::new(None)),
-            dedup: Arc::new(Mutex::new(EventDeduper::new())),
+            dedup: EventDeduper::new_shared(),
         }
     }
 }
@@ -1022,6 +1065,58 @@ mod tests {
         service.send_result(other).await;
         let got = event_rx.recv().await.expect("distinct event delivered");
         assert_eq!(got.get("id").and_then(Value::as_str), Some("8"));
+    }
+
+    /// 跨桥接重建去重保真：判重状态由组件级共享句柄持有，而非每连接的
+    /// `ResponseService`。旧桥接收到事件后「重建」新桥接（复用同一句柄），
+    /// 新桥接收到同一事件副本仍判重丢弃——重建瞬间不出现短时重复投递。
+    ///
+    /// 注入恒定时钟：真实时钟下两次 `send_result().await` 若跨过
+    /// `DEDUP_WINDOW_MS=20ms` 边界会 flaky；恒定时钟使窗口永不滑动。
+    #[tokio::test]
+    async fn shared_dedup_survives_bridge_rebuild() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        let clock = Arc::new(AtomicU64::new(0));
+        let now = {
+            let c = Arc::clone(&clock);
+            Arc::new(move || c.load(Ordering::SeqCst)) as Arc<dyn Fn() -> u64 + Send + Sync>
+        };
+        let dedup = Arc::new(Mutex::new(EventDeduper::with_clock(now)));
+
+        // 旧桥接的响应服务（重建前）。
+        let (events_a, mut rx_a) = mpsc::unbounded_channel();
+        let old_service = ResponseService {
+            router: Arc::new(Mutex::new(ResponseRouter::default())),
+            events: events_a,
+            registration: Arc::new(Mutex::new(None)),
+            dedup: Arc::clone(&dedup),
+        };
+        // 新桥接的响应服务（重建后）：注入同一组件级去重句柄。
+        let (events_b, mut rx_b) = mpsc::unbounded_channel();
+        let new_service = ResponseService {
+            router: Arc::new(Mutex::new(ResponseRouter::default())),
+            events: events_b,
+            registration: Arc::new(Mutex::new(None)),
+            dedup: Arc::clone(&dedup),
+        };
+
+        let evt = serde_json::json!({ "event": "windowClosed", "id": "7", "occurred_at": 49846 })
+            .to_string();
+        // 重建前旧桥接收到并投递该事件。
+        old_service.send_result(evt.clone()).await;
+        assert_eq!(
+            rx_a.recv()
+                .await
+                .and_then(|v| v.get("id").and_then(Value::as_str).map(str::to_string)),
+            Some("7".to_string())
+        );
+        // 重建后新桥接收到同一事件副本：共享句柄判重，不得再次投递。
+        new_service.send_result(evt).await;
+        assert!(
+            rx_b.try_recv().is_err(),
+            "duplicate across bridge rebuild must be dropped by shared dedup"
+        );
     }
 
     #[tokio::test]
