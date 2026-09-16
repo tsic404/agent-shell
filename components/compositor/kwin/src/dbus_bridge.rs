@@ -161,6 +161,12 @@ pub(crate) struct EventDeduper {
     /// (event, id) → 窗口内的去重状态。
     seen: HashMap<(String, String), DedupBucket>,
     clock: DedupClock,
+    /// 新格式 `(event, id, occurred_at)` 精确命中次数（tracing 计数）。
+    occurred_ats_hits: u64,
+    /// 距 legacy 副本 ≤ [`MERGE_WINDOW_MS`] 判重复次数（tracing 计数）。
+    legacy_twin_hits: u64,
+    /// 距新格式副本 ≤ [`MERGE_WINDOW_MS`] 判重复次数（tracing 计数）。
+    new_twin_hits: u64,
 }
 
 /// 同一 `(event, id)` 在滑动窗口内的去重状态。
@@ -189,12 +195,20 @@ impl EventDeduper {
         Self {
             seen: HashMap::new(),
             clock,
+            occurred_ats_hits: 0,
+            legacy_twin_hits: 0,
+            new_twin_hits: 0,
         }
     }
 
     /// 是否为重复事件。新格式按 `(event, id, occurred_at)` 精确判重，仅在
     /// [`MERGE_WINDOW_MS`] 内邻近的 legacy 副本判「legacy twin」；旧格式
     /// 按到达时刻邻近判「同事件副本」（legacy 或 new）。
+    ///
+    /// 命中时按类别累加 tracing 计数（`occurred_ats` / `legacy_twin` /
+    /// `new_twin`）并发射一条 `debug` 事件——三类命中数现场可观测，用于确认
+    /// 窗口余量是否被吃穿（副本到达 >5ms 时 legacy/new twin 命中归零、退化为
+    /// 多投递）。
     fn is_duplicate(&mut self, payload: &Value) -> bool {
         let now = (self.clock)();
         let (Some(event), Some(id)) = (
@@ -210,12 +224,18 @@ impl EventDeduper {
         self.seen
             .retain(|_, b| now.saturating_sub(b.last_receipt) <= DEDUP_WINDOW_MS);
 
+        // 命中类别先记入局部布尔，待 bucket 借用释放后统一累加计数，
+        // 避免跨字段可变借用冲突（seen 与计数字段互斥）。
+        let mut occurred_ats_hit = false;
+        let mut legacy_twin_hit = false;
+        let mut new_twin_hit = false;
+
         match self.seen.get_mut(&key) {
             Some(bucket) => {
-                let duplicate = match occurred_at {
+                match occurred_at {
                     Some(t) => {
                         if bucket.occurred_ats.contains(&t) {
-                            true
+                            occurred_ats_hit = true;
                         } else {
                             let legacy_twin = bucket
                                 .legacy_at
@@ -225,8 +245,8 @@ impl EventDeduper {
                             if legacy_twin {
                                 // 合并后清除 legacy 标记，避免粘滞污染整窗。
                                 bucket.legacy_at = None;
+                                legacy_twin_hit = true;
                             }
-                            legacy_twin
                         }
                     }
                     None => {
@@ -236,16 +256,18 @@ impl EventDeduper {
                         let new_twin = bucket
                             .last_new_at
                             .is_some_and(|nat| now.saturating_sub(nat) <= MERGE_WINDOW_MS);
-                        if legacy_twin || new_twin {
-                            true
-                        } else {
+                        if legacy_twin {
+                            legacy_twin_hit = true;
+                        }
+                        if new_twin {
+                            new_twin_hit = true;
+                        }
+                        if !(legacy_twin || new_twin) {
                             bucket.legacy_at = Some(now);
-                            false
                         }
                     }
-                };
+                }
                 bucket.last_receipt = now;
-                duplicate
             }
             None => {
                 let mut bucket = DedupBucket {
@@ -262,9 +284,39 @@ impl EventDeduper {
                     None => bucket.legacy_at = Some(now),
                 }
                 self.seen.insert(key, bucket);
-                false
             }
         }
+
+        if occurred_ats_hit {
+            self.occurred_ats_hits += 1;
+        }
+        if legacy_twin_hit {
+            self.legacy_twin_hits += 1;
+        }
+        if new_twin_hit {
+            self.new_twin_hits += 1;
+        }
+
+        let duplicate = occurred_ats_hit || legacy_twin_hit || new_twin_hit;
+        if duplicate {
+            let kind = if occurred_ats_hit {
+                "occurred_ats"
+            } else if legacy_twin_hit {
+                "legacy_twin"
+            } else {
+                "new_twin"
+            };
+            tracing::debug!(
+                kind,
+                event,
+                id,
+                occurred_ats_hits = self.occurred_ats_hits,
+                legacy_twin_hits = self.legacy_twin_hits,
+                new_twin_hits = self.new_twin_hits,
+                "duplicate event push dropped"
+            );
+        }
+        duplicate
     }
 }
 
@@ -613,12 +665,10 @@ impl ResponseService {
                 _ => {
                     // 归一化前去重：残留 event_monitor 实例把同一条真实事件
                     // 推送 N 次——以完整 payload（含 occurred_at）判重，窗口内
-                    // 相同的推送只保留第一条。
+                    // 相同的推送只保留第一条。命中计数与 tracing 由
+                    // `EventDeduper::is_duplicate` 内部发射。
                     let mut dedup = self.dedup.lock().await;
                     if dedup.is_duplicate(&value) {
-                        let event = value.get("event").and_then(Value::as_str);
-                        let id = value.get("id").and_then(Value::as_str);
-                        tracing::debug!(?event, ?id, "duplicate event push dropped");
                         return;
                     }
                     let _ = self.events.send(value);
@@ -1067,6 +1117,50 @@ mod tests {
         // 窗口过期后同 (event, id) 不再算重复（滑动窗口清空）。
         clock.store(DEDUP_WINDOW_MS + 1, Ordering::SeqCst);
         assert!(!dedup.is_duplicate(&legacy_fmt));
+    }
+
+    /// tracing 计数语义：三类命中（occurred_ats 精确 / legacy twin /
+    /// new twin）各自累加，供现场确认窗口余量是否被吃穿。恒定时钟使邻近
+    /// 判定确定。
+    #[test]
+    fn event_deduper_counts_hit_kinds() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        let clock = Arc::new(AtomicU64::new(0));
+        let make_now = || {
+            let c = Arc::clone(&clock);
+            Arc::new(move || c.load(Ordering::SeqCst)) as Arc<dyn Fn() -> u64 + Send + Sync>
+        };
+        let mut dedup = EventDeduper::with_clock(make_now());
+
+        // occurred_ats 精确命中：同 (event, id, occurred_at) 副本。
+        let new_fmt = serde_json::json!({
+            "event": "windowFocused", "id": "A", "occurred_at": 100
+        });
+        assert!(!dedup.is_duplicate(&new_fmt));
+        assert!(dedup.is_duplicate(&new_fmt));
+        assert_eq!(dedup.occurred_ats_hits, 1);
+
+        // legacy twin：旧格式（无 occurred_at）先到，新格式后到判重复。
+        let legacy = serde_json::json!({ "event": "windowClosed", "id": "7" });
+        let new_fmt2 = serde_json::json!({
+            "event": "windowClosed", "id": "7", "occurred_at": 200
+        });
+        assert!(!dedup.is_duplicate(&legacy));
+        assert!(dedup.is_duplicate(&new_fmt2));
+        assert_eq!(dedup.legacy_twin_hits, 1);
+
+        // new twin：新格式先到，旧格式后到判重复（反向）。
+        let mut dedup2 = EventDeduper::with_clock(make_now());
+        let new_fmt3 = serde_json::json!({
+            "event": "windowOpened", "id": "9", "occurred_at": 300
+        });
+        let legacy3 = serde_json::json!({ "event": "windowOpened", "id": "9" });
+        assert!(!dedup2.is_duplicate(&new_fmt3));
+        assert!(dedup2.is_duplicate(&legacy3));
+        assert_eq!(dedup2.new_twin_hits, 1);
+        assert_eq!(dedup2.legacy_twin_hits, 0);
+        assert_eq!(dedup2.occurred_ats_hits, 0);
     }
 
     /// 残留 event_monitor 实例把同一真实事件推送 N 次：响应服务只投递第一条，
