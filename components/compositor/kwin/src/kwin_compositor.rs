@@ -15,7 +15,7 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 use tokio::sync::Mutex as AsyncMutex;
 
-use crate::dbus_bridge::KWinBridge;
+use crate::dbus_bridge::{KWinBridge, RegistrationOutcome};
 use crate::error::{KWinError, Result};
 use crate::event_script::EventScriptHandle;
 use crate::scripts::ScriptTemplate;
@@ -268,7 +268,20 @@ impl KWinCompositor {
             Some(Err(msg)) => {
                 format!("✗ 事件脚本    : signal registration failed: {msg}")
             }
-            None => "⚠ 事件脚本    : 未加载（懒启动，首次 events subscribe 时装配）".to_string(),
+            // 本组件未加载：若残留/外部实例曾发出注册标记（无等待者被记录），
+            // 据此区分「加载后零注册」与真正的「未加载」。
+            None => match self.bridge.late_registration() {
+                Some(RegistrationOutcome::Ready) => {
+                    "⚠ 事件脚本    : 检测到外部实例已注册（本组件未加载，疑似残留 event_monitor）"
+                        .to_string()
+                }
+                Some(RegistrationOutcome::Failed(msg)) => {
+                    format!("✗ 事件脚本    : 外部实例信号注册失败: {msg}")
+                }
+                None => {
+                    "⚠ 事件脚本    : 未加载（懒启动，首次 events subscribe 时装配）".to_string()
+                }
+            },
         });
         lines
     }
@@ -1568,6 +1581,65 @@ mod tests {
         assert!(
             !lines.iter().any(|l| l.contains("T3b")),
             "event script line must not mention T3b: {lines:#?}"
+        );
+    }
+
+    /// 无等待者记录的 `__ready__`（残留/外部实例）须让 doctor 区分
+    /// 「加载后零注册」与「未加载」——本组件未加载但已检测到外部注册。
+    #[tokio::test]
+    async fn doctor_event_script_line_reports_external_instance() {
+        let bus = TestBus::start().await;
+        let b = bridge(&bus).await;
+        b.record_late_registration(RegistrationOutcome::Ready);
+        let comp = KWinCompositor::for_test(b, None);
+        let lines = comp.doctor_lines();
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("⚠ 事件脚本") && l.contains("外部实例已注册")),
+            "doctor must report external instance registration: {lines:#?}"
+        );
+    }
+
+    /// 无等待者记录的 `__error__` 须在 doctor 呈现失败诊断，而非静默丢弃
+    /// 后显示「未加载」。
+    #[tokio::test]
+    async fn doctor_event_script_line_reports_external_failure() {
+        let bus = TestBus::start().await;
+        let b = bridge(&bus).await;
+        b.record_late_registration(RegistrationOutcome::Failed("boom".to_string()));
+        let comp = KWinCompositor::for_test(b, None);
+        let lines = comp.doctor_lines();
+        assert!(
+            lines.iter().any(|l| {
+                l.contains("✗ 事件脚本") && l.contains("外部实例信号注册失败: boom")
+            }),
+            "doctor must report external instance failure: {lines:#?}"
+        );
+    }
+
+    /// 新探测（prepare_registration）开始须清除滞留的「外部实例」标记，
+    /// doctor 恢复到「未加载」——残留实例停止/新一轮注册后不再永久误报。
+    #[tokio::test]
+    async fn doctor_event_script_line_restores_unloaded_after_new_probe() {
+        let bus = TestBus::start().await;
+        let b = bridge(&bus).await;
+        b.record_late_registration(RegistrationOutcome::Ready);
+        let comp = KWinCompositor::for_test(b, None);
+        assert!(
+            comp.doctor_lines()
+                .iter()
+                .any(|l| l.contains("外部实例已注册")),
+            "external instance must be reported before a new probe"
+        );
+
+        drop(comp.bridge.prepare_registration().await);
+        let lines = comp.doctor_lines();
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("⚠ 事件脚本") && l.contains("未加载")),
+            "doctor must restore unloaded after a new probe: {lines:#?}"
         );
     }
 }
