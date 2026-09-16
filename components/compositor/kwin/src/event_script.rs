@@ -27,6 +27,10 @@ use crate::scripts::{ScriptTemplate, RESPONSE_IFACE, RESPONSE_PATH, RESPONSE_SER
 const PROBE_INTERVAL: Duration = Duration::from_millis(200);
 const START_GRACE: Duration = Duration::from_millis(300);
 
+/// 长驻 `event_monitor` 的固定插件名：启动时按此名 `unloadScript` 清理
+/// 上次会话异常退出（SIGKILL/panic）残留的实例，保证同一时刻至多一个。
+pub(crate) const EVENT_MONITOR_PLUGIN: &str = "agent_shell_event_monitor";
+
 /// 长驻事件脚本句柄。
 #[derive(Debug)]
 pub struct EventScriptHandle {
@@ -64,8 +68,8 @@ pub async fn ensure_event_script(bridge: &KWinBridge, v6: bool) -> Result<EventS
     start_event_script(bridge.connection(), &js, v6).await
 }
 
-/// 底层启动入口：确认 /Scripting 可达 → loadScript + run，不 stop；
-/// 返回句柄供后续 stop。
+/// 底层启动入口：确认 /Scripting 可达 → 先卸载上次残留 → loadScript + run，
+/// 不 stop；返回句柄供后续 stop。
 async fn start_event_script(conn: &Connection, js: &str, v6: bool) -> Result<EventScriptHandle> {
     // 先探测再加载：KWin 启动早期 Scripting 单例尚未注册
     // /Scripting 时 load_script_via 会直接失败——以固定间隔重试探测至
@@ -81,9 +85,18 @@ async fn start_event_script(conn: &Connection, js: &str, v6: bool) -> Result<Eve
             Err(e) => return Err(e),
         }
     }
+    // 启动即收敛：卸载上次会话因异常退出残留的固定名实例。卸载失败仅告警——
+    // 残留实例会被归一化前去重兜底，不阻塞本次装配。
+    if let Err(e) = crate::dbus_bridge::unload_event_monitor(conn, EVENT_MONITOR_PLUGIN).await {
+        tracing::warn!(
+            plugin = EVENT_MONITOR_PLUGIN,
+            "unload residual event script failed: {e}"
+        );
+    }
     // loadScript 走落盘文件——staged 必须随句柄存活（KWin run
     // 是异步读盘，提前 Drop 会删掉脚本体）。
-    let (path, staged) = crate::dbus_bridge::load_script_via(conn, js, v6).await?;
+    let (path, staged) =
+        crate::dbus_bridge::load_script_via(conn, js, v6, EVENT_MONITOR_PLUGIN).await?;
     let script = crate::dbus_bridge::ScriptInstance::new(conn, &path).await?;
     script
         .run()
@@ -100,17 +113,18 @@ async fn start_event_script(conn: &Connection, js: &str, v6: bool) -> Result<Eve
 
 impl EventScriptHandle {
     /// 停止并卸载长驻脚本（组件关闭时调用；幂等）。同时释放暂存文件——
-    /// stop 之后 KWin 不会再读盘。
+    /// stop 之后 KWin 不会再读盘。失败向上抛，由调用方决定是否致命——
+    /// 不在此处吞掉，避免残留实例静默遗留。
     pub async fn stop(&mut self, conn: &Connection) -> Result<()> {
         let mut running = self.running.lock().await;
         if !*running {
             return Ok(());
         }
         let script = crate::dbus_bridge::ScriptInstance::new(conn, &self.object_path).await?;
-        // stop 失败不致命：脚本可能已被 compositor 侧卸载（会话结束等）。
-        if let Err(e) = script.stop().await {
-            tracing::warn!(path = %self.object_path, "event script stop failed: {e}");
-        }
+        script
+            .stop()
+            .await
+            .map_err(|e| crate::error::KWinError::Scripting(format!("event script stop: {e}")))?;
         *running = false;
         // 释放暂存文件（Drop 删除磁盘脚本体）；stop 后 KWin 不再读盘。
         if let Some(staged) = self.staged.take() {

@@ -86,6 +86,18 @@ impl CompositorBackend {
             Self::Mutter(_) => agent_shell_core::types::DesktopEnvironment::GNOME,
         }
     }
+
+    /// 会话后端清理（daemon 退出前调用）。KWin 会话卸载长驻事件脚本，
+    /// 避免瞬态 daemon 退出后 `event_monitor` 实例在 KWin 内堆积。
+    /// 卸载失败记录告警（不 panic）——下次会话启动的固定名清理会兜底收敛。
+    async fn shutdown(&self) {
+        if let Self::Kwin(c) = self {
+            if let Err(e) = c.shutdown_event_script().await {
+                tracing::warn!("event script unload failed: {e}");
+            }
+        }
+    }
+
     /// 取原始事件源（§18.2），区分三态：
     /// - KWin 会话：事件脚本启动成功 → [`RawSourceOutcome::Ready`]；失败
     ///   （/Scripting 未就绪、一次性队列已被占用）→ [`RawSourceOutcome::Failed`]。
@@ -283,6 +295,14 @@ impl Daemon {
                 "compositor channel unavailable in this session".into(),
             )
         })
+    }
+
+    /// 会话清理（daemon 退出前调用）：卸载合成器持有的长驻事件脚本，
+    /// 与 capture 的 ScreenCast 关闭同属退出钩子。
+    pub async fn shutdown(&self) {
+        if let Some(compositor) = self.compositor.as_ref() {
+            compositor.shutdown().await;
+        }
     }
 
     /// 当前会话对应的 [`event::EventSource`]（审查建议 4：X11 会话不得错标
