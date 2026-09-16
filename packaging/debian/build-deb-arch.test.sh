@@ -1,10 +1,12 @@
 #!/bin/sh
 # build-deb-arch.test.sh — 验证 build-deb.sh 架构检测
 #
-# 覆盖两条契约：
+# 覆盖三条契约：
 #   1) DEB_HOST_ARCH 设置时，包 control 的 Architecture: 字段采用该架构
 #   2) dpkg 不可用且 DEB_HOST_ARCH 未设置时，脚本显式失败（exit 1），
 #      不再静默回退 amd64
+#   3) arm64 需构建时显式 --no-default-features（libspa-sys 0.10.1 与旧
+#      libspa-0.2 头不兼容），无视 PipeWire 版本门槛；其他平台保持默认特性构建不回退
 #
 # 用法：sh packaging/debian/build-deb-arch.test.sh
 set -eu
@@ -131,6 +133,17 @@ export CARGO_ARGS_FILE CAPTURE_FILE
 PATH="$STUB:$PATH" DEB_HOST_ARCH=amd64 PKGCONFIG_PIPEWIRE=1 sh "$BUILD_SH" "$WORK/target" > "$WORK/out4" 2>&1
 check "现代 PipeWire 头时 cargo 不带 --no-default-features" \
     "$(grep -c -- '--no-default-features' "$CARGO_ARGS_FILE")" "0"
+
+# ── 用例 5：arm64 + 需构建 → 显式 --no-default-features（无视 PipeWire 头版本）──
+CARGO_ARGS_FILE="$WORK/cargo_args5"
+CAPTURE_FILE="$WORK/capture5"
+export CARGO_ARGS_FILE CAPTURE_FILE
+: > "$CARGO_ARGS_FILE"
+: > "$CAPTURE_FILE"
+chmod 644 "$WORK/target/release/"*
+PATH="$STUB:$PATH" DEB_HOST_ARCH=arm64 PKGCONFIG_PIPEWIRE=1 sh "$BUILD_SH" "$WORK/target" > "$WORK/out5" 2>&1
+check "arm64 需构建时 cargo 显式 --no-default-features（现代头亦然）" \
+    "$(grep -c -- '--no-default-features' "$CARGO_ARGS_FILE")" "1"
 
 echo
 echo "build-deb-arch.test.sh: $pass passed, $fail failed"
