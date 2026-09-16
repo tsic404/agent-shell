@@ -14,8 +14,34 @@ set -eu
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BUILD_SH="$SCRIPT_DIR/build-deb.sh"
 
-WORK="$(mktemp -d)"
+# /tmp 挂 noexec 时（如 company-04 的 tmpfs），mktemp -d 仍会成功，但下面的
+# stub 二进制无法执行（EACCES）。按优先级探测候选临时目录（默认位置、$HOME、
+# $PWD、$SCRIPT_DIR），取首个「可写且可执行」者作 WORK 基座；全部不可用则明确
+# 失败。正常主机首选默认位置，行为不回退。
+exec_probe() {
+    _p="$1/.exec-probe.$$"
+    if (printf '#!/bin/sh\n' > "$_p" && chmod +x "$_p" && "$_p") 2>/dev/null; then
+        rm -f "$_p"
+        return 0
+    fi
+    rm -f "$_p"
+    return 1
+}
+
+_workbase=""
+for _cand in "${TMPDIR:-/tmp}" "${HOME:-}" "${PWD:-}" "$SCRIPT_DIR"; do
+    if [ -d "$_cand" ] && exec_probe "$_cand"; then
+        _workbase="$_cand"
+        break
+    fi
+done
+if [ -z "$_workbase" ]; then
+    echo "build-deb-arch.test.sh: 无可用临时目录（/tmp、\$HOME、\$PWD、\$SCRIPT_DIR 均不可写或不可执行）" >&2
+    exit 1
+fi
+WORK="$(TMPDIR="$_workbase" mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
+unset _cand _workbase _p
 
 # install_bin 需要 $TARGET_DIR/release/* 存在；用空文件占位即可
 mkdir -p "$WORK/target/release"
