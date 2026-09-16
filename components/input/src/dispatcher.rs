@@ -92,6 +92,10 @@ pub struct InputDispatcher {
     active: std::sync::Mutex<Option<usize>>,
     /// active 状态持久化文件；`None` = 不持久化（测试装配）。
     state_path: Option<PathBuf>,
+    /// 首选后端（libei）探测失败原因，仅当整条降级链无可选后端时回传给
+    /// 调用方作为可诊断错误（如 portal 缺 ConnectToEIS），而非笼统的
+    /// "no available backend"。
+    probe_failure: Option<String>,
 }
 
 /// 状态文件名（D9 状态持久化：`$XDG_RUNTIME_DIR/agent-shell/input-active.json`）。
@@ -201,17 +205,33 @@ fn xdotool_candidate(display: Option<&std::ffi::OsStr>, has_xdotool: bool) -> bo
     display.is_some() && has_xdotool
 }
 
+/// 抽取首选后端探测失败的裸原因（去掉变体前缀，避免与外层
+/// `BackendUnavailable` 包裹重复）。libei 探测只产出 `BackendUnavailable`
+/// 或 `DBus`；其余变体兜底用完整 Display。
+fn probe_reason(err: &AgentShellError) -> String {
+    match err {
+        AgentShellError::BackendUnavailable(m) | AgentShellError::DBus(m) => m.clone(),
+        other => other.to_string(),
+    }
+}
+
 impl InputDispatcher {
     /// 按 DE 探测候选集合并选出第一个可用的 active 后端。
     pub async fn new(de_type: DesktopEnvironment) -> Result<Self> {
         let mut backends: Vec<Box<dyn InputService>> = Vec::new();
+        // 首选后端探测失败原因（仅 libei 有前置探测），供整链无可用后端时
+        // 回传可诊断错误而非笼统 "no available backend"。
+        let mut probe_failure = None;
 
         // 1. libei/EIS（Wayland 首选）：portal RemoteDesktop → EI 协议。
-        //    探测失败（无 portal / 用户未授权 / 非 Wayland）不阻塞后续候选。
+        //    探测失败（无 portal / 缺 ConnectToEIS / 非 Wayland）不阻塞后续候选。
         if de_type != DesktopEnvironment::X11Generic && !de_type.is_tty() {
             match super::libei::LibeiInput::new().await {
                 Ok(libei) => backends.push(Box::new(libei)),
-                Err(e) => tracing::debug!("input: libei candidate unavailable: {e}"),
+                Err(e) => {
+                    tracing::debug!("input: libei candidate unavailable: {e}");
+                    probe_failure = Some(probe_reason(&e));
+                }
             }
         }
 
@@ -264,6 +284,7 @@ impl InputDispatcher {
             backends,
             active: std::sync::Mutex::new(active),
             state_path,
+            probe_failure,
         })
     }
 
@@ -275,6 +296,21 @@ impl InputDispatcher {
     /// 候选后端名列表（诊断/测试用，按降级链顺序）。
     pub fn backend_names(&self) -> Vec<&'static str> {
         self.backends.iter().map(|b| b.name()).collect()
+    }
+
+    /// 空链（`active == None`）时 detect 层应返回的诊断错误：携带首选后端
+    /// （libei）探测失败原因（如 portal 缺 ConnectToEIS），而非笼统
+    /// "no available backend"。`detect` 据此返回 `Err`，daemon 保存后经
+    /// `input_send` 透出。
+    pub(crate) fn empty_chain_error(&self, de_type: DesktopEnvironment) -> AgentShellError {
+        let reason = self
+            .probe_failure
+            .as_deref()
+            .map(|r| format!(" ({r})"))
+            .unwrap_or_default();
+        AgentShellError::BackendUnavailable(format!(
+            "input: no usable input backend in {de_type} session{reason}"
+        ))
     }
 
     /// active 后端健康检查。
@@ -371,6 +407,20 @@ impl InputDispatcher {
     /// 滚动（经降级链，失败自动回落）。
     pub async fn mouse_scroll(&self, dx: i32, dy: i32) -> Result<()> {
         self.dispatch(Op::Scroll(dx, dy)).await
+    }
+}
+
+#[cfg(test)]
+impl InputDispatcher {
+    /// 测试装配：空链 + 指定探测原因——`InputComponentHandle::detect` 空链
+    /// 错误路径的确定性构造（真实探测是环境绑定的 I/O，无法离线复现）。
+    pub(crate) fn test_empty(probe_failure: Option<String>) -> Self {
+        InputDispatcher {
+            backends: Vec::new(),
+            active: std::sync::Mutex::new(None),
+            state_path: None,
+            probe_failure,
+        }
     }
 }
 
@@ -511,6 +561,7 @@ mod tests {
             backends,
             active: std::sync::Mutex::new(active),
             state_path: None,
+            probe_failure: None,
         }
     }
 
@@ -532,6 +583,21 @@ mod tests {
         assert_eq!(d.active_backend_name(), None);
         let err = d.send_key(&combo(true)).await.unwrap_err();
         assert!(matches!(err, AgentShellError::BackendUnavailable(_)));
+    }
+
+    #[test]
+    fn probe_reason_strips_variant_prefix() {
+        // BackendUnavailable/DBus 抽内层消息，避免外层再次包裹重复前缀。
+        assert_eq!(
+            probe_reason(&AgentShellError::BackendUnavailable(
+                "portal lacks EIS".into()
+            )),
+            "portal lacks EIS"
+        );
+        assert_eq!(
+            probe_reason(&AgentShellError::DBus("session bus: gone".into())),
+            "session bus: gone"
+        );
     }
 
     #[tokio::test]
@@ -611,6 +677,7 @@ mod tests {
             backends: vec![Box::new(failing), Box::new(ok)],
             active: std::sync::Mutex::new(Some(0)),
             state_path: Some(state_path.clone()),
+            probe_failure: None,
         };
         d.send_key(&combo(true)).await.expect("falls back");
         assert_eq!(d.active_backend_name(), Some("ok"));
@@ -662,6 +729,7 @@ mod tests {
             backends: vec![Box::new(failing)],
             active: std::sync::Mutex::new(Some(0)),
             state_path: Some(state_path.clone()),
+            probe_failure: None,
         };
         let err = d.send_key(&combo(true)).await.unwrap_err();
         assert!(matches!(err, AgentShellError::BackendUnavailable(_)));

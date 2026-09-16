@@ -24,6 +24,8 @@ use crate::keymap::{char_to_evdev, combo_to_press_sequence};
 const PORTAL_DESTINATION: &str = "org.freedesktop.portal.Desktop";
 /// portal RemoteDesktop 接口名。
 const REMOTE_DESKTOP_IFACE: &str = "org.freedesktop.portal.RemoteDesktop";
+/// portal RemoteDesktop 对象路径（CreateSession/ConnectToEIS 所在）。
+const REMOTE_DESKTOP_PATH: &str = "/org/freedesktop/portal/desktop";
 
 /// libei/EIS 注入后端。
 pub struct LibeiInput {
@@ -44,8 +46,9 @@ struct EiSession {
 }
 
 impl LibeiInput {
-    /// 构造候选实例。轻探测：只验证 session bus 可连、portal 服务在 bus 上；
-    /// 不触发 portal 弹窗。失败返回 `Err` 由 dispatcher 跳过该候选。
+    /// 构造候选实例。轻探测：只验证 session bus 可连、portal 服务在 bus 上、
+    /// RemoteDesktop 实现 `ConnectToEIS`；不触发 portal 弹窗。失败返回 `Err`
+    /// 由 dispatcher 跳过该候选。
     pub async fn new() -> Result<Self> {
         let bus = zbus::Connection::session()
             .await
@@ -67,6 +70,14 @@ impl LibeiInput {
         if !has_portal {
             return Err(AgentShellError::BackendUnavailable(
                 "xdg-desktop-portal not running".into(),
+            ));
+        }
+        // 探测 RemoteDesktop 是否实现 ConnectToEIS：老 portal（如 DDE 20 自带）
+        // 只实现到 Start，缺 ConnectToEIS 时注入必然 UnknownMethod——在探测阶段
+        // 即报可诊断错误并让 dispatcher 走降级链，而非等注入才失败。
+        if !portal_has_connect_to_eis(&bus).await {
+            return Err(AgentShellError::BackendUnavailable(
+                "portal backend does not support EIS: RemoteDesktop.ConnectToEIS missing".into(),
             ));
         }
         Ok(Self {
@@ -233,6 +244,39 @@ fn flush_err(e: rustix::io::Errno) -> AgentShellError {
     AgentShellError::Input(format!("libei flush: {e}"))
 }
 
+/// 探测 portal RemoteDesktop 是否实现 `ConnectToEIS`（§12.3 第 4 步）。
+///
+/// 对 [`REMOTE_DESKTOP_PATH`] 做一次只读 Introspect，检查方法是否被广告。
+/// Introspect 失败按「无法判定」处理并返回 true——内省受限或 portal 早期
+/// 状态不应误摘除可用后端，届时沿用惰性探测（注入期报错）。仅当内省成功
+/// 且方法缺失时才返回 false：该 portal 无 EIS 注入手段。
+async fn portal_has_connect_to_eis(bus: &zbus::Connection) -> bool {
+    let Ok(path) = zbus::zvariant::ObjectPath::try_from(REMOTE_DESKTOP_PATH) else {
+        return true;
+    };
+    let Ok(proxy) = zbus::fdo::IntrospectableProxy::builder(bus)
+        .destination(PORTAL_DESTINATION)
+        .and_then(|b| b.path(path))
+    else {
+        return true;
+    };
+    let Ok(proxy) = proxy.build().await else {
+        return true;
+    };
+    match proxy.introspect().await {
+        Ok(xml) => xml_advertises_connect_to_eis(&xml),
+        Err(_) => true,
+    }
+}
+
+/// introspection XML 是否广告了 `ConnectToEIS` 方法。
+///
+/// 只认方法声明 `<method name="ConnectToEIS"`——裸子串会误匹配文档/注解中
+/// 的提及。method 元素含子节点（in/out 参数），故按开标签前缀匹配。
+fn xml_advertises_connect_to_eis(xml: &str) -> bool {
+    xml.contains("<method name=\"ConnectToEIS\"")
+}
+
 /// portal CreateSession → SelectDevices → Start → ConnectToEIS 全流程，
 /// 返回 EIS socket fd。
 ///
@@ -261,7 +305,7 @@ async fn portal_connect_to_eis(bus: &zbus::Connection) -> Result<zbus::zvariant:
     let rd = zbus::Proxy::new(
         bus,
         PORTAL_DESTINATION,
-        "/org/freedesktop/portal/desktop",
+        REMOTE_DESKTOP_PATH,
         REMOTE_DESKTOP_IFACE,
     )
     .await
@@ -505,5 +549,44 @@ mod tests {
         assert!(flags.contains(DeviceCapability::Keyboard));
         assert!(flags.contains(DeviceCapability::Pointer));
         assert!(!flags.contains(DeviceCapability::Touch));
+    }
+
+    #[test]
+    fn connect_to_eis_detection_matches_only_method_declaration() {
+        // 真实 portal 内省：method 元素带参数子节点，开标签即声明。
+        let xml = r#"<node>
+  <interface name="org.freedesktop.portal.RemoteDesktop">
+    <method name="CreateSession">
+      <arg type="a{sv}" name="options" direction="in"/>
+      <arg type="o" name="handle" direction="out"/>
+    </method>
+    <method name="ConnectToEIS">
+      <arg type="o" name="session_handle" direction="in"/>
+      <arg type="h" name="fd" direction="out"/>
+    </method>
+  </interface>
+</node>"#;
+        assert!(xml_advertises_connect_to_eis(xml));
+
+        // 缺 ConnectToEIS（老 portal，仅到 Start）。
+        let xml = r#"<node>
+  <interface name="org.freedesktop.portal.RemoteDesktop">
+    <method name="CreateSession">
+      <arg type="a{sv}" name="options" direction="in"/>
+    </method>
+    <method name="Start">
+      <arg type="o" name="session_handle" direction="in"/>
+    </method>
+  </interface>
+</node>"#;
+        assert!(!xml_advertises_connect_to_eis(xml));
+
+        // 文档/注解中提及 ConnectToEIS 不算方法声明。
+        let xml = r#"<node>
+  <interface name="org.freedesktop.portal.RemoteDesktop">
+    <annotation name="doc" value="ConnectToEIS is unavailable here"/>
+  </interface>
+</node>"#;
+        assert!(!xml_advertises_connect_to_eis(xml));
     }
 }

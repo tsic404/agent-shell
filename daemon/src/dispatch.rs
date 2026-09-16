@@ -630,10 +630,11 @@ async fn input_send(d: &mut Daemon, req: &Request) -> RpcResult {
         .map_err(|e| (RpcErrorCode::InvalidParams, format!("bad params: {e}")))?;
     let op = crate::input::prepare(p.kind, &p.payload)?;
     let input = d.input.as_ref().ok_or_else(|| {
-        (
-            RpcErrorCode::BackendUnavailable,
-            "input unavailable in this session".into(),
-        )
+        let msg = d
+            .input_error
+            .as_deref()
+            .unwrap_or("input unavailable in this session");
+        (RpcErrorCode::BackendUnavailable, msg.to_string())
     })?;
     crate::input::execute(input.dispatcher(), op).await?;
     Ok(json!({ "ok": true }))
@@ -1938,6 +1939,34 @@ mod tests {
         assert_eq!(
             resp.error.expect("error").code,
             RpcErrorCode::InvalidParams as i32
+        );
+    }
+
+    #[tokio::test]
+    async fn input_send_surfaces_assembly_error_reason() {
+        // 装配失败（如 portal 缺 ConnectToEIS）时 input=None，input_send 必须
+        // 透出 state 保存的装配错误原因，而非笼统 "input unavailable"。
+        let mut d = test_daemon().await;
+        d.input = None;
+        d.input_error = Some(
+            "input: no usable input backend in DDE session (portal backend does not support EIS: \
+             RemoteDesktop.ConnectToEIS missing)"
+                .into(),
+        );
+        let resp = dispatch(
+            &mut d,
+            &req(
+                method::INPUT_SEND,
+                Some(json!({ "kind": "key", "payload": { "combo": "ctrl+c" } })),
+            ),
+        )
+        .await;
+        let err = resp.error.expect("error");
+        assert_eq!(err.code, RpcErrorCode::BackendUnavailable as i32);
+        assert!(
+            err.message.contains("ConnectToEIS missing"),
+            "{}",
+            err.message
         );
     }
 
