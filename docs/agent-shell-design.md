@@ -3707,6 +3707,11 @@ strip = true
 `portal-screencast`，无需手动指定即可编译。手动 `cargo build --release --workspace`
 仍需满足门槛的 dev 头，或显式 `--no-default-features`（§20.6）。
 
+arm64（aarch64）发行构建（`build-deb.sh` / `PKGBUILD` / `flake.nix`）显式采用
+`--no-default-features`：company-04（UOS arm64）系统 `libspa-0.2-dev` 头（0.3.15.x）
+与 libspa-sys 0.10.1 不兼容，默认特性（含 `portal-screencast`）直编失败。显式关闭
+`portal-screencast`，capture 走 Screenshot/X11 降级链；其他平台保持默认特性构建不回退。
+
 ### 20.3 权限模型
 
 | 资源 | 授权方式 |

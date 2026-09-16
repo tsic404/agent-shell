@@ -42,10 +42,22 @@ for bin in agent-shell-daemon agent-shell agent-shell-mcp agent-shell-rootd; do
 done
 if [ "$NEED_BUILD" = "1" ]; then
     FEATURES_FLAGS=""
-    if ! pkg-config --atleast-version=0.3.37 libpipewire-0.3 2>/dev/null; then
-        FEATURES_FLAGS="--no-default-features"
-        echo "warning: libpipewire-0.3 < 0.3.37 (or missing); building with --no-default-features (portal-screencast disabled)" >&2
-    fi
+    case "$ARCH" in
+        arm64|aarch64)
+            # arm64（company-04）系统 libspa-0.2-dev 头（0.3.15.x）与
+            # libspa-sys 0.10.1 不兼容，portal-screencast 默认特性直编失败；
+            # 发行构建显式回退 --no-default-features，capture 走
+            # Screenshot/X11 降级链。其他平台保持默认特性构建（版本门槛见下）。
+            FEATURES_FLAGS="--no-default-features"
+            echo "warning: arm64 release build uses --no-default-features (libspa-sys 0.10.1 vs old libspa-0.2 headers)" >&2
+            ;;
+        *)
+            if ! pkg-config --atleast-version=0.3.37 libpipewire-0.3 2>/dev/null; then
+                FEATURES_FLAGS="--no-default-features"
+                echo "warning: libpipewire-0.3 < 0.3.37 (or missing); building with --no-default-features (portal-screencast disabled)" >&2
+            fi
+            ;;
+    esac
     (cd "$ROOT_DIR" && cargo build --release --target-dir "$TARGET_DIR" $FEATURES_FLAGS)
 else
     echo "release binaries already present; skipping cargo build"

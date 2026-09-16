@@ -26,6 +26,12 @@
         # agent-shell workspace 根
         workspaceRoot = ./../..;
 
+        # arm64（aarch64）上 libspa-0.2-dev 旧头（company-04 0.3.15.x）与
+        # libspa-sys 0.10.1 不兼容，portal-screencast 默认特性直编失败；显式
+        # --no-default-features 回退，capture 走 Screenshot/X11 降级链。
+        # 其他平台保持默认特性构建不回退。
+        cargoFeaturesFlags = if pkgs.stdenv.hostPlatform.isAarch64 then "--no-default-features" else "";
+
         # §20.2 打包：agent-shell（daemon + cli + mcp）
         agent-shell = rustPlatform.buildRustPackage {
           pname = "agent-shell";
@@ -44,7 +50,7 @@
           # 只构建 daemon + cli + mcp 二进制
           buildPhase = ''
             runHook preBuild
-            cargo build --release -p agent-shell-daemon -p agent-shell-cli -p mcp
+            cargo build --release -p agent-shell-daemon -p agent-shell-cli -p mcp ${cargoFeaturesFlags}
             runHook postBuild
           '';
 
