@@ -322,8 +322,10 @@ fn input_doctor_line(d: &Daemon) -> String {
     const LABEL: &str = "输入后端";
     match d.input.as_ref() {
         None => {
-            let detail = d.input_error.as_deref().unwrap_or("TTY 或无注入后端");
-            format!("✗ {LABEL:<12}: 不可用（{detail}）")
+            // 装配失败时透出 state 保存的根因（如 portal 缺 ConnectToEIS），
+            // 无根因（纯 TTY 无任何候选）回退通用文案。
+            let reason = d.input_error.as_deref().unwrap_or("TTY 或无注入后端");
+            format!("✗ {LABEL:<12}: 不可用（{reason}）")
         }
         Some(handle) => {
             let chain = handle.dispatcher().backend_names().join(" → ");
@@ -2150,14 +2152,11 @@ mod tests {
     #[tokio::test]
     async fn input_send_surfaces_assembly_error_reason() {
         // 装配失败（如 portal 缺 ConnectToEIS）时 input=None，input_send 必须
-        // 透出 state 保存的装配错误原因，而非笼统 "input unavailable"。
+        // 透出 state 保存的首选后端探测根因，而非笼统 "input unavailable"。
         let mut d = test_daemon().await;
         d.input = None;
-        d.input_error = Some(
-            "input: no usable input backend in DDE session (portal backend does not support EIS: \
-             RemoteDesktop.ConnectToEIS missing)"
-                .into(),
-        );
+        d.input_error =
+            Some("portal backend does not support EIS: RemoteDesktop.ConnectToEIS missing".into());
         let resp = dispatch(
             &mut d,
             &req(
@@ -2176,33 +2175,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn doctor_input_failure_carries_assembly_reason() {
-        // doctor 输入后端失败行必须携带 state 保存的装配短摘要
-        // （与 input_send 路径一致），而非笼统「TTY 或无注入后端」。
+    async fn doctor_input_line_surfaces_assembly_error_reason() {
+        // input=None 时 doctor 输入后端行透出 state 保存的探测根因
+        // （含 ConnectToEIS missing），而非笼统「不可用」。
         let mut d = test_daemon().await;
         d.input = None;
-        d.input_error = Some(
-            "input: no usable input backend in DDE session (portal backend does not support EIS: \
-             RemoteDesktop.ConnectToEIS missing)"
-                .into(),
-        );
+        d.input_error =
+            Some("portal backend does not support EIS: RemoteDesktop.ConnectToEIS missing".into());
         let line = input_doctor_line(&d);
-        assert!(line.starts_with("✗ 输入后端"), "{line}");
-        assert!(
-            line.contains("ConnectToEIS missing"),
-            "doctor input line must carry assembly reason: {line}"
-        );
+        assert!(line.starts_with("✗ 输入后端"), "got: {line}");
+        assert!(line.contains("ConnectToEIS missing"), "got: {line}");
     }
 
     #[tokio::test]
-    async fn doctor_input_failure_falls_back_without_reason() {
-        // 无 input_error（如纯 TTY 空链）时保留通用描述，不带空括号。
+    async fn doctor_input_line_falls_back_to_generic_without_reason() {
+        // 无探测根因（纯 TTY：libei 前置探测被跳过，detect_with_reason 返回
+        // None）回退友好文案，而非透出裸英文内部消息。该状态生产可达。
         let mut d = test_daemon().await;
         d.input = None;
         d.input_error = None;
         let line = input_doctor_line(&d);
-        assert!(line.contains("TTY 或无注入后端"), "{line}");
-        assert!(!line.contains("（None）"), "{line}");
+        assert!(line.contains("不可用（TTY 或无注入后端）"), "got: {line}");
     }
 
     #[tokio::test]

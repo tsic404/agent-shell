@@ -124,6 +124,33 @@ pub async fn detect(de_type: DesktopEnvironment) -> Result<InputComponentHandle>
     InputComponentHandle::detect(de_type).await
 }
 
+/// 探测输入后端并返回可选的首选后端（libei）探测根因。
+///
+/// daemon 装配用：`detect` 空链失败时无法区分「有具体根因」（如 portal 缺
+/// ConnectToEIS）与「纯 TTY/空链」（无根因）。前者保存到 `state.input_error`
+/// 供 doctor/input_send 透出；后者存 `None`，doctor 回退友好文案而非裸英文
+/// 内部消息。
+pub async fn detect_with_reason(
+    de_type: DesktopEnvironment,
+) -> (Result<InputComponentHandle>, Option<String>) {
+    let dispatcher = match InputDispatcher::new(de_type).await {
+        Ok(d) => d,
+        Err(e) => return (Err(e), None),
+    };
+    assemble_with_reason(dispatcher, de_type)
+}
+
+/// 空链判定 + 根因分类的纯逻辑（脱离环境探测，供测试覆盖真实装配分类）。
+///
+/// 根因 = 首选后端（libei）探测失败原因；纯 TTY（无 libei 前置探测）时 None。
+fn assemble_with_reason(
+    dispatcher: InputDispatcher,
+    de_type: DesktopEnvironment,
+) -> (Result<InputComponentHandle>, Option<String>) {
+    let reason = dispatcher.probe_failure().map(str::to_string);
+    (InputComponentHandle::assemble(dispatcher, de_type), reason)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -157,6 +184,32 @@ mod tests {
         assert_eq!(
             err.to_string(),
             "Backend not available: input: no usable input backend in Tty session"
+        );
+    }
+
+    #[test]
+    fn assemble_with_reason_returns_none_for_generic_tty() {
+        // 纯 TTY：无 libei 前置探测 → 根因 None（daemon 存 None，doctor 回退
+        // 友好文案，而非透出裸英文内部消息）。
+        let (result, reason) =
+            assemble_with_reason(InputDispatcher::test_empty(None), DesktopEnvironment::Tty);
+        assert!(result.is_err(), "empty TTY chain must fail assembly");
+        assert_eq!(reason, None);
+    }
+
+    #[test]
+    fn assemble_with_reason_returns_probe_failure_for_missing_connect_to_eis() {
+        // 缺 ConnectToEIS：libei 探测失败 → 根因 Some，daemon 保存并透出。
+        let (result, reason) = assemble_with_reason(
+            InputDispatcher::test_empty(Some(
+                "portal backend does not support EIS: RemoteDesktop.ConnectToEIS missing".into(),
+            )),
+            DesktopEnvironment::DDE,
+        );
+        assert!(result.is_err(), "empty DDE chain must fail assembly");
+        assert_eq!(
+            reason.as_deref(),
+            Some("portal backend does not support EIS: RemoteDesktop.ConnectToEIS missing")
         );
     }
 }

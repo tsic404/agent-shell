@@ -27,6 +27,12 @@ const REMOTE_DESKTOP_IFACE: &str = "org.freedesktop.portal.RemoteDesktop";
 /// portal RemoteDesktop 对象路径（CreateSession/ConnectToEIS 所在）。
 const REMOTE_DESKTOP_PATH: &str = "/org/freedesktop/portal/desktop";
 
+/// `RemoteDesktop.ConnectToEIS` 缺失的诊断消息——portal 在场但无 EIS 注入
+/// 手段（如 DDE 20 自带老 portal）。探测构造与 doctor/input_send 透出共用，
+/// 避免字符串漂移。
+const MISSING_CONNECT_TO_EIS: &str =
+    "portal backend does not support EIS: RemoteDesktop.ConnectToEIS missing";
+
 /// libei/EIS 注入后端。
 pub struct LibeiInput {
     /// session bus 连接（构造时建立）。
@@ -77,7 +83,7 @@ impl LibeiInput {
         // 即报可诊断错误并让 dispatcher 走降级链，而非等注入才失败。
         if !portal_has_connect_to_eis(&bus).await {
             return Err(AgentShellError::BackendUnavailable(
-                "portal backend does not support EIS: RemoteDesktop.ConnectToEIS missing".into(),
+                MISSING_CONNECT_TO_EIS.into(),
             ));
         }
         Ok(Self {
@@ -242,6 +248,18 @@ async fn ei_handshake_and_negotiate(owned_fd: zbus::zvariant::OwnedFd) -> Result
 
 fn flush_err(e: rustix::io::Errno) -> AgentShellError {
     AgentShellError::Input(format!("libei flush: {e}"))
+}
+
+/// 探测失败若为「portal 在场但缺 ConnectToEIS」返回诊断消息，否则 None。
+///
+/// 仅此一类失败是首选后端探测的可诊断根因（portal 在但能力缺失）。无
+/// portal（headless/TTY/SSH 常态）、无 session bus 等不是缺陷，是「无注入
+/// 后端」的常态——dispatcher 据此不记录根因，doctor 回退友好文案。
+pub(crate) fn missing_connect_to_eis_reason(err: &AgentShellError) -> Option<&str> {
+    match err {
+        AgentShellError::BackendUnavailable(m) if m == MISSING_CONNECT_TO_EIS => Some(m),
+        _ => None,
+    }
 }
 
 /// 探测 portal RemoteDesktop 是否实现 `ConnectToEIS`（§12.3 第 4 步）。
@@ -549,6 +567,27 @@ mod tests {
         assert!(flags.contains(DeviceCapability::Keyboard));
         assert!(flags.contains(DeviceCapability::Pointer));
         assert!(!flags.contains(DeviceCapability::Touch));
+    }
+
+    #[test]
+    fn missing_connect_to_eis_reason_only_for_capability_gap() {
+        // 仅「portal 在场但缺 ConnectToEIS」是可诊断根因；headless 无 portal /
+        // 无 session bus 是常态，dispatcher 不记录，doctor 回退友好文案。
+        let missing = AgentShellError::BackendUnavailable(MISSING_CONNECT_TO_EIS.into());
+        assert_eq!(
+            missing_connect_to_eis_reason(&missing),
+            Some(MISSING_CONNECT_TO_EIS)
+        );
+        assert_eq!(
+            missing_connect_to_eis_reason(&AgentShellError::BackendUnavailable(
+                "xdg-desktop-portal not running".into()
+            )),
+            None
+        );
+        assert_eq!(
+            missing_connect_to_eis_reason(&AgentShellError::DBus("session bus: gone".into())),
+            None
+        );
     }
 
     #[test]
