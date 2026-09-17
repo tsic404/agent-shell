@@ -256,8 +256,8 @@ pub struct ScreenshotCommand {
     /// 截取指定窗口（native id）
     #[arg(long)]
     pub window: Option<String>,
-    /// 截取区域 X,Y,W,H
-    #[arg(long, num_args = 4, value_names = ["X", "Y", "W", "H"])]
+    /// 截取区域 X,Y,W,H（四个坐标均为非负整数）
+    #[arg(long, num_args = 4, value_names = ["X", "Y", "W", "H"], allow_negative_numbers = true)]
     pub area: Option<Vec<i32>>,
     /// 输出文件路径
     #[arg(short = 'f', long = "file", default_value = "screenshot.ppm")]
@@ -1005,6 +1005,32 @@ mod tests {
         };
         assert_eq!(dx, -2);
         assert_eq!(dy, 0);
+    }
+
+    #[test]
+    fn screenshot_area_accepts_negative_numbers_without_double_dash() {
+        // `--area` 负坐标不经 `--` 直传：clap 放行解析，非负校验在 dispatch 层
+        // 完成（此处仅锚定 clap 不再以 `unexpected argument '-5'` 先拒）。
+        let Cli {
+            command:
+                Some(Command::Screenshot(ScreenshotCommand {
+                    area: Some(area), ..
+                })),
+            ..
+        } = Cli::try_parse_from([
+            "agent-shell",
+            "screenshot",
+            "--area",
+            "-5",
+            "-3",
+            "100",
+            "100",
+        ])
+        .expect("parse")
+        else {
+            panic!("expected screenshot");
+        };
+        assert_eq!(area, vec![-5, -3, 100, 100]);
     }
 
     #[test]
