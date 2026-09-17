@@ -56,15 +56,24 @@ pub async fn probe_scripting(conn: &Connection) -> Result<()> {
         .await
         .map_err(|e| KWinError::Scripting(format!("scripting probe build: {e}")))?;
     let xml = node.introspect().await.map_err(|e| {
-        KWinError::Scripting(format!(
-            "scripting probe: {SCRIPTING_SERVICE}{SCRIPTING_PATH} unreachable: {e} \
+        // UnknownObject = 服务可达但 /Scripting 未注册（能力缺失，非时序）；
+        // 其余（ServiceUnknown/NoReply/连接断开）属瞬时不可达，可自愈重试。
+        // introspect() 把标准 FDO 错误反序列化为 `zbus::fdo::Error`。
+        if matches!(&e, zbus::fdo::Error::UnknownObject(_)) {
+            KWinError::ScriptingUnavailable(format!(
+                "scripting probe: {SCRIPTING_SERVICE}{SCRIPTING_PATH} not registered: {e}"
+            ))
+        } else {
+            KWinError::Scripting(format!(
+                "scripting probe: {SCRIPTING_SERVICE}{SCRIPTING_PATH} unreachable: {e} \
                  (KWin may still be starting; retry later)"
-        ))
+            ))
+        }
     })?;
     if scripting_interface_advertised(&xml) {
         Ok(())
     } else {
-        Err(KWinError::Scripting(format!(
+        Err(KWinError::ScriptingUnavailable(format!(
             "scripting probe: org.kde.kwin.Scripting interface not advertised at \
              {SCRIPTING_PATH} (introspection returned no such interface)"
         )))

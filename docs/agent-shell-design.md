@@ -1534,7 +1534,11 @@ focus_window(id):
 move_window(id, x, y):
   0. X11 会话？
      → 是：EWMH `_NET_MOVERESIZE_WINDOW`（只设 X/Y，尺寸标志位 0）
-  1. 协议不支持 set_geometry，走 bridge.move_window.js
+  1. Wayland：probe `/Scripting`
+     → 确证缺失（UnknownObject / 接口未广告）：无原生绝对移动通道
+       （org.kde.KWin 无 moveWindow，协议无 set_geometry），报 `NotImplemented`
+     → 瞬时不可达（KWin 启动中）：传播原始 probe 错误（保留重试提示）
+     → 可用：走 bridge.move_window.js（协议无 set_geometry）
 
 list_workspaces():
   0. X11 会话？
