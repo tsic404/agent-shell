@@ -1093,7 +1093,9 @@ impl CompositorComponent for KWinCompositor {
     }
 
     /// 移动：X11 会话走 EWMH `_NET_MOVERESIZE_WINDOW`（只设位置，尺寸字段
-    /// 标志位为 0）；Wayland 会话协议无 set_geometry（§7.2），始终 Scripting。
+    /// 标志位为 0）；Wayland 会话协议无 set_geometry（§7.2），始终 Scripting——
+    /// `/Scripting` 确证缺失（UnknownObject / 接口未广告）时报明确
+    /// NotImplemented，瞬时不可达传播原始 probe 错误（保留重试提示）。
     async fn move_window(
         &self,
         id: &WindowId,
@@ -1103,6 +1105,20 @@ impl CompositorComponent for KWinCompositor {
         if let Some(x11) = self.x11.as_ref() {
             let window = Self::x11_window_id(id)?;
             return x11.move_resize_window(window, Some(x), Some(y), None, None);
+        }
+        // Wayland：协议无 set_geometry（§7.2）。probe 失败分两类——/Scripting
+        // 确证缺失才是能力缺失（NotImplemented）；瞬时不可达（KWin 启动中）
+        // 属时序现象，传播原始错误并保留重试提示，不误报能力缺失。
+        match self.ensure_scripting_probe().await {
+            Ok(()) => {}
+            Err(KWinError::ScriptingUnavailable(_)) => {
+                return Err(AgentShellError::NotImplemented(
+                    "kwin wayland without /Scripting has no native move_window; \
+                     absolute window move requires KWin Scripting"
+                        .to_string(),
+                ));
+            }
+            Err(e) => return Err(e.into()),
         }
         let v = self
             .query(
@@ -1449,6 +1465,19 @@ mod tests {
         conn
     }
 
+    /// 注册 org.kde.KWin 服务但不注册 `/Scripting` 对象——introspect 返回
+    /// UnknownObject，模拟 deepin-kwin 5.x 禁用 scripting 的「确证缺失」形态。
+    async fn spawn_kwin_without_scripting(bus: &TestBus) -> zbus::Connection {
+        let conn = bus.connect().await;
+        // 强制创建 ObjectServer（空根节点）：zbus 惰性创建，不触发则未注册
+        // 路径无分发任务，调用方 introspect 会永久挂起而非收到 UnknownObject。
+        let _ = conn.object_server();
+        use zbus::names::WellKnownName;
+        let name = WellKnownName::try_from("org.kde.KWin".to_string()).expect("valid bus name");
+        conn.request_name(name).await.expect("claim org.kde.KWin");
+        conn
+    }
+
     async fn bridge(bus: &TestBus) -> KWinBridge {
         let conn = bus.connect().await;
         KWinBridge::with_connection(conn)
@@ -1711,6 +1740,65 @@ mod tests {
         assert_eq!(comp.scripting_probe_ok(), Some(false));
         assert!(has_not_ready_bridge(&lines));
         assert!(!has_ready_bridge(&lines));
+    }
+
+    /// move_window 在 Wayland 且 `/Scripting` 确证缺失（服务可达、对象未注册）
+    /// 时报 NotImplemented，消息含关键诊断；瞬时不可达则传播原始错误。
+    #[tokio::test]
+    async fn move_window_without_scripting_reports_not_implemented() {
+        let bus = TestBus::start().await;
+        // 服务在、/Scripting 不在 → introspect 返回 UnknownObject → 能力缺失。
+        let _kwin = spawn_kwin_without_scripting(&bus).await;
+        let comp = KWinCompositor::for_test(bridge(&bus).await, Some(false)).await;
+        let id = WindowId {
+            native_id: "some-uuid".to_string(),
+            de_type: DesktopEnvironment::KDE,
+        };
+
+        let err = comp
+            .move_window(&id, 100, 100)
+            .await
+            .expect_err("move without /Scripting must fail");
+
+        assert!(
+            matches!(err, AgentShellError::NotImplemented(_)),
+            "expected NotImplemented, got {err:?}"
+        );
+        // 诊断价值全在消息：RPC 边界折叠为 1005 + message，钉住关键语义。
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Scripting"),
+            "message must name Scripting: {msg}"
+        );
+        assert!(msg.contains("wayland"), "message must name wayland: {msg}");
+    }
+
+    /// move_window 在 probe 瞬时不可达（org.kde.KWin 未启动）时传播原始错误
+    /// （含重试提示），不误报 NotImplemented 能力缺失——与 ensure_scripting_probe
+    /// 的可自愈契约一致。
+    #[tokio::test]
+    async fn move_window_transient_probe_failure_propagates_retry_hint() {
+        let bus = TestBus::start().await;
+        // 不注册 org.kde.KWin → introspect 返回 ServiceUnknown → 瞬时不可达。
+        let comp = KWinCompositor::for_test(bridge(&bus).await, Some(false)).await;
+        let id = WindowId {
+            native_id: "some-uuid".to_string(),
+            de_type: DesktopEnvironment::KDE,
+        };
+
+        let err = comp
+            .move_window(&id, 100, 100)
+            .await
+            .expect_err("move with unreachable KWin must fail");
+
+        assert!(
+            !matches!(err, AgentShellError::NotImplemented(_)),
+            "transient failure must not be NotImplemented, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("retry"),
+            "transient failure must preserve retry hint: {err}"
+        );
     }
 
     /// doctor 事件脚本行如实标注为「未加载（懒启动）」，不再以「T3b 待办」
