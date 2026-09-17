@@ -18,8 +18,35 @@ case "$TARGET_DIR" in
     /*) ;;
     *) TARGET_DIR="$(pwd)/$TARGET_DIR" ;;
 esac
+# TMPDIR 可能指向不存在目录（mktemp -d 直接失败），或落在 noexec 挂载点；
+# 与外层 build-deb-arch.test.sh 同策略：按优先级探测候选临时目录，取首个
+# 「可写且可执行」者作 BUILD_DIR 基座，而非沿用可能失效的 TMPDIR。
+exec_probe() {
+    _p="$(mktemp "$1/.exec-probe.XXXXXX")" || return 1
+    if (printf '#!/bin/sh\n' > "$_p" && chmod +x "$_p" && "$_p") 2>/dev/null; then
+        rm -f "$_p"
+        return 0
+    fi
+    rm -f "$_p"
+    return 1
+}
+_buildbase=""
+for _cand in "${TMPDIR:-/tmp}" "${HOME:-}" "${PWD:-}" "$SCRIPT_DIR"; do
+    if [ -d "$_cand" ] && exec_probe "$_cand"; then
+        _buildbase="$_cand"
+        break
+    fi
+done
+if [ -z "$_buildbase" ]; then
+    echo "build-deb.sh: 无可用临时目录（\$TMPDIR、\$HOME、\$PWD、\$SCRIPT_DIR 均不可写或不可执行）" >&2
+    exit 1
+fi
+# 导出有效基座：dpkg-deb / cargo 等子进程同样以 $TMPDIR 为临时目录来源，
+# 仅对单条 mktemp 生效会在打包 staging 阶段继承失效 TMPDIR 而失败。
+export TMPDIR="$_buildbase"
 BUILD_DIR="$(mktemp -d)"
 trap 'rm -rf "$BUILD_DIR"' EXIT
+unset _cand _buildbase _p
 VERSION="$(grep -m1 '^version' "$ROOT_DIR/Cargo.toml" | sed 's/.*"\(.*\)"/\1/')"
 ARCH="${DEB_HOST_ARCH:-$(dpkg --print-architecture 2>/dev/null || true)}"
 if [ -z "$ARCH" ]; then

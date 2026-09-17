@@ -1,12 +1,13 @@
 #!/bin/sh
 # build-deb-arch.test.sh — 验证 build-deb.sh 架构检测
 #
-# 覆盖三条契约：
+# 覆盖四条契约：
 #   1) DEB_HOST_ARCH 设置时，包 control 的 Architecture: 字段采用该架构
 #   2) dpkg 不可用且 DEB_HOST_ARCH 未设置时，脚本显式失败（exit 1），
 #      不再静默回退 amd64
 #   3) arm64 需构建时显式 --no-default-features（libspa-sys 0.10.1 与旧
 #      libspa-0.2 头不兼容），无视 PipeWire 版本门槛；其他平台保持默认特性构建不回退
+#   4) TMPDIR 指向不存在目录时，内层 build-deb.sh 回退到有效临时目录，仍成功打包
 #
 # 用法：sh packaging/debian/build-deb-arch.test.sh
 set -eu
@@ -170,6 +171,42 @@ chmod 644 "$WORK/target/release/"*
 PATH="$STUB:$PATH" DEB_HOST_ARCH=arm64 PKGCONFIG_PIPEWIRE=1 sh "$BUILD_SH" "$WORK/target" > "$WORK/out5" 2>&1
 check "arm64 需构建时 cargo 显式 --no-default-features（现代头亦然）" \
     "$(grep -c -- '--no-default-features' "$CARGO_ARGS_FILE")" "1"
+
+# ── 用例 6：TMPDIR 指向不存在目录 → 内层 build-deb.sh 回退到有效临时目录 ──
+CARGO_ARGS_FILE="$WORK/cargo_args6"
+CAPTURE_FILE="$WORK/capture6"
+export CARGO_ARGS_FILE CAPTURE_FILE
+: > "$CARGO_ARGS_FILE"
+: > "$CAPTURE_FILE"
+chmod +x "$WORK/target/release/"*
+if TMPDIR="$WORK/nonexistent" PATH="$STUB:$PATH" DEB_HOST_ARCH=amd64 PKGCONFIG_PIPEWIRE=1 sh "$BUILD_SH" "$WORK/target" > "$WORK/out6" 2>&1; then
+    rc6=0
+else
+    rc6=$?
+fi
+check "TMPDIR 不存在时内层回退（build-deb.sh exit 0）" "$rc6" "0"
+check "内层回退后仍端到端打包（control Architecture 字段）" \
+    "$(sort -u "$CAPTURE_FILE" | head -n1)" \
+    "Architecture: amd64"
+
+# 真实 dpkg-deb（非 stub）：stub 不建 staging 临时文件，会遮蔽「子进程继承失效
+# TMPDIR」回归。此处以真实 dpkg-deb 跑一次，验证回退后 dpkg-deb 也能建临时文件。
+mkdir -p "$WORK/target-real/release"
+for bin in agent-shell-daemon agent-shell agent-shell-mcp agent-shell-rootd; do
+    : > "$WORK/target-real/release/$bin"
+done
+chmod +x "$WORK/target-real/release/"*
+if TMPDIR="$WORK/nonexistent" DEB_HOST_ARCH=amd64 sh "$BUILD_SH" "$WORK/target-real" > "$WORK/out6real" 2>&1; then
+    rc6real=0
+else
+    rc6real=$?
+fi
+check "真实 dpkg-deb：TMPDIR 不存在时内层回退仍 exit 0" "$rc6real" "0"
+set -- "$WORK/target-real"/agent-shell*.deb
+check "真实 dpkg-deb：产出 2 个 .deb" "$#" "2"
+check "真实 dpkg-deb：deb Architecture 为 amd64" \
+    "$(dpkg-deb -f "$WORK/target-real"/agent-shell_*.deb Architecture)" \
+    "amd64"
 
 echo
 echo "build-deb-arch.test.sh: $pass passed, $fail failed"
