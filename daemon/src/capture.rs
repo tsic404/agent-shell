@@ -140,7 +140,9 @@ fn write_frame_to_ppm(
     if ax < 0 || ay < 0 || aw_raw < 0 || ah_raw < 0 {
         return Err((
             RpcErrorCode::InvalidParams,
-            format!("area must be non-negative, got X={ax} Y={ay} W={aw_raw} H={ah_raw}"),
+            format!(
+                "area coordinates must be non-negative, got X={ax} Y={ay} W={aw_raw} H={ah_raw}"
+            ),
         ));
     }
     let (aw, ah) = (aw_raw.min(fw - ax).max(0), ah_raw.min(fh - ay).max(0));
@@ -334,11 +336,22 @@ mod tests {
     }
 
     #[test]
-    fn negative_area_message_contract() {
-        // dispatch 契约永不 panic：负坐标必须走错误路径（审查项 #1 回归锚定）。
-        let [ax, ay, w, h] = [-5, -3, 100, 100];
-        let msg = format!("area must be non-negative, got X={ax} Y={ay} W={w} H={h}");
-        assert!(msg.contains("non-negative"));
+    fn write_frame_to_ppm_rejects_negative_area() {
+        // 负坐标必须先于 `as usize` 回绕拒绝（永不 panic 契约）——真实调用
+        // write_frame_to_ppm 锚定该分支，而非仅断言自带字面量。
+        let frame = sample_frame(PixelFormat::Rgba);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("out.ppm");
+        let (code, msg) =
+            write_frame_to_ppm(&frame, Some([-5, -3, 100, 100]), &path.to_string_lossy())
+                .unwrap_err();
+        assert_eq!(code, RpcErrorCode::InvalidParams);
+        assert!(
+            msg.contains("area coordinates must be non-negative"),
+            "{msg}"
+        );
+        // 拒绝发生在任何落盘之前。
+        assert!(!path.exists());
     }
 
     /// 构造 2×1 帧：像素 0 = (R=1,G=2,B=3)，像素 1 = (R=4,G=5,B=6)，
