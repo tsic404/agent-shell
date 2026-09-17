@@ -53,8 +53,24 @@ async fn dispatch(args: Cli) -> CmdResult {
     }
 }
 
+/// 本地可判定的参数校验（无 I/O、无 daemon 依赖），在 daemon 连接之前执行。
+///
+/// 目前仅 `screenshot --area` 需要：负坐标经 clap `allow_negative_numbers`
+/// 放行解析后必须在此拦下，否则无效输入也会拉起 daemon（
+/// `connect_with_retries`），daemon 不可用/启动失败时用户拿到连接错误
+/// 而非领域报错，修复目标在该路径失效。
+fn prevalidate_command(command: &Command) -> CmdResult {
+    if let Command::Screenshot(cmd) = command {
+        if let Some(area) = &cmd.area {
+            validate_area([area[0], area[1], area[2], area[3]])?;
+        }
+    }
+    Ok(0)
+}
+
 /// 分派具体子命令（REPL 与单次执行共用）。
 async fn dispatch_command(command: Command, out: OutputFormat, retry: u32) -> CmdResult {
+    prevalidate_command(&command)?;
     let mut c = DaemonClient::connect_with_retries(retry).await?;
     match command {
         Command::Doctor => doctor(out, &mut c).await,
@@ -322,8 +338,21 @@ async fn input(c: &mut DaemonClient, cmd: cli::InputCommand) -> CmdResult {
 
 // ───────────────────────── screenshot ─────────────────────────
 
+/// `--area` 非负校验：负坐标在 clap 层已放行解析（`allow_negative_numbers`），
+/// 此处给领域内报错——否则用户只会看到 `unexpected argument '-5'`。
+fn validate_area(area: [i32; 4]) -> Result<[i32; 4], String> {
+    let [x, y, w, h] = area;
+    if x < 0 || y < 0 || w < 0 || h < 0 {
+        return Err(format!(
+            "area coordinates must be non-negative, got X={x} Y={y} W={w} H={h}"
+        ));
+    }
+    Ok(area)
+}
+
 async fn screenshot(c: &mut DaemonClient, cmd: cli::ScreenshotCommand) -> CmdResult {
-    // --area 接线：X,Y,W,H 直传 daemon 裁剪。
+    // --area 接线：X,Y,W,H 直传 daemon 裁剪。非负已在 `dispatch_command`
+    // 连接前预校验，此处仅做 Vec → 数组形状转换。
     let area = cmd.area.map(|v| [v[0], v[1], v[2], v[3]]);
     let r = c.screenshot(cmd.window, area, &cmd.output).await?;
     println!("saved {} ({}x{})", r.path, r.width, r.height);
@@ -1249,15 +1278,16 @@ fn sysctl_rpc_error(e: CallError) -> CmdResult {
 #[cfg(test)]
 mod tests {
     use super::{
-        a11y_query_exit_code, brightness_rpc_error, is_auth_required, job_status_outcome,
+        a11y_query_exit_code, brightness_rpc_error, dispatch, is_auth_required, job_status_outcome,
         log_query_timeout_error, parse_log_filter, pkg_failed_job_line, process_rootd_error,
         render_capability, render_doctor, render_extension_status, render_info,
         security_audit_params, security_request, sysctl_rpc_error, sysctl_set_accepted_line,
-        wait_for_job_impl, JobStatusSource, LOG_QUERY_TIMEOUT,
+        validate_area, wait_for_job_impl, JobStatusSource, LOG_QUERY_TIMEOUT,
     };
     use crate::client::CallError;
     use crate::{CapabilityStatus, OutputFormat, RpcErrorCode};
     use agent_shell_rpc::{DoctorResult, InfoResult};
+    use clap::Parser;
     use serde_json::{json, Value};
     use std::collections::VecDeque;
     use std::time::Duration;
@@ -1785,5 +1815,52 @@ mod tests {
     #[test]
     fn a11y_query_zero_hit_with_fail_on_empty_exits_two() {
         assert_eq!(a11y_query_exit_code(0, true), 2);
+    }
+
+    #[test]
+    fn validate_area_accepts_non_negative() {
+        assert_eq!(validate_area([0, 0, 100, 100]), Ok([0, 0, 100, 100]));
+        assert_eq!(validate_area([5, 3, 1, 1]), Ok([5, 3, 1, 1]));
+    }
+
+    #[test]
+    fn validate_area_rejects_any_negative_with_domain_message() {
+        // X/Y/W/H 任一为负都必须是领域内报错，且错误串含具体坐标。
+        for area in [
+            [-5, 0, 100, 100],
+            [0, -3, 100, 100],
+            [0, 0, -100, 100],
+            [0, 0, 100, -100],
+        ] {
+            let err = validate_area(area).unwrap_err();
+            assert!(
+                err.contains("area coordinates must be non-negative"),
+                "{area:?}: {err}"
+            );
+            assert!(err.contains("X=") && err.contains("Y="), "{err}");
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn screenshot_negative_area_rejected_before_daemon_connection() {
+        // CLI 入口回归锚定：`--area` 负坐标经 clap 放行解析后在
+        // `dispatch_command` 连接 daemon 之前即返回领域报错——若校验晚于
+        // `connect_with_retries`，此测试会在无 daemon 环境拿到连接错误而非
+        // 领域报错。
+        let cli = crate::cli::Cli::try_parse_from([
+            "agent-shell",
+            "screenshot",
+            "--area",
+            "-5",
+            "-3",
+            "100",
+            "100",
+        ])
+        .expect("parse");
+        let err = dispatch(cli).await.unwrap_err();
+        assert!(
+            err.contains("area coordinates must be non-negative"),
+            "{err}"
+        );
     }
 }
