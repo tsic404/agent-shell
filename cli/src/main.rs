@@ -514,15 +514,39 @@ async fn ime(c: &mut DaemonClient, cmd: cli::ImeCommand) -> CmdResult {
 async fn brightness(c: &mut DaemonClient, cmd: cli::BrightnessCommand) -> CmdResult {
     match cmd.value {
         Some(v) => {
-            c.call(method::BRIGHTNESS_SET, json!({ "value": v }))
-                .await?;
+            let r = c
+                .call_rpc(method::BRIGHTNESS_SET, json!({ "value": v }))
+                .await;
+            match r {
+                Ok(_) => Ok(0),
+                Err(e) => brightness_rpc_error(e),
+            }
         }
         None => {
-            let r = c.call0(method::BRIGHTNESS_GET).await?;
-            println!("{}", serde_json::to_string_pretty(&r).unwrap_or_default());
+            let r = c.call_rpc(method::BRIGHTNESS_GET, Value::Null).await;
+            match r {
+                Ok(v) => {
+                    println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
+                    Ok(0)
+                }
+                Err(e) => brightness_rpc_error(e),
+            }
         }
     }
-    Ok(0)
+}
+
+/// brightness RPC 错误 → `CmdResult`：无后端（1002 BackendUnavailable）→
+/// exit 2；其余（含 1005 BackendError 执行/写失败）保留 `rpc error N: …`
+/// 形态交 `run` 统一打印（exit 1）。与 daemon 侧 `brightness_error` 的
+/// BackendUnavailable/BackendError 区分对齐。
+fn brightness_rpc_error(e: CallError) -> CmdResult {
+    match &e {
+        CallError::Rpc { code, message } if *code == RpcErrorCode::BackendUnavailable as i32 => {
+            eprintln!("error: {message}");
+            Ok(2)
+        }
+        other => Err(other.to_string()),
+    }
 }
 
 // ───────────────────────── file ─────────────────────────
@@ -1225,11 +1249,11 @@ fn sysctl_rpc_error(e: CallError) -> CmdResult {
 #[cfg(test)]
 mod tests {
     use super::{
-        a11y_query_exit_code, is_auth_required, job_status_outcome, log_query_timeout_error,
-        parse_log_filter, pkg_failed_job_line, process_rootd_error, render_capability,
-        render_doctor, render_extension_status, render_info, security_audit_params,
-        security_request, sysctl_rpc_error, sysctl_set_accepted_line, wait_for_job_impl,
-        JobStatusSource, LOG_QUERY_TIMEOUT,
+        a11y_query_exit_code, brightness_rpc_error, is_auth_required, job_status_outcome,
+        log_query_timeout_error, parse_log_filter, pkg_failed_job_line, process_rootd_error,
+        render_capability, render_doctor, render_extension_status, render_info,
+        security_audit_params, security_request, sysctl_rpc_error, sysctl_set_accepted_line,
+        wait_for_job_impl, JobStatusSource, LOG_QUERY_TIMEOUT,
     };
     use crate::client::CallError;
     use crate::{CapabilityStatus, OutputFormat, RpcErrorCode};
@@ -1715,6 +1739,36 @@ mod tests {
             message: "rootd: boom".into(),
         };
         assert_eq!(sysctl_rpc_error(e), Ok(1));
+    }
+
+    #[test]
+    fn brightness_rpc_error_maps_backend_unavailable_to_two() {
+        let e = CallError::Rpc {
+            code: RpcErrorCode::BackendUnavailable as i32,
+            message: "brightnessctl not installed".into(),
+        };
+        assert_eq!(brightness_rpc_error(e), Ok(2));
+    }
+
+    #[test]
+    fn brightness_rpc_error_maps_execution_failure_to_one() {
+        let e = CallError::Rpc {
+            code: RpcErrorCode::BackendError as i32,
+            message: "brightnessctl set 50%: permission denied".into(),
+        };
+        assert_eq!(
+            brightness_rpc_error(e),
+            Err("rpc error 1005: brightnessctl set 50%: permission denied".into())
+        );
+    }
+
+    #[test]
+    fn brightness_rpc_error_maps_transport_error_to_one() {
+        let e = CallError::Other("daemon write: broken pipe".into());
+        assert_eq!(
+            brightness_rpc_error(e),
+            Err("daemon write: broken pipe".into())
+        );
     }
 
     #[test]
