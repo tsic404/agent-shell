@@ -15,7 +15,7 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 use tokio::sync::Mutex as AsyncMutex;
 
-use crate::dbus_bridge::{KWinBridge, RegistrationOutcome};
+use crate::dbus_bridge::{EventDeduper, EventDeduperHandle, KWinBridge, RegistrationOutcome};
 use crate::error::{KWinError, Result};
 use crate::event_script::EventScriptHandle;
 use crate::native::KWinNative;
@@ -59,6 +59,16 @@ pub struct KWinCompositor {
     protocols: Option<Arc<KWinProtocols>>,
     /// D-Bus / Scripting 补充通道（会话无关，共享）。
     bridge: KWinBridge,
+    /// 事件推送去重器（组件级持有）：`EventDeduper` 判重状态从每连接的
+    /// `ResponseService` 提升至此，生命周期与合成器（组件）一致而非与单条
+    /// D-Bus 连接一致。
+    ///
+    /// 当前无桥接重建路径（`KWinBridge` 仅在 `new_wayland`/`new_x11` 各构造
+    /// 一次，`ensure_event_pipeline` 重试复用同一桥接、不重建）：本字段为
+    /// 前瞻性持有——未来引入桥接重建时须经 `KWinBridge::connect_with_dedup`/
+    /// `with_dedup` 复用本句柄，判重历史才不归零。
+    #[allow(dead_code)]
+    event_dedup: EventDeduperHandle,
     /// KWin 原生 D-Bus 通道（`org.kde.KWin` `/KWin` + `/VirtualDesktopManager`，
     /// 会话无关）。Wayland 会话在 `/Scripting` 未注册时窗口/工作区枚举改走
     /// 本通道 + wl_registry stacking order（见 `list_windows` / `list_workspaces`）。
@@ -134,7 +144,8 @@ impl KWinCompositor {
         let wl =
             WaylandDisplayServer::connect().map_err(|e| KWinError::Scripting(e.to_string()))?;
         let protocols = KWinProtocols::probe(&wl)?;
-        let bridge = KWinBridge::connect().await?;
+        let event_dedup = EventDeduper::new_shared();
+        let bridge = KWinBridge::connect_with_dedup(Arc::clone(&event_dedup)).await?;
         let native = KWinNative::new(bridge.connection().clone()).await?;
         let version = version::detect_version(bridge.connection())
             .await
@@ -146,6 +157,7 @@ impl KWinCompositor {
             wayland_core: Some(wl),
             protocols: Some(Arc::new(protocols)),
             bridge,
+            event_dedup,
             native,
             x11: None,
             version,
@@ -160,7 +172,8 @@ impl KWinCompositor {
     /// X11 会话装配：连接 X server + D-Bus 桥接。
     pub async fn new_x11() -> Result<Self> {
         let x11 = X11DisplayServer::connect().map_err(|e| KWinError::Scripting(e.to_string()))?;
-        let bridge = KWinBridge::connect().await?;
+        let event_dedup = EventDeduper::new_shared();
+        let bridge = KWinBridge::connect_with_dedup(Arc::clone(&event_dedup)).await?;
         let native = KWinNative::new(bridge.connection().clone()).await?;
         let version = version::detect_version(bridge.connection())
             .await
@@ -172,6 +185,7 @@ impl KWinCompositor {
             wayland_core: None,
             protocols: None,
             bridge,
+            event_dedup,
             native,
             x11: Some(Arc::new(x11)),
             version,
@@ -193,6 +207,7 @@ impl KWinCompositor {
     #[doc(hidden)]
     pub async fn for_test(bridge: KWinBridge, probe: Option<bool>) -> Self {
         use std::sync::atomic::AtomicU8;
+        let event_dedup = bridge.dedup();
         let probe = match probe {
             Some(true) => PROBE_OK,
             // 注入的「最近失败」不区分瞬时/确证：两种失败态都允许重试，
@@ -210,6 +225,7 @@ impl KWinCompositor {
             wayland_core: None,
             protocols: None,
             bridge,
+            event_dedup,
             native,
             x11: None,
             version: KWinVersion {
@@ -759,6 +775,20 @@ impl KWinCompositor {
             }
         }
         Ok(())
+    }
+
+    /// 卸载长驻事件脚本并清空句柄（daemon 退出前调用）。清理 KWin 侧残留的
+    /// `event_monitor` 实例——瞬态 daemon 退出时若不卸载，脚本实例在 KWin
+    /// 内永驻堆积，下次会话再加载新实例会让每条真实事件被重复投递 N 次。
+    ///
+    /// 无论 stop 成败都清空句柄（`take` 语义）；失败向上返回，由调用方记录，
+    /// 不在此处吞掉。
+    pub async fn shutdown_event_script(&self) -> crate::error::Result<()> {
+        let mut handle = self.event_handle.lock().await;
+        match handle.take() {
+            Some(mut h) => h.stop(self.bridge.connection()).await,
+            None => Ok(()),
+        }
     }
 
     /// 订阅原始事件流（§18.2）：确保事件脚本在跑，返回其 [`RawSource`]
@@ -1753,6 +1783,24 @@ mod tests {
         assert_eq!(
             comp.lazy_capabilities(),
             &["window_events", "workspace_events"]
+        );
+    }
+
+    /// 组件与桥接共享同一去重句柄：经 `KWinBridge::with_dedup` 注入句柄装配
+    /// 后，`for_test` 经 `bridge.dedup()` 同步的组件字段与注入句柄 Arc 相同——
+    /// 验证装配路径真正接线（而非仅手工构造两个 `ResponseService` 共享句柄）。
+    #[tokio::test]
+    async fn compositor_and_bridge_share_event_dedup_handle() {
+        let bus = TestBus::start().await;
+        let dedup = EventDeduper::new_shared();
+        let conn = bus.connect().await;
+        let bridge = KWinBridge::with_dedup(conn, Arc::clone(&dedup))
+            .await
+            .expect("build KWinBridge with shared dedup");
+        let comp = KWinCompositor::for_test(bridge, None).await;
+        assert!(
+            Arc::ptr_eq(&comp.event_dedup, &dedup),
+            "compositor must share the injected dedup handle"
         );
     }
 

@@ -6,9 +6,9 @@
 //! 事件队列（[`EventQueue`]，见 [`crate::event_script`]），与一次性查询的
 //! 按 id 表完全隔离。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
 use tokio::sync::{mpsc, oneshot, Mutex};
@@ -34,7 +34,7 @@ pub const SCRIPT_TIMEOUT: Duration = Duration::from_secs(5);
 /// Scripting 方法调用统一使用本服务名 + `/Scripting` 路径 +
 /// `org.kde.kwin.Scripting` 接口，不做版本分支。
 pub const SCRIPTING_SERVICE: &str = "org.kde.KWin";
-/// Scripting 对象路径（loadScript/loadedScripts 所在）。
+/// Scripting 对象路径（`loadScript`/`unloadScript` 等接口所在）。
 pub const SCRIPTING_PATH: &str = "/Scripting";
 
 /// 响应服务总线名。
@@ -44,7 +44,7 @@ pub const RESPONSE_BUS_NAME: &str = RESPONSE_SERVICE;
 /// `org.kde.kwin.Scripting` 接口是否出现。
 ///
 /// 供 doctor 与降级链在**不加载脚本**的前提下确认通道健康。注意上游
-/// `loadScript` 返回 int、`loadedScripts` 在部分版本不存在——探测刻意
+/// `loadScript` 返回 int（`loadedScripts` 在 KWin 5.27/6 不存在）——探测刻意
 /// 不依赖任何具体方法签名。
 pub async fn probe_scripting(conn: &Connection) -> Result<()> {
     let node = zbus::fdo::IntrospectableProxy::builder(conn)
@@ -120,6 +120,162 @@ impl ResponseRouter {
 
 type SharedRouter = Arc<Mutex<ResponseRouter>>;
 
+/// 事件推送去重（归一化前）：同一 `kwin_wayland` 内残留的 `event_monitor`
+/// 脚本实例会把同一条真实事件推送 N 次。判重分两档：
+/// - 新格式（带 `occurred_at`）：键 = `(event, id, occurred_at)` 精确判重，
+///   同 `(event, id)` 但 `occurred_at` 不同的真实事件（快速 alt-tab A→B→A、
+///   焦点抖动、同窗口连续事件）判独立，不被误吞；
+/// - 旧格式（历史遗留实例无 `occurred_at`）：键 = `(event, id)`，以
+///   [`MERGE_WINDOW_MS`] 内的**到达时刻邻近**判「同一事件的 legacy/new
+///   副本」——legacy 标记按到达时刻记录、合并后清除，不粘滞污染整窗。
+///
+/// `receipt_ms`（桥接接收时刻）仅用于窗口过期与副本邻近判定，不冒充事件
+/// 发生时刻。
+///
+/// 窗口依据：同一信号发射时各实例经异步 `callDBus`（fire-and-forget）在
+/// **微秒级**入队，桥接在 ~1-2ms 内收齐全部副本；窗口生命周期事件
+/// （开关/聚焦）含合成器工作，间隔通常 >20ms。取 20ms 约 10 倍副本突发
+/// 量级、远低于真实事件间隔，既不漏判副本也不误吞连续事件。
+///
+/// 降级语义：若某实例的副本延迟 >5ms（`MERGE_WINDOW_MS`），legacy/new 不再
+/// 互相合并，退化为**多投递**（该副本单独成一条）而非漏投递——合并窗口
+/// （5ms）严格低于真实事件间隔（>20ms），同键下一条不同 `occurred_at` 的
+/// 真实事件必然落在窗口外，不会被当作副本吸收。
+const DEDUP_WINDOW_MS: u64 = 20;
+
+/// 副本邻近窗口：同一次信号发射的 legacy（无 `occurred_at`）与新格式
+/// （带 `occurred_at`）副本经异步 `callDBus` 在微秒级到达，桥接收齐约
+/// 1-2ms；取 5ms 覆盖 DBus 调度抖动，又远低于真实事件间隔（>20ms），
+/// 不会把连续真实事件误判为副本。
+const MERGE_WINDOW_MS: u64 = 5;
+
+/// 去重时钟：生产取桥接接收毫秒，测试注入假时钟以确定性覆盖边界。
+type DedupClock = Arc<dyn Fn() -> u64 + Send + Sync>;
+
+/// 共享去重句柄：由合成器组件（[`crate::KWinCompositor`]）持有，桥接克隆
+/// 同一实例，使判重状态生命周期与合成器一致而非与单条连接一致。当前无桥接
+/// 重建路径，句柄为前瞻性持有。
+pub(crate) type EventDeduperHandle = Arc<Mutex<EventDeduper>>;
+
+pub(crate) struct EventDeduper {
+    /// (event, id) → 窗口内的去重状态。
+    seen: HashMap<(String, String), DedupBucket>,
+    clock: DedupClock,
+}
+
+/// 同一 `(event, id)` 在滑动窗口内的去重状态。
+struct DedupBucket {
+    /// 最近一次接收时刻（窗口过期依据）。
+    last_receipt: u64,
+    /// 新格式已见 `occurred_at` 集合（精确判重）。
+    occurred_ats: HashSet<u64>,
+    /// 最近一次新格式事件的接收时刻（旧格式事件据此判「new twin」）。
+    last_new_at: Option<u64>,
+    /// 最近一次旧格式事件的接收时刻（新格式事件据此判「legacy twin」）。
+    legacy_at: Option<u64>,
+}
+
+impl EventDeduper {
+    fn new() -> Self {
+        Self::with_clock(Arc::new(receipt_ms))
+    }
+
+    /// 新建组件级共享句柄（生产构造路径：合成器持有、桥接克隆）。
+    pub(crate) fn new_shared() -> EventDeduperHandle {
+        Arc::new(Mutex::new(Self::new()))
+    }
+
+    fn with_clock(clock: DedupClock) -> Self {
+        Self {
+            seen: HashMap::new(),
+            clock,
+        }
+    }
+
+    /// 是否为重复事件。新格式按 `(event, id, occurred_at)` 精确判重，仅在
+    /// [`MERGE_WINDOW_MS`] 内邻近的 legacy 副本判「legacy twin」；旧格式
+    /// 按到达时刻邻近判「同事件副本」（legacy 或 new）。
+    fn is_duplicate(&mut self, payload: &Value) -> bool {
+        let now = (self.clock)();
+        let (Some(event), Some(id)) = (
+            payload.get("event").and_then(Value::as_str),
+            payload.get("id").and_then(Value::as_str),
+        ) else {
+            // 无 event/id 的事件（理论不可达）不参与去重，直接放行。
+            return false;
+        };
+        let occurred_at = payload.get("occurred_at").and_then(Value::as_u64);
+        let key = (event.to_string(), id.to_string());
+
+        self.seen
+            .retain(|_, b| now.saturating_sub(b.last_receipt) <= DEDUP_WINDOW_MS);
+
+        match self.seen.get_mut(&key) {
+            Some(bucket) => {
+                let duplicate = match occurred_at {
+                    Some(t) => {
+                        if bucket.occurred_ats.contains(&t) {
+                            true
+                        } else {
+                            let legacy_twin = bucket
+                                .legacy_at
+                                .is_some_and(|lat| now.saturating_sub(lat) <= MERGE_WINDOW_MS);
+                            bucket.occurred_ats.insert(t);
+                            bucket.last_new_at = Some(now);
+                            if legacy_twin {
+                                // 合并后清除 legacy 标记，避免粘滞污染整窗。
+                                bucket.legacy_at = None;
+                            }
+                            legacy_twin
+                        }
+                    }
+                    None => {
+                        let legacy_twin = bucket
+                            .legacy_at
+                            .is_some_and(|lat| now.saturating_sub(lat) <= MERGE_WINDOW_MS);
+                        let new_twin = bucket
+                            .last_new_at
+                            .is_some_and(|nat| now.saturating_sub(nat) <= MERGE_WINDOW_MS);
+                        if legacy_twin || new_twin {
+                            true
+                        } else {
+                            bucket.legacy_at = Some(now);
+                            false
+                        }
+                    }
+                };
+                bucket.last_receipt = now;
+                duplicate
+            }
+            None => {
+                let mut bucket = DedupBucket {
+                    last_receipt: now,
+                    occurred_ats: HashSet::new(),
+                    last_new_at: None,
+                    legacy_at: None,
+                };
+                match occurred_at {
+                    Some(t) => {
+                        bucket.occurred_ats.insert(t);
+                        bucket.last_new_at = Some(now);
+                    }
+                    None => bucket.legacy_at = Some(now),
+                }
+                self.seen.insert(key, bucket);
+                false
+            }
+        }
+    }
+}
+
+/// 进程内单调毫秒时钟：桥接**接收**事件推送的时刻（仅用于去重窗口过期，
+/// 与 `event` crate 的毫秒口径一致，不冒充事件发生时刻）。
+fn receipt_ms() -> u64 {
+    use std::sync::LazyLock;
+    static EPOCH: LazyLock<Instant> = LazyLock::new(Instant::now);
+    Instant::now().duration_since(*EPOCH).as_millis() as u64
+}
+
 /// 事件脚本信号注册验证结果：`event_monitor.js` 的 `__ready__`/`__error__`
 /// 标记经 [`ResponseService::send_result`] 路由至此，供
 /// [`crate::event_script::spawn_event_monitor`] 判定信号是否真实接线。
@@ -142,6 +298,8 @@ pub struct KWinBridge {
     /// 事件脚本信号注册标记的接收通道（spawn_event_monitor 验证用；
     /// 标记先到即被响应服务消费，后续 subscribe 重新 prepare 覆盖）。
     registration: Arc<Mutex<Option<oneshot::Sender<RegistrationOutcome>>>>,
+    /// 事件去重句柄（组件级共享；桥接重建时由合成器复用同一实例）。
+    dedup: EventDeduperHandle,
     /// 无等待者（doctor 默认态 / 残留实例）时记录的最近一次注册标记，
     /// 供 doctor 区分「未加载」与「加载后零注册」。std Mutex——doctor_lines
     /// 同步读取。
@@ -149,10 +307,14 @@ pub struct KWinBridge {
 }
 
 impl KWinBridge {
-    /// 建桥：连接 session bus 并注册 `com.agent_shell.Response` 响应服务。
+    /// 建桥：连接 session bus 并注册 `com.agent_shell.Response` 响应服务，
+    /// 同时创建**独立**的事件去重句柄。
     ///
     /// 总线不可达或服务名被占即失败——补充通道整体不可用时上层应报
     /// BackendUnavailable（Wayland 协议通道不受影响）。
+    ///
+    /// 每次调用都新建去重句柄，不保证跨重建去重；组件级装配（`KWinCompositor`）
+    /// 应经 [`connect_with_dedup`] 注入组件持有的共享句柄。
     pub async fn connect() -> Result<Self> {
         let conn = zbus::Connection::session()
             .await
@@ -160,8 +322,29 @@ impl KWinBridge {
         Self::with_connection(conn).await
     }
 
-    /// 基于既有 session bus 连接建桥（KdeBackend 共享 dbus 句柄场景）。
+    /// 组件级装配：注入组件持有的共享去重句柄建桥，使判重状态的生命周期与
+    /// 合成器（组件）一致而非与单条连接一致。
+    ///
+    /// 当前代码无桥接重建路径（`KWinBridge` 仅在 `new_wayland`/`new_x11`
+    /// 各构造一次，`ensure_event_pipeline` 重试复用同一桥接）：本入口为未来
+    /// 桥接重建的前瞻性接线点——届时复用本句柄判重历史即不归零。
+    pub(crate) async fn connect_with_dedup(dedup: EventDeduperHandle) -> Result<Self> {
+        let conn = zbus::Connection::session()
+            .await
+            .map_err(|e| KWinError::Scripting(format!("session bus connect: {e}")))?;
+        Self::with_dedup(conn, dedup).await
+    }
+
+    /// 基于既有 session bus 连接建桥（KdeBackend 共享 dbus 句柄场景），
+    /// 创建**独立**的事件去重句柄——不保证跨重建去重；组件级装配应经
+    /// [`with_dedup`] 注入组件持有的共享句柄。
     pub async fn with_connection(conn: Connection) -> Result<Self> {
+        Self::with_dedup(conn, EventDeduper::new_shared()).await
+    }
+
+    /// 基于既有连接建桥，注入组件级共享去重句柄（组件级装配路径；与
+    /// [`connect_with_dedup`] 同语义，仅连接来源不同）。
+    pub(crate) async fn with_dedup(conn: Connection, dedup: EventDeduperHandle) -> Result<Self> {
         let router = Arc::new(Mutex::new(ResponseRouter::default()));
         // 事件推送队列：event_monitor.js 的每次 sendResult 进这里，
         // 不进按 id 路由表（事件没有请求 id，见 🔴1）。接收端由桥接持有，
@@ -176,6 +359,7 @@ impl KWinBridge {
             router: Arc::clone(&router),
             events: event_tx,
             registration: Arc::clone(&registration),
+            dedup: Arc::clone(&dedup),
             late_registration: Arc::clone(&late_registration),
         };
         // 在既有连接上挂载响应服务 + 申请 well-known 总线名——单一连接，
@@ -198,8 +382,14 @@ impl KWinBridge {
             router,
             event_rx: Mutex::new(Some(event_rx)),
             registration,
+            dedup,
             late_registration,
         })
+    }
+
+    /// 共享去重句柄（`for_test` 同步组件字段，及未来桥接重建路径复用）。
+    pub(crate) fn dedup(&self) -> EventDeduperHandle {
+        Arc::clone(&self.dedup)
     }
 
     /// 底层连接（版本探测等复用）。
@@ -383,6 +573,7 @@ struct ResponseService {
     router: SharedRouter,
     events: mpsc::UnboundedSender<Value>,
     registration: Arc<Mutex<Option<oneshot::Sender<RegistrationOutcome>>>>,
+    dedup: EventDeduperHandle,
     late_registration: Arc<std::sync::Mutex<Option<RegistrationOutcome>>>,
 }
 #[zbus::interface(name = "com.agent_shell.Response")]
@@ -420,6 +611,16 @@ impl ResponseService {
                         .await;
                 }
                 _ => {
+                    // 归一化前去重：残留 event_monitor 实例把同一条真实事件
+                    // 推送 N 次——以完整 payload（含 occurred_at）判重，窗口内
+                    // 相同的推送只保留第一条。
+                    let mut dedup = self.dedup.lock().await;
+                    if dedup.is_duplicate(&value) {
+                        let event = value.get("event").and_then(Value::as_str);
+                        let id = value.get("id").and_then(Value::as_str);
+                        tracing::debug!(?event, ?id, "duplicate event push dropped");
+                        return;
+                    }
                     let _ = self.events.send(value);
                 }
             },
@@ -461,6 +662,7 @@ impl ResponseService {
             router: Arc::new(Mutex::new(ResponseRouter::default())),
             events,
             registration: Arc::new(Mutex::new(None)),
+            dedup: EventDeduper::new_shared(),
             late_registration: Arc::new(std::sync::Mutex::new(None)),
         }
     }
@@ -541,6 +743,12 @@ impl StagedScript {
     ///
     /// 文件后缀保留 `.js`（仅便于人工排查；KWin 不看后缀）。
     pub(crate) fn stage(script_name: &str, js: &str) -> Result<Self> {
+        Self::stage_named(script_name, &format!("agent_shell-{}", Uuid::new_v4()), js)
+    }
+
+    /// 固定插件名落盘：长驻 `event_monitor` 用固定名——下次会话启动时按名
+    /// `unloadScript` 清理异常退出的残留实例，避免每次叠加一个新实例。
+    pub(crate) fn stage_named(script_name: &str, plugin_name: &str, js: &str) -> Result<Self> {
         let mut file = tempfile::Builder::new()
             .prefix("agent-shell-")
             .suffix(".js")
@@ -551,7 +759,7 @@ impl StagedScript {
             .and_then(|_| file.flush())
             .map_err(|e| KWinError::Scripting(format!("write script {script_name}: {e}")))?;
         Ok(Self {
-            plugin_name: format!("agent_shell-{}", Uuid::new_v4()),
+            plugin_name: plugin_name.to_string(),
             file,
         })
     }
@@ -619,7 +827,7 @@ mod staged_tests {
 
 // ───────────────────────── Scripting 代理 ─────────────────────────
 
-/// `org.kde.kwin.Scripting` 代理（loadScript / start / loadedScripts）。
+/// `org.kde.kwin.Scripting` 代理（`loadScript` / `unloadScript` / `start`）。
 struct ScriptingProxy<'a> {
     inner: Proxy<'a>,
 }
@@ -667,10 +875,20 @@ impl<'a> ScriptingProxy<'a> {
         Ok(script_object_path(id, v6))
     }
 
-    #[allow(dead_code)]
-    async fn loaded_scripts(&self) -> zbus::Result<Vec<String>> {
-        let reply = self.inner.call_method("loadedScripts", &()).await?;
-        reply.body().deserialize()
+    /// 按插件名卸载已加载脚本（`unloadScript(pluginName) -> bool`）。
+    ///
+    /// 返回是否确有实例被卸载。用于启动即收敛：清理上次会话因 SIGKILL/
+    /// panic 异常退出而残留的 `event_monitor` 实例。
+    async fn unload_script(&self, plugin_name: &str) -> Result<bool> {
+        let reply = self
+            .inner
+            .call_method("unloadScript", &(plugin_name,))
+            .await
+            .map_err(|e| KWinError::Scripting(format!("unloadScript D-Bus call: {e}")))?;
+        reply
+            .body()
+            .deserialize()
+            .map_err(|e| KWinError::Scripting(format!("unloadScript reply: {e}")))
     }
 }
 
@@ -705,12 +923,16 @@ impl<'a> ScriptInstance<'a> {
 /// 供 event_script 复用：在指定连接上落盘并加载脚本，返回
 /// （对象路径, 暂存文件句柄）。句柄必须存活至脚本 stop——KWin 的 run
 /// 是异步读盘，提前删文件会让后续重载失败。
+///
+/// `plugin_name` 由调用方给定：长驻 `event_monitor` 用固定名（启动即收敛
+/// 可卸载），一次性查询用 UUID（并发互不顶掉）。
 pub(crate) async fn load_script_via(
     conn: &Connection,
     js: &str,
     v6: bool,
+    plugin_name: &str,
 ) -> Result<(String, StagedScript)> {
-    let staged = StagedScript::stage("event_monitor.js", js)?;
+    let staged = StagedScript::stage_named("event_monitor.js", plugin_name, js)?;
     let scripting = ScriptingProxy::new(conn)
         .await
         .map_err(|e| KWinError::Scripting(format!("scripting proxy: {e}")))?;
@@ -719,6 +941,21 @@ pub(crate) async fn load_script_via(
         .await
         .map(|p| (p, staged))
         .map_err(|e| KWinError::Scripting(format!("loadScript: {e}")))
+}
+
+/// 卸载固定插件名的长驻事件脚本（启动即收敛）。返回是否确有实例被卸载。
+///
+/// 上次会话因 SIGKILL/panic 异常退出时 `serve_connection` 退出钩子不执行，
+/// 脚本实例残留于 KWin——本函数在下次会话装配前按固定名清理，配合
+/// `load_script_via` 的固定名加载，保证**本版本起**任何时刻至多一个
+/// `event_monitor`。历史遗留的旧版 UUID 插件名实例无法按名枚举（KWin 5.27/6
+/// 的 `org.kde.kwin.Scripting` 接口无 `loadedScripts` 方法），由归一化前去重
+/// 兜底投递正确性。
+pub(crate) async fn unload_event_monitor(conn: &Connection, plugin_name: &str) -> Result<bool> {
+    let scripting = ScriptingProxy::new(conn)
+        .await
+        .map_err(|e| KWinError::Scripting(format!("scripting proxy: {e}")))?;
+    scripting.unload_script(plugin_name).await
 }
 
 /// `loadScript` 返回的 int32 脚本 id → 实例对象路径（版本分发的单一来源）。
@@ -748,6 +985,7 @@ mod tests {
             router: Arc::clone(&router),
             events: event_tx,
             registration: Arc::new(Mutex::new(None)),
+            dedup: Arc::new(Mutex::new(EventDeduper::new())),
             late_registration: Arc::new(std::sync::Mutex::new(None)),
         };
 
@@ -772,6 +1010,175 @@ mod tests {
         assert!(router.lock().await.waiters.is_empty());
     }
 
+    /// 归一化前去重的键语义：新格式按 `(event, id, occurred_at)` 精确判重，
+    /// 旧格式（无 `occurred_at` 的历史遗留实例）以 `(event, id)` 短窗兜底。
+    /// 覆盖：同 `(event, id)` 不同 `occurred_at` 的真实事件独立不被误吞
+    /// （快速 alt-tab / 焦点抖动）；旧+新混存副本合并；不同 id 独立；窗口
+    /// 过期后重新放行。
+    #[test]
+    fn event_deduper_preserves_distinct_events_and_dedups_legacy() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        let clock = Arc::new(AtomicU64::new(0));
+        let make_now = || {
+            let c = Arc::clone(&clock);
+            Arc::new(move || c.load(Ordering::SeqCst)) as Arc<dyn Fn() -> u64 + Send + Sync>
+        };
+        let mut dedup = EventDeduper::with_clock(make_now());
+
+        // 同 (event, id, occurred_at) 副本：第一条放行，后续重复。
+        let focus_a = serde_json::json!({
+            "event": "windowFocused", "id": "A", "occurred_at": 100
+        });
+        assert!(!dedup.is_duplicate(&focus_a));
+        assert!(dedup.is_duplicate(&focus_a));
+
+        // 同 (event, id) 不同 occurred_at（快速 alt-tab A→B→A 的第二次 A 焦点、
+        // 焦点抖动）：独立真实事件，不被误吞。
+        let focus_a_again = serde_json::json!({
+            "event": "windowFocused", "id": "A", "occurred_at": 300
+        });
+        assert!(!dedup.is_duplicate(&focus_a_again));
+
+        // 旧格式（遗留实例）先到：放行；新格式同事件后到：判重丢弃。
+        let legacy_fmt = serde_json::json!({ "event": "windowClosed", "id": "7" });
+        let new_fmt = serde_json::json!({
+            "event": "windowClosed", "id": "7", "occurred_at": 500
+        });
+        assert!(!dedup.is_duplicate(&legacy_fmt));
+        assert!(dedup.is_duplicate(&new_fmt));
+        // 回归：legacy E1 → 新格式 E1 合并后，legacy 标记已清除——随后
+        // 同 (event, id) 不同 occurred_at 的新格式 E2 必须放行（粘滞标记
+        // 不得毒化整窗、误吞第二条真实事件）。
+        let new_fmt_distinct = serde_json::json!({
+            "event": "windowClosed", "id": "7", "occurred_at": 501
+        });
+        assert!(!dedup.is_duplicate(&new_fmt_distinct));
+        // 反之：新格式先到放行，旧格式后到判重丢弃。
+        let mut dedup2 = EventDeduper::with_clock(make_now());
+        assert!(!dedup2.is_duplicate(&new_fmt));
+        assert!(dedup2.is_duplicate(&legacy_fmt));
+
+        // 不同 id（另一窗口）：独立。
+        let closed_8 = serde_json::json!({
+            "event": "windowClosed", "id": "8", "occurred_at": 500
+        });
+        assert!(!dedup.is_duplicate(&closed_8));
+        // 窗口过期后同 (event, id) 不再算重复（滑动窗口清空）。
+        clock.store(DEDUP_WINDOW_MS + 1, Ordering::SeqCst);
+        assert!(!dedup.is_duplicate(&legacy_fmt));
+    }
+
+    /// 残留 event_monitor 实例把同一真实事件推送 N 次：响应服务只投递第一条，
+    /// 其余重复推送被丢弃——事件队列下游只见到一次；不同 id 的真实事件不受
+    /// 影响（同 id 的窗口过期后重放语义由纯函数单测覆盖）。
+    ///
+    /// 注入假时钟：真实时钟下 12 次 `send_result().await` 须在
+    /// `MERGE_WINDOW_MS=5ms` 内完成，CI 负载下余量不足会 flaky；恒定时钟使
+    /// 12 份副本共享同一接收时刻，确定性落在合并窗口内。
+    #[tokio::test]
+    async fn send_result_drops_duplicate_event_pushes() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        let router: SharedRouter = Arc::new(Mutex::new(ResponseRouter::default()));
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let clock = Arc::new(AtomicU64::new(0));
+        let now = {
+            let c = Arc::clone(&clock);
+            Arc::new(move || c.load(Ordering::SeqCst)) as Arc<dyn Fn() -> u64 + Send + Sync>
+        };
+        let service = ResponseService {
+            router: Arc::clone(&router),
+            events: event_tx,
+            registration: Arc::new(Mutex::new(None)),
+            dedup: Arc::new(Mutex::new(EventDeduper::with_clock(now))),
+            late_registration: Arc::new(std::sync::Mutex::new(None)),
+        };
+
+        // 旧格式（无 occurred_at）+ 新格式（带 occurred_at）同事件混推：
+        // 历史遗留实例与当前实例对同一真实事件的 N 份副本只投递一次。
+        let legacy = serde_json::json!({ "event": "windowClosed", "id": "7" }).to_string();
+        let new_fmt =
+            serde_json::json!({ "event": "windowClosed", "id": "7", "occurred_at": 49846 })
+                .to_string();
+        for _ in 0..6 {
+            service.send_result(legacy.clone()).await;
+            service.send_result(new_fmt.clone()).await;
+        }
+
+        let got = event_rx.recv().await.expect("first event delivered");
+        assert_eq!(
+            got.get("event").and_then(Value::as_str),
+            Some("windowClosed")
+        );
+        assert_eq!(got.get("id").and_then(Value::as_str), Some("7"));
+        assert!(
+            event_rx.try_recv().is_err(),
+            "mixed-format duplicate pushes must collapse to one delivery"
+        );
+
+        // 不同窗口（不同 id）的事件：独立，必须送达。
+        let other = serde_json::json!({ "event": "windowClosed", "id": "8", "occurred_at": 49846 })
+            .to_string();
+        service.send_result(other).await;
+        let got = event_rx.recv().await.expect("distinct event delivered");
+        assert_eq!(got.get("id").and_then(Value::as_str), Some("8"));
+    }
+
+    /// 跨桥接重建去重保真：判重状态由组件级共享句柄持有，而非每连接的
+    /// `ResponseService`。旧桥接收到事件后「重建」新桥接（复用同一句柄），
+    /// 新桥接收到同一事件副本仍判重丢弃——重建瞬间不出现短时重复投递。
+    ///
+    /// 注入恒定时钟：真实时钟下两次 `send_result().await` 若跨过
+    /// `DEDUP_WINDOW_MS=20ms` 边界会 flaky；恒定时钟使窗口永不滑动。
+    #[tokio::test]
+    async fn shared_dedup_survives_bridge_rebuild() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        let clock = Arc::new(AtomicU64::new(0));
+        let now = {
+            let c = Arc::clone(&clock);
+            Arc::new(move || c.load(Ordering::SeqCst)) as Arc<dyn Fn() -> u64 + Send + Sync>
+        };
+        let dedup = Arc::new(Mutex::new(EventDeduper::with_clock(now)));
+
+        // 旧桥接的响应服务（重建前）。
+        let (events_a, mut rx_a) = mpsc::unbounded_channel();
+        let old_service = ResponseService {
+            router: Arc::new(Mutex::new(ResponseRouter::default())),
+            events: events_a,
+            registration: Arc::new(Mutex::new(None)),
+            dedup: Arc::clone(&dedup),
+            late_registration: Arc::new(std::sync::Mutex::new(None)),
+        };
+        // 新桥接的响应服务（重建后）：注入同一组件级去重句柄。
+        let (events_b, mut rx_b) = mpsc::unbounded_channel();
+        let new_service = ResponseService {
+            router: Arc::new(Mutex::new(ResponseRouter::default())),
+            events: events_b,
+            registration: Arc::new(Mutex::new(None)),
+            dedup: Arc::clone(&dedup),
+            late_registration: Arc::new(std::sync::Mutex::new(None)),
+        };
+
+        let evt = serde_json::json!({ "event": "windowClosed", "id": "7", "occurred_at": 49846 })
+            .to_string();
+        // 重建前旧桥接收到并投递该事件。
+        old_service.send_result(evt.clone()).await;
+        assert_eq!(
+            rx_a.recv()
+                .await
+                .and_then(|v| v.get("id").and_then(Value::as_str).map(str::to_string)),
+            Some("7".to_string())
+        );
+        // 重建后新桥接收到同一事件副本：共享句柄判重，不得再次投递。
+        new_service.send_result(evt).await;
+        assert!(
+            rx_b.try_recv().is_err(),
+            "duplicate across bridge rebuild must be dropped by shared dedup"
+        );
+    }
+
     #[tokio::test]
     async fn query_payload_with_req_id_routes_to_waiter() {
         let router: SharedRouter = Arc::new(Mutex::new(ResponseRouter::default()));
@@ -780,6 +1187,7 @@ mod tests {
             router: Arc::clone(&router),
             events: event_tx,
             registration: Arc::new(Mutex::new(None)),
+            dedup: Arc::new(Mutex::new(EventDeduper::new())),
             late_registration: Arc::new(std::sync::Mutex::new(None)),
         };
 
@@ -811,6 +1219,7 @@ mod tests {
             router: Arc::clone(&router),
             events: event_tx,
             registration: Arc::clone(&registration),
+            dedup: Arc::new(Mutex::new(EventDeduper::new())),
             late_registration: Arc::new(std::sync::Mutex::new(None)),
         };
 
@@ -854,6 +1263,7 @@ mod tests {
             router: Arc::clone(&router),
             events: event_tx,
             registration: Arc::new(Mutex::new(None)),
+            dedup: EventDeduper::new_shared(),
             late_registration: Arc::clone(&late_registration),
         };
 
@@ -897,6 +1307,7 @@ mod tests {
             router: Arc::clone(&router),
             events: event_tx,
             registration: Arc::clone(&registration),
+            dedup: EventDeduper::new_shared(),
             late_registration: Arc::clone(&late_registration),
         };
 

@@ -369,7 +369,10 @@ impl Compat {
                     ("clientAdded", "clientRemoved", "clientActivated")
                 };
                 format!(
-                    "function __push(payload) {{\n{push}\n}}\n\
+                    "function __push(payload) {{\n\
+                     \x20   payload.occurred_at = Date.now();\n\
+                     {push}\n\
+                     }}\n\
                      function __wid(w) {{\n\
                      \x20   return w.internalId !== undefined ? w.internalId.toString() : String(w.id);\n\
                      }}\n\
@@ -548,6 +551,22 @@ mod tests {
         let query = render_v6(ScriptTemplate::ListWindows, &[]);
         assert!(query.contains("req:"));
         assert!(query.contains(REQ_ID_TOKEN));
+    }
+
+    /// `__push` 统一写入 `occurred_at`（KWin 信号分发时刻 `Date.now()`），
+    /// 作为事件身份参与判重键 `(event, id, occurred_at)`（见 dbus_bridge 的
+    /// `EventDeduper`）——据此区分「同一事件的 N 份副本」与「同窗口的连续
+    /// 真实事件」；缺失 `occurred_at` 的旧格式历史遗留实例改以 `(event, id)`
+    /// 短窗兜底判重。
+    #[test]
+    fn event_monitor_push_carries_occurred_at() {
+        let v6 = render_v6(ScriptTemplate::EventMonitor, &[]);
+        assert!(
+            v6.contains("payload.occurred_at = Date.now()"),
+            "event payload must carry occurred_at; script: {v6}"
+        );
+        let v5 = ScriptTemplate::EventMonitor.render(false, &[]).unwrap();
+        assert!(v5.contains("payload.occurred_at = Date.now()"));
     }
 
     /// 信号注册成功/失败必须在脚本内可见标记：try/catch 包住三个 connect，
