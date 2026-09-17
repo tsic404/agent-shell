@@ -21,6 +21,7 @@ agent-shell-capture = { path = "../modules/capture", default-features = false }
 agent-shell-input.workspace = true
 agent-shell-event.workspace = true
 agent-shell-a11y.workspace = true
+agent-shell-power.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true

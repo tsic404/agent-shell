@@ -6,6 +6,7 @@
 //! lock/suspend/hibernate/power_off 属 L4——调用方须先取得用户确认，D-Bus 层再经
 //! polkit 授权。
 
+pub mod brightness;
 pub mod router;
 use agent_shell_core::component::{
     ComponentHealth, ComponentType, DesktopComponent, PowerComponent,
@@ -13,6 +14,7 @@ use agent_shell_core::component::{
 use agent_shell_core::error::{AgentShellError, Result};
 use agent_shell_core::services::BatteryState;
 use async_trait::async_trait;
+pub use brightness::{BrightnessController, BrightnessOps};
 pub use router::{probe_first_existing, service_exists, DDE_POWER_NAMES};
 use zbus::proxy;
 

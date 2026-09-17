@@ -410,6 +410,7 @@ dependencies = [
  "agent-shell-core",
  "agent-shell-event",
  "agent-shell-input",
+ "agent-shell-power",
  "agent-shell-rpc",
  "async-trait",
  "dirs",

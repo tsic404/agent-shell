@@ -15,6 +15,7 @@ use agent_shell_compositor_mutter::{GnomePathKind, MutterCompositor};
 use agent_shell_core::component::{BackendCapabilities, CompositorComponent, DesktopComponent};
 use agent_shell_core::error::AgentShellError;
 use agent_shell_core::types::WindowInfo;
+use agent_shell_power::{BrightnessController, BrightnessOps};
 use event::{EventHub, EventRing};
 use std::time::{Duration, Instant};
 /// daemon 持有的合成器后端。KDE 会话装 KWin，DDE 会话装 DdeCompositor，
@@ -190,6 +191,8 @@ pub struct Daemon {
     pub rootd_connect: crate::rootd_client::RootdConnector,
     /// AT-SPI 组件（None = a11y bus 不可达，a11y.query 返回 BackendUnavailable）。
     pub a11y: Option<std::sync::Arc<dyn A11yOps>>,
+    /// 亮度控制器（KDE powerdevil 优先，brightnessctl 公共降级；§21.25）。
+    pub brightness: Option<std::sync::Arc<dyn BrightnessOps>>,
     /// 事件枢纽（§22.5 D4：订阅者 fan-out 中心）。
     pub hub: EventHub,
     /// 事件环形缓冲（§22.5 D4：CLI `events --replay`）。
@@ -283,6 +286,7 @@ impl Daemon {
             a11y: AtSpiComponent::probe()
                 .await
                 .map(|a| std::sync::Arc::new(a) as std::sync::Arc<dyn A11yOps>),
+            brightness: Some(std::sync::Arc::new(BrightnessController::new().await)),
             rootd_connect: crate::rootd_client::connector(),
             hub: EventHub::new(),
             ring: EventRing::default(),
@@ -733,6 +737,7 @@ mod tests {
             caller_id: "*".into(),
             rootd_connect: crate::rootd_client::connector(),
             a11y: None,
+            brightness: None,
             hub: EventHub::new(),
             ring: EventRing::default(),
             subscriptions: Vec::new(),

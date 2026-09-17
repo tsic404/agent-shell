@@ -86,8 +86,8 @@ pub async fn dispatch(daemon: &mut Daemon, req: &Request) -> Response {
         method::SECURITY_GRANT => security_grant(daemon, req).await,
         method::SECURITY_REVOKE => security_revoke(daemon, req).await,
         method::SECURITY_AUDIT => security_audit(daemon, req).await,
-        method::BRIGHTNESS_GET => stub_ok("brightness.get"),
-        method::BRIGHTNESS_SET => stub_ok("brightness.set"),
+        method::BRIGHTNESS_GET => brightness_get(daemon).await,
+        method::BRIGHTNESS_SET => brightness_set(daemon, req).await,
         method::FILE_PICK => stub_ok("file.pick"),
         method::FILE_TRASH => stub_ok("file.trash"),
         method::FILE_OPEN_DIR => stub_ok("file.open_directory"),
@@ -1034,6 +1034,49 @@ async fn ime_type(d: &mut Daemon, req: &Request) -> RpcResult {
     Ok(serde_json::to_value(result).expect("ImeTypeResult serializable"))
 }
 
+// ───────────────────────── brightness（§21.25） ─────────────────────────
+
+/// 查询亮度：返回 [`BrightnessState`] 列表（KDE powerdevil 优先，brightnessctl 降级）。
+async fn brightness_get(d: &Daemon) -> RpcResult {
+    let backend = d.brightness.as_ref().ok_or((
+        RpcErrorCode::BackendUnavailable,
+        "no brightness backend assembled".into(),
+    ))?;
+    let states = backend.get().await.map_err(brightness_error)?;
+    Ok(serde_json::to_value(states).expect("BrightnessState serializable"))
+}
+
+/// 设置亮度：`{ "value": 0-100 }`。参数校验先于后端判定——非法值恒返回
+/// InvalidParams，不被后端可用性掩盖（CI 无亮度后端环境回归锚定）。
+async fn brightness_set(d: &Daemon, req: &Request) -> RpcResult {
+    let params = params_of(req)?;
+    let value = params.get("value").and_then(Value::as_u64).ok_or((
+        RpcErrorCode::InvalidParams,
+        "missing or invalid 'value' (expected 0-100)".into(),
+    ))?;
+    if value > 100 {
+        return Err((
+            RpcErrorCode::InvalidParams,
+            format!("brightness value out of range: {value} (expected 0-100)"),
+        ));
+    }
+    let backend = d.brightness.as_ref().ok_or((
+        RpcErrorCode::BackendUnavailable,
+        "no brightness backend assembled".into(),
+    ))?;
+    backend.set(value as u8).await.map_err(brightness_error)?;
+    Ok(json!({"status": "ok", "value": value}))
+}
+
+/// 亮度后端错误 → RPC 错误码：无后端（BackendUnavailable）与底层失败
+/// （BackendError）区分，CLI 据此判读退出码。
+fn brightness_error(e: AgentShellError) -> (RpcErrorCode, String) {
+    match e {
+        AgentShellError::BackendUnavailable(m) => (RpcErrorCode::BackendUnavailable, m),
+        other => (RpcErrorCode::BackendError, other.to_string()),
+    }
+}
+
 // ───────────────────────── rootd 特权代理（§23.4） ─────────────────────────
 
 /// rootd 版本对账（§23.4.3：daemon 与 rootd 需匹配安全模型版本）。
@@ -1940,6 +1983,87 @@ mod tests {
             resp.error.expect("error").code,
             RpcErrorCode::InvalidParams as i32
         );
+    }
+
+    struct FakeBrightness {
+        states: Vec<agent_shell_core::services::BrightnessState>,
+        set_calls: Mutex<Vec<u8>>,
+    }
+
+    #[async_trait]
+    impl agent_shell_power::BrightnessOps for FakeBrightness {
+        async fn get(
+            &self,
+        ) -> agent_shell_core::error::Result<Vec<agent_shell_core::services::BrightnessState>>
+        {
+            Ok(self.states.clone())
+        }
+
+        async fn set(&self, value: u8) -> agent_shell_core::error::Result<()> {
+            self.set_calls.lock().push(value);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn brightness_set_rejects_invalid_params_before_backend() {
+        // 参数校验先于后端判定：越界/类型错误/缺省恒 InvalidParams，
+        // 与亮度后端是否可达无关（headless 亦确定性可测）。
+        let mut d = test_daemon().await;
+        for params in [
+            Some(json!({"value": 101})),
+            Some(json!({"value": "50"})),
+            Some(json!({})),
+            None,
+        ] {
+            let resp = dispatch(&mut d, &req(method::BRIGHTNESS_SET, params)).await;
+            assert_eq!(
+                resp.error.expect("error").code,
+                RpcErrorCode::InvalidParams as i32
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn brightness_get_returns_states_from_backend() {
+        // 注入 fake 亮度后端：查询直达后端并投影为 JSON 数组，证明
+        // brightness.get 已从 stub_ok 接线到真实组件。
+        let mut d = test_daemon().await;
+        d.brightness = Some(std::sync::Arc::new(FakeBrightness {
+            states: vec![agent_shell_core::services::BrightnessState {
+                monitor: "default".into(),
+                brightness: 42,
+                max_brightness: 100,
+                adaptive: false,
+            }],
+            set_calls: Mutex::new(Vec::new()),
+        }));
+        let resp = dispatch(&mut d, &req(method::BRIGHTNESS_GET, None)).await;
+        let arr = resp.result.expect("ok").as_array().cloned().expect("array");
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["brightness"], 42);
+        assert_eq!(arr[0]["monitor"], "default");
+    }
+
+    #[tokio::test]
+    async fn brightness_set_dispatches_value_to_backend() {
+        // 合法 0-100 值放行后直达后端 set：fake 记录调用值，证明
+        // brightness.set 已从 stub_ok 接线到真实组件。
+        let mut d = test_daemon().await;
+        let inner = std::sync::Arc::new(FakeBrightness {
+            states: Vec::new(),
+            set_calls: Mutex::new(Vec::new()),
+        });
+        d.brightness =
+            Some(std::sync::Arc::clone(&inner)
+                as std::sync::Arc<dyn agent_shell_power::BrightnessOps>);
+        let resp = dispatch(
+            &mut d,
+            &req(method::BRIGHTNESS_SET, Some(json!({"value": 50}))),
+        )
+        .await;
+        assert!(resp.result.is_some(), "expected ok, got {:?}", resp.error);
+        assert_eq!(*inner.set_calls.lock(), vec![50]);
     }
 
     #[tokio::test]
