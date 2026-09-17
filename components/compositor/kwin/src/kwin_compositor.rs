@@ -85,15 +85,32 @@ pub struct KWinCompositor {
     /// `subscribe`/`subscribe_raw` 改走 org_kde_plasma_window_management
     /// 协议事件）。
     wayland_monitor: AsyncMutex<Option<crate::event_native::WaylandEventMonitor>>,
-    /// `/Scripting` 探测状态：0=未探测，1=失败（不缓存，
-    /// 允许重试），2=成功。原子而非锁——doctor_lines(&self) 同步读取。
+    /// `/Scripting` 探测状态：0=未探测，1=瞬时失败，2=确证缺失，3=成功。
+    /// 原子而非锁——doctor_lines(&self) 同步读取。
     scripting_probe: std::sync::atomic::AtomicU8,
 }
 
 /// `scripting_probe` 状态值。
+///
+/// 确证缺失与瞬时不可达分开缓存：两种失败态都不短路重试（仅 `PROBE_OK`
+/// 短路）——KWin 重启/升级注册 `/Scripting` 后，长驻实例必须能自愈。
 const PROBE_UNSET: u8 = 0;
-const PROBE_FAIL: u8 = 1;
-const PROBE_OK: u8 = 2;
+const PROBE_FAIL_TRANSIENT: u8 = 1;
+const PROBE_FAIL_PERMANENT: u8 = 2;
+const PROBE_OK: u8 = 3;
+
+/// `/Scripting` 探测状态（缓存读端；见 [`Self::ensure_scripting_probe`]）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ScriptingProbe {
+    /// 尚未探测。
+    Unset,
+    /// 瞬时不可达（org.kde.KWin 不可达 / KWin 启动中），可自愈。
+    FailTransient,
+    /// 确证缺失（/Scripting 未注册 / 接口未广告），KWin 重启后可能自愈。
+    FailPermanent,
+    /// 已确认可用。
+    Ok,
+}
 
 impl KWinCompositor {
     /// org_kde_* 私有协议通道引用（含派发队列）。
@@ -178,7 +195,9 @@ impl KWinCompositor {
         use std::sync::atomic::AtomicU8;
         let probe = match probe {
             Some(true) => PROBE_OK,
-            Some(false) => PROBE_FAIL,
+            // 注入的「最近失败」不区分瞬时/确证：两种失败态都允许重试，
+            // 行为等价，取瞬时态作为缺省最近失败形态。
+            Some(false) => PROBE_FAIL_TRANSIENT,
             None => PROBE_UNSET,
         };
         // 测试注入点不触碰真实显示服务器；native 通道仅测试时可能不可达，
@@ -258,17 +277,24 @@ impl KWinCompositor {
             }
         ));
         // 桥接就绪以 /Scripting 探测为证据——不再无条件打 ✓。
-        lines.push(match self.scripting_probe_ok() {
-            Some(true) => "✓ D-Bus 桥接 : callDBus ready (14 templates, req-id routed; \
+        lines.push(match self.scripting_probe_state() {
+            ScriptingProbe::Ok => "✓ D-Bus 桥接 : callDBus ready (14 templates, req-id routed; \
                            /Scripting introspected)"
                 .to_string(),
-            // 探测失败不归因具体形态——可能是 /Scripting 未注册（KWin 5.x
-            // Wayland）、KWin 启动早期时序、或 org.kde.KWin 不可达；窗口/工作区
-            // 枚举改走会话原生通道（Wayland: org.kde.KWin + wl_registry；X11: EWMH）。
-            Some(false) => "⚠ D-Bus 桥接 : /Scripting 未就绪（不可达/未注册/启动早期）；\
+            // 确证缺失与瞬时不可达分开呈现：两种失败态都允许重试（自愈），
+            // 窗口/工作区枚举改走会话原生通道（Wayland: org.kde.KWin +
+            // wl_registry；X11: EWMH）。
+            ScriptingProbe::FailPermanent => {
+                "⚠ D-Bus 桥接 : /Scripting 未就绪（未注册/确证缺失）；\
+                            窗口/工作区走会话原生通道，Scripting 按需重试"
+                    .to_string()
+            }
+            ScriptingProbe::FailTransient => "⚠ D-Bus 桥接 : /Scripting 未就绪（不可达/瞬时）；\
                             窗口/工作区走会话原生通道，Scripting 按需重试"
                 .to_string(),
-            None => "⚠ D-Bus 桥接 : 未探测（调用 ensure_scripting_probe 后更新）".to_string(),
+            ScriptingProbe::Unset => {
+                "⚠ D-Bus 桥接 : 未探测（调用 ensure_scripting_probe 后更新）".to_string()
+            }
         });
         if let Some(p) = &self.protocols {
             match &p.fake_input {
@@ -322,7 +348,7 @@ impl KWinCompositor {
     /// `/Scripting` 实际可达。同步版本 [`Self::doctor_lines`] 保留给
     /// 内部状态渲染；daemon doctor 走本方法补齐证据后渲染。
     pub async fn doctor_lines_async(&self) -> Vec<String> {
-        if self.scripting_probe_ok() != Some(true) {
+        if self.scripting_probe_state() != ScriptingProbe::Ok {
             let _ = self.ensure_scripting_probe().await;
         }
         self.doctor_lines()
@@ -331,30 +357,46 @@ impl KWinCompositor {
     /// 探测并缓存 `/Scripting` 可用性。
     ///
     /// doctor 与降级链的证据来源：成功后 `doctor_lines` 的桥接行升级为
-    /// 确认态；失败写入 PROBE_FAIL（doctor 显示「未就绪」而非「未探测」），
-    /// 但不阻止下次调用重试——KWin 启动早期未就绪属时序现象，可自愈。
+    /// 确认态；失败按形态写入 `PROBE_FAIL_TRANSIENT`（瞬时不可达）或
+    /// `PROBE_FAIL_PERMANENT`（确证缺失），doctor 区分呈现，但两种失败态
+    /// 都不阻止下次调用重试——KWin 启动早期未就绪与 KWin 重启注册
+    /// `/Scripting` 都属时序现象，可自愈。
     pub async fn ensure_scripting_probe(&self) -> Result<()> {
         use std::sync::atomic::Ordering;
+        // 仅 PROBE_OK 短路；UNSET 与两种失败态都重新探测——确证缺失也可能
+        // 随时间恢复（KWin 重启/升级注册 /Scripting），长驻实例不能缓存死。
         if self.scripting_probe.load(Ordering::Relaxed) == PROBE_OK {
             return Ok(());
         }
         let result = crate::dbus_bridge::probe_scripting(self.bridge.connection()).await;
-        self.scripting_probe.store(
-            if result.is_ok() { PROBE_OK } else { PROBE_FAIL },
-            Ordering::Relaxed,
-        );
+        let state = match &result {
+            Ok(()) => PROBE_OK,
+            Err(KWinError::ScriptingUnavailable(_)) => PROBE_FAIL_PERMANENT,
+            Err(_) => PROBE_FAIL_TRANSIENT,
+        };
+        // fetch_update 的 CAS 防 lost update：并发探测已把状态推进到 PROBE_OK
+        // 后，本探测的旧结果（可能失败）不得覆写确认态——仅当当前态仍非
+        // PROBE_OK 时才写回。
+        let _ = self
+            .scripting_probe
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+                if cur == PROBE_OK {
+                    None
+                } else {
+                    Some(state)
+                }
+            });
         result
     }
 
-    /// 探测状态读取端（doctor_lines 用）：Some(true)=已确认可用，
-    /// Some(false)=最近一次失败，None=尚未探测。
-    fn scripting_probe_ok(&self) -> Option<bool> {
+    /// 探测状态读取端（doctor_lines 用）。
+    fn scripting_probe_state(&self) -> ScriptingProbe {
         use std::sync::atomic::Ordering;
         match self.scripting_probe.load(Ordering::Relaxed) {
-            PROBE_OK => Some(true),
-            PROBE_FAIL => Some(false),
-            PROBE_UNSET => None,
-            _ => None,
+            PROBE_OK => ScriptingProbe::Ok,
+            PROBE_FAIL_TRANSIENT => ScriptingProbe::FailTransient,
+            PROBE_FAIL_PERMANENT => ScriptingProbe::FailPermanent,
+            _ => ScriptingProbe::Unset,
         }
     }
 
@@ -1023,17 +1065,16 @@ impl CompositorComponent for KWinCompositor {
         if let Some(x11) = self.x11.as_ref() {
             return self.x11_list_windows(x11);
         }
-        // Wayland：先探测 /Scripting——可用走 Scripting（KDE 主流路径），不可用
-        // （/Scripting 未注册）走原生 D-Bus + wl_registry 枚举兜底。
-        let scripting_ok = self.ensure_scripting_probe().await.is_ok();
-        if scripting_ok {
-            return self.list_windows_scripting().await;
-        }
-        match self.list_windows_native().await {
-            Ok(windows) => Ok(windows),
-            // 原生通道不可用（window_mgmt 未绑定 / getWindowInfo 不可达）时最后
-            // 回退 Scripting——启动早期 /Scripting 未注册属时序现象，可自愈。
-            Err(_) => self.list_windows_scripting().await,
+        // Wayland：先探测 /Scripting。确证缺失（/Scripting 未注册）时原生通道
+        // 是唯一枚举路径，不再回退 Scripting（同样缺省）；瞬时不可达时原生优先、
+        // 失败回退 Scripting——启动早期 /Scripting 未注册属时序现象，可自愈。
+        match self.ensure_scripting_probe().await {
+            Ok(()) => return self.list_windows_scripting().await,
+            Err(KWinError::ScriptingUnavailable(_)) => self.list_windows_native().await,
+            Err(_) => match self.list_windows_native().await {
+                Ok(windows) => Ok(windows),
+                Err(_) => self.list_windows_scripting().await,
+            },
         }
     }
 
@@ -1086,6 +1127,21 @@ impl CompositorComponent for KWinCompositor {
                 return Ok(());
             }
         }
+        // window_mgmt 未短绑时回退 Scripting。Scripting 确证缺失且无
+        // window_mgmt → 无聚焦通道，报 NotImplemented（同 move_window）；
+        // 瞬时不可达传播原始 probe 错误（保留重试提示）。
+        match self.ensure_scripting_probe().await {
+            Ok(()) => {}
+            Err(KWinError::ScriptingUnavailable(_)) => {
+                return Err(AgentShellError::NotImplemented(
+                    "kwin wayland without /Scripting and without window_mgmt has no native \
+                     focus_window; window focus requires KWin Scripting or \
+                     org_kde_plasma_window_management"
+                        .to_string(),
+                ));
+            }
+            Err(e) => return Err(e.into()),
+        }
         let v = self
             .query(ScriptTemplate::FocusWindow, &[("ID", json!(id.native_id))])
             .await?;
@@ -1133,13 +1189,26 @@ impl CompositorComponent for KWinCompositor {
         Self::check_op(&v).map_err(KWinError::into)
     }
 
-    /// 缩放：同 move_window，始终 Scripting。
+    /// 缩放：协议无 set_geometry（§7.2），始终 Scripting——`/Scripting`
+    /// 确证缺失时报 NotImplemented（同 move_window），瞬时不可达传播原始
+    /// probe 错误（保留重试提示）。
     async fn resize_window(
         &self,
         id: &WindowId,
         w: i32,
         h: i32,
     ) -> agent_shell_core::error::Result<()> {
+        match self.ensure_scripting_probe().await {
+            Ok(()) => {}
+            Err(KWinError::ScriptingUnavailable(_)) => {
+                return Err(AgentShellError::NotImplemented(
+                    "kwin without /Scripting has no native resize_window; \
+                     window resize requires KWin Scripting"
+                        .to_string(),
+                ));
+            }
+            Err(e) => return Err(e.into()),
+        }
         let v = self
             .query(
                 ScriptTemplate::ResizeWindow,
@@ -1256,13 +1325,18 @@ impl CompositorComponent for KWinCompositor {
         if let Some(x11) = self.x11.as_ref() {
             return Self::x11_list_workspaces(x11);
         }
-        // Wayland：Scripting 可用走 Scripting；不可用走 VirtualDesktopManager。
-        if self.ensure_scripting_probe().await.is_ok() {
-            return self.list_workspaces_scripting().await;
-        }
-        match self.native.workspaces().await {
-            Ok(ws) => Ok(ws),
-            Err(_) => self.list_workspaces_scripting().await,
+        // Wayland：Scripting 可用走 Scripting；确证缺失走 VirtualDesktopManager
+        // （唯一路径，不再回退 Scripting）；瞬时不可达走 VirtualDesktopManager
+        // 优先、失败回退 Scripting——启动早期属时序现象，可自愈。
+        match self.ensure_scripting_probe().await {
+            Ok(()) => return self.list_workspaces_scripting().await,
+            Err(KWinError::ScriptingUnavailable(_)) => {
+                self.native.workspaces().await.map_err(KWinError::into)
+            }
+            Err(_) => match self.native.workspaces().await {
+                Ok(ws) => Ok(ws),
+                Err(_) => self.list_workspaces_scripting().await,
+            },
         }
     }
 
@@ -1682,53 +1756,53 @@ mod tests {
         );
     }
 
-    /// 三态迁移：`None`（PROBE_UNSET）触发探测 → 成功升级为 Some(true)。
+    /// 探测状态迁移：`None`（PROBE_UNSET）触发探测 → 成功升级为 Ok。
     #[tokio::test]
     async fn unset_probe_triggers_probe_and_becomes_ok() {
         let bus = TestBus::start().await;
         let _kwin = spawn_fake_kwin(&bus).await;
         let comp = KWinCompositor::for_test(bridge(&bus).await, None).await;
 
-        assert_eq!(comp.scripting_probe_ok(), None);
+        assert_eq!(comp.scripting_probe_state(), ScriptingProbe::Unset);
         let lines = comp.doctor_lines_async().await;
 
-        assert_eq!(comp.scripting_probe_ok(), Some(true));
+        assert_eq!(comp.scripting_probe_state(), ScriptingProbe::Ok);
         assert!(has_ready_bridge(&lines));
     }
 
-    /// `Some(false)`（PROBE_FAIL）必须重试，不能把
-    /// 一次性失败固化为永不重试的假阴性。
+    /// `Some(false)`（最近失败）必须重试，不能把一次性失败固化为
+    /// 永不重试的假阴性。
     #[tokio::test]
     async fn failed_probe_is_retried_and_becomes_ok() {
         let bus = TestBus::start().await;
         // 先建桥（无 org.kde.KWin 服务），在桥接上探测一次失败。
         let comp = KWinCompositor::for_test(bridge(&bus).await, None).await;
         let _ = comp.ensure_scripting_probe().await;
-        assert_eq!(comp.scripting_probe_ok(), Some(false));
+        assert_eq!(comp.scripting_probe_state(), ScriptingProbe::FailTransient);
 
         // 服务事后可达——旧失败必须被重试，升级为确认态。
         let _kwin = spawn_fake_kwin(&bus).await;
         let lines = comp.doctor_lines_async().await;
 
-        assert_eq!(comp.scripting_probe_ok(), Some(true));
+        assert_eq!(comp.scripting_probe_state(), ScriptingProbe::Ok);
         assert!(has_ready_bridge(&lines));
     }
 
-    /// 三态迁移：`Some(true)`（PROBE_OK）短路，不再发探测。
+    /// 探测状态迁移：`Some(true)`（PROBE_OK）短路，不再发探测。
     #[tokio::test]
     async fn ok_probe_short_circuits_without_probing() {
         let bus = TestBus::start().await;
         // 不注册 org.kde.KWin：若短路失败，doctor_lines_async 会重测并
-        // 把 PROBE_OK 覆写为 PROBE_FAIL。
+        // 把 PROBE_OK 覆写为失败态。
         let comp = KWinCompositor::for_test(bridge(&bus).await, Some(true)).await;
 
         let lines = comp.doctor_lines_async().await;
 
-        assert_eq!(comp.scripting_probe_ok(), Some(true));
+        assert_eq!(comp.scripting_probe_state(), ScriptingProbe::Ok);
         assert!(has_ready_bridge(&lines));
     }
 
-    /// 三态迁移：`Some(false)` 服务仍不可达 → 保持 PROBE_FAIL，桥接行
+    /// 探测状态迁移：`Some(false)` 服务仍不可达 → 保持瞬时失败态，桥接行
     /// 报「未就绪」而非「未探测」。
     #[tokio::test]
     async fn failed_probe_remains_failed_when_still_unreachable() {
@@ -1737,9 +1811,33 @@ mod tests {
 
         let lines = comp.doctor_lines_async().await;
 
-        assert_eq!(comp.scripting_probe_ok(), Some(false));
+        assert_eq!(comp.scripting_probe_state(), ScriptingProbe::FailTransient);
         assert!(has_not_ready_bridge(&lines));
         assert!(!has_ready_bridge(&lines));
+    }
+
+    /// `/Scripting` 确证缺失（服务在、对象未注册 → UnknownObject）后，同一
+    /// 长驻实例期间 KWin 注册 `/Scripting`（重启/加载 scripting 模块），探测
+    /// 必须重试自愈——不能把确证缺失缓存为永久死态。
+    #[tokio::test]
+    async fn permanent_probe_failure_self_heals_when_scripting_registers() {
+        let bus = TestBus::start().await;
+        let comp = KWinCompositor::for_test(bridge(&bus).await, None).await;
+        let kwin = spawn_kwin_without_scripting(&bus).await;
+
+        // 第一阶段：确证缺失（服务在、/Scripting 未注册）。
+        let _ = comp.ensure_scripting_probe().await;
+        assert_eq!(comp.scripting_probe_state(), ScriptingProbe::FailPermanent);
+
+        // KWin 随后注册 /Scripting（同一连接，模拟重启/加载 scripting 模块）。
+        kwin.object_server()
+            .at("/Scripting", KWinScripting::new())
+            .await
+            .expect("register /Scripting");
+
+        // 旧「确证缺失」必须被重试，升级为确认态——长驻实例自愈。
+        let _ = comp.ensure_scripting_probe().await;
+        assert_eq!(comp.scripting_probe_state(), ScriptingProbe::Ok);
     }
 
     /// move_window 在 Wayland 且 `/Scripting` 确证缺失（服务可达、对象未注册）
@@ -1798,6 +1896,171 @@ mod tests {
         assert!(
             err.to_string().contains("retry"),
             "transient failure must preserve retry hint: {err}"
+        );
+    }
+
+    /// resize_window 与 move_window 同属「协议无 set_geometry，始终 Scripting」：
+    /// `/Scripting` 确证缺失时报 NotImplemented；瞬时不可达传播原始错误
+    /// （含重试提示），不误报能力缺失。
+    #[tokio::test]
+    async fn resize_window_without_scripting_reports_not_implemented() {
+        let bus = TestBus::start().await;
+        let _kwin = spawn_kwin_without_scripting(&bus).await;
+        let comp = KWinCompositor::for_test(bridge(&bus).await, Some(false)).await;
+        let id = WindowId {
+            native_id: "some-uuid".to_string(),
+            de_type: DesktopEnvironment::KDE,
+        };
+
+        let err = comp
+            .resize_window(&id, 200, 200)
+            .await
+            .expect_err("resize without /Scripting must fail");
+
+        assert!(
+            matches!(err, AgentShellError::NotImplemented(_)),
+            "expected NotImplemented, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("Scripting"),
+            "message must name Scripting: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn resize_window_transient_probe_failure_propagates_retry_hint() {
+        let bus = TestBus::start().await;
+        // 不注册 org.kde.KWin → introspect 返回 ServiceUnknown → 瞬时不可达。
+        let comp = KWinCompositor::for_test(bridge(&bus).await, Some(false)).await;
+        let id = WindowId {
+            native_id: "some-uuid".to_string(),
+            de_type: DesktopEnvironment::KDE,
+        };
+
+        let err = comp
+            .resize_window(&id, 200, 200)
+            .await
+            .expect_err("resize with unreachable KWin must fail");
+
+        assert!(
+            !matches!(err, AgentShellError::NotImplemented(_)),
+            "transient failure must not be NotImplemented, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("retry"),
+            "transient failure must preserve retry hint: {err}"
+        );
+    }
+
+    /// focus_window 在 window_mgmt 未短绑（for_test 无协议通道）且 /Scripting
+    /// 确证缺失时无聚焦通道，报 NotImplemented。
+    #[tokio::test]
+    async fn focus_window_without_scripting_reports_not_implemented() {
+        let bus = TestBus::start().await;
+        let _kwin = spawn_kwin_without_scripting(&bus).await;
+        let comp = KWinCompositor::for_test(bridge(&bus).await, Some(false)).await;
+        let id = WindowId {
+            native_id: "some-uuid".to_string(),
+            de_type: DesktopEnvironment::KDE,
+        };
+
+        let err = comp
+            .focus_window(&id)
+            .await
+            .expect_err("focus without /Scripting and window_mgmt must fail");
+
+        assert!(
+            matches!(err, AgentShellError::NotImplemented(_)),
+            "expected NotImplemented, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("Scripting"),
+            "message must name Scripting: {err}"
+        );
+    }
+
+    /// list_windows 在 /Scripting 确证缺失时走「原生通道唯一路径」：不重试
+    /// Scripting（错误来自原生通道的 protocol 缺失，而非 loadScript）。
+    #[tokio::test]
+    async fn list_windows_permanent_missing_uses_native_only() {
+        let bus = TestBus::start().await;
+        let _kwin = spawn_kwin_without_scripting(&bus).await;
+        let comp = KWinCompositor::for_test(bridge(&bus).await, None).await;
+
+        let err = comp
+            .list_windows()
+            .await
+            .expect_err("native channel absent must fail");
+
+        assert!(
+            matches!(err, AgentShellError::BackendUnavailable(_)),
+            "permanent missing must take native-only path, got {err:?}"
+        );
+        assert!(
+            !err.to_string().contains("loadScript"),
+            "permanent missing must not retry scripting: {err}"
+        );
+    }
+
+    /// list_windows 在 probe 瞬时不可达时原生优先、失败回退 Scripting：
+    /// 最终错误来自 Scripting（loadScript），而非原生通道短路。
+    #[tokio::test]
+    async fn list_windows_transient_unreachable_retries_scripting() {
+        let bus = TestBus::start().await;
+        // 不注册 org.kde.KWin → 瞬时不可达。
+        let comp = KWinCompositor::for_test(bridge(&bus).await, None).await;
+
+        let err = comp
+            .list_windows()
+            .await
+            .expect_err("unreachable KWin must fail");
+
+        assert!(
+            err.to_string().contains("loadScript"),
+            "transient must retry scripting (loadScript): {err}"
+        );
+    }
+
+    /// list_workspaces 在 /Scripting 确证缺失时走「VirtualDesktopManager 唯一
+    /// 路径」：不重试 Scripting（错误来自原生 VirtualDesktopManager，而非
+    /// loadScript）。
+    #[tokio::test]
+    async fn list_workspaces_permanent_missing_uses_native_only() {
+        let bus = TestBus::start().await;
+        let _kwin = spawn_kwin_without_scripting(&bus).await;
+        let comp = KWinCompositor::for_test(bridge(&bus).await, None).await;
+
+        let err = comp
+            .list_workspaces()
+            .await
+            .expect_err("native channel absent must fail");
+
+        assert!(
+            err.to_string().contains("VirtualDesktopManager"),
+            "permanent missing must take native-only path, got {err}"
+        );
+        assert!(
+            !err.to_string().contains("loadScript"),
+            "permanent missing must not retry scripting: {err}"
+        );
+    }
+
+    /// list_workspaces 在 probe 瞬时不可达时原生优先、失败回退 Scripting：
+    /// 最终错误来自 Scripting（loadScript），而非原生通道短路。
+    #[tokio::test]
+    async fn list_workspaces_transient_unreachable_retries_scripting() {
+        let bus = TestBus::start().await;
+        // 不注册 org.kde.KWin → 瞬时不可达。
+        let comp = KWinCompositor::for_test(bridge(&bus).await, None).await;
+
+        let err = comp
+            .list_workspaces()
+            .await
+            .expect_err("unreachable KWin must fail");
+
+        assert!(
+            err.to_string().contains("loadScript"),
+            "transient must retry scripting (loadScript): {err}"
         );
     }
 
