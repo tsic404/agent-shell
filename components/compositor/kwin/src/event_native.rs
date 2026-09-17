@@ -184,9 +184,8 @@ impl RawSource for WaylandRawSource {
 /// KWin Wayland 原生事件的近似映射流（core [`agent_shell_core::EventStream`]）。
 ///
 /// `subscribe()` 的 Wayland 原生分支消费本流，映射语义与 EWMH/Scripting
-/// 对齐（同为 T3b 前近似流）：`WindowOpened` 需完整 `WindowInfo`，本层无
-/// resolver，暂以 [`DesktopEvent::WindowClosed`] 承载窗口 id 作为「id 出现」
-/// 信号（消费方勿据以移除缓存）。
+/// 对齐：`WindowClosed`（仅需 id）忠实映射，`WindowOpened` 需完整
+/// [`WindowInfo`]，本层无 resolver 拿不到，跳过而非伪报为 Closed。
 pub struct WaylandEventStream {
     rx: tokio::sync::Mutex<mpsc::UnboundedReceiver<RawEvent>>,
 }
@@ -213,12 +212,12 @@ impl agent_shell_core::EventStream for WaylandEventStream {
 
 /// [`RawEvent`] → core [`DesktopEvent`]（近似映射，见 [`WaylandEventStream`]）。
 ///
-/// `KWinWindowAdded` 映射为 `WindowClosed`（仅承载 id 的「id 出现」信号）；
-/// `KWinWindowRemoved` 跳过——与 Scripting `KWinEventStream` / EWMH
-/// `EwmhEventStream` 对 windowClosed 的跳过口径一致。
+/// `KWinWindowRemoved` 映射为 `WindowClosed`（仅需 id，可忠实表达）；
+/// `KWinWindowAdded` 需要完整 [`WindowInfo`]，本流无 resolver，伪报为
+/// `WindowClosed` 会误导消费方移除缓存——跳过。
 fn map_raw_to_core(raw: RawEvent) -> Option<agent_shell_core::event::DesktopEvent> {
     let id = match raw {
-        RawEvent::KWinWindowAdded { id } => id,
+        RawEvent::KWinWindowRemoved { id } => id,
         _ => return None,
     };
     Some(agent_shell_core::event::DesktopEvent::WindowClosed {
@@ -248,14 +247,14 @@ mod tests {
         assert!((WM_MIN..=WM_MAX).contains(&16));
     }
 
-    /// `window_with_uuid` 事件映射为「id 出现」信号（近似流：WindowOpened 需
-    /// 完整 WindowInfo，本层无 resolver，与 EWMH/Scripting 近似流口径一致）。
+    /// `org_kde_plasma_window.unmapped` 事件映射为 `WindowClosed`（忠实映射：
+    /// 该变体仅需 id，与 EWMH/Scripting 近似流口径一致）。
     #[test]
-    fn map_window_added_carries_kde_wayland_source() {
-        let evt = map_raw_to_core(RawEvent::KWinWindowAdded {
+    fn map_window_removed_carries_kde_wayland_source() {
+        let evt = map_raw_to_core(RawEvent::KWinWindowRemoved {
             id: "uuid-1".to_string(),
         })
-        .expect("KWinWindowAdded must map");
+        .expect("KWinWindowRemoved must map");
         match evt {
             DesktopEvent::WindowClosed { id, source, .. } => {
                 assert_eq!(id.native_id, "uuid-1");
@@ -266,10 +265,11 @@ mod tests {
         }
     }
 
-    /// `KWinWindowRemoved` 跳过（与 Scripting/EWMH 近似流对 close 的跳过口径一致）。
+    /// `KWinWindowAdded` 跳过（需完整 WindowInfo，本流无 resolver，伪报为
+    /// Closed 会误导消费方移除缓存）。
     #[test]
-    fn map_window_removed_is_skipped() {
-        assert!(map_raw_to_core(RawEvent::KWinWindowRemoved {
+    fn map_window_added_is_skipped() {
+        assert!(map_raw_to_core(RawEvent::KWinWindowAdded {
             id: "uuid-1".to_string()
         })
         .is_none());
