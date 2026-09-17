@@ -33,6 +33,9 @@ wayland-backend = "0.3"
 wayland-scanner = "0.31"
 agent-shell-displayserver-wayland.workspace = true
 
+[dev-dependencies]
+libc.workspace = true
+
 [features]
 default = ["portal-screencast"]
 # 透传 capture 的 portal-screencast：DDE 后端经 `CaptureDispatcher::assemble`

@@ -9,8 +9,10 @@
 pub mod dbus_bridge;
 pub mod error;
 pub mod event_ewmh;
+pub mod event_native;
 pub mod event_script;
 pub mod event_source;
+pub mod native;
 pub mod scripts;
 pub mod version;
 pub mod wayland;

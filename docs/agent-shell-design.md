@@ -1495,7 +1495,7 @@ pub struct KWinCompositor {
     version: KWinVersion,
     event_handle: AsyncMutex<Option<EventScriptHandle>>,  // 长驻事件脚本句柄（懒启动；仅 Wayland 会话）
     ewmh_monitor: AsyncMutex<Option<EwmhEventMonitor>>,   // X11 EWMH 事件监视器（懒启动）
-    scripting_probe: AtomicU8,                   // /Scripting 探测状态：0=未探测 1=失败 2=成功
+    scripting_probe: AtomicU8,                   // /Scripting 探测状态：0=未探测 1=瞬时失败 2=确证缺失 3=成功
 }
 
 pub struct KWinProtocols {
@@ -1518,9 +1518,11 @@ list_windows():
   0. X11 会话？
      → 是：EWMH `_NET_CLIENT_LIST_STACKING`（缺失回退 `_NET_CLIENT_LIST`，
             十进制窗口 id；KWin 5.x 部分 X11 会话不注册 /Scripting，见 TSI-3131）
-  1. wayland.window_mgmt 绑定成功？
-     → 是：get_stacking_order() 走协议
-     → 否：bridge.list_windows.js 走 Scripting
+  1. Wayland：probe `/Scripting`
+     → 可用：bridge.list_windows.js 走 Scripting
+     → 确证缺失（UnknownObject / 接口未广告）：原生 D-Bus + wl_registry 枚举
+       （唯一路径，不再回退 Scripting）
+     → 瞬时不可达（KWin 启动中）：原生 D-Bus + wl_registry 优先，失败回退 Scripting
 
 focus_window(id):
   0. X11 会话？
@@ -1529,17 +1531,40 @@ focus_window(id):
             超时即返回明确错误，见 TSI-3131）
   1. wayland.window_mgmt 绑定成功？
      → 是：activate(uuid) 走协议
-     → 否：bridge.focus_window.js 走 Scripting
+     → 否：probe `/Scripting`
+       → 可用：bridge.focus_window.js 走 Scripting
+       → 确证缺失：无聚焦通道（无 window_mgmt 且无 /Scripting），报 `NotImplemented`
+       → 瞬时不可达：传播原始 probe 错误（保留重试提示）
 
 move_window(id, x, y):
   0. X11 会话？
      → 是：EWMH `_NET_MOVERESIZE_WINDOW`（只设 X/Y，尺寸标志位 0）
-  1. 协议不支持 set_geometry，走 bridge.move_window.js
+  1. Wayland：probe `/Scripting`
+     → 确证缺失（UnknownObject / 接口未广告）：无原生绝对移动通道
+       （org.kde.KWin 无 moveWindow，协议无 set_geometry），报 `NotImplemented`
+     → 瞬时不可达（KWin 启动中）：传播原始 probe 错误（保留重试提示）
+     → 可用：走 bridge.move_window.js（协议无 set_geometry）
+
+resize_window(id, w, h):
+  → probe `/Scripting`（协议无 set_geometry，始终 Scripting）
+    → 确证缺失：无原生缩放通道，报 `NotImplemented`
+    → 瞬时不可达：传播原始 probe 错误（保留重试提示）
+    → 可用：走 bridge.resize_window.js
 
 list_workspaces():
   0. X11 会话？
      → 是：EWMH `_NET_NUMBER_OF_DESKTOPS` + `_NET_DESKTOP_NAMES` + `_NET_CURRENT_DESKTOP`
-  1. Wayland：bridge.list_workspaces.js 走 Scripting
+  1. Wayland：probe `/Scripting`
+     → 可用：bridge.list_workspaces.js 走 Scripting
+     → 确证缺失：VirtualDesktopManager（唯一路径，不再回退 Scripting）
+     → 瞬时不可达：VirtualDesktopManager 优先，失败回退 Scripting
+
+activate_workspace(id):
+  0. X11 会话？
+     → 是：bridge.switch_workspace.js 走 Scripting
+  1. Wayland：probe `/Scripting`
+     → 可用：bridge.switch_workspace.js 走 Scripting
+     → 失败（确证缺失/瞬时不可达）：VirtualDesktopManager.current 写桌面 id
 
 subscribe()/subscribe_raw():
   0. X11 会话？
@@ -3596,6 +3621,7 @@ impl<T> FallbackChain<T> {
 | 操作 | 默认超时 | 重试次数 | 重试间隔(退避) |
 |------|---------|---------|--------------|
 | D-Bus 调用（窗口查询） | 5s | 2 | 500ms ×2 |
+| AT-SPI a11y bus 懒激活 (GetAddress) | 30s | 0 | — |
 | KWin Scripting run_script | 5s | 1 | 1000ms |
 | hyprctl socket 请求 | 2s | 2 | 200ms ×2 |
 | portal ScreenCast 会话 | 10s | 1 | 2000ms |
@@ -3705,6 +3731,11 @@ strip = true
 这些符号，`--exists` 探不到，须按版本门槛判旧并回退 `--no-default-features` 关闭
 `portal-screencast`，无需手动指定即可编译。手动 `cargo build --release --workspace`
 仍需满足门槛的 dev 头，或显式 `--no-default-features`（§20.6）。
+
+arm64（aarch64）发行构建（`build-deb.sh` / `PKGBUILD` / `flake.nix`）显式采用
+`--no-default-features`：company-04（UOS arm64）系统 `libspa-0.2-dev` 头（0.3.15.x）
+与 libspa-sys 0.10.1 不兼容，默认特性（含 `portal-screencast`）直编失败。显式关闭
+`portal-screencast`，capture 走 Screenshot/X11 降级链；其他平台保持默认特性构建不回退。
 
 ### 20.3 权限模型
 

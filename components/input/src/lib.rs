@@ -37,16 +37,22 @@ pub struct InputComponentHandle {
 impl InputComponentHandle {
     /// 按 DE 探测降级链并选出 active 后端。
     ///
-    /// 全部后端不可用（如 TTY）返回 `Err(BackendUnavailable)`——与设计一致：
-    /// registry 对 TTY 会话存 `None`，不构造本类型。
+    /// 全部后端不可用（如 TTY 或 portal 缺 ConnectToEIS）返回
+    /// `Err(BackendUnavailable)`——与设计一致：registry 对 TTY 会话存 `None`，
+    /// 不构造本类型。空链错误携带首选后端（libei）探测失败原因，供 daemon
+    /// 保存并在 `input_send` 透出可诊断错误。
     pub async fn detect(de_type: DesktopEnvironment) -> Result<Self> {
         let dispatcher = InputDispatcher::new(de_type).await?;
+        Self::assemble(dispatcher, de_type)
+    }
+
+    /// 由已构造 dispatcher 组装 handle（detect 的空链判定与错误构造）。
+    ///
+    /// 拆为同步纯函数便于端到端测试：`InputDispatcher::new` 的探测是环境
+    /// 绑定的 I/O，无法离线确定性复现；空链错误携带探测原因是纯逻辑。
+    fn assemble(dispatcher: InputDispatcher, de_type: DesktopEnvironment) -> Result<Self> {
         if dispatcher.active_backend_name().is_none() {
-            return Err(
-                agent_shell_core::error::AgentShellError::BackendUnavailable(format!(
-                    "input: no usable input backend in {de_type} session"
-                )),
-            );
+            return Err(dispatcher.empty_chain_error(de_type));
         }
         Ok(Self {
             dispatcher,
@@ -116,4 +122,41 @@ impl InputComponent for InputComponentHandle {
 /// 命名对齐 core 契约注释中的调用形态，避免与 trait `InputComponent` 混淆。
 pub async fn detect(de_type: DesktopEnvironment) -> Result<InputComponentHandle> {
     InputComponentHandle::detect(de_type).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use agent_shell_core::error::AgentShellError;
+
+    #[test]
+    fn assemble_empty_chain_error_carries_probe_reason() {
+        // detect 空链错误必须携带 libei 探测失败原因（如 portal 缺 ConnectToEIS），
+        // 供 daemon input_send 透出可诊断错误——而非笼统 "no usable input backend"。
+        let dispatcher = InputDispatcher::test_empty(Some(
+            "portal backend does not support EIS: RemoteDesktop.ConnectToEIS missing".into(),
+        ));
+        let err = match InputComponentHandle::assemble(dispatcher, DesktopEnvironment::DDE) {
+            Err(e) => e,
+            Ok(_) => panic!("empty chain must fail assembly"),
+        };
+        assert!(
+            matches!(&err, AgentShellError::BackendUnavailable(msg) if msg.contains("ConnectToEIS missing")),
+            "diagnosable probe reason expected, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn assemble_empty_chain_without_reason_is_generic() {
+        // 无 probe_failure（TTY / libei 未尝试）回退通用消息，不带空括号。
+        let dispatcher = InputDispatcher::test_empty(None);
+        let err = match InputComponentHandle::assemble(dispatcher, DesktopEnvironment::Tty) {
+            Err(e) => e,
+            Ok(_) => panic!("empty chain must fail assembly"),
+        };
+        assert_eq!(
+            err.to_string(),
+            "Backend not available: input: no usable input backend in Tty session"
+        );
+    }
 }

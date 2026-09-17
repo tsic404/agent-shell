@@ -15,9 +15,10 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 use tokio::sync::Mutex as AsyncMutex;
 
-use crate::dbus_bridge::{EventDeduper, EventDeduperHandle, KWinBridge};
+use crate::dbus_bridge::{EventDeduper, EventDeduperHandle, KWinBridge, RegistrationOutcome};
 use crate::error::{KWinError, Result};
 use crate::event_script::EventScriptHandle;
+use crate::native::KWinNative;
 use crate::scripts::ScriptTemplate;
 use crate::version::{self, KWinVersion};
 use crate::wayland::{FakeInput, KWinProtocols, WindowManagement};
@@ -53,7 +54,9 @@ pub struct KWinCompositor {
     /// 基类协议通道（仅 Wayland 会话为 Some；私有协议叠加其上）。
     wayland_core: Option<WaylandDisplayServer>,
     /// org_kde_* 私有协议通道（仅 Wayland 会话为 Some，叠加在基类之上）。
-    protocols: Option<KWinProtocols>,
+    /// `Arc` 供 `list_windows` 的 stacking order roundtrip 经 `spawn_blocking`
+    /// 移入阻塞线程（§19：同步段不得占 tokio worker）。
+    protocols: Option<Arc<KWinProtocols>>,
     /// D-Bus / Scripting 补充通道（会话无关，共享）。
     bridge: KWinBridge,
     /// 事件推送去重器（组件级持有）：`EventDeduper` 判重状态从每连接的
@@ -66,6 +69,10 @@ pub struct KWinCompositor {
     /// `with_dedup` 复用本句柄，判重历史才不归零。
     #[allow(dead_code)]
     event_dedup: EventDeduperHandle,
+    /// KWin 原生 D-Bus 通道（`org.kde.KWin` `/KWin` + `/VirtualDesktopManager`，
+    /// 会话无关）。Wayland 会话在 `/Scripting` 未注册时窗口/工作区枚举改走
+    /// 本通道 + wl_registry stacking order（见 `list_windows` / `list_workspaces`）。
+    native: KWinNative,
     /// X11 基础通道（仅 X11 会话为 Some）。窗口枚举/聚焦/移动/工作区/事件
     /// 走 EWMH（`_NET_CLIENT_LIST`、`_NET_ACTIVE_WINDOW`、
     /// `_NET_MOVERESIZE_WINDOW`、`_NET_NUMBER_OF_DESKTOPS` 等）而非 Scripting
@@ -84,20 +91,41 @@ pub struct KWinCompositor {
     event_registration: std::sync::Mutex<Option<std::result::Result<(), String>>>,
     /// X11 会话的 EWMH 事件监视器（懒启动；订阅后事件线程常驻）。
     ewmh_monitor: AsyncMutex<Option<crate::event_ewmh::EwmhEventMonitor>>,
-    /// `/Scripting` 探测状态：0=未探测，1=失败（不缓存，
-    /// 允许重试），2=成功。原子而非锁——doctor_lines(&self) 同步读取。
+    /// Wayland 会话的原生事件监视器（懒启动；`/Scripting` 未注册时
+    /// `subscribe`/`subscribe_raw` 改走 org_kde_plasma_window_management
+    /// 协议事件）。
+    wayland_monitor: AsyncMutex<Option<crate::event_native::WaylandEventMonitor>>,
+    /// `/Scripting` 探测状态：0=未探测，1=瞬时失败，2=确证缺失，3=成功。
+    /// 原子而非锁——doctor_lines(&self) 同步读取。
     scripting_probe: std::sync::atomic::AtomicU8,
 }
 
 /// `scripting_probe` 状态值。
+///
+/// 确证缺失与瞬时不可达分开缓存：两种失败态都不短路重试（仅 `PROBE_OK`
+/// 短路）——KWin 重启/升级注册 `/Scripting` 后，长驻实例必须能自愈。
 const PROBE_UNSET: u8 = 0;
-const PROBE_FAIL: u8 = 1;
-const PROBE_OK: u8 = 2;
+const PROBE_FAIL_TRANSIENT: u8 = 1;
+const PROBE_FAIL_PERMANENT: u8 = 2;
+const PROBE_OK: u8 = 3;
+
+/// `/Scripting` 探测状态（缓存读端；见 [`Self::ensure_scripting_probe`]）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ScriptingProbe {
+    /// 尚未探测。
+    Unset,
+    /// 瞬时不可达（org.kde.KWin 不可达 / KWin 启动中），可自愈。
+    FailTransient,
+    /// 确证缺失（/Scripting 未注册 / 接口未广告），KWin 重启后可能自愈。
+    FailPermanent,
+    /// 已确认可用。
+    Ok,
+}
 
 impl KWinCompositor {
     /// org_kde_* 私有协议通道引用（含派发队列）。
     fn protocols(&self) -> Option<&KWinProtocols> {
-        self.protocols.as_ref()
+        self.protocols.as_ref().map(|p| p.as_ref())
     }
     /// WaylandCompositor 基类通道（§3.3：Wayland 系合成器共享的纯 core 层）。
     ///
@@ -118,6 +146,7 @@ impl KWinCompositor {
         let protocols = KWinProtocols::probe(&wl)?;
         let event_dedup = EventDeduper::new_shared();
         let bridge = KWinBridge::connect_with_dedup(Arc::clone(&event_dedup)).await?;
+        let native = KWinNative::new(bridge.connection().clone()).await?;
         let version = version::detect_version(bridge.connection())
             .await
             .unwrap_or_else(|_| KWinVersion {
@@ -126,14 +155,16 @@ impl KWinCompositor {
             });
         Ok(Self {
             wayland_core: Some(wl),
-            protocols: Some(protocols),
+            protocols: Some(Arc::new(protocols)),
             bridge,
             event_dedup,
+            native,
             x11: None,
             version,
             event_registration: std::sync::Mutex::new(None),
             event_handle: AsyncMutex::new(None),
             ewmh_monitor: AsyncMutex::new(None),
+            wayland_monitor: AsyncMutex::new(None),
             scripting_probe: std::sync::atomic::AtomicU8::new(PROBE_UNSET),
         })
     }
@@ -143,6 +174,7 @@ impl KWinCompositor {
         let x11 = X11DisplayServer::connect().map_err(|e| KWinError::Scripting(e.to_string()))?;
         let event_dedup = EventDeduper::new_shared();
         let bridge = KWinBridge::connect_with_dedup(Arc::clone(&event_dedup)).await?;
+        let native = KWinNative::new(bridge.connection().clone()).await?;
         let version = version::detect_version(bridge.connection())
             .await
             .unwrap_or_else(|_| KWinVersion {
@@ -154,11 +186,13 @@ impl KWinCompositor {
             protocols: None,
             bridge,
             event_dedup,
+            native,
             x11: Some(Arc::new(x11)),
             version,
             event_registration: std::sync::Mutex::new(None),
             event_handle: AsyncMutex::new(None),
             ewmh_monitor: AsyncMutex::new(None),
+            wayland_monitor: AsyncMutex::new(None),
             scripting_probe: std::sync::atomic::AtomicU8::new(PROBE_UNSET),
         })
     }
@@ -171,19 +205,28 @@ impl KWinCompositor {
     /// 最小实例（`Option<bool>` 表达三态），`#[cfg(test)]` 注入点对下游 crate
     /// 不可见；风险仅限误用构造器，不触及真实探测/构造路径。
     #[doc(hidden)]
-    pub fn for_test(bridge: KWinBridge, probe: Option<bool>) -> Self {
+    pub async fn for_test(bridge: KWinBridge, probe: Option<bool>) -> Self {
         use std::sync::atomic::AtomicU8;
         let event_dedup = bridge.dedup();
         let probe = match probe {
             Some(true) => PROBE_OK,
-            Some(false) => PROBE_FAIL,
+            // 注入的「最近失败」不区分瞬时/确证：两种失败态都允许重试，
+            // 行为等价，取瞬时态作为缺省最近失败形态。
+            Some(false) => PROBE_FAIL_TRANSIENT,
             None => PROBE_UNSET,
         };
+        // 测试注入点不触碰真实显示服务器；native 通道仅测试时可能不可达，
+        // 但必须可构造——用 bridge 的既有连接建 proxy（org.kde.KWin 不可达
+        // 时 lazy 报错，构造本身不失败）。
+        let native = KWinNative::new(bridge.connection().clone())
+            .await
+            .expect("KWinNative proxy on private bus must build");
         Self {
             wayland_core: None,
             protocols: None,
             bridge,
             event_dedup,
+            native,
             x11: None,
             version: KWinVersion {
                 full: "6.1.4".into(),
@@ -192,6 +235,7 @@ impl KWinCompositor {
             event_registration: std::sync::Mutex::new(None),
             event_handle: AsyncMutex::new(None),
             ewmh_monitor: AsyncMutex::new(None),
+            wayland_monitor: AsyncMutex::new(None),
             scripting_probe: AtomicU8::new(probe),
         }
     }
@@ -249,14 +293,24 @@ impl KWinCompositor {
             }
         ));
         // 桥接就绪以 /Scripting 探测为证据——不再无条件打 ✓。
-        lines.push(match self.scripting_probe_ok() {
-            Some(true) => "✓ D-Bus 桥接 : callDBus ready (14 templates, req-id routed; \
+        lines.push(match self.scripting_probe_state() {
+            ScriptingProbe::Ok => "✓ D-Bus 桥接 : callDBus ready (14 templates, req-id routed; \
                            /Scripting introspected)"
                 .to_string(),
-            Some(false) => "⚠ D-Bus 桥接 : /Scripting 未就绪（KWin 启动早期或不可达；\
-                            Scripting 调用将按需重试，Wayland 协议通道不受影响）"
+            // 确证缺失与瞬时不可达分开呈现：两种失败态都允许重试（自愈），
+            // 窗口/工作区枚举改走会话原生通道（Wayland: org.kde.KWin +
+            // wl_registry；X11: EWMH）。
+            ScriptingProbe::FailPermanent => {
+                "⚠ D-Bus 桥接 : /Scripting 未就绪（未注册/确证缺失）；\
+                            窗口/工作区走会话原生通道，Scripting 按需重试"
+                    .to_string()
+            }
+            ScriptingProbe::FailTransient => "⚠ D-Bus 桥接 : /Scripting 未就绪（不可达/瞬时）；\
+                            窗口/工作区走会话原生通道，Scripting 按需重试"
                 .to_string(),
-            None => "⚠ D-Bus 桥接 : 未探测（调用 ensure_scripting_probe 后更新）".to_string(),
+            ScriptingProbe::Unset => {
+                "⚠ D-Bus 桥接 : 未探测（调用 ensure_scripting_probe 后更新）".to_string()
+            }
         });
         if let Some(p) = &self.protocols {
             match &p.fake_input {
@@ -284,7 +338,20 @@ impl KWinCompositor {
             Some(Err(msg)) => {
                 format!("✗ 事件脚本    : signal registration failed: {msg}")
             }
-            None => "⚠ 事件脚本    : 未加载（懒启动，首次 events subscribe 时装配）".to_string(),
+            // 本组件未加载：若残留/外部实例曾发出注册标记（无等待者被记录），
+            // 据此区分「加载后零注册」与真正的「未加载」。
+            None => match self.bridge.late_registration() {
+                Some(RegistrationOutcome::Ready) => {
+                    "⚠ 事件脚本    : 检测到外部实例已注册（本组件未加载，疑似残留 event_monitor）"
+                        .to_string()
+                }
+                Some(RegistrationOutcome::Failed(msg)) => {
+                    format!("✗ 事件脚本    : 外部实例信号注册失败: {msg}")
+                }
+                None => {
+                    "⚠ 事件脚本    : 未加载（懒启动，首次 events subscribe 时装配）".to_string()
+                }
+            },
         });
         lines
     }
@@ -297,7 +364,7 @@ impl KWinCompositor {
     /// `/Scripting` 实际可达。同步版本 [`Self::doctor_lines`] 保留给
     /// 内部状态渲染；daemon doctor 走本方法补齐证据后渲染。
     pub async fn doctor_lines_async(&self) -> Vec<String> {
-        if self.scripting_probe_ok() != Some(true) {
+        if self.scripting_probe_state() != ScriptingProbe::Ok {
             let _ = self.ensure_scripting_probe().await;
         }
         self.doctor_lines()
@@ -306,30 +373,46 @@ impl KWinCompositor {
     /// 探测并缓存 `/Scripting` 可用性。
     ///
     /// doctor 与降级链的证据来源：成功后 `doctor_lines` 的桥接行升级为
-    /// 确认态；失败写入 PROBE_FAIL（doctor 显示「未就绪」而非「未探测」），
-    /// 但不阻止下次调用重试——KWin 启动早期未就绪属时序现象，可自愈。
+    /// 确认态；失败按形态写入 `PROBE_FAIL_TRANSIENT`（瞬时不可达）或
+    /// `PROBE_FAIL_PERMANENT`（确证缺失），doctor 区分呈现，但两种失败态
+    /// 都不阻止下次调用重试——KWin 启动早期未就绪与 KWin 重启注册
+    /// `/Scripting` 都属时序现象，可自愈。
     pub async fn ensure_scripting_probe(&self) -> Result<()> {
         use std::sync::atomic::Ordering;
+        // 仅 PROBE_OK 短路；UNSET 与两种失败态都重新探测——确证缺失也可能
+        // 随时间恢复（KWin 重启/升级注册 /Scripting），长驻实例不能缓存死。
         if self.scripting_probe.load(Ordering::Relaxed) == PROBE_OK {
             return Ok(());
         }
         let result = crate::dbus_bridge::probe_scripting(self.bridge.connection()).await;
-        self.scripting_probe.store(
-            if result.is_ok() { PROBE_OK } else { PROBE_FAIL },
-            Ordering::Relaxed,
-        );
+        let state = match &result {
+            Ok(()) => PROBE_OK,
+            Err(KWinError::ScriptingUnavailable(_)) => PROBE_FAIL_PERMANENT,
+            Err(_) => PROBE_FAIL_TRANSIENT,
+        };
+        // fetch_update 的 CAS 防 lost update：并发探测已把状态推进到 PROBE_OK
+        // 后，本探测的旧结果（可能失败）不得覆写确认态——仅当当前态仍非
+        // PROBE_OK 时才写回。
+        let _ = self
+            .scripting_probe
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+                if cur == PROBE_OK {
+                    None
+                } else {
+                    Some(state)
+                }
+            });
         result
     }
 
-    /// 探测状态读取端（doctor_lines 用）：Some(true)=已确认可用，
-    /// Some(false)=最近一次失败，None=尚未探测。
-    fn scripting_probe_ok(&self) -> Option<bool> {
+    /// 探测状态读取端（doctor_lines 用）。
+    fn scripting_probe_state(&self) -> ScriptingProbe {
         use std::sync::atomic::Ordering;
         match self.scripting_probe.load(Ordering::Relaxed) {
-            PROBE_OK => Some(true),
-            PROBE_FAIL => Some(false),
-            PROBE_UNSET => None,
-            _ => None,
+            PROBE_OK => ScriptingProbe::Ok,
+            PROBE_FAIL_TRANSIENT => ScriptingProbe::FailTransient,
+            PROBE_FAIL_PERMANENT => ScriptingProbe::FailPermanent,
+            _ => ScriptingProbe::Unset,
         }
     }
 
@@ -717,9 +800,12 @@ impl KWinCompositor {
         &self,
     ) -> agent_shell_core::error::Result<Box<dyn event::RawSource>> {
         // X11 会话走 EWMH 事件源（PropertyNotify 差分），不依赖 /Scripting；
-        // Wayland 会话走长驻事件脚本。
+        // Wayland 会话优先长驻事件脚本，/Scripting 未注册走原生协议事件。
         if let Some(x11) = self.x11.as_ref() {
             return self.subscribe_ewmh_raw(x11).await;
+        }
+        if self.ensure_scripting_probe().await.is_err() {
+            return self.subscribe_wayland_native_raw().await;
         }
         // 先确保事件脚本在跑（幂等，内部自带 /Scripting 重试探测），成功后再
         // 取一次性接收端——若先取流后启动脚本，脚本启动失败（5s 探测窗口内
@@ -780,6 +866,124 @@ impl KWinCompositor {
             )
         })?;
         Ok(Box::new(crate::event_ewmh::EwmhEventStream::new(rx)))
+    }
+
+    /// 懒启动 Wayland 原生事件监视器并取一次性接收端（`subscribe`/
+    /// `subscribe_raw` 共享）。`/Scripting` 未注册时的事件通道兜底：
+    /// window_mgmt 协议事件线程常驻，接收端仅其一可取走。
+    async fn wayland_take_rx(
+        &self,
+    ) -> agent_shell_core::error::Result<
+        Option<tokio::sync::mpsc::UnboundedReceiver<event::RawEvent>>,
+    > {
+        let wl = self.wayland_core.as_ref().ok_or_else(|| {
+            AgentShellError::BackendUnavailable("no wayland display (X11 session)".to_string())
+        })?;
+        let mut slot = self.wayland_monitor.lock().await;
+        if slot.is_none() {
+            *slot = Some(crate::event_native::spawn_wayland_monitor(
+                wl.connection(),
+                wl.globals(),
+            )?);
+        }
+        Ok(slot.as_mut().and_then(|m| m.take_rx()))
+    }
+
+    /// Wayland 会话原始事件源（原生协议事件）：懒启动监视器，取一次性接收端。
+    async fn subscribe_wayland_native_raw(
+        &self,
+    ) -> agent_shell_core::error::Result<Box<dyn event::RawSource>> {
+        let rx = self.wayland_take_rx().await?.ok_or_else(|| {
+            AgentShellError::BackendUnavailable(
+                "kwin native event stream already subscribed".to_string(),
+            )
+        })?;
+        Ok(Box::new(crate::event_native::WaylandRawSource::new(rx)))
+    }
+
+    /// Wayland 会话近似事件流（原生协议事件）：懒启动监视器，取一次性接收端。
+    async fn subscribe_wayland_native(
+        &self,
+    ) -> agent_shell_core::error::Result<Box<dyn EventStream>> {
+        let rx = self.wayland_take_rx().await?.ok_or_else(|| {
+            AgentShellError::BackendUnavailable(
+                "kwin native event stream already subscribed".to_string(),
+            )
+        })?;
+        Ok(Box::new(crate::event_native::WaylandEventStream::new(rx)))
+    }
+
+    /// Scripting `list_windows.js`：一次 callDBus 批量取全量详情。
+    async fn list_windows_scripting(&self) -> agent_shell_core::error::Result<Vec<WindowInfo>> {
+        let v = self.query(ScriptTemplate::ListWindows, &[]).await?;
+        let arr = v.as_array().cloned().unwrap_or_default();
+        Ok(arr
+            .iter()
+            .enumerate()
+            .filter_map(|(i, w)| Self::parse_window(w, i as u32))
+            .collect())
+    }
+
+    /// 原生通道窗口列表：wl_registry stacking order 枚举 uuid → `getWindowInfo`
+    /// 逐窗回读（stacking order 从底到顶，索引越大越靠上，与 Scripting 口径一致）。
+    async fn list_windows_native(&self) -> agent_shell_core::error::Result<Vec<WindowInfo>> {
+        let protocols = self.protocols.clone().ok_or_else(|| {
+            AgentShellError::BackendUnavailable(
+                "no wayland protocol channel (X11 session uses EWMH)".to_string(),
+            )
+        })?;
+        // stacking order 的 roundtrip 是同步阻塞调用——经 spawn_blocking 移出
+        // tokio worker（§19 审查项：同步段不得占执行器线程）。
+        let uuids = tokio::task::spawn_blocking(move || protocols.stacking_order_uuids())
+            .await
+            .map_err(|e| {
+                AgentShellError::Other(
+                    format!("kwin stacking order blocking task join: {e}").into(),
+                )
+            })??;
+        let uuids = uuids.ok_or_else(|| {
+            AgentShellError::BackendUnavailable(
+                "window_mgmt unbound or no stacking order snapshot (no enumeration)".to_string(),
+            )
+        })?;
+        let mut windows = Vec::with_capacity(uuids.len());
+        for (i, uuid) in uuids.iter().enumerate() {
+            let map = self.native.window_info(uuid).await?;
+            if let Some(w) = crate::native::parse_window(&map, i as u32) {
+                windows.push(w);
+            }
+        }
+        Ok(windows)
+    }
+
+    /// Scripting `list_workspaces.js`：一次 callDBus 批量取全量工作区。
+    async fn list_workspaces_scripting(
+        &self,
+    ) -> agent_shell_core::error::Result<Vec<WorkspaceInfo>> {
+        let v = self.query(ScriptTemplate::ListWorkspaces, &[]).await?;
+        let arr = v.as_array().cloned().unwrap_or_default();
+        Ok(arr
+            .iter()
+            .map(|d| WorkspaceInfo {
+                id: WorkspaceId {
+                    native_id: d
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                    de_type: DesktopEnvironment::KDE,
+                },
+                name: d
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                number: d.get("number").and_then(Value::as_u64).unwrap_or(0) as u32,
+                is_active: d.get("isActive").and_then(Value::as_bool).unwrap_or(false),
+                monitor_ids: Vec::new(),
+                window_ids: Vec::new(),
+            })
+            .collect())
     }
 }
 
@@ -879,26 +1083,29 @@ impl CompositorComponent for KWinCompositor {
         &["window_events", "workspace_events"]
     }
 
-    /// 窗口列表：X11 会话走 EWMH（`_NET_CLIENT_LIST_STACKING`），Wayland
-    /// 会话走 list_windows.js（一次 callDBus 批量取全量详情）。
+    /// 窗口列表：X11 会话走 EWMH（`_NET_CLIENT_LIST_STACKING`）；Wayland 会话
+    /// 优先 Scripting `list_windows.js`，`/Scripting` 未注册（KWin 5.x Wayland
+    /// 实测）时降级原生通道——`org_kde_plasma_window_management` 的
+    /// `get_stacking_order`（wl_registry 枚举 uuid）→ `org.kde.KWin`
+    /// `getWindowInfo(uuid)` 逐窗回读详情。
     ///
     /// X11 分支优先于 Scripting——部分 KWin 5.x X11 会话不注册 `/Scripting`
     /// 且 EWMH 无需事件聚合即可给出完整 `WindowInfo`。
-    /// Wayland 下协议 stacking-order 仅提供 uuid 列表，逐窗 get_window_by_uuid
-    /// 仍需事件聚合才能取属性（本层 inert 不消费事件）——T3b 前纯协议路径
-    /// 无法给出 WindowInfo，故仍走 Scripting。window_mgmt 短绑状态只影响
-    /// focus/minimize/close 走协议还是 Scripting。
     async fn list_windows(&self) -> agent_shell_core::error::Result<Vec<WindowInfo>> {
         if let Some(x11) = self.x11.as_ref() {
             return self.x11_list_windows(x11);
         }
-        let v = self.query(ScriptTemplate::ListWindows, &[]).await?;
-        let arr = v.as_array().cloned().unwrap_or_default();
-        Ok(arr
-            .iter()
-            .enumerate()
-            .filter_map(|(i, w)| Self::parse_window(w, i as u32))
-            .collect())
+        // Wayland：先探测 /Scripting。确证缺失（/Scripting 未注册）时原生通道
+        // 是唯一枚举路径，不再回退 Scripting（同样缺省）；瞬时不可达时原生优先、
+        // 失败回退 Scripting——启动早期 /Scripting 未注册属时序现象，可自愈。
+        match self.ensure_scripting_probe().await {
+            Ok(()) => return self.list_windows_scripting().await,
+            Err(KWinError::ScriptingUnavailable(_)) => self.list_windows_native().await,
+            Err(_) => match self.list_windows_native().await {
+                Ok(windows) => Ok(windows),
+                Err(_) => self.list_windows_scripting().await,
+            },
+        }
     }
 
     /// 当前活动窗口（可能为空——桌面无焦点）。X11 会话走 `_NET_ACTIVE_WINDOW`，
@@ -950,6 +1157,21 @@ impl CompositorComponent for KWinCompositor {
                 return Ok(());
             }
         }
+        // window_mgmt 未短绑时回退 Scripting。Scripting 确证缺失且无
+        // window_mgmt → 无聚焦通道，报 NotImplemented（同 move_window）；
+        // 瞬时不可达传播原始 probe 错误（保留重试提示）。
+        match self.ensure_scripting_probe().await {
+            Ok(()) => {}
+            Err(KWinError::ScriptingUnavailable(_)) => {
+                return Err(AgentShellError::NotImplemented(
+                    "kwin wayland without /Scripting and without window_mgmt has no native \
+                     focus_window; window focus requires KWin Scripting or \
+                     org_kde_plasma_window_management"
+                        .to_string(),
+                ));
+            }
+            Err(e) => return Err(e.into()),
+        }
         let v = self
             .query(ScriptTemplate::FocusWindow, &[("ID", json!(id.native_id))])
             .await?;
@@ -957,7 +1179,9 @@ impl CompositorComponent for KWinCompositor {
     }
 
     /// 移动：X11 会话走 EWMH `_NET_MOVERESIZE_WINDOW`（只设位置，尺寸字段
-    /// 标志位为 0）；Wayland 会话协议无 set_geometry（§7.2），始终 Scripting。
+    /// 标志位为 0）；Wayland 会话协议无 set_geometry（§7.2），始终 Scripting——
+    /// `/Scripting` 确证缺失（UnknownObject / 接口未广告）时报明确
+    /// NotImplemented，瞬时不可达传播原始 probe 错误（保留重试提示）。
     async fn move_window(
         &self,
         id: &WindowId,
@@ -967,6 +1191,20 @@ impl CompositorComponent for KWinCompositor {
         if let Some(x11) = self.x11.as_ref() {
             let window = Self::x11_window_id(id)?;
             return x11.move_resize_window(window, Some(x), Some(y), None, None);
+        }
+        // Wayland：协议无 set_geometry（§7.2）。probe 失败分两类——/Scripting
+        // 确证缺失才是能力缺失（NotImplemented）；瞬时不可达（KWin 启动中）
+        // 属时序现象，传播原始错误并保留重试提示，不误报能力缺失。
+        match self.ensure_scripting_probe().await {
+            Ok(()) => {}
+            Err(KWinError::ScriptingUnavailable(_)) => {
+                return Err(AgentShellError::NotImplemented(
+                    "kwin wayland without /Scripting has no native move_window; \
+                     absolute window move requires KWin Scripting"
+                        .to_string(),
+                ));
+            }
+            Err(e) => return Err(e.into()),
         }
         let v = self
             .query(
@@ -981,13 +1219,26 @@ impl CompositorComponent for KWinCompositor {
         Self::check_op(&v).map_err(KWinError::into)
     }
 
-    /// 缩放：同 move_window，始终 Scripting。
+    /// 缩放：协议无 set_geometry（§7.2），始终 Scripting——`/Scripting`
+    /// 确证缺失时报 NotImplemented（同 move_window），瞬时不可达传播原始
+    /// probe 错误（保留重试提示）。
     async fn resize_window(
         &self,
         id: &WindowId,
         w: i32,
         h: i32,
     ) -> agent_shell_core::error::Result<()> {
+        match self.ensure_scripting_probe().await {
+            Ok(()) => {}
+            Err(KWinError::ScriptingUnavailable(_)) => {
+                return Err(AgentShellError::NotImplemented(
+                    "kwin without /Scripting has no native resize_window; \
+                     window resize requires KWin Scripting"
+                        .to_string(),
+                ));
+            }
+            Err(e) => return Err(e.into()),
+        }
         let v = self
             .query(
                 ScriptTemplate::ResizeWindow,
@@ -1097,41 +1348,38 @@ impl CompositorComponent for KWinCompositor {
     }
 
     /// 工作区列表：X11 会话走 EWMH（`_NET_NUMBER_OF_DESKTOPS` +
-    /// `_NET_DESKTOP_NAMES` + `_NET_CURRENT_DESKTOP`），Wayland 会话走
-    /// list_workspaces.js。
+    /// `_NET_DESKTOP_NAMES` + `_NET_CURRENT_DESKTOP`）；Wayland 会话优先
+    /// list_workspaces.js，`/Scripting` 未注册时走 `org.kde.KWin.VirtualDesktopManager`
+    /// 的 `desktops` + `current` 属性。
     async fn list_workspaces(&self) -> agent_shell_core::error::Result<Vec<WorkspaceInfo>> {
         if let Some(x11) = self.x11.as_ref() {
             return Self::x11_list_workspaces(x11);
         }
-        let v = self.query(ScriptTemplate::ListWorkspaces, &[]).await?;
-        let arr = v.as_array().cloned().unwrap_or_default();
-        Ok(arr
-            .iter()
-            .map(|d| WorkspaceInfo {
-                id: WorkspaceId {
-                    native_id: d
-                        .get("id")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .to_string(),
-                    de_type: DesktopEnvironment::KDE,
-                },
-                name: d
-                    .get("name")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string(),
-                number: d.get("number").and_then(Value::as_u64).unwrap_or(0) as u32,
-                is_active: d.get("isActive").and_then(Value::as_bool).unwrap_or(false),
-                monitor_ids: Vec::new(),
-                window_ids: Vec::new(),
-            })
-            .collect())
+        // Wayland：Scripting 可用走 Scripting；确证缺失走 VirtualDesktopManager
+        // （唯一路径，不再回退 Scripting）；瞬时不可达走 VirtualDesktopManager
+        // 优先、失败回退 Scripting——启动早期属时序现象，可自愈。
+        match self.ensure_scripting_probe().await {
+            Ok(()) => return self.list_workspaces_scripting().await,
+            Err(KWinError::ScriptingUnavailable(_)) => {
+                self.native.workspaces().await.map_err(KWinError::into)
+            }
+            Err(_) => match self.native.workspaces().await {
+                Ok(ws) => Ok(ws),
+                Err(_) => self.list_workspaces_scripting().await,
+            },
+        }
     }
 
-    /// 激活工作区：switch_workspace.js（协议 vd_mgmt 的 request_activate 需要
-    /// 先有桌面对象缓存，T3b 事件任务补全后切换为协议优先）。
+    /// 激活工作区：switch_workspace.js 优先；`/Scripting` 未注册（Wayland）时
+    /// 走 `VirtualDesktopManager.current` 属性（写桌面 id）。
     async fn activate_workspace(&self, id: &WorkspaceId) -> agent_shell_core::error::Result<()> {
+        if self.x11.is_none() && self.ensure_scripting_probe().await.is_err() {
+            return self
+                .native
+                .set_current_desktop(&id.native_id)
+                .await
+                .map_err(KWinError::into);
+        }
         let v = self
             .query(
                 ScriptTemplate::SwitchWorkspace,
@@ -1201,9 +1449,12 @@ impl CompositorComponent for KWinCompositor {
     /// 直接消费近似流的调用方（如 DDE deepin-kwin 委托）。
     async fn subscribe(&self) -> agent_shell_core::error::Result<Box<dyn EventStream>> {
         // X11 会话走 EWMH 近似映射流（`EwmhEventStream`），不依赖 /Scripting；
-        // Wayland 会话走长驻事件脚本。
+        // Wayland 会话优先长驻事件脚本，/Scripting 未注册走原生协议事件。
         if let Some(x11) = self.x11.as_ref() {
             return self.subscribe_ewmh(x11).await;
+        }
+        if self.ensure_scripting_probe().await.is_err() {
+            return self.subscribe_wayland_native().await;
         }
         // 与 `subscribe_raw` 同款顺序：先确保事件脚本在跑，成功后再取一次性
         // 接收端，避免脚本启动失败时接收端随栈销毁、事件队列永久丢失。
@@ -1259,7 +1510,10 @@ mod tests {
 
     impl Drop for TestBus {
         fn drop(&mut self) {
-            let _ = self._child.kill();
+            // `kill()` 发 SIGKILL，跳过 dbus-daemon 正常退出路径，其 /tmp/dbus-*
+            // socket 不 unlink、累积 stale 文件；SIGTERM 让其自行清理。
+            // SAFETY: `_child.id()` 是存活的子进程 PID，发 SIGTERM 无内存安全风险。
+            unsafe { libc::kill(self._child.id() as i32, libc::SIGTERM) };
             let _ = self._child.wait();
         }
     }
@@ -1309,6 +1563,19 @@ mod tests {
             .at("/Scripting", KWinScripting::new())
             .await
             .expect("register /Scripting");
+        use zbus::names::WellKnownName;
+        let name = WellKnownName::try_from("org.kde.KWin".to_string()).expect("valid bus name");
+        conn.request_name(name).await.expect("claim org.kde.KWin");
+        conn
+    }
+
+    /// 注册 org.kde.KWin 服务但不注册 `/Scripting` 对象——introspect 返回
+    /// UnknownObject，模拟 deepin-kwin 5.x 禁用 scripting 的「确证缺失」形态。
+    async fn spawn_kwin_without_scripting(bus: &TestBus) -> zbus::Connection {
+        let conn = bus.connect().await;
+        // 强制创建 ObjectServer（空根节点）：zbus 惰性创建，不触发则未注册
+        // 路径无分发任务，调用方 introspect 会永久挂起而非收到 UnknownObject。
+        let _ = conn.object_server();
         use zbus::names::WellKnownName;
         let name = WellKnownName::try_from("org.kde.KWin".to_string()).expect("valid bus name");
         conn.request_name(name).await.expect("claim org.kde.KWin");
@@ -1512,7 +1779,7 @@ mod tests {
     #[tokio::test]
     async fn lazy_capabilities_lists_event_streams() {
         let bus = TestBus::start().await;
-        let comp = KWinCompositor::for_test(bridge(&bus).await, None);
+        let comp = KWinCompositor::for_test(bridge(&bus).await, None).await;
         assert_eq!(
             comp.lazy_capabilities(),
             &["window_events", "workspace_events"]
@@ -1530,71 +1797,319 @@ mod tests {
         let bridge = KWinBridge::with_dedup(conn, Arc::clone(&dedup))
             .await
             .expect("build KWinBridge with shared dedup");
-        let comp = KWinCompositor::for_test(bridge, None);
+        let comp = KWinCompositor::for_test(bridge, None).await;
         assert!(
             Arc::ptr_eq(&comp.event_dedup, &dedup),
             "compositor must share the injected dedup handle"
         );
     }
 
-    /// 三态迁移：`None`（PROBE_UNSET）触发探测 → 成功升级为 Some(true)。
+    /// 探测状态迁移：`None`（PROBE_UNSET）触发探测 → 成功升级为 Ok。
     #[tokio::test]
     async fn unset_probe_triggers_probe_and_becomes_ok() {
         let bus = TestBus::start().await;
         let _kwin = spawn_fake_kwin(&bus).await;
-        let comp = KWinCompositor::for_test(bridge(&bus).await, None);
+        let comp = KWinCompositor::for_test(bridge(&bus).await, None).await;
 
-        assert_eq!(comp.scripting_probe_ok(), None);
+        assert_eq!(comp.scripting_probe_state(), ScriptingProbe::Unset);
         let lines = comp.doctor_lines_async().await;
 
-        assert_eq!(comp.scripting_probe_ok(), Some(true));
+        assert_eq!(comp.scripting_probe_state(), ScriptingProbe::Ok);
         assert!(has_ready_bridge(&lines));
     }
 
-    /// `Some(false)`（PROBE_FAIL）必须重试，不能把
-    /// 一次性失败固化为永不重试的假阴性。
+    /// `Some(false)`（最近失败）必须重试，不能把一次性失败固化为
+    /// 永不重试的假阴性。
     #[tokio::test]
     async fn failed_probe_is_retried_and_becomes_ok() {
         let bus = TestBus::start().await;
         // 先建桥（无 org.kde.KWin 服务），在桥接上探测一次失败。
-        let comp = KWinCompositor::for_test(bridge(&bus).await, None);
+        let comp = KWinCompositor::for_test(bridge(&bus).await, None).await;
         let _ = comp.ensure_scripting_probe().await;
-        assert_eq!(comp.scripting_probe_ok(), Some(false));
+        assert_eq!(comp.scripting_probe_state(), ScriptingProbe::FailTransient);
 
         // 服务事后可达——旧失败必须被重试，升级为确认态。
         let _kwin = spawn_fake_kwin(&bus).await;
         let lines = comp.doctor_lines_async().await;
 
-        assert_eq!(comp.scripting_probe_ok(), Some(true));
+        assert_eq!(comp.scripting_probe_state(), ScriptingProbe::Ok);
         assert!(has_ready_bridge(&lines));
     }
 
-    /// 三态迁移：`Some(true)`（PROBE_OK）短路，不再发探测。
+    /// 探测状态迁移：`Some(true)`（PROBE_OK）短路，不再发探测。
     #[tokio::test]
     async fn ok_probe_short_circuits_without_probing() {
         let bus = TestBus::start().await;
         // 不注册 org.kde.KWin：若短路失败，doctor_lines_async 会重测并
-        // 把 PROBE_OK 覆写为 PROBE_FAIL。
-        let comp = KWinCompositor::for_test(bridge(&bus).await, Some(true));
+        // 把 PROBE_OK 覆写为失败态。
+        let comp = KWinCompositor::for_test(bridge(&bus).await, Some(true)).await;
 
         let lines = comp.doctor_lines_async().await;
 
-        assert_eq!(comp.scripting_probe_ok(), Some(true));
+        assert_eq!(comp.scripting_probe_state(), ScriptingProbe::Ok);
         assert!(has_ready_bridge(&lines));
     }
 
-    /// 三态迁移：`Some(false)` 服务仍不可达 → 保持 PROBE_FAIL，桥接行
+    /// 探测状态迁移：`Some(false)` 服务仍不可达 → 保持瞬时失败态，桥接行
     /// 报「未就绪」而非「未探测」。
     #[tokio::test]
     async fn failed_probe_remains_failed_when_still_unreachable() {
         let bus = TestBus::start().await;
-        let comp = KWinCompositor::for_test(bridge(&bus).await, Some(false));
+        let comp = KWinCompositor::for_test(bridge(&bus).await, Some(false)).await;
 
         let lines = comp.doctor_lines_async().await;
 
-        assert_eq!(comp.scripting_probe_ok(), Some(false));
+        assert_eq!(comp.scripting_probe_state(), ScriptingProbe::FailTransient);
         assert!(has_not_ready_bridge(&lines));
         assert!(!has_ready_bridge(&lines));
+    }
+
+    /// `/Scripting` 确证缺失（服务在、对象未注册 → UnknownObject）后，同一
+    /// 长驻实例期间 KWin 注册 `/Scripting`（重启/加载 scripting 模块），探测
+    /// 必须重试自愈——不能把确证缺失缓存为永久死态。
+    #[tokio::test]
+    async fn permanent_probe_failure_self_heals_when_scripting_registers() {
+        let bus = TestBus::start().await;
+        let comp = KWinCompositor::for_test(bridge(&bus).await, None).await;
+        let kwin = spawn_kwin_without_scripting(&bus).await;
+
+        // 第一阶段：确证缺失（服务在、/Scripting 未注册）。
+        let _ = comp.ensure_scripting_probe().await;
+        assert_eq!(comp.scripting_probe_state(), ScriptingProbe::FailPermanent);
+
+        // KWin 随后注册 /Scripting（同一连接，模拟重启/加载 scripting 模块）。
+        kwin.object_server()
+            .at("/Scripting", KWinScripting::new())
+            .await
+            .expect("register /Scripting");
+
+        // 旧「确证缺失」必须被重试，升级为确认态——长驻实例自愈。
+        let _ = comp.ensure_scripting_probe().await;
+        assert_eq!(comp.scripting_probe_state(), ScriptingProbe::Ok);
+    }
+
+    /// move_window 在 Wayland 且 `/Scripting` 确证缺失（服务可达、对象未注册）
+    /// 时报 NotImplemented，消息含关键诊断；瞬时不可达则传播原始错误。
+    #[tokio::test]
+    async fn move_window_without_scripting_reports_not_implemented() {
+        let bus = TestBus::start().await;
+        // 服务在、/Scripting 不在 → introspect 返回 UnknownObject → 能力缺失。
+        let _kwin = spawn_kwin_without_scripting(&bus).await;
+        let comp = KWinCompositor::for_test(bridge(&bus).await, Some(false)).await;
+        let id = WindowId {
+            native_id: "some-uuid".to_string(),
+            de_type: DesktopEnvironment::KDE,
+        };
+
+        let err = comp
+            .move_window(&id, 100, 100)
+            .await
+            .expect_err("move without /Scripting must fail");
+
+        assert!(
+            matches!(err, AgentShellError::NotImplemented(_)),
+            "expected NotImplemented, got {err:?}"
+        );
+        // 诊断价值全在消息：RPC 边界折叠为 1005 + message，钉住关键语义。
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Scripting"),
+            "message must name Scripting: {msg}"
+        );
+        assert!(msg.contains("wayland"), "message must name wayland: {msg}");
+    }
+
+    /// move_window 在 probe 瞬时不可达（org.kde.KWin 未启动）时传播原始错误
+    /// （含重试提示），不误报 NotImplemented 能力缺失——与 ensure_scripting_probe
+    /// 的可自愈契约一致。
+    #[tokio::test]
+    async fn move_window_transient_probe_failure_propagates_retry_hint() {
+        let bus = TestBus::start().await;
+        // 不注册 org.kde.KWin → introspect 返回 ServiceUnknown → 瞬时不可达。
+        let comp = KWinCompositor::for_test(bridge(&bus).await, Some(false)).await;
+        let id = WindowId {
+            native_id: "some-uuid".to_string(),
+            de_type: DesktopEnvironment::KDE,
+        };
+
+        let err = comp
+            .move_window(&id, 100, 100)
+            .await
+            .expect_err("move with unreachable KWin must fail");
+
+        assert!(
+            !matches!(err, AgentShellError::NotImplemented(_)),
+            "transient failure must not be NotImplemented, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("retry"),
+            "transient failure must preserve retry hint: {err}"
+        );
+    }
+
+    /// resize_window 与 move_window 同属「协议无 set_geometry，始终 Scripting」：
+    /// `/Scripting` 确证缺失时报 NotImplemented；瞬时不可达传播原始错误
+    /// （含重试提示），不误报能力缺失。
+    #[tokio::test]
+    async fn resize_window_without_scripting_reports_not_implemented() {
+        let bus = TestBus::start().await;
+        let _kwin = spawn_kwin_without_scripting(&bus).await;
+        let comp = KWinCompositor::for_test(bridge(&bus).await, Some(false)).await;
+        let id = WindowId {
+            native_id: "some-uuid".to_string(),
+            de_type: DesktopEnvironment::KDE,
+        };
+
+        let err = comp
+            .resize_window(&id, 200, 200)
+            .await
+            .expect_err("resize without /Scripting must fail");
+
+        assert!(
+            matches!(err, AgentShellError::NotImplemented(_)),
+            "expected NotImplemented, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("Scripting"),
+            "message must name Scripting: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn resize_window_transient_probe_failure_propagates_retry_hint() {
+        let bus = TestBus::start().await;
+        // 不注册 org.kde.KWin → introspect 返回 ServiceUnknown → 瞬时不可达。
+        let comp = KWinCompositor::for_test(bridge(&bus).await, Some(false)).await;
+        let id = WindowId {
+            native_id: "some-uuid".to_string(),
+            de_type: DesktopEnvironment::KDE,
+        };
+
+        let err = comp
+            .resize_window(&id, 200, 200)
+            .await
+            .expect_err("resize with unreachable KWin must fail");
+
+        assert!(
+            !matches!(err, AgentShellError::NotImplemented(_)),
+            "transient failure must not be NotImplemented, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("retry"),
+            "transient failure must preserve retry hint: {err}"
+        );
+    }
+
+    /// focus_window 在 window_mgmt 未短绑（for_test 无协议通道）且 /Scripting
+    /// 确证缺失时无聚焦通道，报 NotImplemented。
+    #[tokio::test]
+    async fn focus_window_without_scripting_reports_not_implemented() {
+        let bus = TestBus::start().await;
+        let _kwin = spawn_kwin_without_scripting(&bus).await;
+        let comp = KWinCompositor::for_test(bridge(&bus).await, Some(false)).await;
+        let id = WindowId {
+            native_id: "some-uuid".to_string(),
+            de_type: DesktopEnvironment::KDE,
+        };
+
+        let err = comp
+            .focus_window(&id)
+            .await
+            .expect_err("focus without /Scripting and window_mgmt must fail");
+
+        assert!(
+            matches!(err, AgentShellError::NotImplemented(_)),
+            "expected NotImplemented, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("Scripting"),
+            "message must name Scripting: {err}"
+        );
+    }
+
+    /// list_windows 在 /Scripting 确证缺失时走「原生通道唯一路径」：不重试
+    /// Scripting（错误来自原生通道的 protocol 缺失，而非 loadScript）。
+    #[tokio::test]
+    async fn list_windows_permanent_missing_uses_native_only() {
+        let bus = TestBus::start().await;
+        let _kwin = spawn_kwin_without_scripting(&bus).await;
+        let comp = KWinCompositor::for_test(bridge(&bus).await, None).await;
+
+        let err = comp
+            .list_windows()
+            .await
+            .expect_err("native channel absent must fail");
+
+        assert!(
+            matches!(err, AgentShellError::BackendUnavailable(_)),
+            "permanent missing must take native-only path, got {err:?}"
+        );
+        assert!(
+            !err.to_string().contains("loadScript"),
+            "permanent missing must not retry scripting: {err}"
+        );
+    }
+
+    /// list_windows 在 probe 瞬时不可达时原生优先、失败回退 Scripting：
+    /// 最终错误来自 Scripting（loadScript），而非原生通道短路。
+    #[tokio::test]
+    async fn list_windows_transient_unreachable_retries_scripting() {
+        let bus = TestBus::start().await;
+        // 不注册 org.kde.KWin → 瞬时不可达。
+        let comp = KWinCompositor::for_test(bridge(&bus).await, None).await;
+
+        let err = comp
+            .list_windows()
+            .await
+            .expect_err("unreachable KWin must fail");
+
+        assert!(
+            err.to_string().contains("loadScript"),
+            "transient must retry scripting (loadScript): {err}"
+        );
+    }
+
+    /// list_workspaces 在 /Scripting 确证缺失时走「VirtualDesktopManager 唯一
+    /// 路径」：不重试 Scripting（错误来自原生 VirtualDesktopManager，而非
+    /// loadScript）。
+    #[tokio::test]
+    async fn list_workspaces_permanent_missing_uses_native_only() {
+        let bus = TestBus::start().await;
+        let _kwin = spawn_kwin_without_scripting(&bus).await;
+        let comp = KWinCompositor::for_test(bridge(&bus).await, None).await;
+
+        let err = comp
+            .list_workspaces()
+            .await
+            .expect_err("native channel absent must fail");
+
+        assert!(
+            err.to_string().contains("VirtualDesktopManager"),
+            "permanent missing must take native-only path, got {err}"
+        );
+        assert!(
+            !err.to_string().contains("loadScript"),
+            "permanent missing must not retry scripting: {err}"
+        );
+    }
+
+    /// list_workspaces 在 probe 瞬时不可达时原生优先、失败回退 Scripting：
+    /// 最终错误来自 Scripting（loadScript），而非原生通道短路。
+    #[tokio::test]
+    async fn list_workspaces_transient_unreachable_retries_scripting() {
+        let bus = TestBus::start().await;
+        // 不注册 org.kde.KWin → 瞬时不可达。
+        let comp = KWinCompositor::for_test(bridge(&bus).await, None).await;
+
+        let err = comp
+            .list_workspaces()
+            .await
+            .expect_err("unreachable KWin must fail");
+
+        assert!(
+            err.to_string().contains("loadScript"),
+            "transient must retry scripting (loadScript): {err}"
+        );
     }
 
     /// doctor 事件脚本行如实标注为「未加载（懒启动）」，不再以「T3b 待办」
@@ -1602,7 +2117,7 @@ mod tests {
     #[tokio::test]
     async fn doctor_event_script_line_marks_unloaded() {
         let bus = TestBus::start().await;
-        let comp = KWinCompositor::for_test(bridge(&bus).await, None);
+        let comp = KWinCompositor::for_test(bridge(&bus).await, None).await;
         let lines = comp.doctor_lines();
         assert!(
             lines
@@ -1613,6 +2128,65 @@ mod tests {
         assert!(
             !lines.iter().any(|l| l.contains("T3b")),
             "event script line must not mention T3b: {lines:#?}"
+        );
+    }
+
+    /// 无等待者记录的 `__ready__`（残留/外部实例）须让 doctor 区分
+    /// 「加载后零注册」与「未加载」——本组件未加载但已检测到外部注册。
+    #[tokio::test]
+    async fn doctor_event_script_line_reports_external_instance() {
+        let bus = TestBus::start().await;
+        let b = bridge(&bus).await;
+        b.record_late_registration(RegistrationOutcome::Ready);
+        let comp = KWinCompositor::for_test(b, None).await;
+        let lines = comp.doctor_lines();
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("⚠ 事件脚本") && l.contains("外部实例已注册")),
+            "doctor must report external instance registration: {lines:#?}"
+        );
+    }
+
+    /// 无等待者记录的 `__error__` 须在 doctor 呈现失败诊断，而非静默丢弃
+    /// 后显示「未加载」。
+    #[tokio::test]
+    async fn doctor_event_script_line_reports_external_failure() {
+        let bus = TestBus::start().await;
+        let b = bridge(&bus).await;
+        b.record_late_registration(RegistrationOutcome::Failed("boom".to_string()));
+        let comp = KWinCompositor::for_test(b, None).await;
+        let lines = comp.doctor_lines();
+        assert!(
+            lines.iter().any(|l| {
+                l.contains("✗ 事件脚本") && l.contains("外部实例信号注册失败: boom")
+            }),
+            "doctor must report external instance failure: {lines:#?}"
+        );
+    }
+
+    /// 新探测（prepare_registration）开始须清除滞留的「外部实例」标记，
+    /// doctor 恢复到「未加载」——残留实例停止/新一轮注册后不再永久误报。
+    #[tokio::test]
+    async fn doctor_event_script_line_restores_unloaded_after_new_probe() {
+        let bus = TestBus::start().await;
+        let b = bridge(&bus).await;
+        b.record_late_registration(RegistrationOutcome::Ready);
+        let comp = KWinCompositor::for_test(b, None).await;
+        assert!(
+            comp.doctor_lines()
+                .iter()
+                .any(|l| l.contains("外部实例已注册")),
+            "external instance must be reported before a new probe"
+        );
+
+        drop(comp.bridge.prepare_registration().await);
+        let lines = comp.doctor_lines();
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("⚠ 事件脚本") && l.contains("未加载")),
+            "doctor must restore unloaded after a new probe: {lines:#?}"
         );
     }
 }

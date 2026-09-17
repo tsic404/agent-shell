@@ -26,6 +26,11 @@ pub enum KWinError {
     #[error("KWin scripting error: {0}")]
     Scripting(String),
 
+    /// KWin Scripting 通道缺失（`/Scripting` 未注册 / 接口未广告）——能力缺失，
+    /// 非瞬时不可达；调用方据此报 NotImplemented 而非重试。
+    #[error("KWin scripting unavailable: {0}")]
+    ScriptingUnavailable(String),
+
     /// Scripting 脚本执行后未在时限内收到 callDBus 回传。
     #[error("KWin script response timeout after {timeout_secs}s: {script}")]
     ResponseTimeout {
@@ -57,6 +62,9 @@ impl From<KWinError> for AgentShellError {
                 AgentShellError::Permission("kwin fake_input not authenticated".into())
             }
             KWinError::Scripting(msg) => AgentShellError::DBus(format!("kwin scripting: {msg}")),
+            KWinError::ScriptingUnavailable(msg) => {
+                AgentShellError::BackendUnavailable(format!("kwin scripting unavailable: {msg}"))
+            }
             KWinError::ResponseTimeout {
                 script,
                 timeout_secs,

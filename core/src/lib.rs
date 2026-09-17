@@ -31,9 +31,9 @@ pub use event::{
 pub use registry::{BackendKind, ComponentRegistry};
 pub use services::{
     AccessibilityChange, AppInfo, AppTarget, AudioDevice, AudioDeviceType, AudioState,
-    BatteryState, BtDevice, ColorScheme, Connectivity, MonitorConfig, MonitorTransform,
-    NetworkState, NotificationSpec, NotificationUrgency, PowerState, SystemdTimer, SystemdUnit,
-    WifiNetwork,
+    BatteryState, BrightnessState, BtDevice, ColorScheme, Connectivity, MonitorConfig,
+    MonitorTransform, NetworkState, NotificationSpec, NotificationUrgency, PowerState,
+    SystemdTimer, SystemdUnit, WifiNetwork,
 };
 pub use types::{
     CaptureTarget, DesktopEnvironment, Key, KeyCombo, KeyName, MonitorId, MonitorInfo, MouseButton,

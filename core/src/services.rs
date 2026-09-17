@@ -294,6 +294,21 @@ pub enum PowerState {
     Off,
 }
 
+// ───────────────────────── 亮度 ─────────────────────────
+
+/// 屏幕亮度状态（设计文档 §21.25）。
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct BrightnessState {
+    /// 显示器/背光设备标识（聚合后端用 "default"）。
+    pub monitor: String,
+    /// 当前亮度（0-100 百分比）。
+    pub brightness: u8,
+    /// 最大亮度（0-100 百分比；聚合后端恒为 100）。
+    pub max_brightness: u8,
+    /// 是否启用自适应亮度。
+    pub adaptive: bool,
+}
+
 // ───────────────────────── 外观 ─────────────────────────
 
 /// 配色方案。

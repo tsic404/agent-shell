@@ -13,7 +13,9 @@ use agent_shell_capture::CaptureDispatcher;
 use agent_shell_compositor_kwin::KWinCompositor;
 use agent_shell_compositor_mutter::{GnomePathKind, MutterCompositor};
 use agent_shell_core::component::{BackendCapabilities, CompositorComponent, DesktopComponent};
+use agent_shell_core::error::AgentShellError;
 use agent_shell_core::types::WindowInfo;
+use agent_shell_power::{BrightnessController, BrightnessOps};
 use event::{EventHub, EventRing};
 use std::time::{Duration, Instant};
 /// daemon 持有的合成器后端。KDE 会话装 KWin，DDE 会话装 DdeCompositor，
@@ -183,6 +185,10 @@ pub struct Daemon {
     pub capture: Option<CaptureDispatcher>,
     /// input 组件（libei → ydotool → XTest 降级链；None = 全后端探测失败，TTY 场景）。
     pub input: Option<agent_shell_input::InputComponentHandle>,
+    /// input 装配失败原因（如 portal 缺 ConnectToEIS；detect 空链错误的裸消息）。
+    /// None = 装配成功。`input_send` 在 `input == None` 时透出，而非笼统
+    /// "input unavailable"。
+    pub input_error: Option<String>,
     /// Portal 会话管理器（§22.6 D5）。
     pub portal_sessions: std::sync::Arc<crate::portal_sessions::PortalSessionManager>,
     /// IME 会话（§22.8 D7）。
@@ -197,6 +203,8 @@ pub struct Daemon {
     pub rootd_connect: crate::rootd_client::RootdConnector,
     /// AT-SPI 组件（None = a11y bus 不可达，a11y.query 返回 BackendUnavailable）。
     pub a11y: Option<std::sync::Arc<dyn A11yOps>>,
+    /// 亮度控制器（KDE powerdevil 优先，brightnessctl 公共降级；§21.25）。
+    pub brightness: Option<std::sync::Arc<dyn BrightnessOps>>,
     /// 事件枢纽（§22.5 D4：订阅者 fan-out 中心）。
     pub hub: EventHub,
     /// 事件环形缓冲（§22.5 D4：CLI `events --replay`）。
@@ -244,10 +252,21 @@ impl Daemon {
             }
         }
         .map(std::sync::Arc::new);
-        // 输入降级链（libei → ydotool → XTest）：与 compositor 独立装配，
-        // TTY/无后端会话探测失败返回 None，input.send 报 BackendUnavailable。
+        // 输入降级链（libei → ydotool → XTest）：与 compositor 独立装配。
+        // 探测失败（TTY / portal 缺 ConnectToEIS / 无后端）不再静默吞错——保存
+        // 装配错误原因，input_send 透出可诊断错误而非笼统 "unavailable"。
         let de_type = agent_shell_core::de_detection::detect_desktop_environment();
-        let input = agent_shell_input::detect(de_type).await.ok();
+        let (input, input_error) = match agent_shell_input::detect(de_type).await {
+            Ok(handle) => (Some(handle), None),
+            Err(e) => {
+                tracing::warn!("input assemble failed: {e}");
+                let msg = match e {
+                    AgentShellError::BackendUnavailable(m) => m,
+                    other => other.to_string(),
+                };
+                (None, Some(msg))
+            }
+        };
 
         // PortalSessionManager 先建——注入 CaptureDispatcher 作 TokenStore，
         // 使 ScreenCast 能 restore_token 静默恢复（§22.7 D5）。
@@ -268,6 +287,7 @@ impl Daemon {
             compositor,
             capture: CaptureDispatcher::with_token_store(Some(token_store)).await,
             input,
+            input_error,
             cache: Vec::new(),
             cached_at: None,
             idle_timeout,
@@ -278,6 +298,7 @@ impl Daemon {
             a11y: AtSpiComponent::probe()
                 .await
                 .map(|a| std::sync::Arc::new(a) as std::sync::Arc<dyn A11yOps>),
+            brightness: Some(std::sync::Arc::new(BrightnessController::new().await)),
             rootd_connect: crate::rootd_client::connector(),
             hub: EventHub::new(),
             ring: EventRing::default(),
@@ -719,6 +740,7 @@ mod tests {
             idle_timeout: Duration::from_secs(1),
             capture: None,
             input: None,
+            input_error: None,
             portal_sessions: std::sync::Arc::new(
                 crate::portal_sessions::PortalSessionManager::new(
                     crate::single_instance::state_dir(),
@@ -735,6 +757,7 @@ mod tests {
             caller_id: "*".into(),
             rootd_connect: crate::rootd_client::connector(),
             a11y: None,
+            brightness: None,
             hub: EventHub::new(),
             ring: EventRing::default(),
             subscriptions: Vec::new(),

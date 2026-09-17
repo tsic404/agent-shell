@@ -524,7 +524,10 @@ mod tests {
 
     impl Drop for TestBus {
         fn drop(&mut self) {
-            let _ = self._child.kill();
+            // `kill()` 发 SIGKILL，跳过 dbus-daemon 正常退出路径，其 /tmp/dbus-*
+            // socket 不 unlink、累积 stale 文件；SIGTERM 让其自行清理。
+            // SAFETY: `_child.id()` 是存活的子进程 PID，发 SIGTERM 无内存安全风险。
+            unsafe { libc::kill(self._child.id() as i32, libc::SIGTERM) };
             let _ = self._child.wait();
         }
     }
@@ -586,7 +589,7 @@ mod tests {
 
         // 最小 KWin 实例：/Scripting 探测初值 None——只有走
         // doctor_lines_async 才会触发懒探测并把桥接行升级为「就绪」。
-        let kwin = KWinCompositor::for_test(bridge_on(&bus).await, None);
+        let kwin = KWinCompositor::for_test(bridge_on(&bus).await, None).await;
         let v = DdeVersion::from_probes([("display".into(), "org.deepin.dde.Display1".into())]);
         let c = DdeCompositor::with_parts(Compositor::DeepinKwin(Box::new(kwin)), v);
 
@@ -625,7 +628,7 @@ mod tests {
         // A1：X11 分支持有真实 `KWinCompositor`（`new_x11` 的 EWMH/ICCCM +
         // D-Bus 桥）。离线用 `for_test` 注入最小实例——`protocols=None` 等价
         // X11 会话，doctor 必须经 KWin 委托渲染并重命名服务行。
-        let kwin = KWinCompositor::for_test(bridge_on(&bus).await, None);
+        let kwin = KWinCompositor::for_test(bridge_on(&bus).await, None).await;
         let c = DdeCompositor::with_parts(Compositor::X11(Box::new(kwin)), DdeVersion::default());
 
         let lines = c.doctor_lines_async().await;

@@ -56,15 +56,24 @@ pub async fn probe_scripting(conn: &Connection) -> Result<()> {
         .await
         .map_err(|e| KWinError::Scripting(format!("scripting probe build: {e}")))?;
     let xml = node.introspect().await.map_err(|e| {
-        KWinError::Scripting(format!(
-            "scripting probe: {SCRIPTING_SERVICE}{SCRIPTING_PATH} unreachable: {e} \
+        // UnknownObject = 服务可达但 /Scripting 未注册（能力缺失，非时序）；
+        // 其余（ServiceUnknown/NoReply/连接断开）属瞬时不可达，可自愈重试。
+        // introspect() 把标准 FDO 错误反序列化为 `zbus::fdo::Error`。
+        if matches!(&e, zbus::fdo::Error::UnknownObject(_)) {
+            KWinError::ScriptingUnavailable(format!(
+                "scripting probe: {SCRIPTING_SERVICE}{SCRIPTING_PATH} not registered: {e}"
+            ))
+        } else {
+            KWinError::Scripting(format!(
+                "scripting probe: {SCRIPTING_SERVICE}{SCRIPTING_PATH} unreachable: {e} \
                  (KWin may still be starting; retry later)"
-        ))
+            ))
+        }
     })?;
     if scripting_interface_advertised(&xml) {
         Ok(())
     } else {
-        Err(KWinError::Scripting(format!(
+        Err(KWinError::ScriptingUnavailable(format!(
             "scripting probe: org.kde.kwin.Scripting interface not advertised at \
              {SCRIPTING_PATH} (introspection returned no such interface)"
         )))
@@ -291,6 +300,10 @@ pub struct KWinBridge {
     registration: Arc<Mutex<Option<oneshot::Sender<RegistrationOutcome>>>>,
     /// 事件去重句柄（组件级共享；桥接重建时由合成器复用同一实例）。
     dedup: EventDeduperHandle,
+    /// 无等待者（doctor 默认态 / 残留实例）时记录的最近一次注册标记，
+    /// 供 doctor 区分「未加载」与「加载后零注册」。std Mutex——doctor_lines
+    /// 同步读取。
+    late_registration: Arc<std::sync::Mutex<Option<RegistrationOutcome>>>,
 }
 
 impl KWinBridge {
@@ -340,12 +353,14 @@ impl KWinBridge {
         // 信号注册标记通道：spawn_event_monitor 在 run 前 prepare，响应服务
         // 收到 __ready__/__error__ 标记时消费并投递，事件队列保持纯净。
         let registration = Arc::new(Mutex::new(None::<oneshot::Sender<RegistrationOutcome>>));
+        let late_registration = Arc::new(std::sync::Mutex::new(None::<RegistrationOutcome>));
 
         let service = ResponseService {
             router: Arc::clone(&router),
             events: event_tx,
             registration: Arc::clone(&registration),
             dedup: Arc::clone(&dedup),
+            late_registration: Arc::clone(&late_registration),
         };
         // 在既有连接上挂载响应服务 + 申请 well-known 总线名——单一连接，
         // 保活即保活服务（无需第二个连接句柄）。
@@ -368,6 +383,7 @@ impl KWinBridge {
             event_rx: Mutex::new(Some(event_rx)),
             registration,
             dedup,
+            late_registration,
         })
     }
 
@@ -516,10 +532,33 @@ impl KWinBridge {
     /// 预备事件脚本信号注册验证：注册等待 `__ready__`/`__error__` 标记的
     /// 接收端。必须在脚本 `run` 之前调用——标记先于 `run` 返回到达时由
     /// 响应服务路由至此而非事件队列。后续 prepare 会覆盖前次未消费的通道。
+    ///
+    /// 同时清除上一次记录的「无等待者」标记：新一轮注册尝试会重新判定脚本
+    /// 状态，旧的残留/外部实例证据不得滞留成永久误报。
     pub(crate) async fn prepare_registration(&self) -> oneshot::Receiver<RegistrationOutcome> {
         let (tx, rx) = oneshot::channel();
         *self.registration.lock().await = Some(tx);
+        *self
+            .late_registration
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = None;
         rx
+    }
+
+    /// 无等待者时记录的最近一次注册标记（doctor 诊断用）。
+    pub(crate) fn late_registration(&self) -> Option<RegistrationOutcome> {
+        self.late_registration
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+    }
+}
+
+#[cfg(test)]
+impl KWinBridge {
+    /// 测试注入：模拟无等待者时已记录的注册标记（doctor 渲染测试用）。
+    pub(crate) fn record_late_registration(&self, outcome: RegistrationOutcome) {
+        *self.late_registration.lock().expect("not poisoned") = Some(outcome);
     }
 }
 
@@ -535,6 +574,7 @@ struct ResponseService {
     events: mpsc::UnboundedSender<Value>,
     registration: Arc<Mutex<Option<oneshot::Sender<RegistrationOutcome>>>>,
     dedup: EventDeduperHandle,
+    late_registration: Arc<std::sync::Mutex<Option<RegistrationOutcome>>>,
 }
 #[zbus::interface(name = "com.agent_shell.Response")]
 impl ResponseService {
@@ -589,13 +629,28 @@ impl ResponseService {
 }
 
 impl ResponseService {
-    /// 投递注册标记到等待者；无等待者（迟到标记）仅记录不阻塞事件流。
+    /// 投递注册标记到等待者；无等待者或发送失败（接收端已 drop，如
+    /// `spawn_event_monitor` 超时后迟到的标记）时记录到 `late_registration`
+    /// 而非静默丢弃，使 doctor 能区分「未加载」与「加载后零注册」。
     async fn deliver_registration(&self, outcome: RegistrationOutcome) {
-        if let Some(tx) = self.registration.lock().await.take() {
-            let _ = tx.send(outcome);
-        } else {
-            tracing::debug!("event script registration marker with no waiter (late)");
+        match self.registration.lock().await.take() {
+            Some(tx) => {
+                // 发送失败 = 接收端已 drop：与无等待者同义，不得吞掉标记。
+                if let Err(outcome) = tx.send(outcome) {
+                    self.record_late(outcome);
+                }
+            }
+            None => self.record_late(outcome),
         }
+    }
+
+    /// 记录「无等待者」的注册标记供 doctor 诊断（同步 `std::sync::Mutex`，
+    /// doctor_lines 同步读取）。
+    fn record_late(&self, outcome: RegistrationOutcome) {
+        *self
+            .late_registration
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = Some(outcome);
     }
 }
 
@@ -608,6 +663,7 @@ impl ResponseService {
             events,
             registration: Arc::new(Mutex::new(None)),
             dedup: EventDeduper::new_shared(),
+            late_registration: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 }
@@ -930,6 +986,7 @@ mod tests {
             events: event_tx,
             registration: Arc::new(Mutex::new(None)),
             dedup: Arc::new(Mutex::new(EventDeduper::new())),
+            late_registration: Arc::new(std::sync::Mutex::new(None)),
         };
 
         // 1) 用真实模板渲染出 event_monitor.js 的推送语句。
@@ -1035,6 +1092,7 @@ mod tests {
             events: event_tx,
             registration: Arc::new(Mutex::new(None)),
             dedup: Arc::new(Mutex::new(EventDeduper::with_clock(now))),
+            late_registration: Arc::new(std::sync::Mutex::new(None)),
         };
 
         // 旧格式（无 occurred_at）+ 新格式（带 occurred_at）同事件混推：
@@ -1091,6 +1149,7 @@ mod tests {
             events: events_a,
             registration: Arc::new(Mutex::new(None)),
             dedup: Arc::clone(&dedup),
+            late_registration: Arc::new(std::sync::Mutex::new(None)),
         };
         // 新桥接的响应服务（重建后）：注入同一组件级去重句柄。
         let (events_b, mut rx_b) = mpsc::unbounded_channel();
@@ -1099,6 +1158,7 @@ mod tests {
             events: events_b,
             registration: Arc::new(Mutex::new(None)),
             dedup: Arc::clone(&dedup),
+            late_registration: Arc::new(std::sync::Mutex::new(None)),
         };
 
         let evt = serde_json::json!({ "event": "windowClosed", "id": "7", "occurred_at": 49846 })
@@ -1128,6 +1188,7 @@ mod tests {
             events: event_tx,
             registration: Arc::new(Mutex::new(None)),
             dedup: Arc::new(Mutex::new(EventDeduper::new())),
+            late_registration: Arc::new(std::sync::Mutex::new(None)),
         };
 
         // 注册一个等待者（模拟进行中的一次性查询）。
@@ -1159,6 +1220,7 @@ mod tests {
             events: event_tx,
             registration: Arc::clone(&registration),
             dedup: Arc::new(Mutex::new(EventDeduper::new())),
+            late_registration: Arc::new(std::sync::Mutex::new(None)),
         };
 
         // __ready__ → 注册通道 Ready。
@@ -1184,6 +1246,84 @@ mod tests {
         );
 
         // 两次标记都不得进事件队列。
+        assert!(
+            event_rx.try_recv().is_err(),
+            "markers must skip event queue"
+        );
+    }
+
+    /// 无等待者（doctor 默认态 / 残留实例）时，注册标记不得被静默丢弃——
+    /// 记录到 `late_registration`，供 doctor 区分「未加载」与「加载后零注册」。
+    #[tokio::test]
+    async fn registration_markers_without_waiter_are_recorded_not_dropped() {
+        let router: SharedRouter = Arc::new(Mutex::new(ResponseRouter::default()));
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let late_registration = Arc::new(std::sync::Mutex::new(None::<RegistrationOutcome>));
+        let service = ResponseService {
+            router: Arc::clone(&router),
+            events: event_tx,
+            registration: Arc::new(Mutex::new(None)),
+            dedup: EventDeduper::new_shared(),
+            late_registration: Arc::clone(&late_registration),
+        };
+
+        // 无等待者：__ready__ 记录为 Ready。
+        service
+            .send_result(r#"{"event": "__ready__"}"#.to_string())
+            .await;
+        assert_eq!(
+            *late_registration.lock().expect("not poisoned"),
+            Some(RegistrationOutcome::Ready)
+        );
+
+        // 无等待者：__error__ 覆盖为 Failed(msg)。
+        service
+            .send_result(r#"{"event": "__error__", "error": "boom"}"#.to_string())
+            .await;
+        assert_eq!(
+            *late_registration.lock().expect("not poisoned"),
+            Some(RegistrationOutcome::Failed("boom".to_string()))
+        );
+
+        // 标记仍不得进事件队列。
+        assert!(
+            event_rx.try_recv().is_err(),
+            "unattended markers must skip event queue"
+        );
+    }
+
+    /// `tx.send` 失败（接收端已 drop，如 spawn_event_monitor 超时后迟到的
+    /// 标记）不得被吞掉——按无等待者记录到 `late_registration`。
+    #[tokio::test]
+    async fn registration_marker_with_dropped_waiter_is_recorded() {
+        let router: SharedRouter = Arc::new(Mutex::new(ResponseRouter::default()));
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let late_registration = Arc::new(std::sync::Mutex::new(None::<RegistrationOutcome>));
+        // 制造 stale sender：接收端立即 drop，模拟 5s 超时后的残留等待者。
+        let (tx, rx) = oneshot::channel();
+        drop(rx);
+        let registration = Arc::new(Mutex::new(Some(tx)));
+        let service = ResponseService {
+            router: Arc::clone(&router),
+            events: event_tx,
+            registration: Arc::clone(&registration),
+            dedup: EventDeduper::new_shared(),
+            late_registration: Arc::clone(&late_registration),
+        };
+
+        service
+            .send_result(r#"{"event": "__error__", "error": "late"}"#.to_string())
+            .await;
+
+        // 发送失败仍须记录，且 sender 已被 take 清空。
+        assert_eq!(
+            *late_registration.lock().expect("not poisoned"),
+            Some(RegistrationOutcome::Failed("late".to_string()))
+        );
+        assert!(
+            registration.lock().await.is_none(),
+            "stale sender must be consumed"
+        );
         assert!(
             event_rx.try_recv().is_err(),
             "markers must skip event queue"
