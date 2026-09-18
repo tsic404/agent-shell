@@ -4,7 +4,7 @@
 //! （evdev+8），自行维护映射。US QWERTY 近似——完整 keysym/keycode 解析
 //! 需要 xkbcommon，后续任务接入。
 
-use agent_shell_core::types::{Key, KeyCombo, KeyName};
+use agent_shell_core::types::{Key, KeyCombo, KeyName, MouseButton};
 
 /// 命名键 → evdev 键码。
 pub fn named_to_evdev(name: KeyName) -> Option<u32> {
@@ -156,10 +156,32 @@ pub fn combo_to_press_sequence(combo: &KeyCombo) -> Result<Vec<(u32, bool)>, Str
     Ok(seq)
 }
 
+/// `MouseButton` → evdev 按钮码（BTN_LEFT=0x110 起；侧键 BTN_BACK/FORWARD）。
+///
+/// libei 与 uinput 直写后端共用；XTest 使用 Xorg 默认 keymap，自行维护。
+pub fn evdev_mouse_button(b: MouseButton) -> u32 {
+    match b {
+        MouseButton::Left => 0x110,
+        MouseButton::Right => 0x111,
+        MouseButton::Middle => 0x112,
+        MouseButton::Back => 0x116,
+        MouseButton::Forward => 0x115,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use agent_shell_core::types::ModifierMask;
+
+    #[test]
+    fn mouse_button_codes_match_evdev() {
+        assert_eq!(evdev_mouse_button(MouseButton::Left), 0x110);
+        assert_eq!(evdev_mouse_button(MouseButton::Right), 0x111);
+        assert_eq!(evdev_mouse_button(MouseButton::Middle), 0x112);
+        assert_eq!(evdev_mouse_button(MouseButton::Back), 0x116);
+        assert_eq!(evdev_mouse_button(MouseButton::Forward), 0x115);
+    }
 
     #[test]
     fn char_mapping_covers_common_ascii() {

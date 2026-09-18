@@ -1,6 +1,6 @@
 //! daemon 侧输入注入：经 components/input 降级链执行（§12）。
 //!
-//! daemon 持有 `InputComponentHandle`（libei → ydotool → XTest → xdotool），
+//! daemon 持有 `InputComponentHandle`（libei → ydotool → uinput → XTest → xdotool），
 //! CLI 的 `input.send` 在此解析参数后委托 active 后端。参数校验先于后端
 //! 探测——坏载荷必须返回 InvalidParams（-32602），而非被后端不可用（1002）
 //! 掩盖（CI 无显示服务器环境回归锚定）。

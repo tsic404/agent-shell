@@ -348,7 +348,7 @@ pub trait AppearanceComponent: DesktopComponent {
 
 // ───────────────────────── 探测期占位接口（后续任务实现具体语义） ─────────────────────────
 
-/// 输入组件接口（components/input，libei → ydotool → XTest 降级链）。
+/// 输入组件接口（components/input，libei → ydotool → uinput → XTest 降级链）。
 ///
 /// T2 任务实现注入方法；此处仅定义契约形状。
 #[async_trait]
