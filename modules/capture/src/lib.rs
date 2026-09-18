@@ -687,11 +687,13 @@ pub async fn doctor_line(dispatcher: Option<&CaptureDispatcher>) -> String {
 
 /// 渲染 capture doctor 行（纯函数，可单测）。
 ///
-/// `active` 为 [`CaptureDispatcher::probe`] 探测结果：`Some`=已建会话，`None`=非交互
-/// 探测失败。失败去向复用 [`portal_fallback`]：Wayland 下 portal 是唯一授权闸门，
-/// 降级 x11 会静默抓 XWayland root（越权），故报「已拒绝 x11 兜底」；probe 不携带
-/// 具体失败原因，故不武断「无授权」，仅保留「已拒绝 x11 兜底」信号。候选链无
-/// `x11`（纯 Wayland）时无兜底可拒，如实报无可用后端。
+/// `active` 为 [`CaptureDispatcher::probe`] 探测结果：`Some`=非交互探测已建会话，
+/// `None`=探测失败。失败去向复用 [`portal_fallback`]：Wayland 下 portal 是唯一授权
+/// 闸门，降级 x11 会静默抓 XWayland root（越权），故报「已拒绝 x11 兜底」；候选链
+/// 无 `x11`（纯 Wayland）时无兜底可拒，如实报无可用后端。
+///
+/// Wayland 且候选链含 ScreenCast 时，`Some(ScreenshotPortal)` 仅证 Screenshot 门户
+/// 非交互可用——真实 capture 优先走 ScreenCast 交互弹窗、无授权时永不回落，故回落 ⚠。
 fn render_capture_doctor_line(
     label: &str,
     backends: &[&'static str],
@@ -699,7 +701,20 @@ fn render_capture_doctor_line(
     fallback: PortalFallback,
 ) -> String {
     let chain = backends.join(" → ");
+    // 仅当候选链确含 portal-screencast（`screencast_ok`）时，真实 capture 才先走
+    // ScreenCast 交互弹窗——feature 关闭或无 ScreenCast 门户的桌面上，路径直落
+    // Screenshot 预探测即成功，须保留 ✓。
+    let screencast_first_on_wayland = matches!(
+        &fallback,
+        PortalFallback::Fail(AgentShellError::Permission(_))
+    ) && backends.contains(&ActiveBackend::ScreenCast.name());
     match active {
+        Some(ActiveBackend::ScreenshotPortal) if screencast_first_on_wayland => {
+            format!(
+                "⚠ {label:<12}: {chain}（选中 {}，需 portal 交互授权才能真实捕获）",
+                ActiveBackend::ScreenshotPortal.name()
+            )
+        }
         Some(b) => format!("✓ {label:<12}: {chain}（选中 {}）", b.name()),
         None => match fallback {
             // Wayland + XWayland 候选链含 x11：portal 是唯一授权闸门，降级
@@ -1433,6 +1448,58 @@ mod tests {
         );
         assert!(line.contains("portal-screencast → portal-screenshot → x11"));
         assert!(line.contains("选中 portal-screencast"), "{line}");
+    }
+
+    #[test]
+    fn render_capture_doctor_line_with_screenshot_portal_on_wayland_warns() {
+        // Wayland 下非交互探测只选中 Screenshot 门户（ScreenCast 无 token 需交互
+        // 弹窗）→ 真实 capture 会优先 ScreenCast 弹窗、无授权时永不回落，故回落
+        // ⚠ 并明示「需 portal 交互授权」，不冒充 ✓ 可捕获（QA gap：doctor 勾选
+        // 与实际 capture 失败不一致）。
+        let line = render_capture_doctor_line(
+            "截图捕获",
+            &["portal-screencast", "portal-screenshot"],
+            Some(ActiveBackend::ScreenshotPortal),
+            PortalFallback::Fail(AgentShellError::Permission(
+                "portal authorization unavailable on Wayland".into(),
+            )),
+        );
+        assert!(line.starts_with("⚠ 截图捕获"), "{line}");
+        assert!(line.contains("选中 portal-screenshot"), "{line}");
+        assert!(line.contains("需 portal 交互授权才能真实捕获"), "{line}");
+        assert!(!line.starts_with("✓"), "{line}");
+    }
+
+    #[test]
+    fn render_capture_doctor_line_with_screenshot_portal_without_screencast_keeps_check() {
+        // 候选链无 portal-screencast（`portal-screencast` feature 关闭或 ScreenCast
+        // 门户不可用）：真实 capture 直落 Screenshot 非交互预探测即成功，✓ 准确——
+        // 回落 ⚠ 反而复刻「doctor 与真实捕获不符」的缺陷镜像。
+        let line = render_capture_doctor_line(
+            "截图捕获",
+            &["portal-screenshot"],
+            Some(ActiveBackend::ScreenshotPortal),
+            PortalFallback::Fail(AgentShellError::Permission(
+                "portal authorization unavailable on Wayland".into(),
+            )),
+        );
+        assert!(line.starts_with("✓ 截图捕获"), "{line}");
+        assert!(line.contains("选中 portal-screenshot"), "{line}");
+        assert!(!line.contains("需 portal 交互授权"), "{line}");
+    }
+
+    #[test]
+    fn render_capture_doctor_line_with_screenshot_portal_on_x11_keeps_check() {
+        // 原生 X11 会话：Screenshot 门户选中后，真实 capture 失败仍可降级 x11
+        // 兜底，故 ✓ 准确，不受 Wayland ⚠ 分支影响。
+        let line = render_capture_doctor_line(
+            "截图捕获",
+            &["portal-screencast", "portal-screenshot", "x11"],
+            Some(ActiveBackend::ScreenshotPortal),
+            PortalFallback::X11,
+        );
+        assert!(line.starts_with("✓ 截图捕获"), "{line}");
+        assert!(line.contains("选中 portal-screenshot"), "{line}");
     }
 
     #[test]
