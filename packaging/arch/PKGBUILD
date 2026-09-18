@@ -43,6 +43,10 @@ package_agent-shell() {
     # systemd user service（§22.2 D1）
     install -Dm644 daemon/agent-shell-daemon.service \
         "$pkgdir/usr/lib/systemd/user/agent-shell-daemon.service"
+    # KWin 私有 Wayland 接口授权（§7.6：window_mgmt/fake_input 仅向声明
+    # X-KDE-Wayland-Interfaces 的客户端通告）
+    install -Dm644 daemon/org.agentshell.Daemon.desktop \
+        "$pkgdir/usr/share/applications/org.agentshell.Daemon.desktop"
     # udev rules for ydotool /dev/uinput（§20.3 权限模型）
     install -Dm644 packaging/debian/60-agent-shell-uinput.rules \
         "$pkgdir/usr/lib/udev/rules.d/60-agent-shell-uinput.rules"

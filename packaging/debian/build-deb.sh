@@ -102,12 +102,14 @@ install_bin() {
 # ── agent-shell 包（daemon + cli + mcp） ──
 PKG1="$BUILD_DIR/agent-shell"
 mkdir -p "$PKG1/DEBIAN" "$PKG1/usr/bin" "$PKG1/usr/lib/systemd/user" \
-         "$PKG1/usr/lib/udev/rules.d"
+         "$PKG1/usr/lib/udev/rules.d" "$PKG1/usr/share/applications"
 install_bin agent-shell-daemon "$PKG1/usr/bin/agent-shell-daemon"
 install_bin agent-shell "$PKG1/usr/bin/agent-shell"
 install_bin agent-shell-mcp "$PKG1/usr/bin/agent-shell-mcp"
 install -Dm644 "$ROOT_DIR/daemon/agent-shell-daemon.service" \
     "$PKG1/usr/lib/systemd/user/agent-shell-daemon.service"
+install -Dm644 "$ROOT_DIR/daemon/org.agentshell.Daemon.desktop" \
+    "$PKG1/usr/share/applications/org.agentshell.Daemon.desktop"
 install -Dm644 "$SCRIPT_DIR/60-agent-shell-uinput.rules" \
     "$PKG1/usr/lib/udev/rules.d/60-agent-shell-uinput.rules"
 # postinst / prerm
