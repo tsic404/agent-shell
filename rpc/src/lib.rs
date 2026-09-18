@@ -421,6 +421,22 @@ pub struct WindowEntry {
     pub keep_above: bool,
 }
 
+/// workspaces.list 条目：core `WorkspaceInfo` → 协议扁平 JSON。
+///
+/// 与 [`WindowEntry`] 同理——daemon 把结构化 `WorkspaceInfo`（core 类型，含
+/// `WorkspaceId`/`monitor_ids`/`window_ids`）投影为协议类型，CLI 仅依赖 rpc crate。
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct WorkspaceEntry {
+    /// 原生工作区标识（`workspaces.switch` 的定位键）。
+    pub id: String,
+    /// 工作区名称。
+    pub name: String,
+    /// 工作区编号（从 1 开始）。
+    pub number: u32,
+    /// 是否为当前活动工作区。
+    pub is_active: bool,
+}
+
 /// windows.op 参数。
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct WindowOpParams {

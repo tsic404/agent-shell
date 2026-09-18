@@ -6,7 +6,9 @@
 use crate::state::Daemon;
 use agent_shell_core::error::AgentShellError;
 use agent_shell_core::security::{Operation, PermissionDecision, PermissionLevel};
-use agent_shell_core::types::{SemanticTarget, TitleMatchMode, TitleMatcher, WindowInfo};
+use agent_shell_core::types::{
+    SemanticTarget, TitleMatchMode, TitleMatcher, WindowInfo, WorkspaceInfo,
+};
 use agent_shell_rpc::{
     method, A11yElementResult, A11yQueryResult, A11yStatusResult, CapabilityStatus, CaptureParams,
     DoctorResult, ExtensionStatus, InfoResult, InputParams, Request, Response, RpcErrorCode,
@@ -608,7 +610,22 @@ struct WindowOpParamsDe {
 
 async fn workspaces_list(d: &Daemon) -> RpcResult {
     let list = d.list_workspaces().await?;
-    Ok(json!({ "workspaces": list }))
+    let items: Vec<Value> = list.iter().map(workspace_entry_json).collect();
+    Ok(json!({ "workspaces": items }))
+}
+
+/// `workspaces.list` 逐项投影：core [`WorkspaceInfo`] → 协议 JSON。
+///
+/// 与 [`window_entry_json`] 对齐——把嵌套的 `id`（`WorkspaceId`）拍平为
+/// `id`（native_id 串），`is_active` 保持与 core 同名字段；`monitor_ids`/
+/// `window_ids` 不随列表暴露（列表只消费定位/显示所需的编号/名称/活动态）。
+fn workspace_entry_json(w: &WorkspaceInfo) -> Value {
+    json!({
+        "id": w.id.native_id,
+        "name": w.name,
+        "number": w.number,
+        "is_active": w.is_active,
+    })
 }
 
 async fn workspace_switch(d: &Daemon, req: &Request) -> RpcResult {
@@ -1705,6 +1722,30 @@ mod tests {
         assert_eq!(v["states"], json!(["Maximized", "FullScreen"]));
         assert_eq!(v["window_type"], "Dialog");
         assert_eq!(v["keep_above"], true);
+    }
+
+    #[test]
+    fn workspace_entry_json_projects_flat_id_and_active() {
+        use agent_shell_core::types::{DesktopEnvironment, WorkspaceId};
+        let w = WorkspaceInfo {
+            id: WorkspaceId {
+                native_id: "1".into(),
+                de_type: DesktopEnvironment::KDE,
+            },
+            name: "桌面 1".into(),
+            number: 1,
+            is_active: true,
+            monitor_ids: vec![],
+            window_ids: vec![],
+        };
+        let v = workspace_entry_json(&w);
+        assert_eq!(v["id"], "1");
+        assert_eq!(v["name"], "桌面 1");
+        assert_eq!(v["number"], 1);
+        assert_eq!(v["is_active"], true);
+        // monitor_ids/window_ids 不随列表暴露——列表只承载定位/显示所需字段。
+        assert!(v.get("monitor_ids").is_none());
+        assert!(v.get("window_ids").is_none());
     }
 
     #[test]

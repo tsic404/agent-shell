@@ -475,17 +475,16 @@ impl DaemonClient {
         .map(|_| ())
     }
 
-    pub async fn workspaces_list(&mut self) -> Result<Vec<String>, String> {
+    pub async fn workspaces_list(
+        &mut self,
+    ) -> Result<Vec<agent_shell_rpc::WorkspaceEntry>, String> {
         let v = self.call0(method::WORKSPACES_LIST).await?;
-        let arr = v
-            .get("workspaces")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default();
-        Ok(arr
-            .iter()
-            .filter_map(|s| s.as_str().map(str::to_string))
-            .collect())
+        #[derive(serde::Deserialize)]
+        struct W {
+            workspaces: Vec<agent_shell_rpc::WorkspaceEntry>,
+        }
+        let w: W = serde_json::from_value(v).map_err(|e| e.to_string())?;
+        Ok(w.workspaces)
     }
 
     pub async fn workspace_switch(&mut self, id: &str) -> Result<(), String> {
