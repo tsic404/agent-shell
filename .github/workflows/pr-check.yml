@@ -62,3 +62,51 @@ jobs:
       - name: Build (Rust, no PipeWire dev headers)
         if: matrix.profile == 'no-pipewire'
         run: cargo build --release --workspace --no-default-features
+
+  # arm64 交叉编译门禁：company-04（UOS arm64）系统 libspa-0.2-dev 头（0.3.15.x）
+  # 与 libspa-sys 0.10.1 不兼容，arm64 发行构建须显式 --no-default-features
+  # （capture 走 Screenshot/X11 降级链，§20.2）。x86_64 的 no-pipewire profile 只
+  # 验证特性开关，不覆盖 aarch64 目标；本 job 交叉编译 aarch64 验证该路径不回归。
+  check-arm64:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-gnu
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install arm64 cross toolchain
+        # 仅需 wayland-client 交叉链接（libspa-sys/pipewire-sys 由 --no-default-features
+        # 排除；wayland-backend 的 log_shim.c 只含 libc 头，gcc-aarch64-linux-gnu 自带
+        # arm64 sysroot）。Ubuntu 主归档（archive/security.ubuntu.com）不承载 binary-arm64
+        # 索引，`dpkg --add-architecture arm64` 后必须重写 apt 源按架构限定：amd64 走主
+        # 归档、arm64 走 ports.ubuntu.com/ubuntu-ports，否则 apt-get update 对
+        # binary-arm64 全 404（exit 100，构建未开始）。
+        run: |
+          sudo dpkg --add-architecture arm64
+          codename=$(. /etc/os-release && printf '%s' "$VERSION_CODENAME")
+          sudo rm -f /etc/apt/sources.list /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources
+          sudo tee /etc/apt/sources.list.d/cross-arch.list >/dev/null <<EOF
+          deb [arch=amd64 signed-by=/usr/share/keyrings/ubuntu-archive-keyring.gpg] http://archive.ubuntu.com/ubuntu/ ${codename} main restricted universe multiverse
+          deb [arch=amd64 signed-by=/usr/share/keyrings/ubuntu-archive-keyring.gpg] http://archive.ubuntu.com/ubuntu/ ${codename}-updates main restricted universe multiverse
+          deb [arch=amd64 signed-by=/usr/share/keyrings/ubuntu-archive-keyring.gpg] http://security.ubuntu.com/ubuntu/ ${codename}-security main restricted universe multiverse
+          deb [arch=arm64 signed-by=/usr/share/keyrings/ubuntu-archive-keyring.gpg] http://ports.ubuntu.com/ubuntu-ports/ ${codename} main restricted universe multiverse
+          deb [arch=arm64 signed-by=/usr/share/keyrings/ubuntu-archive-keyring.gpg] http://ports.ubuntu.com/ubuntu-ports/ ${codename}-updates main restricted universe multiverse
+          deb [arch=arm64 signed-by=/usr/share/keyrings/ubuntu-archive-keyring.gpg] http://ports.ubuntu.com/ubuntu-ports/ ${codename}-security main restricted universe multiverse
+          EOF
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu libwayland-dev:arm64
+
+      - name: Build (arm64, no default features)
+        run: cargo build --release --workspace --no-default-features --target aarch64-unknown-linux-gnu
+        env:
+          # pkg-config crate 默认拒绝 host != target 交叉探测；多架构 .pc 位于
+          # /usr/lib/aarch64-linux-gnu/pkgconfig，须显式放行并指路。
+          PKG_CONFIG_ALLOW_CROSS: "1"
+          PKG_CONFIG_PATH: /usr/lib/aarch64-linux-gnu/pkgconfig
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
