@@ -14,7 +14,7 @@ use agent_shell_compositor_kwin::KWinCompositor;
 use agent_shell_compositor_mutter::{GnomePathKind, MutterCompositor};
 use agent_shell_core::component::{BackendCapabilities, CompositorComponent, DesktopComponent};
 use agent_shell_core::error::AgentShellError;
-use agent_shell_core::types::WindowInfo;
+use agent_shell_core::types::{WindowInfo, WorkspaceInfo};
 use agent_shell_power::{BrightnessController, BrightnessOps};
 use event::{EventHub, EventRing};
 use std::time::{Duration, Instant};
@@ -482,19 +482,15 @@ impl Daemon {
             .map_err(|e| (agent_shell_rpc::RpcErrorCode::BackendError, e.to_string()))
     }
 
-    /// 工作区列表（无缓存——低频操作）。
+    /// 工作区列表（无缓存——低频操作）。返回结构化 [`WorkspaceInfo`]，
+    /// 由 dispatch 层投影为协议 JSON——格式化属 CLI 渲染职责，不在此处。
     pub async fn list_workspaces(
         &self,
-    ) -> Result<Vec<String>, (agent_shell_rpc::RpcErrorCode, String)> {
+    ) -> Result<Vec<WorkspaceInfo>, (agent_shell_rpc::RpcErrorCode, String)> {
         let comp = self.require_compositor()?;
-        let list = comp
-            .list_workspaces()
+        comp.list_workspaces()
             .await
-            .map_err(|e| (agent_shell_rpc::RpcErrorCode::BackendError, e.to_string()))?;
-        Ok(list
-            .into_iter()
-            .map(|w| format!("{} {} active={}", w.number, w.name, w.is_active))
-            .collect())
+            .map_err(|e| (agent_shell_rpc::RpcErrorCode::BackendError, e.to_string()))
     }
 
     /// 组件健康摘要（doctor 数据源之一）。

@@ -1,6 +1,6 @@
 //! 输出格式化：table / json 两种渲染（设计文档 §17.2 CLI）。
 
-use agent_shell_rpc::WindowEntry;
+use agent_shell_rpc::{WindowEntry, WorkspaceEntry};
 use serde_json::json;
 
 /// `native_id` 列宽。KWin `{uuid}` 为 38 字符，此前 20 字符列宽会把 id 截断成
@@ -50,6 +50,31 @@ pub fn windows_entries_json(wins: &[WindowEntry]) -> String {
         })
         .collect();
     serde_json::to_string_pretty(&items).expect("WindowEntry is JSON-serializable")
+}
+
+/// 工作区列表 table 行（沿用历史 `number name active=…` 逐行格式，无表头）。
+pub fn workspaces_entries_table(ws: &[WorkspaceEntry]) -> String {
+    let mut out = String::new();
+    for w in ws {
+        out.push_str(&format!("{} {} active={}\n", w.number, w.name, w.is_active));
+    }
+    out
+}
+
+/// 工作区列表 JSON（结构化条目，供 agent/脚本解析与 `workspaces.switch` 定位）。
+pub fn workspaces_entries_json(ws: &[WorkspaceEntry]) -> String {
+    let items: Vec<_> = ws
+        .iter()
+        .map(|w| {
+            json!({
+                "id": w.id,
+                "name": w.name,
+                "number": w.number,
+                "is_active": w.is_active,
+            })
+        })
+        .collect();
+    serde_json::to_string_pretty(&items).expect("WorkspaceEntry is JSON-serializable")
 }
 
 fn truncate(s: &str, max_chars: usize) -> String {
@@ -137,5 +162,42 @@ mod tests {
     fn empty_list_renders_header_only() {
         assert_eq!(windows_entries_table(&[]).lines().count(), 1);
         assert_eq!(windows_entries_json(&[]), "[]");
+    }
+
+    fn ws_sample(id: &str, name: &str, number: u32, active: bool) -> WorkspaceEntry {
+        WorkspaceEntry {
+            id: id.into(),
+            name: name.into(),
+            number,
+            is_active: active,
+        }
+    }
+
+    #[test]
+    fn workspaces_table_preserves_legacy_line_shape() {
+        // 历史 table 输出逐行 `number name active=…`，脚本解析不应被改动破坏。
+        let t = workspaces_entries_table(&[
+            ws_sample("1", "桌面 1", 1, true),
+            ws_sample("2", "桌面 2", 2, false),
+        ]);
+        assert_eq!(t, "1 桌面 1 active=true\n2 桌面 2 active=false\n");
+    }
+
+    #[test]
+    fn workspaces_json_is_structured_not_preformatted() {
+        // 回归：--output-format json 此前输出与 table 相同的预格式化行，此处
+        // 必须产出可解析的结构化对象。
+        let j = workspaces_entries_json(&[ws_sample("1", "桌面 1", 1, true)]);
+        let v: serde_json::Value = serde_json::from_str(&j).expect("valid json");
+        assert_eq!(v[0]["id"], "1");
+        assert_eq!(v[0]["name"], "桌面 1");
+        assert_eq!(v[0]["number"], 1);
+        assert_eq!(v[0]["is_active"], true);
+    }
+
+    #[test]
+    fn workspaces_empty_renders_empty_array() {
+        assert_eq!(workspaces_entries_table(&[]), "");
+        assert_eq!(workspaces_entries_json(&[]), "[]");
     }
 }

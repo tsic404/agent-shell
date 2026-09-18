@@ -76,7 +76,7 @@ async fn dispatch_command(command: Command, out: OutputFormat, retry: u32) -> Cm
         Command::Doctor => doctor(out, &mut c).await,
         Command::Info => info(out, &mut c).await,
         Command::Windows(cmd) => windows(out, &mut c, cmd).await,
-        Command::Workspaces(cmd) => workspaces(&mut c, cmd).await,
+        Command::Workspaces(cmd) => workspaces(out, &mut c, cmd).await,
         Command::Input(cmd) => input(&mut c, cmd).await,
         Command::Screenshot(cmd) => screenshot(&mut c, cmd).await,
         Command::A11y(cmd) => a11y(&mut c, cmd).await,
@@ -302,11 +302,17 @@ fn emit_windows_json_or_table(out: OutputFormat, wins: &[agent_shell_rpc::Window
     }
 }
 
-async fn workspaces(c: &mut DaemonClient, cmd: cli::WorkspacesCommand) -> CmdResult {
+async fn workspaces(
+    out: OutputFormat,
+    c: &mut DaemonClient,
+    cmd: cli::WorkspacesCommand,
+) -> CmdResult {
     match cmd {
         cli::WorkspacesCommand::List => {
-            for line in c.workspaces_list().await? {
-                println!("{line}");
+            let ws = c.workspaces_list().await?;
+            match out {
+                OutputFormat::Json => println!("{}", format::workspaces_entries_json(&ws)),
+                OutputFormat::Table => print!("{}", format::workspaces_entries_table(&ws)),
             }
         }
         cli::WorkspacesCommand::Switch { id } => c.workspace_switch(&id).await?,
