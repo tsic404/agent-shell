@@ -571,14 +571,16 @@ fn window_entry_json(w: &WindowInfo) -> Value {
     })
 }
 
-/// `windows.list` 过滤谓词：app_id 精确命中，或标题按给定模式命中。
+/// `windows.list` 过滤谓词：app_id 或标题命中即通过。
 ///
-/// app_id 是稳定标识，恒用精确比较（不随 `--match` 变 glob/regex）；标题
-/// 匹配由预编译的 [`TitleMatcher`] 判定，`Substring` 即历史默认行为。
+/// app_id 经 [`TitleMatcher::matches_app_id`] 判定——`Substring`/`Exact` 保持
+/// 精确比对（历史兼容，`app_id == f`），`Glob`/`Regex` 将 pattern 作用于
+/// app_id；标题经 [`TitleMatcher::matches`] 按 `--match` 模式求值。空标题
+/// 窗口（如 plasma 面板）仍可经 app_id glob/regex 命中。
 fn filter_matches(w: &WindowInfo, matcher: Option<&TitleMatcher>) -> bool {
     match matcher {
         None => true,
-        Some(m) => w.app_id == m.pattern() || m.matches(&w.title),
+        Some(m) => m.matches_app_id(&w.app_id) || m.matches(&w.title),
     }
 }
 
@@ -1768,7 +1770,7 @@ mod tests {
             assert!(filter_matches(w, None));
         }
 
-        // app_id 精确命中，独立于标题匹配模式。
+        // app_id 命中独立于标题（regex 模式亦作用于 app_id）。
         assert!(filter_matches(
             &wins[2],
             Some(&m(TitleMatchMode::Regex, "firefox"))
@@ -1805,6 +1807,40 @@ mod tests {
         assert!(!filter_matches(
             &wins[0],
             Some(&m(TitleMatchMode::Glob, "*.pdf"))
+        ));
+        // app_id 匹配语义：Substring/Exact 保持精确比对（历史兼容），
+        // Glob/Regex 将 pattern 作用于 app_id——空标题窗口（如 plasma 面板）
+        // 仍可经 app_id glob/regex 命中。
+        let panel = win("p", "", "plasmashell");
+        assert!(filter_matches(
+            &panel,
+            Some(&m(TitleMatchMode::Glob, "plasma*"))
+        ));
+        assert!(!filter_matches(
+            &panel,
+            Some(&m(TitleMatchMode::Glob, "konsole*"))
+        ));
+        assert!(filter_matches(
+            &panel,
+            Some(&m(TitleMatchMode::Regex, "^plasma.*shell$"))
+        ));
+        // substring：app_id 仍精确比对，不因标题子串语义放宽。
+        assert!(!filter_matches(
+            &panel,
+            Some(&m(TitleMatchMode::Substring, "sma"))
+        ));
+        assert!(filter_matches(
+            &panel,
+            Some(&m(TitleMatchMode::Substring, "plasmashell"))
+        ));
+        // exact：app_id 须全等，前缀不命中。
+        assert!(!filter_matches(
+            &panel,
+            Some(&m(TitleMatchMode::Exact, "plasma"))
+        ));
+        assert!(filter_matches(
+            &panel,
+            Some(&m(TitleMatchMode::Exact, "plasmashell"))
         ));
         // 非法 regex 视为不匹配（不 panic）。
         assert!(!filter_matches(
