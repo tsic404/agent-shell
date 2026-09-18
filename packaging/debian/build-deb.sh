@@ -55,11 +55,12 @@ if [ -z "$ARCH" ]; then
 fi
 
 # ── 构建 release 二进制（已存在则跳过，保留交叉编译预构建路径）──
-# portal-screencast（capture 默认 feature）需能编译 libspa-sys 0.10.1。其
-# type-info.c 无条件引用 spa_type_param_bitorder（0.3.37 引入）、
-# spa_type_audio_iec958_codec（0.3.34 引入）等符号；旧 pipewire（UOS 20 /
-# bullseye 0.3.19）有 .pc 但头缺这些符号，`--exists` 探不到，须按版本门槛判旧。
-# 不满足时回退 --no-default-features，capture 走 Screenshot/X11 降级链。
+# 默认走 BE：--no-default-features（portal-screencast 关闭，capture 走
+# Screenshot/X11 降级链）。portal-screencast 需能编译 libspa-sys 0.10.1，其
+# type-info.c 无条件引用 spa_type_param_bitorder（0.3.37 引入）等符号；旧
+# libpipewire-0.3（UOS 20 / DDE 20 0.3.15、bullseye 0.3.19）有 .pc 但头缺这些
+# 符号，`--exists` 探不到，须按版本门槛判旧。仅门槛满足（>= 0.3.37）时启用
+# portal-screencast；否则保持 BE。
 NEED_BUILD=0
 for bin in agent-shell-daemon agent-shell agent-shell-mcp agent-shell-rootd; do
     if [ ! -x "$TARGET_DIR/release/$bin" ]; then
@@ -68,19 +69,16 @@ for bin in agent-shell-daemon agent-shell agent-shell-mcp agent-shell-rootd; do
     fi
 done
 if [ "$NEED_BUILD" = "1" ]; then
-    FEATURES_FLAGS=""
+    FEATURES_FLAGS="--no-default-features"
     case "$ARCH" in
         arm64|aarch64)
-            # arm64（company-04）系统 libspa-0.2-dev 头（0.3.15.x）与
-            # libspa-sys 0.10.1 不兼容，portal-screencast 默认特性直编失败；
-            # 发行构建显式回退 --no-default-features，capture 走
-            # Screenshot/X11 降级链。其他平台保持默认特性构建（版本门槛见下）。
-            FEATURES_FLAGS="--no-default-features"
+            # company-04（UOS arm64）系统头版本上报不可靠，无视门槛强制 BE。
             echo "warning: arm64 release build uses --no-default-features (libspa-sys 0.10.1 vs old libspa-0.2 headers)" >&2
             ;;
         *)
-            if ! pkg-config --atleast-version=0.3.37 libpipewire-0.3 2>/dev/null; then
-                FEATURES_FLAGS="--no-default-features"
+            if pkg-config --atleast-version=0.3.37 libpipewire-0.3 2>/dev/null; then
+                FEATURES_FLAGS=""
+            else
                 echo "warning: libpipewire-0.3 < 0.3.37 (or missing); building with --no-default-features (portal-screencast disabled)" >&2
             fi
             ;;

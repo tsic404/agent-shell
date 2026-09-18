@@ -26,11 +26,10 @@
         # agent-shell workspace 根
         workspaceRoot = ./../..;
 
-        # arm64（aarch64）上 libspa-0.2-dev 旧头（company-04 0.3.15.x）与
-        # libspa-sys 0.10.1 不兼容，portal-screencast 默认特性直编失败；显式
-        # --no-default-features 回退，capture 走 Screenshot/X11 降级链。
-        # 其他平台保持默认特性构建不回退。
-        cargoFeaturesFlags = if pkgs.stdenv.hostPlatform.isAarch64 then "--no-default-features" else "";
+        # 默认走 BE：--no-default-features（portal-screencast 关闭，capture 走
+        # Screenshot/X11 降级链）。nixpkgs 自带 pipewire 头满足门槛（>= 0.3.37）
+        # 时启用 portal-screencast；旧 nixpkgs 固定版本保持 BE。
+        cargoFeaturesFlags = if pkgs.lib.versionAtLeast pkgs.pipewire.version "0.3.37" then "" else "--no-default-features";
 
         # §20.2 打包：agent-shell（daemon + cli + mcp）
         agent-shell = rustPlatform.buildRustPackage {

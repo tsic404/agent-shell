@@ -10,22 +10,23 @@ url="https://github.com/tsic404/agent-shell"
 license=('MIT')
 # pipewire：portal-screencast feature（默认）所需；--no-default-features 构建可省略
 # （无 dev 头发行版）。
-makedepends=('cargo' 'pipewire' 'systemd' 'polkit')
+makedepends=('cargo' 'pkg-config' 'pipewire' 'systemd' 'polkit')
 source=("agent-shell::git+$url")
 sha256sums=('SKIP')
 
 build() {
     cd "$srcdir/agent-shell"
     # D2 编译策略：release profile lto + strip（Cargo.toml [profile.release]）
-    # arm64（aarch64）上 libspa-0.2-dev 旧头（company-04 0.3.15.x）与
-    # libspa-sys 0.10.1 不兼容，portal-screencast 默认特性直编失败；显式
-    # --no-default-features 回退，capture 走 Screenshot/X11 降级链。
-    # 其他平台保持默认特性构建不回退。
-    if [ "$CARCH" = "aarch64" ]; then
-        cargo build --release --no-default-features
-    else
-        cargo build --release
+    # 默认走 BE：--no-default-features（portal-screencast 关闭，capture 走
+    # Screenshot/X11 降级链）。libspa-sys 0.10.1 的 type-info.c 无条件引用
+    # spa_type_param_bitorder（0.3.37 引入）等符号，旧 libpipewire-0.3（UOS 20 /
+    # DDE 20 0.3.15、bullseye 0.3.19）头缺这些符号；仅门槛满足时启用
+    # portal-screencast。arm64（company-04）头版本上报不可靠，跳过门槛强制 BE。
+    FEATURES_FLAGS="--no-default-features"
+    if [ "$CARCH" != "aarch64" ] && pkg-config --atleast-version=0.3.37 libpipewire-0.3 2>/dev/null; then
+        FEATURES_FLAGS=""
     fi
+    cargo build --release $FEATURES_FLAGS
 }
 
 package_agent-shell() {
