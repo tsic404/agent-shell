@@ -10,6 +10,7 @@
 //! 最大化协议不支持，始终走 Scripting。
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
@@ -516,6 +517,54 @@ impl KWinCompositor {
         }
     }
 
+    /// 回读校验重试等待：KWin 对 width/height 的 `w.frameGeometry` 赋值
+    /// 异步生效（下一帧 commit 才落到几何），立即回读会拿到陈旧几何。
+    /// 覆盖一帧周期（60Hz ≈ 16ms）并留调度余量。
+    const READBACK_RETRY_DELAY: Duration = Duration::from_millis(50);
+    /// 回读校验最大重试次数（首读不等待，随后最多重试 N 次）。
+    const READBACK_RETRIES: u32 = 3;
+
+    /// 读回窗口屏幕矩形：`frame_geometry` 优先，未知（default 全零）回退
+    /// `geometry`。字段选择抽成纯函数 [`window_rect`] 便于单测。
+    async fn read_window_rect(&self, id: &WindowId) -> Result<Rect> {
+        let info = self.get_window_info(id).await.map_err(KWinError::from)?;
+        Ok(window_rect(&info))
+    }
+
+    /// 回读校验：Scripting 几何变更后读回窗口几何，检测静默 no-op。
+    ///
+    /// `w.frameGeometry = {...}` 对 x/y 同步生效、对 width/height 异步生效
+    /// （下一帧 commit 才落地），因此首读可能抓到陈旧几何。首读不等待
+    /// （move 的 x/y 同步，避免无谓延迟），随后短重试等待异步几何落地；
+    /// 读错误按「本轮未命中」计入预算而非立即中断，重试耗尽相关维度仍无
+    /// 变化才报 no-op（或报最后一轮的读错误）。
+    async fn verify_window_geometry(
+        &self,
+        id: &WindowId,
+        before: Rect,
+        x: Option<i32>,
+        y: Option<i32>,
+        w: Option<i32>,
+        h: Option<i32>,
+    ) -> Result<()> {
+        let mut readouts: Vec<Result<Rect>> =
+            Vec::with_capacity(Self::READBACK_RETRIES as usize + 1);
+        for attempt in 0..=Self::READBACK_RETRIES {
+            if attempt > 0 {
+                tokio::time::sleep(Self::READBACK_RETRY_DELAY).await;
+            }
+            let r = self.read_window_rect(id).await;
+            let hit = r
+                .as_ref()
+                .is_ok_and(|after| readback_ok(before, *after, x, y, w, h));
+            readouts.push(r);
+            if hit {
+                break;
+            }
+        }
+        settle_readback(readouts, before, x, y, w, h)
+    }
+
     // ───────────────────────── X11 EWMH 枚举 ─────────────────────────
 
     /// `_NET_CLIENT_LIST_STACKING`（缺失回退 `_NET_CLIENT_LIST`）。
@@ -1014,6 +1063,96 @@ fn parse_window_type(v: Option<&Value>) -> agent_shell_core::types::WindowType {
     }
 }
 
+/// 窗口屏幕矩形：`frame_geometry` 优先，未知（default 全零）回退 `geometry`。
+fn window_rect(info: &WindowInfo) -> Rect {
+    if info.frame_geometry != Rect::default() {
+        info.frame_geometry
+    } else {
+        info.geometry
+    }
+}
+
+/// 矩形与目标全等对比（`None` 维度跳过）。
+fn rect_matches(
+    rect: Rect,
+    x: Option<i32>,
+    y: Option<i32>,
+    w: Option<i32>,
+    h: Option<i32>,
+) -> bool {
+    x.is_none_or(|v| rect.x == v)
+        && y.is_none_or(|v| rect.y == v)
+        && w.is_none_or(|v| rect.width == v)
+        && h.is_none_or(|v| rect.height == v)
+}
+
+/// 矩形在相关维度上是否发生变化（`None` 维度不参与）。
+fn rect_changed(
+    before: Rect,
+    after: Rect,
+    x: Option<i32>,
+    y: Option<i32>,
+    w: Option<i32>,
+    h: Option<i32>,
+) -> bool {
+    (x.is_some() && before.x != after.x)
+        || (y.is_some() && before.y != after.y)
+        || (w.is_some() && before.width != after.width)
+        || (h.is_some() && before.height != after.height)
+}
+
+/// 单次回读是否通过（纯函数）：`before` 与回读 `after` 对比目标。
+///
+/// 幂等请求（变更前已在目标）通过；否则相关维度必须发生变化——未变即
+/// 静默 no-op。合法钳制（min/max size 约束）属于变化，不算失败。
+fn readback_ok(
+    before: Rect,
+    after: Rect,
+    x: Option<i32>,
+    y: Option<i32>,
+    w: Option<i32>,
+    h: Option<i32>,
+) -> bool {
+    rect_matches(before, x, y, w, h) || rect_changed(before, after, x, y, w, h)
+}
+
+/// 回读重试判定（纯函数）：按时间序给定各轮回读结果，裁定最终校验结果。
+///
+/// - `Ok(after)` 且 [`readback_ok`] → 立即通过（几何已落地）；
+/// - `Ok(after)` 但未命中 → 陈旧读，继续下一轮；
+/// - `Err(e)` → 本轮未命中（读通道瞬态失败），继续下一轮；
+/// - 序列耗尽 → 最后一轮是读错误则报之，否则报几何未变 no-op。
+fn settle_readback(
+    readouts: impl IntoIterator<Item = Result<Rect>>,
+    before: Rect,
+    x: Option<i32>,
+    y: Option<i32>,
+    w: Option<i32>,
+    h: Option<i32>,
+) -> Result<()> {
+    let mut last_rect = before;
+    let mut last_err = None;
+    for r in readouts {
+        match r {
+            Ok(after) => {
+                last_rect = after;
+                last_err = None;
+                if readback_ok(before, after, x, y, w, h) {
+                    return Ok(());
+                }
+            }
+            Err(e) => last_err = Some(e),
+        }
+    }
+    if let Some(e) = last_err {
+        return Err(e);
+    }
+    Err(KWinError::Scripting(format!(
+        "geometry readback mismatch: no change on requested dimensions; \
+         requested x={x:?} y={y:?} w={w:?} h={h:?}, before={before:?} after={last_rect:?}"
+    )))
+}
+
 /// 协议通道的窗口列表：stacking order uuids → get_window_by_uuid → 事件聚合。
 #[async_trait]
 impl DesktopComponent for KWinCompositor {
@@ -1063,11 +1202,16 @@ impl WaylandCompositor for KWinCompositor {
 /// | 操作 | 协议路径 | Scripting 路径 |
 /// |------|---------|---------------|
 /// | focus/minimize/unminimize/close | 发完即 Ok（wayland 请求无回执）；uuid 不存在时 compositor 静默忽略，**不报错** | 窗口不存在返回 `Window not found` 错误 |
-/// | move/resize/maximize/set_geometry | 不可用（协议无 set_geometry），始终 Scripting | 同上报错语义 |
+/// | move/resize/set_geometry | 不可用（协议无 set_geometry），始终 Scripting | 窗口不存在报错；v6 Wayland 下变更后回读几何校验，静默 no-op 报错 |
+/// | maximize | 不可用，始终 Scripting | 窗口不存在报错 |
 ///
 /// 即：协议通道「乐观发送」，Scripting 通道「确认式」。同一 uuid 在
 /// 两通道下的失败表现不同——调用方以 `get_window_info` 预校验可消除
-/// 差异；T3b 协议事件聚合落地后统一为确认式。
+/// 差异；协议通道在 T3b 事件聚合落地后统一为确认式。move/resize/
+/// set_geometry 在 v6 Wayland 会话下额外回读几何对比（v5 读写基准
+/// frame/client 不一致、X11 读回为内容几何，均跳过），显式检测「脚本
+/// 返回 success 但几何未变」的静默 no-op（如无 seat 焦点的 D-Bus
+/// `PlasmaWindow.RequestMove`/`RequestResize`）。
 #[async_trait]
 impl CompositorComponent for KWinCompositor {
     fn capabilities(&self) -> BackendCapabilities {
@@ -1216,6 +1360,14 @@ impl CompositorComponent for KWinCompositor {
             }
             Err(e) => return Err(e.into()),
         }
+        // 变更前回读基准几何，供回读 no-op 检测；仅 v6 有意义——v5 读写
+        // 基准不一致（写 frameGeometry、读 geometry），服务端装饰窗口会
+        // 误报。基准读不到时跳过校验，不阻断移动。
+        let before = if self.version.is_v6() {
+            self.read_window_rect(id).await.ok()
+        } else {
+            None
+        };
         let v = self
             .query(
                 ScriptTemplate::MoveWindow,
@@ -1226,7 +1378,13 @@ impl CompositorComponent for KWinCompositor {
                 ],
             )
             .await?;
-        Self::check_op(&v).map_err(KWinError::into)
+        Self::check_op(&v).map_err(AgentShellError::from)?;
+        if let Some(before) = before {
+            self.verify_window_geometry(id, before, Some(x), Some(y), None, None)
+                .await
+                .map_err(AgentShellError::from)?;
+        }
+        Ok(())
     }
 
     /// 缩放：协议无 set_geometry（§7.2），始终 Scripting——`/Scripting`
@@ -1249,6 +1407,14 @@ impl CompositorComponent for KWinCompositor {
             }
             Err(e) => return Err(e.into()),
         }
+        // 变更前回读基准几何；仅 v6 Wayland 有意义——v5 读写基准不一致、
+        // X11 读回为内容几何（坐标相对 frame，非根坐标），均会误报。
+        // 基准读不到时跳过校验，不阻断缩放。
+        let before = if self.x11.is_none() && self.version.is_v6() {
+            self.read_window_rect(id).await.ok()
+        } else {
+            None
+        };
         let v = self
             .query(
                 ScriptTemplate::ResizeWindow,
@@ -1259,7 +1425,13 @@ impl CompositorComponent for KWinCompositor {
                 ],
             )
             .await?;
-        Self::check_op(&v).map_err(KWinError::into)
+        Self::check_op(&v).map_err(AgentShellError::from)?;
+        if let Some(before) = before {
+            self.verify_window_geometry(id, before, None, None, Some(w), Some(h))
+                .await
+                .map_err(AgentShellError::from)?;
+        }
+        Ok(())
     }
 
     /// 最小化(true)/还原(false)：协议 set_state 位操作优先。
@@ -1332,6 +1504,13 @@ impl CompositorComponent for KWinCompositor {
         id: &WindowId,
         geo: Rect,
     ) -> agent_shell_core::error::Result<()> {
+        // 变更前回读基准几何；仅 v6 Wayland 有意义（同 resize_window）。
+        // 基准读不到时跳过校验，不阻断几何设定。
+        let before = if self.x11.is_none() && self.version.is_v6() {
+            self.read_window_rect(id).await.ok()
+        } else {
+            None
+        };
         let v = self
             .query(
                 ScriptTemplate::SetWindowGeometry,
@@ -1344,7 +1523,20 @@ impl CompositorComponent for KWinCompositor {
                 ],
             )
             .await?;
-        Self::check_op(&v).map_err(KWinError::into)
+        Self::check_op(&v).map_err(AgentShellError::from)?;
+        if let Some(before) = before {
+            self.verify_window_geometry(
+                id,
+                before,
+                Some(geo.x),
+                Some(geo.y),
+                Some(geo.width),
+                Some(geo.height),
+            )
+            .await
+            .map_err(AgentShellError::from)?;
+        }
+        Ok(())
     }
 
     /// 单窗查询：list_windows 过滤（协议 get_window_by_uuid 仅给对象句柄，
@@ -2223,6 +2415,248 @@ mod tests {
                 .iter()
                 .any(|l| l.contains("⚠ 事件脚本") && l.contains("未加载")),
             "doctor must restore unloaded after a new probe: {lines:#?}"
+        );
+    }
+
+    /// `rect_matches`：命中维度精确匹配，`None` 维度跳过——回读校验的
+    /// 纯比较逻辑（move 只校验 x/y、resize 只校验 w/h、set_geometry 全量）。
+    #[test]
+    fn rect_matches_checks_only_requested_dimensions() {
+        let rect = Rect {
+            x: 100,
+            y: 50,
+            width: 800,
+            height: 600,
+        };
+        // 全量匹配。
+        assert!(rect_matches(
+            rect,
+            Some(100),
+            Some(50),
+            Some(800),
+            Some(600)
+        ));
+        // move：只校验 x/y，w/h 维度 None 跳过。
+        assert!(rect_matches(rect, Some(100), Some(50), None, None));
+        // resize：只校验 w/h。
+        assert!(rect_matches(rect, None, None, Some(800), Some(600)));
+        // 任一命中维度不匹配即失败（静默 no-op 场景：请求后几何未变）。
+        assert!(!rect_matches(rect, Some(584), Some(453), None, None));
+        assert!(!rect_matches(rect, None, None, Some(992), Some(533)));
+        assert!(!rect_matches(rect, Some(100), Some(50), Some(1), Some(1)));
+    }
+
+    /// 最小 `WindowInfo`：只填几何相关字段，供 [`window_rect`] 字段选择测试。
+    fn win_info(frame: Rect, content: Rect) -> WindowInfo {
+        WindowInfo {
+            id: WindowId {
+                native_id: "w".into(),
+                de_type: DesktopEnvironment::KDE,
+            },
+            title: String::new(),
+            app_id: String::new(),
+            pid: 0,
+            geometry: content,
+            frame_geometry: frame,
+            states: vec![WindowState::Normal],
+            workspace_id: None,
+            monitor_id: None,
+            stacking_order: 0,
+            desktop_file: None,
+            window_type: WindowType::Normal,
+            icon_geometry: None,
+            keep_above: false,
+        }
+    }
+
+    /// `window_rect`：`frame_geometry` 优先，default（全零，未知）回退 `geometry`。
+    #[test]
+    fn window_rect_prefers_frame_geometry_over_content() {
+        let frame = Rect {
+            x: 10,
+            y: 20,
+            width: 800,
+            height: 600,
+        };
+        let content = Rect {
+            x: 12,
+            y: 34,
+            width: 796,
+            height: 588,
+        };
+        assert_eq!(window_rect(&win_info(frame, content)), frame);
+        // frame 未知（default）→ 回退 content。
+        assert_eq!(window_rect(&win_info(Rect::default(), content)), content);
+    }
+
+    /// `rect_changed`：只检测请求维度变化，`None` 维度不参与。
+    #[test]
+    fn rect_changed_detects_only_requested_dimensions() {
+        let before = Rect {
+            x: 100,
+            y: 50,
+            width: 800,
+            height: 600,
+        };
+        let moved = Rect {
+            x: 200,
+            y: 50,
+            width: 800,
+            height: 600,
+        };
+        let resized = Rect {
+            x: 100,
+            y: 50,
+            width: 900,
+            height: 600,
+        };
+        // move 只看 x/y：x 变了。
+        assert!(rect_changed(before, moved, Some(200), Some(50), None, None));
+        // move 只看 x/y：两者都没变。
+        assert!(!rect_changed(
+            before,
+            before,
+            Some(200),
+            Some(50),
+            None,
+            None
+        ));
+        // resize 只看 w/h：w 变了。
+        assert!(rect_changed(
+            before,
+            resized,
+            None,
+            None,
+            Some(900),
+            Some(600)
+        ));
+        // resize 只看 w/h：w/h 都没变。
+        assert!(!rect_changed(
+            before,
+            before,
+            None,
+            None,
+            Some(900),
+            Some(600)
+        ));
+    }
+
+    /// `readback_ok`：命中 → true；钳制（变了但未达目标）→ true；静默
+    /// no-op（未变且未达目标）→ false；幂等（已在目标）→ true。
+    #[test]
+    fn readback_ok_detects_noop_not_clamping() {
+        let before = Rect {
+            x: 584,
+            y: 453,
+            width: 992,
+            height: 533,
+        };
+        // 命中：回读等于目标。
+        let hit = Rect {
+            x: 100,
+            y: 50,
+            width: 992,
+            height: 533,
+        };
+        assert!(readback_ok(before, hit, Some(100), Some(50), None, None));
+        // 钳制：变了但未达目标（合法 min/max size 约束，非 no-op）。
+        let clamped = Rect {
+            x: 584,
+            y: 453,
+            width: 1000,
+            height: 500,
+        };
+        assert!(
+            readback_ok(before, clamped, None, None, Some(100), Some(50)),
+            "clamping is a change, not a no-op"
+        );
+        // 静默 no-op：回读与基准一致且未达目标。
+        assert!(
+            !readback_ok(before, before, Some(100), Some(50), None, None),
+            "unchanged geometry must be reported as no-op"
+        );
+        // 幂等：请求前已处目标（move 到当前位置），跳过变化检测。
+        let at_target = Rect {
+            x: 100,
+            y: 50,
+            width: 800,
+            height: 600,
+        };
+        assert!(readback_ok(
+            at_target,
+            at_target,
+            Some(100),
+            Some(50),
+            None,
+            None
+        ));
+    }
+
+    /// `settle_readback`：陈旧读→重试→命中 → Ok；预算耗尽仍陈旧 → Err；
+    /// 读错误计入预算（陈旧→错误→命中 → Ok；持续错误 → Err）。
+    #[test]
+    fn settle_readback_retries_stale_then_hit_and_absorbs_read_errors() {
+        let before = Rect {
+            x: 584,
+            y: 453,
+            width: 992,
+            height: 533,
+        };
+        // width/height 异步落地：回读最终等于目标（1234×777）。
+        let hit = Rect {
+            x: 584,
+            y: 453,
+            width: 1234,
+            height: 777,
+        };
+        let stale = before;
+        // 首读陈旧、次读命中 → Ok（QA 失败的异步落地路径）。
+        assert!(settle_readback(
+            vec![Ok(stale), Ok(hit)],
+            before,
+            None,
+            None,
+            Some(1234),
+            Some(777)
+        )
+        .is_ok());
+        // 预算耗尽（0..=RETRIES 共 4 轮）仍陈旧 → Err(no-op)。
+        let all_stale: Vec<Result<Rect>> = (0..=KWinCompositor::READBACK_RETRIES)
+            .map(|_| Ok(stale))
+            .collect();
+        let err = settle_readback(all_stale, before, None, None, Some(1234), Some(777))
+            .expect_err("exhausted budget with unchanged geometry must fail");
+        assert!(
+            matches!(err, KWinError::Scripting(_)),
+            "expected no-op mismatch, got {err:?}"
+        );
+        // 读错误计入预算：陈旧→读错误→命中 → Ok（瞬态往返失败被吸收）。
+        assert!(
+            settle_readback(
+                vec![
+                    Ok(stale),
+                    Err(KWinError::Scripting("transient".into())),
+                    Ok(hit),
+                ],
+                before,
+                None,
+                None,
+                Some(1234),
+                Some(777)
+            )
+            .is_ok(),
+            "transient read error must be absorbed by the retry budget"
+        );
+        // 持续读错误 → Err(最后读错误)。
+        let all_err: Vec<Result<Rect>> = (0..=KWinCompositor::READBACK_RETRIES)
+            .map(|_| Err(KWinError::Scripting("boom".into())))
+            .collect();
+        assert!(
+            matches!(
+                settle_readback(all_err, before, None, None, Some(1234), Some(777)),
+                Err(KWinError::Scripting(_))
+            ),
+            "persistent read error must surface after budget exhausted"
         );
     }
 }
