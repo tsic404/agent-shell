@@ -135,9 +135,10 @@ pub enum Command {
 
 // ───────────────────────── windows ─────────────────────────
 
-/// 窗口标题匹配模式（`windows list` / `windows wait` 的 `--match`）。
+/// 窗口匹配模式（`windows list` / `windows wait` 的 `--match`）。
 ///
-/// 与 core `TitleMatchMode` 一一对应，wire 值固定为小写 snake_case。
+/// 作用于标题；`glob`/`regex` 亦作用于 app_id，`substring`/`exact` 下 app_id
+/// 恒精确比对。与 core `TitleMatchMode` 一一对应，wire 值固定为小写 snake_case。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
 pub enum MatchMode {
     /// 子串包含（默认，兼容现有调用）
@@ -169,7 +170,7 @@ pub enum WindowsCommand {
         /// 按 app_id 或标题过滤
         #[arg(long)]
         filter: Option<String>,
-        /// 标题匹配模式（默认 substring；须与 --filter 搭配）
+        /// 匹配模式（默认 substring；作用于标题，glob/regex 亦作用于 app_id；须与 --filter 搭配）
         #[arg(long = "match", value_enum, requires = "filter")]
         match_mode: Option<MatchMode>,
     },
@@ -193,7 +194,7 @@ pub enum WindowsCommand {
     Wait {
         /// 目标 app_id 或标题模式
         app_id: String,
-        /// 标题匹配模式（默认 substring）
+        /// 匹配模式（默认 substring；作用于标题，glob/regex 亦作用于 app_id）
         #[arg(long = "match", value_enum)]
         match_mode: Option<MatchMode>,
         /// 超时时长（如 `10s`、`500ms`、`2m`、`1h`；默认 15000ms）

@@ -472,7 +472,7 @@ pub enum TitleMatchMode {
     Glob,
 }
 
-/// 预编译标题匹配器（§15.3 第 3 级：子串 → 精确 → 正则 → glob）。
+/// 预编译模式匹配器（§15.3 第 3 级：子串 → 精确 → 正则 → glob）。
 ///
 /// `Regex` 模式在构造时编译一次，供批量过滤（`windows list` 逐窗口）与
 /// 轮询（`windows wait` 每 200ms 一轮）复用，避免每次匹配重复编译同一
@@ -498,22 +498,26 @@ impl<'a> TitleMatcher<'a> {
         }
     }
 
-    /// 原始 pattern（供 `app_id` 精确比对等旁路判断）。
-    pub fn pattern(&self) -> &str {
-        self.pattern
-    }
-
-    /// 标题是否命中。
-    pub fn matches(&self, title: &str) -> bool {
+    /// 目标字符串是否按模式命中。
+    pub fn matches(&self, value: &str) -> bool {
         match self.mode {
-            TitleMatchMode::Substring => title.contains(self.pattern),
-            TitleMatchMode::Exact => title == self.pattern,
+            TitleMatchMode::Substring => value.contains(self.pattern),
+            TitleMatchMode::Exact => value == self.pattern,
             TitleMatchMode::Regex => self
                 .regex
                 .as_ref()
-                .map(|r| r.is_match(title))
+                .map(|r| r.is_match(value))
                 .unwrap_or(false),
-            TitleMatchMode::Glob => glob_match::glob_match(self.pattern, title),
+            TitleMatchMode::Glob => glob_match::glob_match(self.pattern, value),
+        }
+    }
+
+    /// app_id 是否命中：`Substring`/`Exact` 保持精确比对（历史兼容，不随
+    /// `--match` 放宽），`Glob`/`Regex` 将 pattern 作用于 app_id。
+    pub fn matches_app_id(&self, app_id: &str) -> bool {
+        match self.mode {
+            TitleMatchMode::Substring | TitleMatchMode::Exact => app_id == self.pattern,
+            TitleMatchMode::Glob | TitleMatchMode::Regex => self.matches(app_id),
         }
     }
 }
