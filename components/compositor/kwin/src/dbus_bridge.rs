@@ -681,9 +681,10 @@ pub struct KWinEventStream {
 impl agent_shell_core::EventStream for KWinEventStream {
     /// 下一条可归一化的事件；未识别载荷跳过，桥接关闭返回 None。
     ///
-    /// 当前映射（T3b 前的最小集）：`windowOpened`/`windowClosed`/
-    /// `windowFocused` → 对应 `DesktopEvent` 变体；窗口详情字段由 T3b
-    /// 归一化任务补全。
+    /// 仅映射可忠实表达的变体：`windowClosed` → [`DesktopEvent::WindowClosed`]
+    /// （该变体仅需 id）。`windowOpened`/`windowFocused` 需要完整
+    /// [`WindowInfo`]，本流无 resolver 拿不到，跳过而非伪报为 Closed——
+    /// 否则消费方会据 `WindowClosed` 移除窗口缓存，语义错误。
     async fn next_event(&self) -> Option<agent_shell_core::event::DesktopEvent> {
         loop {
             let value = self.rx.lock().await.recv().await?;
@@ -696,25 +697,16 @@ impl agent_shell_core::EventStream for KWinEventStream {
                 }
             });
             match (value.get("event").and_then(Value::as_str), id) {
-                (Some("windowOpened"), Some(id)) => {
-                    // ⚠️ 语义近似映射（🟡1）：WindowOpened 需要完整 WindowInfo，
-                    // T3b 前暂以 Closed 变体承载 id。调用方在 window_events
-                    // 已声明 false 的前提下不应消费本流；若消费，请把此事件
-                    // 当作「id 出现」信号而非关闭语义（勿据以移除缓存）。
+                (Some("windowClosed"), Some(id)) => {
                     return Some(agent_shell_core::event::DesktopEvent::WindowClosed {
                         id,
                         source,
                         occurred_at,
                     });
                 }
-                (Some("windowFocused"), Some(id)) => {
-                    return Some(agent_shell_core::event::DesktopEvent::WindowClosed {
-                        id,
-                        source,
-                        occurred_at,
-                    });
-                }
-                _ => continue, // 未识别事件类型：跳过，等待下一条
+                // windowOpened/windowFocused 需要完整 WindowInfo（本流无
+                // resolver），伪报为 Closed 会误导消费方——跳过。
+                _ => continue, // 未识别或无法忠实表达的事件：跳过，等待下一条
             }
         }
     }
@@ -1008,6 +1000,55 @@ mod tests {
             Some("windowOpened")
         );
         assert!(router.lock().await.waiters.is_empty());
+    }
+
+    /// Scripting 流 `next_event` 的映射契约：仅 `windowClosed` 产出
+    /// [`agent_shell_core::event::DesktopEvent::WindowClosed`]；`windowOpened`/
+    /// `windowFocused` 需要完整 `WindowInfo`（本流无 resolver），跳过而非伪报
+    /// 为 Closed——否则消费方会据 `WindowClosed` 移除窗口缓存。open/focus 先
+    /// 入队、closed 殿后时，单次 `next_event` 跳过前两者仍返回 closed，证明
+    /// 跳过后流不阻塞。
+    #[tokio::test]
+    async fn kwin_event_stream_maps_only_window_closed_and_skips_open_focus() {
+        use agent_shell_core::event::{
+            DesktopEvent, EventSource as CoreEventSource, EventStream as _,
+        };
+
+        let (tx, rx) = mpsc::unbounded_channel();
+        let stream = KWinEventStream { rx: Mutex::new(rx) };
+        for (event, id) in [
+            ("windowOpened", "42"),
+            ("windowFocused", "43"),
+            ("windowClosed", "44"),
+        ] {
+            tx.send(serde_json::json!({ "event": event, "id": id }))
+                .expect("send");
+        }
+
+        let evt = stream.next_event().await.expect("closed must be emitted");
+        match evt {
+            DesktopEvent::WindowClosed { id, source, .. } => {
+                assert_eq!(id.native_id, "44");
+                assert_eq!(id.de_type, agent_shell_core::DesktopEnvironment::KDE);
+                assert_eq!(source, CoreEventSource::KWinWayland);
+            }
+            other => panic!("expected WindowClosed for windowClosed, got {other:?}"),
+        }
+
+        // 仅 open/focus（无 closed）时流不产出任何事件：sender drop 后
+        // next_event 返回 None（流结束），而非误报 WindowClosed。
+        let (tx_open_focus, rx_open_focus) = mpsc::unbounded_channel();
+        let stream_open_focus = KWinEventStream {
+            rx: Mutex::new(rx_open_focus),
+        };
+        tx_open_focus
+            .send(serde_json::json!({ "event": "windowOpened", "id": "42" }))
+            .expect("send");
+        tx_open_focus
+            .send(serde_json::json!({ "event": "windowFocused", "id": "42" }))
+            .expect("send");
+        drop(tx_open_focus);
+        assert!(stream_open_focus.next_event().await.is_none());
     }
 
     /// 归一化前去重的键语义：新格式按 `(event, id, occurred_at)` 精确判重，

@@ -87,9 +87,8 @@ impl RawSource for EwmhRawSource {
 /// KWin X11 EWMH 事件的近似映射流（core [`agent_shell_core::EventStream`]）。
 ///
 /// `subscribe()` 的 X11 分支消费本流，映射语义与 Scripting `KWinEventStream`
-/// 对齐（同为 T3b 前近似流）：`WindowOpened`/`WindowFocused` 需要完整
-/// [`WindowInfo`]，本层无 resolver 拿不到，暂以 [`DesktopEvent::WindowClosed`]
-/// 承载窗口 id 作为「id 出现」信号（消费方勿据以移除缓存）。
+/// 对齐：`WindowClosed`（仅需 id）忠实映射，`WindowOpened`/`WindowFocused`
+/// 需要完整 [`WindowInfo`]，本层无 resolver 拿不到，跳过而非伪报为 Closed。
 pub struct EwmhEventStream {
     rx: tokio::sync::Mutex<mpsc::UnboundedReceiver<RawEvent>>,
 }
@@ -116,12 +115,12 @@ impl agent_shell_core::EventStream for EwmhEventStream {
 
 /// [`RawEvent`] → core [`DesktopEvent`]（近似映射，见 [`EwmhEventStream`]）。
 ///
-/// `KWinWindowAdded` / `KWinActiveWindowChanged` 映射为 `WindowClosed`（仅承载
-/// id 的「id 出现」信号）；`KWinWindowRemoved` 与失焦（`id: None`）跳过——
-/// 与 Scripting `KWinEventStream` 对 `windowClosed` 的跳过口径一致。
+/// `KWinWindowRemoved` 映射为 `WindowClosed`（仅需 id，可忠实表达）；
+/// `KWinWindowAdded` / `KWinActiveWindowChanged` 需要完整 [`WindowInfo`]，
+/// 本流无 resolver，伪报为 `WindowClosed` 会误导消费方移除缓存——跳过。
 fn map_raw_to_core(raw: RawEvent) -> Option<agent_shell_core::event::DesktopEvent> {
     let id = match raw {
-        RawEvent::KWinWindowAdded { id } | RawEvent::KWinActiveWindowChanged { id: Some(id) } => id,
+        RawEvent::KWinWindowRemoved { id } => id,
         _ => return None,
     };
     Some(agent_shell_core::event::DesktopEvent::WindowClosed {
@@ -277,25 +276,23 @@ mod tests {
     }
 
     #[test]
-    fn map_raw_to_core_maps_open_focus_to_closed_and_skips_others() {
+    fn map_raw_to_core_maps_removed_to_closed_and_skips_others() {
         use agent_shell_core::event::{DesktopEvent, EventSource as CoreEventSource};
-        // windowOpened → WindowClosed（id 出现信号，与 Scripting KWinEventStream 对齐）。
-        let opened = map_raw_to_core(RawEvent::KWinWindowAdded { id: "42".into() });
-        let DesktopEvent::WindowClosed { id, source, .. } = opened.unwrap() else {
-            panic!("expected WindowClosed for windowOpened");
+        // windowClosed → WindowClosed（忠实映射，与 Scripting KWinEventStream 对齐）。
+        let closed = map_raw_to_core(RawEvent::KWinWindowRemoved { id: "42".into() });
+        let DesktopEvent::WindowClosed { id, source, .. } = closed.unwrap() else {
+            panic!("expected WindowClosed for windowClosed");
         };
         assert_eq!(id.native_id, "42");
         assert_eq!(id.de_type, DesktopEnvironment::KDE);
         assert_eq!(source, CoreEventSource::KWinX11);
 
-        // windowFocused → WindowClosed（近似）。
-        let focused = map_raw_to_core(RawEvent::KWinActiveWindowChanged {
-            id: Some("7".into()),
-        });
-        assert!(matches!(focused, Some(DesktopEvent::WindowClosed { .. })));
-
-        // windowClosed / 失焦 → 跳过。
-        assert!(map_raw_to_core(RawEvent::KWinWindowRemoved { id: "42".into() }).is_none());
+        // windowOpened / windowFocused 需完整 WindowInfo，本流无 resolver → 跳过。
+        assert!(map_raw_to_core(RawEvent::KWinWindowAdded { id: "42".into() }).is_none());
+        assert!(map_raw_to_core(RawEvent::KWinActiveWindowChanged {
+            id: Some("7".into())
+        })
+        .is_none());
         assert!(map_raw_to_core(RawEvent::KWinActiveWindowChanged { id: None }).is_none());
     }
 }
