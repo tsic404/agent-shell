@@ -2558,6 +2558,43 @@ impl CaptureCache {
 }
 ```
 
+### 13.5 doctor 截图行括注矩阵
+
+doctor 输出截图行由 `CaptureDispatcher::doctor_line` 经纯函数
+`render_capture_doctor_line` 渲染（`modules/capture/src/lib.rs`）。行前缀为
+`✓` / `⚠` / `✗`；`⚠` 分支的括注文案是后续文案变更的唯一对照来源，须与下表一一对应：
+
+| 分支 | `active`（探测结果） | `portal_fallback`（降级去向） | 候选链特征 | 括注文案（契约） |
+|------|----------------------|-------------------------------|------------|------------------|
+| ⚠ 1 | `Some(ScreenshotPortal)` | `Fail(Permission)`（Wayland） | 含 `portal-screencast` | 选中 portal-screenshot，需 portal 交互授权才能真实捕获 |
+| ⚠ 2 | `None` | `Fail(Permission)`（Wayland） | 含 `x11` | Wayland 下 portal 未就绪/未授权，已拒绝 x11 兜底 |
+| ⚠ 3 | `None` | `Fail(Permission)`（Wayland） | 无 `x11` | Wayland 下 portal 未就绪/未授权，无可用后端 |
+| ⚠ 4 | `None` | `X11` 或 `Fail(BackendUnavailable)` | 含 `portal-*` | 非交互探测未就绪，需 portal 交互授权 |
+| ⚠ 5 | `None` | `X11` 或 `Fail(BackendUnavailable)` | 无 `portal-*` | 非交互探测失败，无可用后端 |
+
+行格式约定：`{符号} {label:<12}: [候选 ]{chain}（{括注文案}）`。`{chain}` 为候选后端名按
+探测顺序以 ` → ` 连接（如 `portal-screencast → portal-screenshot → x11`）；`{label:<12}`
+左对齐补齐 12 列宽。⚠ 1 直接输出 `{chain}`，⚠ 2–5 输出 `候选 {chain}`。
+
+> ⚠ 4 的「需 portal 交互授权」为非确定性措辞：该分支覆盖 `active = None` 且非
+> `Fail(Permission)` 兜底、含 `portal-*` 候选的**全部**探测失败情形（后端不可用、
+> 无效帧/全黑帧、X11 探测失败等），`probe()` 不携带失败原因，源码注释自承「多半仍是
+> portal 未授权」——括注仅表最可能原因。修订该文案须保留非确定性语义，或同步修订代码与单测。
+
+非 `⚠` 情形：
+
+- `✓ {label:<12}: {chain}（选中 {backend}）`——`active = Some` 且不满足 ⚠ 1 条件
+  （`screencast_first_on_wayland`）：
+  - `Some(ScreenCast)` / `Some(X11)`：非交互探测已建会话；
+  - `Some(ScreenshotPortal)` 且非 Wayland（`portal_fallback ≠ Fail(Permission)`，典型为
+    原生 X11）：候选链含 `portal-screencast` 仍输出 `✓`——真实 capture 失败可降级 x11 兜底；
+  - `Some(ScreenshotPortal)` 且 Wayland 但候选链无 `portal-screencast`：真实 capture
+    直落 Screenshot 预探测即成功，`✓` 准确。
+- `✗ {label:<12}: 不可用（无 portal 且无原生 X11 会话，TTY？）`——dispatcher 装配失败
+  （`doctor_line` 层 `dispatcher = None`）。`dispatcher = None` 多成因：session bus 连接
+  失败（`with_token_store` 首步 `?` 短路，即使原生 X11 存在亦返回 `None`），或所有后端
+  探测失败（无 portal 且无原生 X11 会话，TTY）。
+
 ---
 
 ## 14. AT-SPI 无障碍模块
