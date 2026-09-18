@@ -1577,6 +1577,8 @@ activate_workspace(id):
   1. Wayland：probe `/Scripting`
      → 可用：bridge.switch_workspace.js 走 Scripting
      → 失败（确证缺失/瞬时不可达）：VirtualDesktopManager.current 写桌面 id
+       （数字 id 翻译为 UUID，未知 id 显式拒绝，不透传——KWin D-Bus 对越界
+        输入夹取/拒绝语义不一致）
 
 subscribe()/subscribe_raw():
   0. X11 会话？
