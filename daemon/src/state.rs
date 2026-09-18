@@ -14,7 +14,7 @@ use agent_shell_compositor_kwin::KWinCompositor;
 use agent_shell_compositor_mutter::{GnomePathKind, MutterCompositor};
 use agent_shell_core::component::{BackendCapabilities, CompositorComponent, DesktopComponent};
 use agent_shell_core::error::AgentShellError;
-use agent_shell_core::types::WindowInfo;
+use agent_shell_core::types::{WindowInfo, WorkspaceInfo};
 use agent_shell_power::{BrightnessController, BrightnessOps};
 use event::{EventHub, EventRing};
 use std::time::{Duration, Instant};
@@ -468,15 +468,12 @@ impl Daemon {
             .list_workspaces()
             .await
             .map_err(|e| (agent_shell_rpc::RpcErrorCode::BackendError, e.to_string()))?;
-        let target = list
-            .iter()
-            .find(|w| w.id.native_id == ws || w.number.to_string() == ws)
-            .ok_or_else(|| {
-                (
-                    agent_shell_rpc::RpcErrorCode::NotFound,
-                    format!("workspace not found: {ws:?}"),
-                )
-            })?;
+        let target = resolve_workspace(&list, ws).ok_or_else(|| {
+            (
+                agent_shell_rpc::RpcErrorCode::NotFound,
+                format!("workspace not found: {ws:?}"),
+            )
+        })?;
         comp.activate_workspace(&target.id)
             .await
             .map_err(|e| (agent_shell_rpc::RpcErrorCode::BackendError, e.to_string()))
@@ -612,6 +609,19 @@ impl Daemon {
     }
 }
 
+/// 用户输入 → 工作区：1 基 `number` 优先，`native_id` 次之，`name` 兜底。
+///
+/// `number` 与 `workspaces list` 展示对齐，故优先；`native_id` 是数据层定位
+/// 键（X11 0 基 EWMH 索引 / KWin UUID），不等同于桌面名；`name` 覆盖照抄
+/// 列表名的输入（Sway 下 native_id == name）。X11 下 number 与 native_id 差
+/// 1，native_id 优先会把 "1" 错切到第二个桌面，故 number 必须在先。
+fn resolve_workspace<'a>(list: &'a [WorkspaceInfo], ws: &str) -> Option<&'a WorkspaceInfo> {
+    list.iter()
+        .find(|w| w.number.to_string() == ws)
+        .or_else(|| list.iter().find(|w| w.id.native_id == ws))
+        .or_else(|| list.iter().find(|w| w.name == ws))
+}
+
 /// 当前会话的 DE 归类（与 core 检测同口径）。
 fn session_kind() -> String {
     use agent_shell_core::de_detection::detect_desktop_environment;
@@ -711,6 +721,42 @@ mod tests {
             mutter_event_source(K::Extension),
             event::EventSource::MutterExtension
         );
+    }
+
+    #[test]
+    fn resolve_workspace_prefers_number_over_native_id() {
+        use agent_shell_core::types::{DesktopEnvironment, WorkspaceId, WorkspaceInfo};
+        let ws = |number: u32, native: &str, name: &str| WorkspaceInfo {
+            id: WorkspaceId {
+                native_id: native.to_string(),
+                de_type: DesktopEnvironment::KDE,
+            },
+            name: name.to_string(),
+            number,
+            is_active: false,
+            monitor_ids: Vec::new(),
+            window_ids: Vec::new(),
+        };
+        // X11：number 1 基、native_id 0 基，差 1。
+        let x11 = vec![ws(1, "0", "桌面 1"), ws(2, "1", "桌面 2")];
+        // "1" 命中 number=1 的 ws[0]（第一个桌面），而非 native_id="1" 的 ws[1]。
+        assert_eq!(resolve_workspace(&x11, "1").unwrap().id.native_id, "0");
+        assert_eq!(resolve_workspace(&x11, "2").unwrap().id.native_id, "1");
+        // "0" 无对应 number，回退 native_id → 第一个桌面（0 基 EWMH 兜底）。
+        assert_eq!(resolve_workspace(&x11, "0").unwrap().id.native_id, "0");
+        // 桌面名兜底：照抄 `workspaces list` 展示的名字。
+        assert_eq!(resolve_workspace(&x11, "桌面 2").unwrap().id.native_id, "1");
+        // 非数字 native_id（KWin UUID）在 number 无命中时按 native_id 兜底。
+        let kwin = vec![ws(1, "{uuid-1}", "桌面 1")];
+        assert_eq!(
+            resolve_workspace(&kwin, "{uuid-1}").unwrap().id.native_id,
+            "{uuid-1}"
+        );
+        assert_eq!(
+            resolve_workspace(&kwin, "桌面 1").unwrap().id.native_id,
+            "{uuid-1}"
+        );
+        assert!(resolve_workspace(&kwin, "3").is_none());
     }
 
     #[test]
