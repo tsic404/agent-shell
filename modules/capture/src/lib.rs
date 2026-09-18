@@ -1130,7 +1130,7 @@ mod tests {
         let jpeg = dir.path().join("kwin_screenshot.jpg");
         // JPEG SOI（FF D8 FF E0）+ 非全零填充：非 PNG 魔数、非「空/全 0」。
         let mut bytes = vec![0xFF, 0xD8, 0xFF, 0xE0];
-        bytes.extend(std::iter::repeat(0x11).take(1024));
+        bytes.extend(std::iter::repeat_n(0x11, 1024));
         std::fs::write(&jpeg, &bytes).unwrap();
         assert!(is_png_black_or_invalid(&jpeg));
         assert!(validated_screenshot_frame(jpeg.clone()).is_none());
