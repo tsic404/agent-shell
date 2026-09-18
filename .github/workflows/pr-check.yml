@@ -58,7 +58,9 @@ jobs:
 
       - name: Test (Packaging)
         if: matrix.profile == 'default'
-        run: sh packaging/debian/build-deb-arch.test.sh
+        run: |
+          sh packaging/debian/build-deb-arch.test.sh
+          bash packaging/arch/pkgbuild.test.sh
       - name: Build (Rust, no PipeWire dev headers)
         if: matrix.profile == 'no-pipewire'
         run: cargo build --release --workspace --no-default-features
