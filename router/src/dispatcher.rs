@@ -31,7 +31,7 @@ pub trait ElementActions: Send + Sync {
         -> Result<Vec<std::sync::Arc<dyn A11yElement>>>;
 }
 
-/// 输入注入封装（libei → ydotool → XTest 降级链在 T2 内部完成，路由层只见此接口）。
+/// 输入注入封装（libei → ydotool → uinput → XTest 降级链在 T2 内部完成，路由层只见此接口）。
 #[async_trait]
 pub trait InputDispatcher: Send + Sync {
     /// 键盘模拟输入文本，`delay_us` 为键间延迟（微秒）。

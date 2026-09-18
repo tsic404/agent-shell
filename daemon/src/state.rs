@@ -183,7 +183,7 @@ pub struct Daemon {
     pub idle_timeout: Duration,
     /// capture 组件（三级降级链；None = 全后端探测失败，TTY 场景）。
     pub capture: Option<CaptureDispatcher>,
-    /// input 组件（libei → ydotool → XTest 降级链；None = 全后端探测失败，TTY 场景）。
+    /// input 组件（libei → ydotool → uinput → XTest 降级链；None = 全后端探测失败，TTY 场景）。
     pub input: Option<agent_shell_input::InputComponentHandle>,
     /// input 装配失败原因（如 portal 缺 ConnectToEIS；detect 空链错误的裸消息）。
     /// None = 装配成功。`input_send` 在 `input == None` 时透出，而非笼统
@@ -252,7 +252,7 @@ impl Daemon {
             }
         }
         .map(std::sync::Arc::new);
-        // 输入降级链（libei → ydotool → XTest）：与 compositor 独立装配。
+        // 输入降级链（libei → ydotool → uinput → XTest）：与 compositor 独立装配。
         // 探测失败（TTY / portal 缺 ConnectToEIS / 无后端）不再静默吞错——保存
         // 装配错误原因，input_send 透出可诊断错误而非笼统 "unavailable"。
         let de_type = agent_shell_core::de_detection::detect_desktop_environment();

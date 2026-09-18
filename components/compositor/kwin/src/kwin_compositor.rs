@@ -319,7 +319,8 @@ impl KWinCompositor {
                 }
                 Some(_) => lines.push("⚠ 输入注入   : fake_input bound, not authenticated".into()),
                 None => lines.push(
-                    "⚠ 输入注入   : 无 fake_input（降级 libei/ydotool/XTest/xdotool）".into(),
+                    "⚠ 输入注入   : 无 fake_input（降级 libei/ydotool/uinput/XTest/xdotool）"
+                        .into(),
                 ),
             }
         }

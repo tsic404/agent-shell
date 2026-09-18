@@ -18,7 +18,7 @@ use reis::event::{DeviceCapability, EiEvent};
 use tokio::sync::Mutex;
 
 use super::dispatcher::{InputService, Op, INPUT_TIMEOUT};
-use crate::keymap::{char_to_evdev, combo_to_press_sequence};
+use crate::keymap::{char_to_evdev, combo_to_press_sequence, evdev_mouse_button};
 
 /// portal 服务 bus 名。
 const PORTAL_DESTINATION: &str = "org.freedesktop.portal.Desktop";
@@ -518,29 +518,9 @@ impl InputService for LibeiInput {
     }
 }
 
-/// MouseButton → evdev 按钮码（BTN_LEFT=0x110 起；侧键 BTN_BACK/FORWARD）。
-fn evdev_mouse_button(b: MouseButton) -> u32 {
-    match b {
-        MouseButton::Left => 0x110,
-        MouseButton::Right => 0x111,
-        MouseButton::Middle => 0x112,
-        MouseButton::Back => 0x116,
-        MouseButton::Forward => 0x115,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn mouse_button_codes_match_evdev() {
-        assert_eq!(evdev_mouse_button(MouseButton::Left), 0x110);
-        assert_eq!(evdev_mouse_button(MouseButton::Right), 0x111);
-        assert_eq!(evdev_mouse_button(MouseButton::Middle), 0x112);
-        assert_eq!(evdev_mouse_button(MouseButton::Back), 0x116);
-        assert_eq!(evdev_mouse_button(MouseButton::Forward), 0x115);
-    }
 
     #[test]
     fn capability_bitflags_cover_keyboard_and_pointer() {
