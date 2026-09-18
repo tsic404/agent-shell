@@ -313,10 +313,16 @@ async fn doctor(d: &mut Daemon) -> RpcResult {
 }
 
 /// input 组件 doctor 行（§12 降级链状态；None = TTY/全后端探测失败）。
+///
+/// 失败行携带 `Daemon::input_error` 装配短摘要（如 portal 缺 ConnectToEIS），
+/// 与 `input_send` 路径同源；无摘要时才回落通用「TTY 或无注入后端」。
 fn input_doctor_line(d: &Daemon) -> String {
     const LABEL: &str = "输入后端";
     match d.input.as_ref() {
-        None => format!("✗ {LABEL:<12}: 不可用（TTY 或无注入后端）"),
+        None => {
+            let detail = d.input_error.as_deref().unwrap_or("TTY 或无注入后端");
+            format!("✗ {LABEL:<12}: 不可用（{detail}）")
+        }
         Some(handle) => {
             let chain = handle.dispatcher().backend_names().join(" → ");
             // detect 仅在选出 active 后端时返回 Ok，故 backend_name 恒 Some。
@@ -2092,6 +2098,36 @@ mod tests {
             "{}",
             err.message
         );
+    }
+
+    #[tokio::test]
+    async fn doctor_input_failure_carries_assembly_reason() {
+        // doctor 输入后端失败行必须携带 state 保存的装配短摘要
+        // （与 input_send 路径一致），而非笼统「TTY 或无注入后端」。
+        let mut d = test_daemon().await;
+        d.input = None;
+        d.input_error = Some(
+            "input: no usable input backend in DDE session (portal backend does not support EIS: \
+             RemoteDesktop.ConnectToEIS missing)"
+                .into(),
+        );
+        let line = input_doctor_line(&d);
+        assert!(line.starts_with("✗ 输入后端"), "{line}");
+        assert!(
+            line.contains("ConnectToEIS missing"),
+            "doctor input line must carry assembly reason: {line}"
+        );
+    }
+
+    #[tokio::test]
+    async fn doctor_input_failure_falls_back_without_reason() {
+        // 无 input_error（如纯 TTY 空链）时保留通用描述，不带空括号。
+        let mut d = test_daemon().await;
+        d.input = None;
+        d.input_error = None;
+        let line = input_doctor_line(&d);
+        assert!(line.contains("TTY 或无注入后端"), "{line}");
+        assert!(!line.contains("（None）"), "{line}");
     }
 
     #[tokio::test]
