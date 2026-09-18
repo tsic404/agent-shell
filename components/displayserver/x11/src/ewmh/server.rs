@@ -11,7 +11,8 @@ use x11rb::errors::{ConnectError, ConnectionError, ReplyError};
 use x11rb::protocol::randr::ConnectionExt as _RandrExt;
 use x11rb::protocol::shm::{self, ConnectionExt as _ShmExt};
 use x11rb::protocol::xproto::{
-    AtomEnum, ClientMessageEvent, ConnectionExt, EventMask, ImageFormat,
+    AtomEnum, ClientMessageData, ClientMessageEvent, ConnectionExt, EventMask, ImageFormat,
+    CLIENT_MESSAGE_EVENT,
 };
 use x11rb::protocol::xtest::ConnectionExt as _XTestExt;
 use x11rb::rust_connection::RustConnection;
@@ -210,7 +211,7 @@ impl X11DisplayServer {
         window: x11rb::protocol::xproto::Window,
         protocol: x11rb::protocol::xproto::Atom,
     ) -> Result<()> {
-        let event = ClientMessageEvent::new(
+        let event = wm_client_message(
             32,
             window,
             self.wm_atoms.wm_protocols,
@@ -384,7 +385,7 @@ impl X11DisplayServer {
     /// focus-stealing prevention 会拒收/降级来源不明的聚焦请求；`data.l[1]`
     /// 携带 `CurrentTime`（服务端按「当前时刻」解释）。wmctrl/xdotool 同款。
     pub fn activate_window(&self, window: x11rb::protocol::xproto::Window) -> Result<()> {
-        let event = ClientMessageEvent::new(
+        let event = wm_client_message(
             32,
             window,
             self.atoms._NET_ACTIVE_WINDOW,
@@ -430,8 +431,7 @@ impl X11DisplayServer {
 
     /// `_NET_CLOSE_WINDOW` ClientMessage：礼貌关闭窗口。
     pub fn close_window(&self, window: x11rb::protocol::xproto::Window) -> Result<()> {
-        let event =
-            ClientMessageEvent::new(32, window, self.atoms._NET_CLOSE_WINDOW, [0u32, 0, 0, 0, 0]);
+        let event = wm_client_message(32, window, self.atoms._NET_CLOSE_WINDOW, [0u32, 0, 0, 0, 0]);
         self.send_root_event(
             event,
             EventMask::SUBSTRUCTURE_REDIRECT | EventMask::SUBSTRUCTURE_NOTIFY,
@@ -464,7 +464,7 @@ impl X11DisplayServer {
             w.unwrap_or(0) as u32,
             h.unwrap_or(0) as u32,
         ];
-        let event = ClientMessageEvent::new(32, window, self.atoms._NET_MOVERESIZE_WINDOW, data);
+        let event = wm_client_message(32, window, self.atoms._NET_MOVERESIZE_WINDOW, data);
         self.send_root_event(
             event,
             EventMask::SUBSTRUCTURE_REDIRECT | EventMask::SUBSTRUCTURE_NOTIFY,
@@ -574,7 +574,7 @@ impl X11DisplayServer {
         state_atom: u32,
         second_atom: Option<u32>,
     ) -> Result<()> {
-        let event = ClientMessageEvent::new(
+        let event = wm_client_message(
             32,
             window,
             self.atoms._NET_WM_STATE,
@@ -588,7 +588,7 @@ impl X11DisplayServer {
 
     /// `_NET_CURRENT_DESKTOP` ClientMessage：切换工作区。
     pub fn set_current_desktop(&self, desktop: u32) -> Result<()> {
-        let event = ClientMessageEvent::new(
+        let event = wm_client_message(
             32,
             self.root,
             self.atoms._NET_CURRENT_DESKTOP,
@@ -606,7 +606,7 @@ impl X11DisplayServer {
         window: x11rb::protocol::xproto::Window,
         desktop: u32,
     ) -> Result<()> {
-        let event = ClientMessageEvent::new(
+        let event = wm_client_message(
             32,
             window,
             self.atoms._NET_WM_DESKTOP,
@@ -946,6 +946,31 @@ fn usize_flag(value: Option<&i32>, flag: u32) -> u32 {
     }
 }
 
+/// X11 `send_event` 标志位：事件 `response_type` 的 bit 7（0x80）。
+///
+/// `SendEvent` 请求只透传事件原始字节、不替客户端置位（x11rb 文档注释宣称
+/// 强制置位，实际实现未做）；KWin 5.x 仅消费 `send_event=true` 的 WM
+/// ClientMessage，故 EWMH/ICCCM 消息必须显式置位。
+const SEND_EVENT_FLAG: u8 = 0x80;
+
+/// 构造发送给 WM 的 ClientMessage（`send_event` 位置位）。
+///
+/// 统一取代 `ClientMessageEvent::new`：EWMH/ICCCM 根窗口消息须由 WM 消费，
+/// KWin 5.x 会拒收 `send_event=false` 的消息（对照 wmctrl/xdotool 的
+/// `ev.xclient.send_event = True`）。`new` 仅置 `response_type =
+/// CLIENT_MESSAGE_EVENT`（bit 7 未置），此处补上 `SEND_EVENT_FLAG`。
+fn wm_client_message(
+    format: u8,
+    window: x11rb::protocol::xproto::Window,
+    type_: impl Into<x11rb::protocol::xproto::Atom>,
+    data: impl Into<ClientMessageData>,
+) -> ClientMessageEvent {
+    ClientMessageEvent {
+        response_type: CLIENT_MESSAGE_EVENT | SEND_EVENT_FLAG,
+        ..ClientMessageEvent::new(format, window, type_, data)
+    }
+}
+
 fn cerr(e: ConnectionError) -> AgentShellError {
     AgentShellError::DBus(format!("x11 request: {e}"))
 }
@@ -989,6 +1014,19 @@ mod tests {
             matches!(err, AgentShellError::BackendUnavailable(_)),
             "got: {err:?}"
         );
+    }
+
+    #[test]
+    fn wm_client_message_sets_send_event_flag() {
+        // WM 消费的 ClientMessage 必须置 send_event 位（response_type bit 7）；
+        // KWin 5.x 拒收 send_event=false 的 EWMH/ICCCM 消息（对照 wmctrl）。
+        let ev = wm_client_message(32, 1, 2u32, [0u32; 5]);
+        assert_eq!(ev.response_type, CLIENT_MESSAGE_EVENT | SEND_EVENT_FLAG);
+        assert_eq!(ev.response_type & SEND_EVENT_FLAG, SEND_EVENT_FLAG);
+        // 其余字段与 ClientMessageEvent::new 保持一致（format/window/type）。
+        assert_eq!(ev.format, 32);
+        assert_eq!(ev.window, 1);
+        assert_eq!(ev.type_, 2u32);
     }
 
     /// 真实 X server（Xvfb / XWayland 均可）下的 MIT-SHM 截图验证：

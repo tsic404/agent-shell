@@ -694,6 +694,16 @@ impl KWinCompositor {
         })
     }
 
+    /// 工作区 ID 字符串 → `_NET_CURRENT_DESKTOP` 桌面索引（u32，十进制 0 基）。
+    ///
+    /// X11 会话 `x11_workspaces` 的 `native_id` 取 0 基索引，与
+    /// `_NET_CURRENT_DESKTOP` 口径一致；`workspaces switch` 按十进制回读。
+    fn x11_workspace_id(id: &WorkspaceId) -> agent_shell_core::error::Result<u32> {
+        id.native_id.parse::<u32>().map_err(|_| {
+            AgentShellError::Other(format!("invalid workspace id: {}", id.native_id).into())
+        })
+    }
+
     /// `_NET_DESKTOP_NAMES` → 工作区名称列表（NULL 分隔；缺失回空，调用方
     /// 按索引合成 `Desktop N` 兜底名）。
     fn x11_desktop_names(x11: &X11DisplayServer) -> Vec<String> {
@@ -1370,10 +1380,15 @@ impl CompositorComponent for KWinCompositor {
         }
     }
 
-    /// 激活工作区：switch_workspace.js 优先；`/Scripting` 未注册（Wayland）时
-    /// 走 `VirtualDesktopManager.current` 属性（写桌面 id）。
+    /// 激活工作区：X11 会话走 EWMH `_NET_CURRENT_DESKTOP` ClientMessage（无需
+    /// `/Scripting`——部分 KWin 5.x X11 会话不注册该对象路径）；Wayland 会话
+    /// switch_workspace.js 优先，`/Scripting` 未注册时走
+    /// `VirtualDesktopManager.current` 属性（写桌面 id）。
     async fn activate_workspace(&self, id: &WorkspaceId) -> agent_shell_core::error::Result<()> {
-        if self.x11.is_none() && self.ensure_scripting_probe().await.is_err() {
+        if let Some(x11) = self.x11.as_ref() {
+            return x11.set_current_desktop(Self::x11_workspace_id(id)?);
+        }
+        if self.ensure_scripting_probe().await.is_err() {
             return self
                 .native
                 .set_current_desktop(&id.native_id)
@@ -1740,6 +1755,26 @@ mod tests {
         assert!(matches!(
             KWinCompositor::x11_window_id(&win("")),
             Err(AgentShellError::WindowNotFound(_))
+        ));
+    }
+
+    #[test]
+    fn x11_workspace_id_parses_decimal_and_rejects_non_numeric() {
+        let ws = |native_id: &str| WorkspaceId {
+            native_id: native_id.to_string(),
+            de_type: DesktopEnvironment::KDE,
+        };
+        // 十进制往返：workspaces switch 按 0 基桌面索引回读。
+        assert_eq!(KWinCompositor::x11_workspace_id(&ws("2")).unwrap(), 2);
+        assert_eq!(KWinCompositor::x11_workspace_id(&ws("0")).unwrap(), 0);
+        // 非十进制（hex 前缀 / 空 / 负数）→ Other。
+        assert!(matches!(
+            KWinCompositor::x11_workspace_id(&ws("0x1a0")),
+            Err(AgentShellError::Other(_))
+        ));
+        assert!(matches!(
+            KWinCompositor::x11_workspace_id(&ws("")),
+            Err(AgentShellError::Other(_))
         ));
     }
 
