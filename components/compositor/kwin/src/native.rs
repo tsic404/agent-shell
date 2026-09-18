@@ -33,12 +33,13 @@ pub const VD_IFACE: &str = "org.kde.KWin.VirtualDesktopManager";
 
 /// 单窗详情 `getWindowInfo(uuid) -> a{sv}` 的解析结果 → core [`WindowInfo`]。
 ///
-/// 字段取自 KWin `dbusinterface.cpp` `clientToVariantMap`（5.27 实测形态）：
-/// `caption` / `resourceClass` / `resourceName` / `desktopFile` / `x` / `y` /
-/// `width` / `height` / `uuid` / `desktops`（桌面 id 数组）/ `minimized` /
-/// `maximizeHorizontal` / `maximizeVertical` / `fullscreen` / `keepAbove` /
-/// `type`（`NET::WindowType` 整数枚举）。该 map **不含 pid**（KWin 未导出），
-/// `pid` 恒 0；缺失字段按默认值兜底（同 Scripting `parse_window` 口径）。
+/// 字段取自 KWin `dbusinterface.cpp` `clientToVariantMap`：`caption` /
+/// `resourceClass` / `resourceName` / `desktopFile` / `uuid` / `desktops`（桌面
+/// id 数组）/ `minimized` / `maximizeHorizontal` / `maximizeVertical` /
+/// `fullscreen` / `keepAbove` / `type`（`NET::WindowType` 整数枚举）。几何字段
+/// `x`/`y`/`width`/`height` 由 `QRect` 序列化为 double（company-04 aarch64
+/// 实测 `"x" d 242`），以 [`as_coord_i32`] 宽容归一化为 i32。该 map **不含
+/// pid**（KWin 未导出），`pid` 恒 0；缺失字段按默认值兜底（同 Scripting 口径）。
 ///
 /// `uuid` 缺失返回 `None`——调用方按 uuid 枚举，回读结果必须可回溯到该 uuid，
 /// 否则是竞态（窗口已销毁）而非可渲染的窗口条目。
@@ -46,10 +47,10 @@ pub fn parse_window(map: &HashMap<String, OwnedValue>, stacking_order: u32) -> O
     let id_str = map.get("uuid").and_then(as_string)?;
 
     let rect = |kx: &str, ky: &str, kw: &str, kh: &str| Rect {
-        x: map.get(kx).and_then(as_i32).unwrap_or(0),
-        y: map.get(ky).and_then(as_i32).unwrap_or(0),
-        width: map.get(kw).and_then(as_i32).unwrap_or(0),
-        height: map.get(kh).and_then(as_i32).unwrap_or(0),
+        x: map.get(kx).and_then(as_coord_i32).unwrap_or(0),
+        y: map.get(ky).and_then(as_coord_i32).unwrap_or(0),
+        width: map.get(kw).and_then(as_coord_i32).unwrap_or(0),
+        height: map.get(kh).and_then(as_coord_i32).unwrap_or(0),
     };
 
     let mut states = Vec::new();
@@ -261,9 +262,23 @@ fn as_bool(v: &OwnedValue) -> Option<bool> {
     v.downcast_ref::<bool>().ok()
 }
 
-/// `OwnedValue` → `i32`（几何/坐标字段；QVariantMap 的 int 均为 32 位）。
+/// `OwnedValue` → `i32`（`type` 字段；QVariantMap 的 int 均为 32 位）。
 fn as_i32(v: &OwnedValue) -> Option<i32> {
     v.downcast_ref::<i32>().ok()
+}
+
+/// `OwnedValue` → `i32`（几何/坐标字段）。
+///
+/// KWin `clientToVariantMap` 把 `QRect` 的几何序列化为 double（company-04
+/// aarch64 实测 `"x" d 242`），QVariant int 则为 32 位——几何按 f64/i64/i32
+/// 三种形态归一化为 i32。仅 `downcast_ref::<i32>` 会在 double 形态得
+/// `IncorrectType`，几何恒 0。
+fn as_coord_i32(v: &OwnedValue) -> Option<i32> {
+    v.downcast_ref::<f64>()
+        .ok()
+        .map(|f| f as i32)
+        .or_else(|| v.downcast_ref::<i64>().ok().map(|i| i as i32))
+        .or_else(|| v.downcast_ref::<i32>().ok())
 }
 
 /// `OwnedValue` → `String`（caption / resourceClass / uuid 等）。
@@ -345,6 +360,31 @@ mod tests {
             Some("vd-uuid-1")
         );
         assert_eq!(w.window_type, agent_shell_core::types::WindowType::Normal);
+    }
+
+    /// `getWindowInfo` 真实 wire 形态：几何字段为 double（`"x" d 242`，`QRect`
+    /// 序列化）而非 i32——必须宽容归一化回读非零几何，否则 `windows list`
+    /// 原生通道恒 0。
+    #[test]
+    fn parse_window_maps_double_geometry() {
+        let mut map = HashMap::new();
+        map.insert("uuid".to_string(), s("{f8b1-..}"));
+        map.insert("x".to_string(), OwnedValue::from(242.0_f64));
+        map.insert("y".to_string(), OwnedValue::from(270.0_f64));
+        map.insert("width".to_string(), OwnedValue::from(1676.0_f64));
+        map.insert("height".to_string(), OwnedValue::from(900.0_f64));
+
+        let w = parse_window(&map, 0).expect("window must parse");
+        assert_ne!(w.geometry, Rect::default(), "geometry must not be all-zero");
+        assert_eq!(
+            w.geometry,
+            Rect {
+                x: 242,
+                y: 270,
+                width: 1676,
+                height: 900,
+            }
+        );
     }
 
     /// `NET::WindowType` 整数枚举 → core `WindowType`（type 字段是整数非字符串）。
