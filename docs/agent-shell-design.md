@@ -3751,6 +3751,15 @@ arm64（aarch64）发行构建（`build-deb.sh` / `PKGBUILD` / `flake.nix`）显
 与 libspa-sys 0.10.1 不兼容，默认特性（含 `portal-screencast`）直编失败。显式关闭
 `portal-screencast`，capture 走 Screenshot/X11 降级链；其他平台保持默认特性构建不回退。
 
+PR 门禁（`.github/workflows/pr-check.yml`）除 x86_64 的 `default` / `no-pipewire`
+两个 profile 外，另有 `check-arm64` job 交叉编译 `aarch64-unknown-linux-gnu`：
+x86_64 的 `no-pipewire` profile 只验证特性开关、不覆盖 aarch64 目标，`check-arm64`
+以 `--no-default-features` 编译整个 workspace，锁定 arm64 发行构建路径不回归。
+交叉链接仅需 `gcc-aarch64-linux-gnu` + `libwayland-dev:arm64`（libspa-sys 已由
+特性开关排除；wayland-backend 的 C shim 只含 libc 头），并显式 `PKG_CONFIG_ALLOW_CROSS=1`
+放行 host != target 的 pkg-config 探测。Ubuntu 主归档不承载 binary-arm64，`check-arm64`
+重写 apt 源按架构限定：amd64 走主归档、arm64 走 `ports.ubuntu.com/ubuntu-ports`。
+
 ### 20.3 权限模型
 
 | 资源 | 授权方式 |
