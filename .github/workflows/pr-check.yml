@@ -48,7 +48,9 @@ jobs:
 
       - name: Test (Rust)
         if: matrix.profile == 'default'
-        run: cargo test
+        # --all-targets：把 examples 的 #[test]（如 area_smoke 的 smoke_verdict
+        # 纯函数单测）纳入门禁——裸 cargo test 只编译 examples、不运行其测试。
+        run: cargo test --all-targets
 
       - name: Build (Rust)
         if: matrix.profile == 'default'
