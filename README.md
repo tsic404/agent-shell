@@ -27,8 +27,10 @@ cargo build --release --workspace --no-default-features
 - `packaging/arch/PKGBUILD` — Arch Linux
 - `packaging/nix/flake.nix` — Nix flakes
 
-三个脚本默认走 BE（`--no-default-features`），仅在 `libpipewire-0.3` >= 0.3.37
-时启用 `portal-screencast`。`build-deb.sh` / `PKGBUILD` 探测 host 的 dev 头：
-arm64（company-04 UOS）头版本上报不可靠，无视门槛强制 BE。`flake.nix` 不探测
-host 头，按 nixpkgs 自带 pipewire 的版本门槛判定（nixos-unstable 为 1.x，恒启用
-`portal-screencast`）。
+三个脚本默认走 BE（`--no-default-features`）：`PKGBUILD`（Arch）恒走 BE——
+portal-screencast 依赖 libspa-sys 0.10.1 的 `_libspa_rs` shim 符号与 release LTO
+交互，在部分 Arch 类机器链接期报 undefined `spa_*_libspa_rs`（pre-existing 上游
+问题，与 libpipewire 版本无关），故不启用。`build-deb.sh` 仅在 `libpipewire-0.3`
+>= 0.3.37 时启用 `portal-screencast`；arm64（company-04 UOS）头版本上报不可靠，
+无视门槛强制 BE。`flake.nix` 不探测 host 头，按 nixpkgs 自带 pipewire 的版本门槛
+判定（nixos-unstable 为 1.x，恒启用 `portal-screencast`）。

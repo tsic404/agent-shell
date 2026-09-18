@@ -3776,17 +3776,20 @@ strip = true
 ```
 
 发行构建默认走 BE（`--no-default-features`，`portal-screencast` 关闭，capture 走
-Screenshot/X11 降级链）。libspa-sys 0.10.1 的 `type-info.c` 无条件引用
-`spa_type_param_bitorder`（0.3.37 引入）、`spa_type_audio_iec958_codec`（0.3.34
-引入）等符号，旧 libpipewire-0.3（UOS 20 / DDE 20 0.3.15、bullseye 0.3.19）有
-`.pc` 但头缺这些符号，`--exists` 探不到，须按版本门槛（`pkg-config
---atleast-version=0.3.37 libpipewire-0.3`）判旧：仅门槛满足时启用
-`portal-screencast`，否则保持 BE。`build-deb.sh` / `PKGBUILD` 探测 host 头，
-arm64（aarch64）因 company-04（UOS arm64）头版本上报不可靠，无视门槛强制 BE；
-`flake.nix` 不探测 host 头，按 nixpkgs 自带 pipewire 版本门槛判定（nixos-unstable
-为 1.x，恒启用 `portal-screencast`）。手动 `cargo build --release --workspace`
-默认启用 `portal-screencast`，仍需满足门槛的 dev 头，或显式 `--no-default-features`
-（§20.6）。
+Screenshot/X11 降级链）。portal-screencast 依赖 libspa-sys 0.10.1，其 bindgen
+`_libspa_rs` shim（`wrap_static_fns` 生成）与 release LTO 交互，在部分 Arch 类
+机器（libpipewire-0.3 = 1.6.8 亦然）链接期报 undefined `spa_*_libspa_rs` /
+`libspa_rs_type_*`——pre-existing 上游问题，与 libpipewire 版本无关，故 `PKGBUILD`
+（Arch）恒走 BE，不设版本门槛。`build-deb.sh`（Debian）另因 libspa-sys 的
+`type-info.c` 无条件引用 `spa_type_param_bitorder`（0.3.37 引入）、
+`spa_type_audio_iec958_codec`（0.3.34 引入）等符号，旧 libpipewire-0.3（UOS 20 /
+DDE 20 0.3.15、bullseye 0.3.19）有 `.pc` 但头缺这些符号，须按版本门槛
+（`pkg-config --atleast-version=0.3.37 libpipewire-0.3`）判旧：门槛满足时启用
+`portal-screencast`，否则保持 BE；arm64（aarch64）因 company-04（UOS arm64）头
+版本上报不可靠，无视门槛强制 BE。`flake.nix` 不探测 host 头，按 nixpkgs 自带
+pipewire 版本门槛判定（nixos-unstable 为 1.x，恒启用 `portal-screencast`）。手动
+`cargo build --release --workspace` 默认启用 `portal-screencast`，仍需满足门槛的
+dev 头，或显式 `--no-default-features`（§20.6）。
 
 PR 门禁（`.github/workflows/pr-check.yml`）除 x86_64 的 `default` / `no-pipewire`
 两个 profile 外，另有 `check-arm64` job 交叉编译 `aarch64-unknown-linux-gnu`：

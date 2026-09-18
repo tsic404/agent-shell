@@ -1,12 +1,13 @@
 #!/bin/bash
-# pkgbuild.test.sh — 验证 PKGBUILD build() 的 features-gate（CARCH × pkg-config 版本门槛）
+# pkgbuild.test.sh — 验证 PKGBUILD build() 恒走 BE（--no-default-features）
 #
 # PKGBUILD 由 makepkg 以 bash source（顶层含数组语法），故本测试须 bash 运行，
-# 不能像 build-deb-arch.test.sh 那样用 dash。覆盖契约（与 debian 侧对称）：
-#   1) 非 aarch64 + libpipewire-0.3 >= 0.3.37（现代头）→ 升级默认特性
-#      （cargo 不带 --no-default-features）
-#   2) 非 aarch64 + 头缺失/过旧 → 保持 BE（cargo 带 --no-default-features）
-#   3) aarch64 无视门槛强制 BE（现代头亦然）
+# 不能像 build-deb-arch.test.sh 那样用 dash。覆盖契约：
+#   1) 任意 CARCH（x86_64 / aarch64）build() 均带 --no-default-features（恒 BE）
+#   2) build() 不探测 pkg-config（无 libpipewire 版本门槛）——portal-screencast
+#      依赖 libspa-sys 0.10.1 的 `_libspa_rs` shim（wrap_static_fns 生成）与
+#      release LTO 交互，在部分 Arch 类机器链接期报 undefined `spa_*_libspa_rs`，
+#     为 pre-existing 上游链接问题；Arch 一律不启用 portal-screencast。
 #
 # 用法：bash packaging/arch/pkgbuild.test.sh
 set -eu
@@ -57,16 +58,15 @@ exit 0
 EOF
 chmod +x "$STUB/cargo"
 
-# stub pkg-config：断言 PKGBUILD 恰以版本门槛探测（--atleast-version=0.3.37
-# libpipewire-0.3）。门槛/包名回归（--exists、0.3.19、错包名）都在此失败并被
-# 用例捕获；PKGCONFIG_PIPEWIRE=1 表示门槛满足（现代头），否则缺失/过旧（exit 1）。
+# stub pkg-config：仅记录调用。build() 恒走 BE，不得探测 libpipewire 版本门槛；
+# 用例 3 断言其从未被调用，回归「重新引入门槛」时失败。
+PKGCONFIG_CALLED_FILE="$WORK/pkgconfig_called"
+export PKGCONFIG_CALLED_FILE
+: > "$PKGCONFIG_CALLED_FILE"
 cat > "$STUB/pkg-config" <<'EOF'
 #!/bin/sh
-if [ "$#" -ne 2 ] || [ "$1" != "--atleast-version=0.3.37" ] || [ "$2" != "libpipewire-0.3" ]; then
-    echo "pkg-config stub: expected '--atleast-version=0.3.37 libpipewire-0.3', got: $*" >&2
-    exit 2
-fi
-[ "${PKGCONFIG_PIPEWIRE:-0}" = "1" ]
+printf 'called\n' >> "${PKGCONFIG_CALLED_FILE:?}"
+exit 0
 EOF
 chmod +x "$STUB/pkg-config"
 
@@ -89,32 +89,27 @@ check() {
     fi
 }
 
-# ── 用例 1：x86_64 + 现代头（>= 0.3.37）→ 升级默认特性 ──
+# ── 用例 1：x86_64 → 恒走 BE ──
 CARGO_ARGS_FILE="$WORK/cargo_args1"
 export CARGO_ARGS_FILE
 : > "$CARGO_ARGS_FILE"
-export CARCH=x86_64 PKGCONFIG_PIPEWIRE=1
+export CARCH=x86_64
 build > "$WORK/out1" 2>&1
-check "x86_64 + 现代头时 cargo 不带 --no-default-features（升级默认特性）" \
-    "$(grep -c -- '--no-default-features' "$CARGO_ARGS_FILE")" "0"
+check "x86_64 build() 带 --no-default-features（恒 BE）" \
+    "$(grep -c -- '--no-default-features' "$CARGO_ARGS_FILE")" "1"
 
-# ── 用例 2：x86_64 + 头缺失/过旧 → 保持 BE ──
+# ── 用例 2：aarch64 → 恒走 BE ──
 CARGO_ARGS_FILE="$WORK/cargo_args2"
 export CARGO_ARGS_FILE
 : > "$CARGO_ARGS_FILE"
-export CARCH=x86_64 PKGCONFIG_PIPEWIRE=0
+export CARCH=aarch64
 build > "$WORK/out2" 2>&1
-check "x86_64 + 头缺失/过旧时 cargo 带 --no-default-features（保持 BE）" \
+check "aarch64 build() 带 --no-default-features（恒 BE）" \
     "$(grep -c -- '--no-default-features' "$CARGO_ARGS_FILE")" "1"
 
-# ── 用例 3：aarch64 + 现代头 → 无视门槛强制 BE ──
-CARGO_ARGS_FILE="$WORK/cargo_args3"
-export CARGO_ARGS_FILE
-: > "$CARGO_ARGS_FILE"
-export CARCH=aarch64 PKGCONFIG_PIPEWIRE=1
-build > "$WORK/out3" 2>&1
-check "aarch64 + 现代头时 cargo 仍带 --no-default-features（强制 BE）" \
-    "$(grep -c -- '--no-default-features' "$CARGO_ARGS_FILE")" "1"
+# ── 用例 3：build() 不探测 pkg-config（无 libpipewire 版本门槛）──
+check "build() 不调用 pkg-config（门槛已移除）" \
+    "$(grep -c 'called' "$PKGCONFIG_CALLED_FILE")" "0"
 
 echo
 echo "pkgbuild.test.sh: $pass passed, $fail failed"
