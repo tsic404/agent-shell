@@ -429,6 +429,82 @@ impl EventFilter {
         }
     }
 
+    /// 将单个过滤器 token 应用到自身，返回是否识别。
+    ///
+    /// `events.subscribe` / `events.replay` 的 `--filter` 解析复用本方法，
+    /// 使 token → 类别归属与 [`EventFilter::matches`] 保持单一事实来源，
+    /// 避免两处枚举漂移。类别名（`window`/`workspace`/…）与 [`DesktopEvent`]
+    /// 变体名（`WindowOpened`/`WindowClosed`/…）均可；`all` 覆盖为全量，
+    /// 未识别返回 `false`（调用方据此上抛 InvalidParams）。
+    pub fn apply_token(&mut self, token: &str) -> bool {
+        match token {
+            "all" => *self = Self::all(),
+            // 类别名
+            "window" => self.window_events = true,
+            "workspace" => self.workspace_events = true,
+            "monitor" => self.monitor_events = true,
+            "input" => self.input_events = true,
+            "app" => self.app_events = true,
+            "a11y" => self.a11y_events = true,
+            "power" => self.power_events = true,
+            // 事件枚举名（窗口，FullscreenChanged 亦归窗口）
+            "WindowOpened"
+            | "WindowClosed"
+            | "WindowFocused"
+            | "WindowMoved"
+            | "WindowStateChanged"
+            | "WindowMetadataChanged"
+            | "WindowStackingChanged"
+            | "FullscreenChanged" => self.window_events = true,
+            "WorkspaceChanged" | "WorkspaceListChanged" | "WorkspaceWindowMoved" => {
+                self.workspace_events = true
+            }
+            "MonitorHotplug" | "MonitorChanged" => self.monitor_events = true,
+            "PointerButton" | "KeyComboPressed" => self.input_events = true,
+            "AppLaunched" | "AppExited" => self.app_events = true,
+            "PowerStateChanged" => self.power_events = true,
+            "AccessibilityTreeChanged" => self.a11y_events = true,
+            _ => return false,
+        }
+        true
+    }
+
+    /// 全部可用过滤器值（`--help` / 错误提示列出）。
+    ///
+    /// 顺序固定：类别名在前，事件枚举名随后按类别分组列出（窗口、工作区、
+    /// 监视器、输入、应用、电源、无障碍）。
+    pub const fn valid_values() -> &'static [&'static str] {
+        &[
+            "all",
+            "window",
+            "workspace",
+            "monitor",
+            "input",
+            "app",
+            "a11y",
+            "power",
+            "WindowOpened",
+            "WindowClosed",
+            "WindowFocused",
+            "WindowMoved",
+            "WindowStateChanged",
+            "WindowMetadataChanged",
+            "WindowStackingChanged",
+            "FullscreenChanged",
+            "WorkspaceChanged",
+            "WorkspaceListChanged",
+            "WorkspaceWindowMoved",
+            "MonitorHotplug",
+            "MonitorChanged",
+            "PointerButton",
+            "KeyComboPressed",
+            "AppLaunched",
+            "AppExited",
+            "PowerStateChanged",
+            "AccessibilityTreeChanged",
+        ]
+    }
+
     /// 判断事件是否匹配过滤器。`Noop` 永不匹配（归一化已丢弃）。
     pub fn matches(&self, event: &DesktopEvent) -> bool {
         if let Some(p) = self.priority {

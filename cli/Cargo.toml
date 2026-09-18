@@ -30,3 +30,5 @@ shell-words = "1"
 
 [dev-dependencies]
 tempfile = "3"
+# 仅测试用：表驱动守护 EVENT_FILTER_HELP 与 EventFilter::valid_values() 同步。
+agent-shell-event = { workspace = true }

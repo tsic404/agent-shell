@@ -247,6 +247,57 @@ fn filter_never_matches_noop() {
     assert!(!EventFilter::all().matches(&DesktopEvent::Noop));
 }
 
+#[test]
+fn filter_apply_token_accepts_categories_and_event_names() {
+    // 类别名
+    let mut f = EventFilter::default();
+    assert!(f.apply_token("window"));
+    assert!(f.window_events && !f.workspace_events && !f.power_events);
+
+    // 事件枚举名 → 所属类别（WindowOpened 归 window，WorkspaceChanged 归 workspace）
+    let mut f = EventFilter::default();
+    assert!(f.apply_token("WindowOpened"));
+    assert!(f.window_events && !f.workspace_events);
+    assert!(f.apply_token("WorkspaceChanged"));
+    assert!(f.workspace_events);
+
+    // 全部 19 个事件枚举名均须识别（apply_token 与 matches 同源，防漂移）
+    let mut f = EventFilter::default();
+    for name in [
+        "WindowOpened",
+        "WindowClosed",
+        "WindowFocused",
+        "WindowMoved",
+        "WindowStateChanged",
+        "WindowMetadataChanged",
+        "WindowStackingChanged",
+        "FullscreenChanged",
+        "WorkspaceChanged",
+        "WorkspaceListChanged",
+        "WorkspaceWindowMoved",
+        "MonitorHotplug",
+        "MonitorChanged",
+        "PointerButton",
+        "KeyComboPressed",
+        "AppLaunched",
+        "AppExited",
+        "PowerStateChanged",
+        "AccessibilityTreeChanged",
+    ] {
+        assert!(f.apply_token(name), "event name {name} must be accepted");
+    }
+
+    // all 覆盖为全量
+    let mut f = EventFilter::default();
+    assert!(f.apply_token("all"));
+    assert!(f.window_events && f.workspace_events && f.power_events);
+
+    // 未知 token（含已废弃的旧名 WindowAdded）拒绝
+    let mut f = EventFilter::default();
+    assert!(!f.apply_token("WindowAdded"));
+    assert!(!f.apply_token("bogus"));
+}
+
 #[tokio::test]
 async fn hub_does_not_deliver_unsubscribed_categories() {
     let hub = EventHub::with_capacity(8);
