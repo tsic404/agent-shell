@@ -5,8 +5,9 @@
 #   1) DEB_HOST_ARCH 设置时，包 control 的 Architecture: 字段采用该架构
 #   2) dpkg 不可用且 DEB_HOST_ARCH 未设置时，脚本显式失败（exit 1），
 #      不再静默回退 amd64
-#   3) arm64 需构建时显式 --no-default-features（libspa-sys 0.10.1 与旧
-#      libspa-0.2 头不兼容），无视 PipeWire 版本门槛；其他平台保持默认特性构建不回退
+#   3) 构建时默认走 BE（--no-default-features）；非 arm64 平台仅在
+#      libpipewire-0.3 >= 0.3.37（现代头）时升级为默认特性（portal-screencast）；
+#      arm64（company-04）头版本上报不可靠，无视门槛强制 BE
 #   4) TMPDIR 指向不存在目录时，内层 build-deb.sh 回退到有效临时目录，仍成功打包
 #
 # 用法：sh packaging/debian/build-deb-arch.test.sh
@@ -140,7 +141,7 @@ check "无 dpkg 且未设 DEB_HOST_ARCH 时 exit 1" "$rc" "1"
 check "无 dpkg 时错误信息写入 stderr" \
     "$(grep -c 'unable to determine build architecture' "$WORK/out2")" "1"
 
-# ── 用例 3：PipeWire 头缺失/过旧 → cargo 回退 --no-default-features ──
+# ── 用例 3：PipeWire 头缺失/过旧 → 保持 BE（cargo 带 --no-default-features）──
 CARGO_ARGS_FILE="$WORK/cargo_args3"
 CAPTURE_FILE="$WORK/capture3"
 export CARGO_ARGS_FILE CAPTURE_FILE
@@ -148,17 +149,18 @@ export CARGO_ARGS_FILE CAPTURE_FILE
 : > "$CAPTURE_FILE"
 chmod 644 "$WORK/target/release/"*
 PATH="$STUB:$PATH" DEB_HOST_ARCH=amd64 PKGCONFIG_PIPEWIRE=0 sh "$BUILD_SH" "$WORK/target" > "$WORK/out3" 2>&1
-check "PipeWire 头缺失/过旧时 cargo 带 --no-default-features" \
+check "PipeWire 头缺失/过旧时 cargo 带 --no-default-features（保持 BE 默认）" \
     "$(grep -c -- '--no-default-features' "$CARGO_ARGS_FILE")" "1"
 
-# ── 用例 4：PipeWire 头满足门槛 → cargo 不带 --no-default-features ──
+# ── 用例 4：现代 PipeWire 头（>= 0.3.37）→ 从 BE 升级为默认特性 ──
 CARGO_ARGS_FILE="$WORK/cargo_args4"
 CAPTURE_FILE="$WORK/capture4"
 export CARGO_ARGS_FILE CAPTURE_FILE
 : > "$CARGO_ARGS_FILE"
 : > "$CAPTURE_FILE"
+chmod 644 "$WORK/target/release/"*
 PATH="$STUB:$PATH" DEB_HOST_ARCH=amd64 PKGCONFIG_PIPEWIRE=1 sh "$BUILD_SH" "$WORK/target" > "$WORK/out4" 2>&1
-check "现代 PipeWire 头时 cargo 不带 --no-default-features" \
+check "现代 PipeWire 头时 cargo 不带 --no-default-features（升级默认特性）" \
     "$(grep -c -- '--no-default-features' "$CARGO_ARGS_FILE")" "0"
 
 # ── 用例 5：arm64 + 需构建 → 显式 --no-default-features（无视 PipeWire 头版本）──
