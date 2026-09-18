@@ -237,6 +237,7 @@ dependencies = [
 name = "agent-shell-cli"
 version = "0.1.0"
 dependencies = [
+ "agent-shell-event",
  "agent-shell-rpc",
  "clap",
  "parking_lot",

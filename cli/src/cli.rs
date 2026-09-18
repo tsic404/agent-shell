@@ -305,12 +305,29 @@ pub enum A11yCommand {
 
 // ───────────────────────── events ─────────────────────────
 
+/// `events subscribe --filter` / `events replay --filter` 的可用值（逗号分隔）。
+///
+/// 类别名与事件枚举名均可：类别名按域过滤，事件枚举名等价于其所属类别
+/// （如 `WindowOpened` 等价于 `window`）。两份值表须与
+/// `event::EventFilter::valid_values()` 保持同步——新增
+/// `DesktopEvent` 变体而漏改此处，会被 `mod tests` 的表驱动测试捕获。
+const EVENT_FILTER_CATEGORIES: &str = "all/window/workspace/monitor/input/app/a11y/power";
+const EVENT_FILTER_EVENT_NAMES: &str = "WindowOpened/WindowClosed/WindowFocused/WindowMoved/WindowStateChanged/WindowMetadataChanged/WindowStackingChanged/FullscreenChanged/WorkspaceChanged/WorkspaceListChanged/WorkspaceWindowMoved/MonitorHotplug/MonitorChanged/PointerButton/KeyComboPressed/AppLaunched/AppExited/PowerStateChanged/AccessibilityTreeChanged";
+
+/// `--filter` 的 `--help` 文案：首次使用时由上方两份值表拼接生成，
+/// 无第三份手写列表，杜绝文案与值表漂移。
+static EVENT_FILTER_HELP: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    format!(
+        "过滤器，逗号分隔。类别：{EVENT_FILTER_CATEGORIES}；事件枚举名：{EVENT_FILTER_EVENT_NAMES}"
+    )
+});
+
 /// 事件订阅/回放命令。
 #[derive(Subcommand, Debug)]
 pub enum EventsCommand {
-    /// 订阅事件流（按类型过滤）
+    /// 订阅事件流（按类别或事件枚举名过滤）
     Subscribe {
-        #[arg(long)]
+        #[arg(long, help = EVENT_FILTER_HELP.as_str())]
         filter: Option<String>,
     },
     /// 取消订阅
@@ -318,9 +335,9 @@ pub enum EventsCommand {
         #[arg(long)]
         id: String,
     },
-    /// 回放历史事件
+    /// 回放历史事件（过滤同 subscribe）
     Replay {
-        #[arg(long)]
+        #[arg(long, help = EVENT_FILTER_HELP.as_str())]
         filter: Option<String>,
     },
 }
@@ -865,6 +882,25 @@ pub use agent_shell_rpc::duration::parse_duration;
 mod tests {
     use super::*;
     use agent_shell_rpc::keys::{Key, KeyName};
+
+    #[test]
+    fn event_filter_help_values_match_valid_values() {
+        use event::EventFilter;
+        // 表驱动守护：CLI `--help` 的两份值表（类别 + 事件枚举名）必须与
+        // daemon 侧 `EventFilter::valid_values()` 完全一致，防止新增
+        // DesktopEvent 变体后 help 静默过期。
+        let mut help_values: Vec<&str> = EVENT_FILTER_CATEGORIES
+            .split('/')
+            .chain(EVENT_FILTER_EVENT_NAMES.split('/'))
+            .collect();
+        let mut valid: Vec<&str> = EventFilter::valid_values().to_vec();
+        help_values.sort_unstable();
+        valid.sort_unstable();
+        assert_eq!(
+            help_values, valid,
+            "EVENT_FILTER_HELP 值表须与 EventFilter::valid_values() 保持同步"
+        );
+    }
 
     #[test]
     fn parses_modifier_combo() {

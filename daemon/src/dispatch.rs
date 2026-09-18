@@ -980,7 +980,12 @@ async fn events_replay(d: &mut Daemon, req: &Request) -> RpcResult {
     Ok(json!({"events": events, "count": count}))
 }
 
-/// 解析 events.subscribe 的可选 `filter` 字符串（逗号分隔类别）。
+/// 解析 events.subscribe / events.replay 的可选 `filter` 字符串（逗号分隔）。
+///
+/// 每项可为类别名（`window`/`workspace`/…）或事件枚举名
+/// （`WindowOpened`/`WindowClosed`/…），识别与类别归属逻辑集中在
+/// [`EventFilter::apply_token`]，此处只负责切分与错误上抛；错误文案列出
+/// 全部可用值，避免用户盲猜枚举名。
 fn parse_event_filter(req: &Request) -> Result<EventFilter, (RpcErrorCode, String)> {
     let Some(params) = req.params.as_ref() else {
         return Ok(EventFilter::all());
@@ -993,21 +998,14 @@ fn parse_event_filter(req: &Request) -> Result<EventFilter, (RpcErrorCode, Strin
     }
     let mut f = EventFilter::default();
     for token in raw.split(',').map(str::trim).filter(|t| !t.is_empty()) {
-        match token {
-            "all" => return Ok(EventFilter::all()),
-            "window" => f.window_events = true,
-            "workspace" => f.workspace_events = true,
-            "monitor" => f.monitor_events = true,
-            "input" => f.input_events = true,
-            "app" => f.app_events = true,
-            "a11y" => f.a11y_events = true,
-            "power" => f.power_events = true,
-            other => {
-                return Err((
-                    RpcErrorCode::InvalidParams,
-                    format!("unknown event filter: {other}"),
-                ))
-            }
+        if !f.apply_token(token) {
+            return Err((
+                RpcErrorCode::InvalidParams,
+                format!(
+                    "unknown event filter: {token}; valid values: {}",
+                    EventFilter::valid_values().join(", ")
+                ),
+            ));
         }
     }
     Ok(f)
@@ -2538,6 +2536,31 @@ mod tests {
         assert_eq!(
             resp.error.expect("error").code,
             RpcErrorCode::InvalidParams as i32
+        );
+    }
+
+    #[test]
+    fn parse_event_filter_accepts_event_enum_names() {
+        // 事件枚举名与类别名均可（`WindowOpened` 归 window，`WorkspaceChanged`
+        // 归 workspace），此前仅类别名可用 → `--filter WindowOpened` 报 unknown。
+        let f = parse_event_filter(&req(
+            method::EVENTS_SUBSCRIBE,
+            Some(json!({"filter": "WindowOpened,WorkspaceChanged"})),
+        ))
+        .expect("event enum names accepted");
+        assert!(f.window_events && f.workspace_events);
+        assert!(!f.monitor_events && !f.input_events);
+
+        // 已废弃旧名（WindowAdded）与乱码均拒绝，错误文案列出可用值
+        let (code, msg) = parse_event_filter(&req(
+            method::EVENTS_SUBSCRIBE,
+            Some(json!({"filter": "WindowAdded"})),
+        ))
+        .unwrap_err();
+        assert_eq!(code, RpcErrorCode::InvalidParams);
+        assert!(
+            msg.contains("WindowOpened"),
+            "error must list valid values, got: {msg}"
         );
     }
 

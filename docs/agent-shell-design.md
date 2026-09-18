@@ -1970,10 +1970,10 @@ pub struct HyprlandCompositor {
 | 输入 | wlr-virtual-pointer | 无 | Wayland |
 
 **事件流**：`.socket2.sock` 行协议 `EVENT>>DATA`。
-- `openwindow>>ADDR,WS,CLASS,TITLE` → WindowAdded
-- `closewindow>>ADDR` → WindowRemoved
-- `activewindowv2>>ADDR` → WindowFocusChanged
-- `workspacev2>>ID` → WorkspaceActivated
+- `openwindow>>ADDR,WS,CLASS,TITLE` → WindowOpened
+- `closewindow>>ADDR` → WindowClosed
+- `activewindowv2>>ADDR` → WindowFocused
+- `workspacev2>>ID` → WorkspaceChanged
 
 事件流 task 持续更新 `window_cache`，后端查询优先从缓存读取。
 
