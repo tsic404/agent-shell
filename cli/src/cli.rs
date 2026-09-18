@@ -217,7 +217,14 @@ pub enum WorkspacesCommand {
     /// 列出工作区
     List,
     /// 切换工作区
-    Switch { id: String },
+    ///
+    /// 目标词表（按优先级）：1 基 number（`workspaces list` 展示）→ native_id
+    /// （X11 为 0 基 EWMH 索引、KWin 为 UUID）→ 桌面名。X11 下 `windows list`
+    /// 的 workspace 列是 0 基 native_id，照抄到 `switch` 需 +1 才是同义 number。
+    Switch {
+        /// 目标：number / native_id / 桌面名（见 `workspaces switch --help`）
+        id: String,
+    },
 }
 
 // ───────────────────────── input ─────────────────────────
