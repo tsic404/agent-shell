@@ -8,7 +8,10 @@
 //! == 请求区域且非全黑；结束经 Drop 恢复原始像素，真机桌面不残留污点。
 //!
 //! 无 `DISPLAY` 打印 SKIP 退出 0（无头不适用）；`DISPLAY` 存在但连不上 X server
-//! 视为环境损坏、退出 2。运行（`--no-default-features` 与 issue 构建口径一致）：
+//! 视为环境损坏、退出 2；锁屏遮挡桌面同样按环境未就绪退出 2（探测
+//! `com.deepin.dde.lockFront.Visible` / `org.deepin.dde.LockFront1.Visible`），
+//! 仅未锁屏却内容全黑才判语义缺陷（assert panic，exit 101）。运行
+//! （`--no-default-features` 与 issue 构建口径一致）：
 //!   cargo run --release --example area_smoke -p agent-shell-capture --no-default-features
 
 use agent_shell_capture::{CaptureDispatcher, CaptureTarget, Frame, PixelFormat, X11Capture};
@@ -17,6 +20,32 @@ use x11rb::connection::Connection as _;
 use x11rb::protocol::xproto::{ConnectionExt as _, CreateGCAux, ImageFormat, Rectangle};
 use x11rb::rust_connection::RustConnection;
 use x11rb::wrapper::ConnectionExt as _;
+use zbus::proxy;
+
+// DDE 锁屏前端有两代互斥的 session-bus 接口：经典 `com.deepin.dde.lockFront`
+// 与 SNIPE `org.deepin.dde.LockFront1`。按序探测，取先命中者的 `Visible` 属性。
+
+/// dde-lock 锁屏前端（经典 DDE）。
+#[proxy(
+    interface = "com.deepin.dde.lockFront",
+    default_service = "com.deepin.dde.lockFront",
+    default_path = "/com/deepin/dde/lockFront"
+)]
+trait LockFront {
+    #[zbus(property)]
+    fn visible(&self) -> zbus::Result<bool>;
+}
+
+/// dde-lock 锁屏前端（DDE SNIPE）。
+#[proxy(
+    interface = "org.deepin.dde.LockFront1",
+    default_service = "org.deepin.dde.LockFront1",
+    default_path = "/org/deepin/dde/LockFront1"
+)]
+trait LockFrontSnipe {
+    #[zbus(property)]
+    fn visible(&self) -> zbus::Result<bool>;
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -130,13 +159,83 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "cropped {}x{} non-black fraction: {frac:.3}",
         cropped.width, cropped.height
     );
-    assert!(
-        frac > 0.5,
-        "cropped marker region is mostly black ({frac:.3}) — crop produced no recognizable content"
-    );
+    match smoke_verdict(frac, dde_lock_visible().await) {
+        SmokeVerdict::Ok => {}
+        SmokeVerdict::Locked => {
+            // process::exit 不跑析构；显式 drop 恢复 root 原始像素再退出。
+            drop(_restore);
+            println!("SKIP: session locked — lock screen obscures the desktop (exit 2)");
+            std::process::exit(2);
+        }
+        SmokeVerdict::SemanticFailure => {
+            panic!(
+                "cropped marker region is mostly black ({frac:.3}) — crop produced no recognizable content"
+            );
+        }
+    }
 
     println!("SMOKE OK");
     Ok(())
+}
+
+/// 探测 DDE 锁屏是否可见（经典 `com.deepin.dde.lockFront.Visible`，降级
+/// SNIPE `org.deepin.dde.LockFront1.Visible`）。
+///
+/// 返回 `None` 表示无法判定（无 session bus / 非 DDE 会话 / 接口缺失），
+/// 调用方应继续走语义断言——宁可报真实缺陷，也不把「判定不到」误当「已锁屏」。
+async fn dde_lock_visible() -> Option<bool> {
+    let conn = zbus::Connection::session().await.ok()?;
+
+    if let Ok(p) = LockFrontProxy::builder(&conn)
+        .cache_properties(zbus::proxy::CacheProperties::No)
+        .build()
+        .await
+    {
+        if let Ok(visible) = p.visible().await {
+            return Some(visible);
+        }
+    }
+
+    if let Ok(p) = LockFrontSnipeProxy::builder(&conn)
+        .cache_properties(zbus::proxy::CacheProperties::No)
+        .build()
+        .await
+    {
+        if let Ok(visible) = p.visible().await {
+            return Some(visible);
+        }
+    }
+
+    None
+}
+
+/// 裁切产物「非黑」判定阈值：非黑像素占比高于此值视为识别到内容。
+const NON_BLACK_THRESHOLD: f64 = 0.5;
+
+/// 冒烟裁切产物判定结果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SmokeVerdict {
+    /// 内容非黑，通过。
+    Ok,
+    /// 锁屏遮挡（环境未就绪）→ exit 2。
+    Locked,
+    /// 内容全黑且非锁屏 → 语义缺陷（panic，exit 101）。
+    SemanticFailure,
+}
+
+/// 据非黑占比与锁屏探测结果判定冒烟结论（纯函数，可单测）。
+///
+/// 全黑帧有两种来源——锁屏遮挡（环境未就绪）或真语义缺陷——字节级不可分；
+/// 仅 `locked == Some(true)` 归为锁屏，判定不到（`None`）按未锁屏对待：宁可报
+/// 缺陷，也不把「判定不到」误当「已锁屏」。
+fn smoke_verdict(frac: f64, locked: Option<bool>) -> SmokeVerdict {
+    if frac > NON_BLACK_THRESHOLD {
+        SmokeVerdict::Ok
+    } else if locked == Some(true) {
+        SmokeVerdict::Locked
+    } else {
+        SmokeVerdict::SemanticFailure
+    }
 }
 
 /// 从全帧裁出紧排子帧（`--area` 裁切步骤；stride 感知，W/H 夹取到帧边界）。
@@ -219,5 +318,37 @@ impl Drop for RootRestore<'_> {
         let _ = self.conn.flush();
         // 确保 put_image 已提交到 server 再关连接，避免残留。
         let _ = self.conn.sync();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 四象限判定（纯函数门控单测）：锁屏+黑→Locked（exit 2）；未锁+黑 /
+    /// 判定不到+黑→SemanticFailure（exit 101）；非黑→Ok（与锁屏状态无关）。
+    #[test]
+    fn smoke_verdict_covers_four_quadrants() {
+        // 锁屏 + 黑 → 环境未就绪（exit 2）。
+        assert_eq!(smoke_verdict(0.0, Some(true)), SmokeVerdict::Locked);
+        // 未锁屏 + 黑 → 语义缺陷（exit 101）。
+        assert_eq!(
+            smoke_verdict(0.0, Some(false)),
+            SmokeVerdict::SemanticFailure
+        );
+        // 判定不到（None）+ 黑 → 按未锁屏对待，语义缺陷（exit 101）。
+        assert_eq!(smoke_verdict(0.0, None), SmokeVerdict::SemanticFailure);
+        // 非黑 → 通过，与锁屏状态无关。
+        assert_eq!(smoke_verdict(0.6, Some(true)), SmokeVerdict::Ok);
+        assert_eq!(smoke_verdict(0.6, None), SmokeVerdict::Ok);
+    }
+
+    /// 阈值边界：`frac` 恰为阈值仍判「黑」（`>` 为通过判据，边界归语义失败）。
+    #[test]
+    fn smoke_verdict_threshold_is_exclusive() {
+        assert_eq!(
+            smoke_verdict(NON_BLACK_THRESHOLD, None),
+            SmokeVerdict::SemanticFailure
+        );
     }
 }
