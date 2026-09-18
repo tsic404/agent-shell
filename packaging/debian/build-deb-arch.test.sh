@@ -160,6 +160,14 @@ export CARGO_ARGS_FILE CAPTURE_FILE
 : > "$CAPTURE_FILE"
 chmod 644 "$WORK/target/release/"*
 PATH="$STUB:$PATH" DEB_HOST_ARCH=amd64 PKGCONFIG_PIPEWIRE=1 sh "$BUILD_SH" "$WORK/target" > "$WORK/out4" 2>&1
+# 期望缺失型断言不抗回归：先证 cargo 确被调用，再证 argv 不含 --no-default-features，
+# 否则构建路径未来不可达时 grep -c 得 0 == 0 仍会静默通过。
+if [ -s "$CARGO_ARGS_FILE" ]; then
+    cargo_called="called"
+else
+    cargo_called="not-called"
+fi
+check "现代 PipeWire 头时 cargo 被调用（构建路径可达）" "$cargo_called" "called"
 check "现代 PipeWire 头时 cargo 不带 --no-default-features（升级默认特性）" \
     "$(grep -c -- '--no-default-features' "$CARGO_ARGS_FILE")" "0"
 
