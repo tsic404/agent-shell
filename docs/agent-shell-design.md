@@ -3755,7 +3755,7 @@ arm64（aarch64）发行构建（`build-deb.sh` / `PKGBUILD` / `flake.nix`）显
 |------|---------|
 | D-Bus (org.kde.KWin / org.gnome.Shell) | session bus 默认可调用 |
 | portal ScreenCast / RemoteDesktop / Screenshot | portal 弹窗用户确认（可持久化 token） |
-| /dev/uinput (ydotool) | udev 规则 `uinput` 组 |
+| /dev/uinput (ydotool / uinput 直写) | udev 规则 `uinput` 组 |
 | AT-SPI | 需 a11y-bus 可用（KDE 默认开启；GNOME 需手动开启） |
 
 ### 20.4 测试策略
