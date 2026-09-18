@@ -216,14 +216,18 @@ impl KWinNative {
             .map_err(|e| KWinError::Scripting(format!("VirtualDesktopManager.current: {e}")))
     }
 
-    /// 激活工作区：写 `VirtualDesktopManager.current` 属性为桌面 id。
+    /// 激活工作区：解析 id 为已知桌面 id 后写 `VirtualDesktopManager.current`。
     ///
-    /// 与 `list_workspaces` 的 `native_id`（`desktops` 每项的 id）同源——切换
-    /// 传入的 [`WorkspaceId`] 直接来自原生列表时按 id 写回；Scripting 通道的
-    /// numeric id 与本通道的 UUID id 不互通，跨通道切换不在本方法职责内。
+    /// KWin 5.x Scripting 列表返回 1 基数字 id，而原生 `desktops()` 返回 UUID——
+    /// 先做数字→UUID 翻译（`desktops()[k-1]`）再做存在性守卫，未知 id 显式
+    /// 拒绝。KWin D-Bus 对越界输入语义不一致（有时夹取、有时拒绝），透传会
+    /// 让行为随 KWin 版本漂移；拒绝口径与 Scripting 通道「无效输入报错」一致。
     pub async fn set_current_desktop(&self, id: &str) -> Result<()> {
+        let desktops = self.desktops().await?;
+        let resolved = resolve_desktop_id(&desktops, id)
+            .ok_or_else(|| KWinError::Scripting(format!("workspace not found: {id}")))?;
         self.vd
-            .set_property("current", id)
+            .set_property("current", resolved)
             .await
             .map_err(|e| KWinError::Scripting(format!("VirtualDesktopManager.set current: {e}")))
     }
@@ -300,6 +304,20 @@ fn as_string_vec(v: &OwnedValue) -> Option<Vec<String>> {
             .collect(),
         _ => None,
     }
+}
+
+/// 输入 id → `desktops`（`a(uss)` → `(position, id, name)`）中的桌面 id（纯函数，可单测）。
+///
+/// 直接 UUID 命中则原样返回；否则按 KWin 5.x Scripting 列表的 1 基数字 id
+/// 口径翻译为 `desktops()[k-1]` 的 UUID；其余返回 None（未知/越界 id）。
+fn resolve_desktop_id<'a>(desktops: &'a [(u32, String, String)], id: &str) -> Option<&'a str> {
+    if let Some((_, did, _)) = desktops.iter().find(|(_, did, _)| did == id) {
+        return Some(did.as_str());
+    }
+    let k: usize = id.parse().ok()?;
+    desktops
+        .get(k.checked_sub(1)?)
+        .map(|(_, did, _)| did.as_str())
 }
 
 #[cfg(test)]
@@ -467,5 +485,33 @@ mod tests {
             err.is_err(),
             "a(uss) must NOT deserialize into Vec<(i32,..)> (signature mismatch)"
         );
+    }
+
+    /// 数字 id → UUID 翻译：KWin 5.x Scripting 列表返回 1 基数字 id，原生
+    /// `desktops()` 返回 UUID；`resolve_desktop_id` 闭合该映射（纯函数）。
+    #[test]
+    fn resolve_desktop_id_translates_numeric_to_uuid() {
+        let desktops = vec![
+            (0u32, "vd-uuid-1".to_string(), "Desktop 1".to_string()),
+            (1u32, "vd-uuid-2".to_string(), "Desktop 2".to_string()),
+        ];
+        // 直接 UUID 命中，原样返回。
+        assert_eq!(
+            resolve_desktop_id(&desktops, "vd-uuid-1"),
+            Some("vd-uuid-1")
+        );
+        assert_eq!(
+            resolve_desktop_id(&desktops, "vd-uuid-2"),
+            Some("vd-uuid-2")
+        );
+        // 1 基数字 id → desktops()[k-1] 的 UUID。
+        assert_eq!(resolve_desktop_id(&desktops, "1"), Some("vd-uuid-1"));
+        assert_eq!(resolve_desktop_id(&desktops, "2"), Some("vd-uuid-2"));
+        // 越界/非法 → None。
+        assert_eq!(resolve_desktop_id(&desktops, "0"), None);
+        assert_eq!(resolve_desktop_id(&desktops, "3"), None);
+        assert_eq!(resolve_desktop_id(&desktops, ""), None);
+        assert_eq!(resolve_desktop_id(&desktops, "abc"), None);
+        assert_eq!(resolve_desktop_id(&desktops, "-1"), None);
     }
 }

@@ -1383,7 +1383,8 @@ impl CompositorComponent for KWinCompositor {
     /// 激活工作区：X11 会话走 EWMH `_NET_CURRENT_DESKTOP` ClientMessage（无需
     /// `/Scripting`——部分 KWin 5.x X11 会话不注册该对象路径）；Wayland 会话
     /// switch_workspace.js 优先，`/Scripting` 未注册时走
-    /// `VirtualDesktopManager.current` 属性（写桌面 id）。
+    /// `VirtualDesktopManager.current` 属性（数字 id 翻译为 UUID，未知 id
+    /// 显式拒绝，避免 KWin D-Bus 对越界输入夹取/拒绝语义不一致）。
     async fn activate_workspace(&self, id: &WorkspaceId) -> agent_shell_core::error::Result<()> {
         if let Some(x11) = self.x11.as_ref() {
             return x11.set_current_desktop(Self::x11_workspace_id(id)?);
