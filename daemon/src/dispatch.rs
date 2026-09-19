@@ -299,7 +299,7 @@ async fn doctor(d: &mut Daemon) -> RpcResult {
     lines.push(crate::a11y::atspi_line());
     // 4. capture 组件（三级降级链状态，§13）。
     lines.push(agent_shell_capture::doctor_line(d.capture.as_ref()).await);
-    // 5. input 组件（libei → ydotool → XTest 降级链，§12）。
+    // 5. input 组件（libei → ydotool → uinput → XTest 降级链，§12）。
     lines.push(input_doctor_line(d));
     // 6. GNOME 47+ 合成器唯一通道是 Shell Extension：缺安装机制即窗口
     //    语义整体缺失。仅 GNOME 会话渲染该行，缺失/未启用时给出可执行提示
@@ -648,7 +648,7 @@ async fn workspace_switch(d: &Daemon, req: &Request) -> RpcResult {
 // ───────────────────────── input ─────────────────────────
 
 /// 输入注入：daemon 经 `InputComponentHandle` 降级链（libei → ydotool →
-/// XTest → xdotool）执行。参数校验先于后端探测——坏载荷返回 InvalidParams，
+/// uinput → XTest → xdotool）执行。参数校验先于后端探测——坏载荷返回 InvalidParams，
 /// 不被 BackendUnavailable 掩盖（CI 无显示服务器环境回归锚定）。
 async fn input_send(d: &mut Daemon, req: &Request) -> RpcResult {
     let p: InputParams = serde_json::from_value(params_of(req)?.clone())

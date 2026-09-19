@@ -894,7 +894,7 @@ AgentShell::detect_and_assemble()
   │      （DDE backend 可改用 dde 网络服务——需调研）
   │
   │    输入 / 截图 / 无障碍 / 剪贴板（公共组件，探测链）：
-  │      input    libei portal → ydotool → XTest
+  │      input    libei portal → ydotool → uinput 直写 → XTest
   │      capture  portal ScreenCast → Screenshot → X11
   │      a11y     org.a11y.atspi.Registry 存在？
   │      clipboard 会话类型 → wl-clipboard / xclip
@@ -2351,6 +2351,7 @@ impl TtyBackend {
 │              │
 │  首选 libei  │──► libei (EIS)  ──► compositor (Wayland 原生)
 │  降级 ydotool│──► ydotool       ──► /dev/uinput ──► 内核
+│  降级 uinput │──► uinput 直写   ──► /dev/uinput ──► 内核
 │  X11 原生    │──► XTest 扩展     ──► x11rb::xtest_fake_input (仅 X11 会话)
 │  再降级      │──► xdotool       ──► XTest (仅保底)
 └──────────────┘
@@ -2388,13 +2389,17 @@ impl InputDispatcher {
         if which("ydotool").is_ok() && Path::new("/dev/uinput").exists() {
             backends.push(Box::new(YdotoolInput::new()));
         }
-        // 3. XTest 扩展 (X11 原生)
+        // 3. uinput 直写 (无 ydotool 时的跨 DE 保底)
+        if let Ok(uinput) = UinputInput::new() {
+            backends.push(Box::new(uinput));
+        }
+        // 4. XTest 扩展 (X11 原生)
         if de_type == DesktopEnvironment::X11Generic {
             if let Ok(xtest) = XTestInput::new().await {
                 backends.push(Box::new(xtest));
             }
         }
-        // 4. xdotool (X11 保底)
+        // 5. xdotool (X11 保底)
         if de_type == DesktopEnvironment::X11Generic && which("xdotool").is_ok() {
             backends.push(Box::new(XdotoolInput::new()));
         }
@@ -2447,6 +2452,19 @@ impl InputService for YdotoolInput {
     }
 }
 ```
+
+### 12.5 uinput 直写后端
+
+不依赖 `ydotool` 二进制/ydotoold，直接以 `O_WRONLY` 打开 `/dev/uinput`，用 ioctl
+（`UI_SET_EVBIT`/`UI_SET_KEYBIT`/`UI_SET_RELBIT`/`UI_SET_ABSBIT` + `UI_DEV_CREATE`）
+注册一个虚拟输入设备，再向 fd 写 `input_event` 完成键盘/鼠标/滚轮注入。能力与
+ydotool 后端等价（key/type/move/click/scroll）。
+
+用于 portal 缺 `ConnectToEIS`（libei 不可用）且未安装 ydotool 时的降级：链顺序
+`libei → ydotool → uinput 直写 → XTest → xdotool`，因此 ydotool 在场时仍优先走
+ydotool（不回归既有路径），仅在 ydotool 缺失时落到直写。权限模型与 ydotool 一致
+（§20.3 udev 规则 `uinput` 组）；`/dev/uinput` 不可写/权限不足时构造期探测失败，
+dispatcher 记录失败原因，整链空链时并入 `BackendUnavailable` 可诊断错误。
 
 ---
 
