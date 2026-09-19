@@ -13,7 +13,6 @@ use agent_shell_capture::CaptureDispatcher;
 use agent_shell_compositor_kwin::KWinCompositor;
 use agent_shell_compositor_mutter::{GnomePathKind, MutterCompositor};
 use agent_shell_core::component::{BackendCapabilities, CompositorComponent, DesktopComponent};
-use agent_shell_core::error::AgentShellError;
 use agent_shell_core::types::{WindowInfo, WorkspaceInfo};
 use agent_shell_power::{BrightnessController, BrightnessOps};
 use event::{EventHub, EventRing};
@@ -185,9 +184,9 @@ pub struct Daemon {
     pub capture: Option<CaptureDispatcher>,
     /// input 组件（libei → ydotool → XTest 降级链；None = 全后端探测失败，TTY 场景）。
     pub input: Option<agent_shell_input::InputComponentHandle>,
-    /// input 装配失败原因（如 portal 缺 ConnectToEIS；detect 空链错误的裸消息）。
-    /// None = 装配成功。`input_send` 在 `input == None` 时透出，而非笼统
-    /// "input unavailable"。
+    /// input 装配失败的首选后端探测根因（如 portal 缺 ConnectToEIS）。
+    /// None = 装配成功，或无具体根因的纯 TTY/空链。`input_send` 在
+    /// `input == None` 时透出；doctor 对 None 回退友好文案。
     pub input_error: Option<String>,
     /// Portal 会话管理器（§22.6 D5）。
     pub portal_sessions: std::sync::Arc<crate::portal_sessions::PortalSessionManager>,
@@ -253,18 +252,15 @@ impl Daemon {
         }
         .map(std::sync::Arc::new);
         // 输入降级链（libei → ydotool → XTest）：与 compositor 独立装配。
-        // 探测失败（TTY / portal 缺 ConnectToEIS / 无后端）不再静默吞错——保存
-        // 装配错误原因，input_send 透出可诊断错误而非笼统 "unavailable"。
+        // detect_with_reason 返回 (装配结果, 首选后端探测根因)：有具体根因
+        // （如 portal 缺 ConnectToEIS）时保存供 doctor/input_send 透出；纯
+        // TTY/空链（无根因）存 None，doctor 回退友好文案而非裸英文内部消息。
         let de_type = agent_shell_core::de_detection::detect_desktop_environment();
-        let (input, input_error) = match agent_shell_input::detect(de_type).await {
-            Ok(handle) => (Some(handle), None),
-            Err(e) => {
+        let (input, input_error) = match agent_shell_input::detect_with_reason(de_type).await {
+            (Ok(handle), _) => (Some(handle), None),
+            (Err(e), reason) => {
                 tracing::warn!("input assemble failed: {e}");
-                let msg = match e {
-                    AgentShellError::BackendUnavailable(m) => m,
-                    other => other.to_string(),
-                };
-                (None, Some(msg))
+                (None, reason)
             }
         };
 

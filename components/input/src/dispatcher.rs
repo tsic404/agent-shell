@@ -92,9 +92,9 @@ pub struct InputDispatcher {
     active: std::sync::Mutex<Option<usize>>,
     /// active 状态持久化文件；`None` = 不持久化（测试装配）。
     state_path: Option<PathBuf>,
-    /// 首选后端（libei）探测失败原因，仅当整条降级链无可选后端时回传给
-    /// 调用方作为可诊断错误（如 portal 缺 ConnectToEIS），而非笼统的
-    /// "no available backend"。
+    /// 首选后端（libei）探测失败的可诊断根因——仅「portal 在场但缺
+    /// ConnectToEIS」这类能力缺失（headless 无 portal / 无 session bus 是
+    /// 常态，不记录）。整链无可选后端时回传，而非笼统 "no available backend"。
     probe_failure: Option<String>,
 }
 
@@ -205,22 +205,13 @@ fn xdotool_candidate(display: Option<&std::ffi::OsStr>, has_xdotool: bool) -> bo
     display.is_some() && has_xdotool
 }
 
-/// 抽取首选后端探测失败的裸原因（去掉变体前缀，避免与外层
-/// `BackendUnavailable` 包裹重复）。libei 探测只产出 `BackendUnavailable`
-/// 或 `DBus`；其余变体兜底用完整 Display。
-fn probe_reason(err: &AgentShellError) -> String {
-    match err {
-        AgentShellError::BackendUnavailable(m) | AgentShellError::DBus(m) => m.clone(),
-        other => other.to_string(),
-    }
-}
-
 impl InputDispatcher {
     /// 按 DE 探测候选集合并选出第一个可用的 active 后端。
     pub async fn new(de_type: DesktopEnvironment) -> Result<Self> {
         let mut backends: Vec<Box<dyn InputService>> = Vec::new();
-        // 首选后端探测失败原因（仅 libei 有前置探测），供整链无可用后端时
-        // 回传可诊断错误而非笼统 "no available backend"。
+        // 首选后端探测失败的可诊断根因（仅「portal 在场但缺 ConnectToEIS」这类
+        // 能力缺失；headless 无 portal / 无 session bus 是常态，不记录）。供整链
+        // 无可用后端时回传可诊断错误，而非笼统 "no available backend"。
         let mut probe_failure = None;
 
         // 1. libei/EIS（Wayland 首选）：portal RemoteDesktop → EI 协议。
@@ -230,7 +221,9 @@ impl InputDispatcher {
                 Ok(libei) => backends.push(Box::new(libei)),
                 Err(e) => {
                     tracing::debug!("input: libei candidate unavailable: {e}");
-                    probe_failure = Some(probe_reason(&e));
+                    if let Some(reason) = super::libei::missing_connect_to_eis_reason(&e) {
+                        probe_failure = Some(reason.to_string());
+                    }
                 }
             }
         }
@@ -296,6 +289,14 @@ impl InputDispatcher {
     /// 候选后端名列表（诊断/测试用，按降级链顺序）。
     pub fn backend_names(&self) -> Vec<&'static str> {
         self.backends.iter().map(|b| b.name()).collect()
+    }
+
+    /// 首选后端（libei）探测失败的根因（None = 无前置探测或探测成功）。
+    ///
+    /// daemon 据此区分「有具体根因」（如 portal 缺 ConnectToEIS，透出给
+    /// doctor/input_send）与「纯 TTY/空链」（无根因，doctor 回退友好文案）。
+    pub fn probe_failure(&self) -> Option<&str> {
+        self.probe_failure.as_deref()
     }
 
     /// 空链（`active == None`）时 detect 层应返回的诊断错误：携带首选后端
@@ -583,21 +584,6 @@ mod tests {
         assert_eq!(d.active_backend_name(), None);
         let err = d.send_key(&combo(true)).await.unwrap_err();
         assert!(matches!(err, AgentShellError::BackendUnavailable(_)));
-    }
-
-    #[test]
-    fn probe_reason_strips_variant_prefix() {
-        // BackendUnavailable/DBus 抽内层消息，避免外层再次包裹重复前缀。
-        assert_eq!(
-            probe_reason(&AgentShellError::BackendUnavailable(
-                "portal lacks EIS".into()
-            )),
-            "portal lacks EIS"
-        );
-        assert_eq!(
-            probe_reason(&AgentShellError::DBus("session bus: gone".into())),
-            "session bus: gone"
-        );
     }
 
     #[tokio::test]
