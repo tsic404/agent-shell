@@ -630,7 +630,10 @@ pub struct ImeTypeResult {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct DaemonStatusResult {
     pub running: bool,
-    pub windows_cached: usize,
+    /// 当前窗口缓存条目数。窗口缓存是 TTL 短缓存（`windows.list` 触发、2s 过期）；
+    /// 冷缓存时窗口走合成器实时查询、无条目可报告，故省略该字段而非输出恒 0。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub windows_cached: Option<usize>,
     pub subscribers: usize,
     pub ime_engine: Option<String>,
 }

@@ -1017,7 +1017,7 @@ async fn daemon_status(d: &mut Daemon) -> RpcResult {
     use agent_shell_rpc::DaemonStatusResult;
     let r = DaemonStatusResult {
         running: true,
-        windows_cached: d.cache_len(),
+        windows_cached: d.windows_cached(),
         subscribers: d.subscriber_count(),
         ime_engine: d.ime_session.current_engine(),
     };
@@ -1895,6 +1895,21 @@ mod tests {
         let err = resp.error.expect("error");
         assert_eq!(err.code, RpcErrorCode::MethodNotFound as i32);
         assert!(err.message.contains("bogus.method"));
+    }
+
+    #[tokio::test]
+    async fn daemon_status_omits_windows_cached_when_cold() {
+        // 窗口缓存是 TTL 短缓存；冷缓存（从未 windows.list）时 `windows_cached`
+        // 必须省略而非输出恒 0——0 会把「无缓存」误读为「0 个窗口」。
+        let mut d = test_daemon().await;
+        let resp = dispatch(&mut d, &req(method::DAEMON_STATUS, None)).await;
+        let v = resp.result.expect("ok");
+        assert_eq!(v.get("running"), Some(&serde_json::json!(true)));
+        assert_eq!(v.get("subscribers"), Some(&serde_json::json!(0)));
+        assert!(
+            v.get("windows_cached").is_none(),
+            "cold cache must omit windows_cached, got: {v}"
+        );
     }
 
     #[tokio::test]

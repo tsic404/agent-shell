@@ -529,9 +529,16 @@ impl Daemon {
             .unwrap_or("unavailable")
     }
 
-    /// 当前窗口缓存条目数（daemon_status 报告用）。
-    pub fn cache_len(&self) -> usize {
-        self.cache.len()
+    /// 窗口缓存是否新鲜（TTL 内）。`daemon.status` 据此决定是否报告缓存条目数。
+    fn cache_is_warm(&self) -> bool {
+        self.cached_at.is_some_and(|at| at.elapsed() < CACHE_TTL)
+    }
+
+    /// daemon.status 报告的窗口缓存条目数：缓存新鲜时返回条目数；冷缓存
+    /// （从未填充或 TTL 已过期，窗口走合成器实时查询）返回 None——调用方
+    /// 省略该字段，避免把「无缓存」误读为「0 个窗口」。
+    pub fn windows_cached(&self) -> Option<usize> {
+        self.cache_is_warm().then_some(self.cache.len())
     }
 
     /// 当前事件订阅者数量。
@@ -770,12 +777,11 @@ mod tests {
         assert!(fd_is_socket(a.as_raw_fd()));
     }
 
-    #[test]
-    fn compositor_name_reports_unavailable_without_backend() {
-        // Compositor 变体在 A1 下均需 I/O 装配（KWinCompositor/Treeland），
-        // 单测无法离线构造；名称委托的 Dde 路径由 dde crate 的 name() 契约
-        // 覆盖。此处仅固化 None 路径（doctor 兜底展示名）。
-        let d = Daemon {
+    /// 离线 bare Daemon 夹具：所有外部组件为 None，字段可逐项覆盖。
+    /// Compositor 变体在 A1 下均需 I/O 装配（KWinCompositor/Treeland），
+    /// 单测无法离线构造，故此处只固化 None 路径。
+    fn bare_daemon() -> Daemon {
+        Daemon {
             compositor: None,
             cache: Vec::new(),
             cached_at: None,
@@ -804,8 +810,58 @@ mod tests {
             ring: EventRing::default(),
             subscriptions: Vec::new(),
             event_pipeline_started: false,
-        };
+        }
+    }
+
+    #[test]
+    fn compositor_name_reports_unavailable_without_backend() {
+        // 名称委托的 Dde 路径由 dde crate 的 name() 契约覆盖。此处固化 None
+        // 路径（doctor 兜底展示名）。
+        let d = bare_daemon();
         assert_eq!(d.compositor_name(), "unavailable");
+    }
+
+    #[test]
+    fn windows_cached_reports_count_when_warm_and_none_when_cold() {
+        use agent_shell_core::types::{DesktopEnvironment, Rect, WindowId, WindowType};
+        let mut d = bare_daemon();
+        // 冷缓存（从未填充）→ None（daemon.status 省略该字段）。
+        assert_eq!(d.windows_cached(), None);
+        // 新鲜缓存 → 报告条目数。
+        d.cache = vec![WindowInfo {
+            id: WindowId {
+                native_id: "w1".into(),
+                de_type: DesktopEnvironment::KDE,
+            },
+            title: "t".into(),
+            app_id: "a".into(),
+            pid: 1,
+            geometry: Rect {
+                x: 0,
+                y: 0,
+                width: 1,
+                height: 1,
+            },
+            frame_geometry: Rect {
+                x: 0,
+                y: 0,
+                width: 1,
+                height: 1,
+            },
+            states: Vec::new(),
+            workspace_id: None,
+            monitor_id: None,
+            stacking_order: 0,
+            desktop_file: None,
+            window_type: WindowType::Normal,
+            icon_geometry: None,
+            keep_above: false,
+        }];
+        d.cached_at = Some(Instant::now());
+        assert_eq!(d.windows_cached(), Some(1));
+        // TTL 过期 → 回落 None。
+        d.cached_at = Some(Instant::now() - CACHE_TTL - Duration::from_millis(1));
+        assert_eq!(d.windows_cached(), None);
     }
 
     #[tokio::test]
