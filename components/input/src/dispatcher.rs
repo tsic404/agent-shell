@@ -1,8 +1,9 @@
 //! `InputService` trait 与 `InputDispatcher`（设计文档 §12.2）。
 //!
 //! 降级链构造顺序（§12.1/§12.2）：libei（Wayland 首选）→ ydotool（需 /dev/uinput）→
-//! XTest（仅原生 X11）→ xdotool（`DISPLAY` 存在即压入）；取第一个 `is_available()` 者
-//! 为 active，全不可用则 active=None（返回错误、不 panic）。
+//! uinput 直写（无 ydotool 时替代）→ XTest（仅原生 X11）→ xdotool（`DISPLAY` 存在
+//! 即压入）；取第一个 `is_available()` 者为 active，全不可用则 active=None（返回
+//! 错误、不 panic）。
 //! **操作期降级**：libei 的 is_available 仅验证 portal 在场、会话延迟到首次注入
 //! （`ensure_ready`），建立失败或能力缺失即摘除回落且不重复弹窗；注入期错误直接返回、
 //! 不降级重放。超时/重试（§19）由各后端命令执行层统一施加。
@@ -96,6 +97,9 @@ pub struct InputDispatcher {
     /// ConnectToEIS」这类能力缺失（headless 无 portal / 无 session bus 是
     /// 常态，不记录）。整链无可选后端时回传，而非笼统 "no available backend"。
     probe_failure: Option<String>,
+    /// 降级后端（uinput 直写）探测失败原因（如 /dev/uinput 不可写）；与
+    /// `probe_failure` 一并并入整链空链时的可诊断错误。
+    fallback_failure: Option<String>,
 }
 
 /// 状态文件名（D9 状态持久化：`$XDG_RUNTIME_DIR/agent-shell/input-active.json`）。
@@ -213,6 +217,8 @@ impl InputDispatcher {
         // 能力缺失；headless 无 portal / 无 session bus 是常态，不记录）。供整链
         // 无可用后端时回传可诊断错误，而非笼统 "no available backend"。
         let mut probe_failure = None;
+        // 降级后端（uinput 直写）探测失败原因，与 probe_failure 一并透出。
+        let mut fallback_failure = None;
 
         // 1. libei/EIS（Wayland 首选）：portal RemoteDesktop → EI 协议。
         //    探测失败（无 portal / 缺 ConnectToEIS / 非 Wayland）不阻塞后续候选。
@@ -233,13 +239,34 @@ impl InputDispatcher {
             backends.push(Box::new(super::ydotool::YdotoolInput::new()));
         }
 
-        // 3. XTest 扩展（X11 原生）：连接失败不压入。
+        // 3. uinput 直写（Wayland 无 ydotool 时的跨 DE 保底）：直接写
+        //    /dev/uinput，不依赖 ydotool 二进制/ydotoold。仅 Wayland 会话压入
+        //    （与 libei 同条件）——X11Generic 由 XTest/xdotool 以像素坐标原生
+        //    处理，uinput 的 [0,0x7fff] 设备坐标会改退 move 语义（审查 #3）。
+        //    探测 /dev/uinput 可写性，不可写/权限不足跳过候选；失败原因保存
+        //    供整链空链时透出可诊断错误。
+        if de_type != DesktopEnvironment::X11Generic && !de_type.is_tty() {
+            match super::uinput::UinputInput::new() {
+                Ok(uinput) => backends.push(Box::new(uinput)),
+                Err(e) => {
+                    tracing::debug!("input: uinput direct-write candidate unavailable: {e}");
+                    // 只存裸原因（剥变体前缀）：空链错误自会包裹外层变体，
+                    // 重复前缀稀释诊断文案（与 libei 探测根因同口径）。
+                    fallback_failure = Some(match e {
+                        AgentShellError::BackendUnavailable(m) => m,
+                        other => other.to_string(),
+                    });
+                }
+            }
+        }
+
+        // 4. XTest 扩展（X11 原生）：连接失败不压入。
         if de_type == DesktopEnvironment::X11Generic {
             if let Ok(xtest) = super::xtest::XTestInput::new() {
                 backends.push(Box::new(xtest));
             }
         }
-        // 4. xdotool（X11 / XWayland 兜底）：`DISPLAY` 存在即入链——xdotool
+        // 5. xdotool（X11 / XWayland 兜底）：`DISPLAY` 存在即入链——xdotool
         //    直连 `DISPLAY` 指向的 X server（原生 X11 或 XWayland 均可），
         //    不依赖 `de_type.supports_x11()`：Wayland-only DE（Hyprland/Sway/
         //    WLRWayland）在 XWayland 会话下同样可经 xdotool 注入，作为
@@ -278,6 +305,7 @@ impl InputDispatcher {
             active: std::sync::Mutex::new(active),
             state_path,
             probe_failure,
+            fallback_failure,
         })
     }
 
@@ -300,15 +328,22 @@ impl InputDispatcher {
     }
 
     /// 空链（`active == None`）时 detect 层应返回的诊断错误：携带首选后端
-    /// （libei）探测失败原因（如 portal 缺 ConnectToEIS），而非笼统
-    /// "no available backend"。`detect` 据此返回 `Err`，daemon 保存后经
-    /// `input_send` 透出。
+    /// （libei）与降级后端（uinput 直写）的探测失败原因（如 portal 缺
+    /// ConnectToEIS 或 /dev/uinput 不可写），而非笼统 "no available backend"。
+    /// `detect` 据此返回 `Err`，daemon 保存后经 `input_send` 透出。
     pub(crate) fn empty_chain_error(&self, de_type: DesktopEnvironment) -> AgentShellError {
-        let reason = self
-            .probe_failure
-            .as_deref()
-            .map(|r| format!(" ({r})"))
-            .unwrap_or_default();
+        let reasons: Vec<&str> = [
+            self.probe_failure.as_deref(),
+            self.fallback_failure.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        let reason = if reasons.is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", reasons.join("; "))
+        };
         AgentShellError::BackendUnavailable(format!(
             "input: no usable input backend in {de_type} session{reason}"
         ))
@@ -421,6 +456,7 @@ impl InputDispatcher {
             active: std::sync::Mutex::new(None),
             state_path: None,
             probe_failure,
+            fallback_failure: None,
         }
     }
 }
@@ -563,6 +599,7 @@ mod tests {
             active: std::sync::Mutex::new(active),
             state_path: None,
             probe_failure: None,
+            fallback_failure: None,
         }
     }
 
@@ -584,6 +621,22 @@ mod tests {
         assert_eq!(d.active_backend_name(), None);
         let err = d.send_key(&combo(true)).await.unwrap_err();
         assert!(matches!(err, AgentShellError::BackendUnavailable(_)));
+    }
+
+    #[test]
+    fn empty_chain_error_composes_probe_and_fallback_reasons() {
+        // 首选（libei）与降级（uinput）探测都失败时，空链错误必须同时透出
+        // 两个原因（验收标准 2：/dev/uinput 不可用可诊断）。
+        let d = InputDispatcher {
+            backends: Vec::new(),
+            active: std::sync::Mutex::new(None),
+            state_path: None,
+            probe_failure: Some("portal backend does not support EIS".into()),
+            fallback_failure: Some("/dev/uinput not writable: Permission denied".into()),
+        };
+        let err = d.empty_chain_error(DesktopEnvironment::DDE).to_string();
+        assert!(err.contains("portal backend does not support EIS"), "{err}");
+        assert!(err.contains("/dev/uinput not writable"), "{err}");
     }
 
     #[tokio::test]
@@ -664,6 +717,7 @@ mod tests {
             active: std::sync::Mutex::new(Some(0)),
             state_path: Some(state_path.clone()),
             probe_failure: None,
+            fallback_failure: None,
         };
         d.send_key(&combo(true)).await.expect("falls back");
         assert_eq!(d.active_backend_name(), Some("ok"));
@@ -716,6 +770,7 @@ mod tests {
             active: std::sync::Mutex::new(Some(0)),
             state_path: Some(state_path.clone()),
             probe_failure: None,
+            fallback_failure: None,
         };
         let err = d.send_key(&combo(true)).await.unwrap_err();
         assert!(matches!(err, AgentShellError::BackendUnavailable(_)));

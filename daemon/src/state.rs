@@ -182,7 +182,7 @@ pub struct Daemon {
     pub idle_timeout: Duration,
     /// capture 组件（三级降级链；None = 全后端探测失败，TTY 场景）。
     pub capture: Option<CaptureDispatcher>,
-    /// input 组件（libei → ydotool → XTest 降级链；None = 全后端探测失败，TTY 场景）。
+    /// input 组件（libei → ydotool → uinput → XTest 降级链；None = 全后端探测失败，TTY 场景）。
     pub input: Option<agent_shell_input::InputComponentHandle>,
     /// input 装配失败的首选后端探测根因（如 portal 缺 ConnectToEIS）。
     /// None = 装配成功，或无具体根因的纯 TTY/空链。`input_send` 在
@@ -251,7 +251,7 @@ impl Daemon {
             }
         }
         .map(std::sync::Arc::new);
-        // 输入降级链（libei → ydotool → XTest）：与 compositor 独立装配。
+        // 输入降级链（libei → ydotool → uinput → XTest）：与 compositor 独立装配。
         // detect_with_reason 返回 (装配结果, 首选后端探测根因)：有具体根因
         // （如 portal 缺 ConnectToEIS）时保存供 doctor/input_send 透出；纯
         // TTY/空链（无根因）存 None，doctor 回退友好文案而非裸英文内部消息。
