@@ -26,6 +26,10 @@ pub const REGISTRY_SERVICE: &str = "org.a11y.atspi.Registry";
 pub const ROOT_PATH: &str = "/org/a11y/atspi/accessible/root";
 /// session bus 上负责公布 a11y 总线地址的服务。
 pub const BUS_SERVICE: &str = "org.a11y.Bus";
+/// `org.a11y.Status` 接口（session bus 上 AT-SPI 启用开关所在处）。
+pub const STATUS_IFACE: &str = "org.a11y.Status";
+/// `org.a11y.Status` 所在对象路径（at-spi2-core bus launcher 注册处）。
+pub const STATUS_PATH: &str = "/org/a11y/bus";
 /// 坐标类型：屏幕坐标（AT_SPI_COORD_TYPE_SCREEN = 0）。
 const COORD_TYPE_SCREEN: u32 = 0;
 /// 语义遍历最大深度保护（深层 Web 树可达数十层）。
@@ -39,14 +43,38 @@ const SESSION_CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs
 /// dbus-daemon 激活超时 ~120s。
 const GET_ADDRESS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// 会话 AT-SPI 启用态（`org.a11y.Status`）。
+///
+/// 工具包（Qt/GTK）据此判定「是否有人消费无障碍」，决定是否向 a11y bus 注册
+/// 应用树——默认桌面会话两属性均为 false 时，Registry 可达但**应用树为空**。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SessionA11yStatus {
+    /// `IsEnabled`（at-spi2-core 2011+ 的标准启用位）。
+    pub is_enabled: bool,
+    /// `ScreenReaderEnabled`（读屏软件在跑）。
+    pub screen_reader_enabled: bool,
+}
+
+impl SessionA11yStatus {
+    /// 工具包是否已按「有人消费无障碍」注册。
+    ///
+    /// 任一属性为真即视为已启用：Qt 同时读 `IsEnabled` 与 `ScreenReaderEnabled`
+    /// （`libQt6Gui` 实测引用两者），读屏软件通常置位其一。
+    pub fn is_active(self) -> bool {
+        self.is_enabled || self.screen_reader_enabled
+    }
+}
+
 /// AT-SPI D-Bus 桥接。
 ///
 /// 持有到 a11y bus 的独立连接；所有树查询都经由本桥接的引用寻址
-/// `(bus_name, path)` 完成。`Clone` 语义为共享同一连接（zbus::Connection
-/// 内部是 Arc）。
+/// `(bus_name, path)` 完成。另持 session bus 连接——启用开关
+/// （[`STATUS_IFACE`]）只存在于 session bus，a11y bus 上没有该对象。
+/// `Clone` 语义为共享同一连接（zbus::Connection 内部是 Arc）。
 #[derive(Clone)]
 pub struct AtspiBridge {
     conn: zbus::Connection,
+    session: zbus::Connection,
 }
 
 impl AtspiBridge {
@@ -110,13 +138,83 @@ impl AtspiBridge {
             .await
             .map_err(|e| AgentShellError::BackendUnavailable(format!("a11y bus dial: {e}")))?;
 
-        Ok(Self { conn })
+        Ok(Self { conn, session })
     }
 
     /// 共享连接的克隆构造（component.rs 的 Arc 包装用）。
     pub fn clone_bridge(&self) -> Self {
         Self {
             conn: self.conn.clone(),
+            session: self.session.clone(),
+        }
+    }
+
+    /// 读会话 AT-SPI 启用态（session bus [`STATUS_IFACE`]）。
+    ///
+    /// 属性缺失（老 at-spi2 无 `IsEnabled`）或读取失败按 false 处理——调用方
+    /// [`Self::ensure_enabled`] 据此尝试置位，失败也不阻断树查询。
+    pub async fn session_status(&self) -> Result<SessionA11yStatus> {
+        let proxy = zbus::Proxy::new(&self.session, BUS_SERVICE, STATUS_PATH, STATUS_IFACE)
+            .await
+            .map_err(|e| AgentShellError::DBus(format!("org.a11y.Status proxy: {e}")))?;
+        Ok(SessionA11yStatus {
+            is_enabled: proxy
+                .get_property::<bool>("IsEnabled")
+                .await
+                .unwrap_or(false),
+            screen_reader_enabled: proxy
+                .get_property::<bool>("ScreenReaderEnabled")
+                .await
+                .unwrap_or(false),
+        })
+    }
+
+    /// 确保会话 AT-SPI 已启用，返回本次是否发生变更（`true` = 刚置位）。
+    ///
+    /// 默认桌面会话（实测 KDE Plasma 6 Wayland）两属性均为 false，工具包因此
+    /// **不向 a11y bus 注册**，Registry 可达却应用树为空——`a11y query --all`
+    /// 恒返回 0 元素。该属性正是读屏软件启动时置位的开关；本工具读屏/语义定位
+    /// 与读屏同源，故在枚举前置位（调用方据此决定是否等待注册完成）。
+    ///
+    /// 已置位时不写总线（幂等且不扰动既有状态）；写入失败（属性不存在 /
+    /// 权限拒绝）返回错误，由调用方决定是否继续枚举。
+    pub async fn ensure_enabled(&self) -> Result<bool> {
+        if self.session_status().await?.is_active() {
+            return Ok(false);
+        }
+        let props = zbus::Proxy::new(
+            &self.session,
+            BUS_SERVICE,
+            STATUS_PATH,
+            "org.freedesktop.DBus.Properties",
+        )
+        .await
+        .map_err(|e| AgentShellError::DBus(format!("org.a11y.Status props proxy: {e}")))?;
+        let mut wrote = false;
+        let mut last_err = None;
+        for prop in ["IsEnabled", "ScreenReaderEnabled"] {
+            match props
+                .call::<_, _, ()>(
+                    "Set",
+                    &(STATUS_IFACE, prop, zbus::zvariant::Value::Bool(true)),
+                )
+                .await
+            {
+                Ok(()) => wrote = true,
+                Err(e) => {
+                    // 单个属性缺失不致命（不同 at-spi2 版本属性集不同），
+                    // 但两个都写不进来说明无法启用——如实上抛。
+                    tracing::debug!(prop, "org.a11y.Status set failed: {e}");
+                    last_err = Some(e);
+                }
+            }
+        }
+        match (wrote, last_err) {
+            (true, _) => Ok(true),
+            (false, Some(e)) => Err(AgentShellError::DBus(format!(
+                "org.a11y.Status enable failed: {e}"
+            ))),
+            (false, None) => Ok(false),
         }
     }
 
@@ -319,16 +417,33 @@ impl AtspiBridge {
     }
 
     /// 枚举一个应用下的全部顶层窗口（FRAME/WINDOW 角色）。
+    ///
+    /// 单个子节点的属性探测失败（节点已销毁，或实现不完整——AT-SPI 不要求
+    /// 每个节点实现全部接口，实测有节点不实现 `GetState`/`GetRole`）时跳过该
+    /// 节点，而非让整棵树枚举失败：与 [`Self::children`] 同口径，语义定位的
+    /// 搜索空间只损失不可读节点。
     pub async fn app_windows(&self, app: &ApplicationNode) -> Result<Vec<WindowNode>> {
         let count = self.child_count(&app.bus_name, &app.path).await?;
         let mut windows = Vec::new();
         for i in 0..count {
             let (bus, path) = self.child_at(&app.bus_name, &app.path, i).await?;
-            let states = self.get_state(&bus, &path).await?;
+            let states = match self.get_state(&bus, &path).await {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::debug!(%bus, %path, "atspi node state unavailable, skipping: {e}");
+                    continue;
+                }
+            };
             if states.contains(AtspiState::DEFUNCT) {
                 continue;
             }
-            let role = self.get_role(&bus, &path).await?;
+            let role = match self.get_role(&bus, &path).await {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::debug!(%bus, %path, "atspi node role unavailable, skipping: {e}");
+                    continue;
+                }
+            };
             if !matches!(role.code, 23 | 69) {
                 // 23 = FRAME, 69 = WINDOW（AtspiRoleType）
                 continue;
@@ -526,5 +641,20 @@ mod tests {
             &[owned("org.freedesktop.DBus")]
         ));
         assert!(!should_probe_address(false, &[]));
+    }
+
+    /// 会话启用态判定：任一属性为真即视为「工具包会注册」——Qt 同时读
+    /// `IsEnabled` 与 `ScreenReaderEnabled`（libQt6Gui 实测引用两者），
+    /// 只认其中一个会把另一种置位方式的会话误判为未启用（进而重复写总线）。
+    #[test]
+    fn session_status_is_active_on_either_flag() {
+        let s = |is_enabled, screen_reader_enabled| SessionA11yStatus {
+            is_enabled,
+            screen_reader_enabled,
+        };
+        assert!(!s(false, false).is_active());
+        assert!(s(true, false).is_active());
+        assert!(s(false, true).is_active());
+        assert!(s(true, true).is_active());
     }
 }

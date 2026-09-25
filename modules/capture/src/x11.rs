@@ -86,6 +86,20 @@ fn capture_with(x: &X11DisplayServer, window: Option<u32>) -> Result<Frame> {
     let root = window.unwrap_or_else(|| x.root_window());
     let drawable = root as Drawable;
 
+    // 窗口直捕前置检查：`GetImage` 只对 viewable 窗口有效，未映射/不可见窗口
+    // 由 server 以 `BadMatch` 拒绝，而原始错误只给 `bad_value <id> (Match)`——
+    // 用户无从判断是「窗口没映射」「id 不是客户端窗口」还是抓屏实现有问题
+    // （实测 QA 取到 Fcitx 的 1x1 OverrideRedirect 辅助窗口即属此类）。
+    if let Some(win) = window {
+        let attrs = XProtoExt::get_window_attributes(conn, win)
+            .map_err(cerr2)?
+            .reply()
+            .map_err(cerr)?;
+        if let Some(reason) = window_capture_blocker(win, attrs.map_state) {
+            return Err(AgentShellError::Capture(reason));
+        }
+    }
+
     // 几何 + 位深决定行步长。X 协议 GetImage 回包无 stride 字段：
     // server 端 bytes_per_line = (width × bits-per-pixel) 按 32 位
     // 扫描线对齐（bitmap-format-scanline-pad），可能大于 width × bpp。
@@ -244,9 +258,36 @@ fn capture_err(e: impl std::fmt::Display) -> AgentShellError {
     AgentShellError::Capture(format!("x11 capture: {e}"))
 }
 
+/// 窗口直捕前置判定（纯函数，可单测）：非 viewable 窗口返回面向用户的原因，
+/// `None` 表示可直捕。
+///
+/// X11 协议规定 `GetImage` 的目标窗口必须 viewable；不满足时 server 回
+/// `BadMatch`，原始错误不含原因。提前判定把「窗口没映射」与「抓屏失败」区分开。
+fn window_capture_blocker(
+    window: u32,
+    map_state: x11rb::protocol::xproto::MapState,
+) -> Option<String> {
+    use x11rb::protocol::xproto::MapState;
+    if map_state == MapState::VIEWABLE {
+        return None;
+    }
+    let detail = if map_state == MapState::UNMAPPED {
+        "is not mapped (MapState::IsUnmapped)"
+    } else if map_state == MapState::UNVIEWABLE {
+        "is mapped but not visible on screen (MapState::IsUnviewable)"
+    } else {
+        "is not viewable"
+    };
+    Some(format!(
+        "x11 capture: window {window} (0x{window:x}) {detail}; X11 window capture \
+         requires a mapped, on-screen window — pick one from `windows list`"
+    ))
+}
+
 /// `GetGeometry`/`GetImage` 回包错误 → 可读错误，而非只回吐原始 `X11Error` 结构。
-/// `Drawable`（桌面窗口 id 等非可绘窗口）补可读提示；其余 X11 错误补一句上下文
-/// （bad_value + 错误类型 + 请求名）。
+/// `Drawable`（桌面窗口 id 等非可绘窗口）补可读提示；`Match`（窗口未映射 /
+/// 部分移出屏幕）补协议层原因；其余 X11 错误补一句上下文（bad_value + 错误类型
+/// + 请求名）。
 fn capture_reply_err(e: x11rb::errors::ReplyError) -> AgentShellError {
     if let x11rb::errors::ReplyError::X11Error(x11) = &e {
         if x11.error_kind == x11rb::protocol::ErrorKind::Drawable {
@@ -256,7 +297,15 @@ fn capture_reply_err(e: x11rb::errors::ReplyError) -> AgentShellError {
                 x11.bad_value
             ));
         }
-        // 非 Drawable 类 X11 错误（Match/Window/Value…）补一句可读上下文。
+        if x11.error_kind == x11rb::protocol::ErrorKind::Match {
+            return AgentShellError::Capture(format!(
+                "x11 capture: drawable {} rejected by the X server (BadMatch); the target \
+                 must be a mapped window fully inside the screen — X11 cannot capture \
+                 unmapped, hidden, or partially off-screen windows",
+                x11.bad_value
+            ));
+        }
+        // 非 Drawable/Match 类 X11 错误（Window/Value…）补一句可读上下文。
         // bad_value 仅在 Window/Drawable 下才是窗口 ID，故此处用通用标签
         // `bad_value`（X11Error 原始字段名），而非误导性的 `window id`。
         return capture_err(format!(
@@ -372,14 +421,14 @@ mod tests {
         }
     }
 
-    /// `request_name: None` 时回退为 `<unknown>`；用 `Match` kind（Xvfb 无合成器
-    /// 截子窗口场景）覆盖回退文案，同时验证错误类型名不被吞。
+    /// `request_name: None` 时回退为 `<unknown>`；用 `Value` kind 覆盖回退文案，
+    /// 同时验证错误类型名不被吞。
     #[test]
     fn non_drawable_error_without_request_name_falls_back() {
         let mapped = capture_reply_err(x11rb::errors::ReplyError::X11Error(
             x11rb::x11_utils::X11Error {
-                error_kind: x11rb::protocol::ErrorKind::Match,
-                error_code: 8,
+                error_kind: x11rb::protocol::ErrorKind::Value,
+                error_code: 2,
                 sequence: 1,
                 bad_value: 7,
                 minor_opcode: 0,
@@ -394,7 +443,7 @@ mod tests {
                     msg.contains("bad_value 7"),
                     "should label the bad value: {msg}"
                 );
-                assert!(msg.contains("Match"), "should name the error kind: {msg}");
+                assert!(msg.contains("Value"), "should name the error kind: {msg}");
                 assert!(
                     msg.contains("request <unknown>"),
                     "should fall back on missing request name: {msg}"
@@ -402,5 +451,49 @@ mod tests {
             }
             other => panic!("expected Capture error, got {other:?}"),
         }
+    }
+
+    /// `BadMatch` 回包必须说明协议层原因（窗口未映射 / 移出屏幕），而非只回吐
+    /// `bad_value <id> (Match)`——QA 用十进制 X11 id 截未映射辅助窗口时只拿到
+    /// 后者，无法判断是窗口状态问题还是抓屏缺陷。
+    #[test]
+    fn match_error_explains_window_visibility() {
+        let mapped = capture_reply_err(x11rb::errors::ReplyError::X11Error(
+            x11rb::x11_utils::X11Error {
+                error_kind: x11rb::protocol::ErrorKind::Match,
+                error_code: 8,
+                sequence: 1,
+                bad_value: 4194307,
+                minor_opcode: 0,
+                major_opcode: 14,
+                extension_name: None,
+                request_name: Some("GetImage"),
+            },
+        ));
+        match mapped {
+            AgentShellError::Capture(msg) => {
+                assert!(msg.contains("4194307"), "should name the drawable: {msg}");
+                assert!(msg.contains("BadMatch"), "should name the error: {msg}");
+                assert!(
+                    msg.contains("mapped window fully inside the screen"),
+                    "should explain the protocol requirement: {msg}"
+                );
+            }
+            other => panic!("expected Capture error, got {other:?}"),
+        }
+    }
+
+    /// 窗口直捕前置判定：只有 `IsViewable` 放行；未映射/不可见各给出可操作原因
+    /// （含十进制与十六进制 id，便于与 `windows list` / `xwininfo` 对照）。
+    #[test]
+    fn window_capture_blocker_classifies_map_state() {
+        use x11rb::protocol::xproto::MapState;
+        assert_eq!(window_capture_blocker(4194307, MapState::VIEWABLE), None);
+        let unmapped = window_capture_blocker(4194307, MapState::UNMAPPED).unwrap();
+        assert!(unmapped.contains("4194307"), "{unmapped}");
+        assert!(unmapped.contains("0x400003"), "{unmapped}");
+        assert!(unmapped.contains("is not mapped"), "{unmapped}");
+        let unviewable = window_capture_blocker(42, MapState::UNVIEWABLE).unwrap();
+        assert!(unviewable.contains("not visible on screen"), "{unviewable}");
     }
 }

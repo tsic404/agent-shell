@@ -60,7 +60,8 @@ impl EventScriptHandle {
     }
 }
 
-/// 启动长驻 `event_monitor.js`：订阅窗口增/删/激活信号（信号名随 KWin 5/6 分派）。
+/// 启动长驻 `event_monitor.js`：QTimer 轮询窗口列表差分（信号名/访问器随
+/// KWin 5/6 分派，信号仅作低延迟补充）。
 ///
 /// 幂等：已有运行中的实例先停止再启动（handle 换新）。
 pub async fn ensure_event_script(bridge: &KWinBridge, v6: bool) -> Result<EventScriptHandle> {
@@ -102,7 +103,7 @@ async fn start_event_script(conn: &Connection, js: &str, v6: bool) -> Result<Eve
         .run()
         .await
         .map_err(|e| crate::error::KWinError::Scripting(format!("event script run: {e}")))?;
-    // run 仅是发起执行；给 compositor 一点注册信号连接的时间。
+    // run 仅是发起执行（异步读盘 + 求值）；给脚本启动轮询/注册信号的时间。
     tokio::time::sleep(START_GRACE).await;
     Ok(EventScriptHandle {
         object_path: path,
@@ -139,10 +140,11 @@ impl EventScriptHandle {
 /// 事件推送进入 bridge 的独立事件队列（`KWinBridge::take_event_stream`），
 /// 与一次性查询完全隔离；本模块只负责脚本生命周期。
 ///
-/// 启动后**校验信号实际注册成功**：脚本在三个 `connect` 全部成功后推送
-/// `__ready__`、任一抛错推送 `__error__`；两者都未在时限内到达则判为
-/// 「脚本已加载但零注册」。失败时卸载脚本并返回可见错误，使
-/// `events subscribe` 直接暴露问题而不必查 journalctl。
+/// 启动后**校验监视器实际启动**：脚本在 QTimer 轮询启动后推送 `__ready__`、
+/// 启动失败推送 `__error__`；两者都未在时限内到达则判为「脚本已加载但未启动」。
+/// 失败时卸载脚本并返回可见错误，使 `events subscribe` 直接暴露问题而不必查
+/// journalctl。信号 `connect` 失败是非致命的（脚本推 `__signal_error__`）：
+/// 轮询才是事件保证通道。
 pub async fn spawn_event_monitor(bridge: &KWinBridge, v6: bool) -> Result<EventScriptHandle> {
     // 注册验证通道必须在 run 之前 prepare——脚本可能先于 run 返回发出标记，
     // 由响应服务路由至此而非事件队列。
@@ -154,7 +156,7 @@ pub async fn spawn_event_monitor(bridge: &KWinBridge, v6: bool) -> Result<EventS
         Ok(Ok(RegistrationOutcome::Failed(msg))) => {
             let _ = handle.stop(bridge.connection()).await;
             Err(KWinError::Scripting(format!(
-                "event script signal registration failed: {msg}"
+                "event monitor failed to start: {msg}"
             )))
         }
         Ok(Err(_)) => {
@@ -166,9 +168,8 @@ pub async fn spawn_event_monitor(bridge: &KWinBridge, v6: bool) -> Result<EventS
         Err(_) => {
             let _ = handle.stop(bridge.connection()).await;
             Err(KWinError::Scripting(format!(
-                "event script loaded but signal registration not confirmed within {}s \
-                 (a workspace signal .connect likely threw; check event_monitor.js \
-                 signal names for this KWin version)",
+                "event script loaded but monitor start not confirmed within {}s \
+                 (QTimer/workspace.windowList unavailable in this KWin version?)",
                 SCRIPT_TIMEOUT.as_secs()
             )))
         }
