@@ -17,6 +17,15 @@ use agent_shell_core::error::Result;
 use agent_shell_core::types::SemanticTarget;
 use async_trait::async_trait;
 
+/// 置位启用开关后等待工具包注册的上限。
+///
+/// 工具包收到 `org.a11y.Status` 变更信号后才连 a11y bus 并注册（实测 KDE
+/// Plasma 6 Wayland 首次置位后 <1s 完成 5 → 23 个应用）；上限只用于防御
+/// 「本会话确实没有应用注册」时不把 a11y 命令拖长。
+const ENABLE_SETTLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+/// 注册等待轮询间隔。
+const ENABLE_SETTLE_POLL: std::time::Duration = std::time::Duration::from_millis(200);
+
 /// AT-SPI 公共无障碍组件。
 ///
 /// 桥接在构造时连接并缓存；语义定位与元素操作基于同一连接
@@ -54,6 +63,29 @@ impl AtSpiComponent {
     /// 元素操作封装（共享桥接连接）。
     pub fn actions(&self) -> ElementActions {
         ElementActions::new(self.bridge.clone_bridge())
+    }
+
+    /// 无障碍树可见性前置：确保会话 AT-SPI 已启用，刚置位时等待工具包注册。
+    ///
+    /// 默认会话里 `org.a11y.Status` 两位皆为 false，工具包不注册 → Registry
+    /// 可达而应用树为空。置位是**异步生效**的（工具包收到属性变更信号后才连
+    /// a11y bus），置位后立即枚举会漏掉已开应用，故有界轮询到出现应用或超时。
+    /// 已启用（含用户自开读屏）时不写总线、不等待。
+    async fn prepare_tree(&self) -> Result<()> {
+        if !self.bridge.ensure_enabled().await? {
+            return Ok(());
+        }
+        let deadline = tokio::time::Instant::now() + ENABLE_SETTLE_TIMEOUT;
+        loop {
+            if !self.bridge.list_applications().await?.is_empty() {
+                return Ok(());
+            }
+            if tokio::time::Instant::now() >= deadline {
+                tracing::debug!("no a11y application registered after enabling AT-SPI");
+                return Ok(());
+            }
+            tokio::time::sleep(ENABLE_SETTLE_POLL).await;
+        }
     }
 }
 
@@ -97,14 +129,17 @@ impl A11yComponent for AtSpiComponent {
 #[async_trait]
 impl A11yOps for AtSpiComponent {
     async fn locate(&self, target: &SemanticTarget) -> Result<Vec<ElementNode>> {
+        self.prepare_tree().await?;
         self.locator().locate(target).await
     }
 
     async fn locate_by_path(&self, bus: Option<&str>, path: &str) -> Result<ElementNode> {
+        self.prepare_tree().await?;
         self.locator().locate_by_path(bus, path).await
     }
 
     async fn click(&self, element: &ElementNode) -> Result<()> {
+        self.prepare_tree().await?;
         self.actions().click(element).await
     }
 }

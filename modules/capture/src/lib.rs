@@ -232,19 +232,18 @@ impl CaptureDispatcher {
         self.capture_impl(target, interactive, false).await
     }
 
-    /// 区域裁剪所需的原始像素捕获（`--area` 路径）：ScreenCast → X11。
+    /// 区域裁剪所需的原始像素捕获（`--area` 路径）：静默 Screenshot → ScreenCast → X11。
     ///
-    /// portal Screenshot 只落全屏 PNG、无像素数据，无法在 daemon 侧裁剪；
-    /// 故 `--area` 跳过 Screenshot 段（`require_pixels`），ScreenCast 返回的
-    /// 原始帧可直接裁剪。ScreenCast 不可用/未授权时按 [`portal_fallback`]
-    /// 降级：原生 X11 会话抓 X11 root 帧；Wayland/无 x11 会话返回
-    /// [`AgentShellError::NotSupported`]（Screenshot PNG 无法裁剪），映射到
-    /// `InvalidParams` 而非冒充授权拒绝。
+    /// 静默 portal Screenshot 落盘的 PNG 在本地解码为原始像素帧
+    /// （[`decode_png_frame`]），ScreenCast 返回的帧本身即像素，X11 直捕亦然
+    /// ——三条路径都能给出可裁剪帧。全部不可用时按 [`portal_fallback`] 决策：
+    /// 原生 X11 会话抓 X11 root 帧；Wayland 会话快速失败并给出 portal 段真实
+    /// 原因（而非冒充「参数非法」）。
     pub async fn capture_pixels(&self, target: CaptureTarget, interactive: bool) -> Result<Frame> {
         match self.capture_impl(target, interactive, true).await? {
             CapturedFrame::Pixels(frame) => Ok(frame),
             CapturedFrame::Png(_) => Err(AgentShellError::Capture(
-                "capture_pixels: unexpected portal Screenshot PNG (Screenshot 段应被跳过)".into(),
+                "capture_pixels: portal Screenshot PNG not decoded to pixels".into(),
             )),
         }
     }
@@ -294,18 +293,9 @@ impl CaptureDispatcher {
         };
         match portal {
             Ok(frame) => Ok(frame),
-            Err(AgentShellError::NotSupported(msg)) => {
-                // Screenshot 可用但被跳过（PNG 无法裁剪）：能力缺口，非 portal
-                // 故障。原生 X11 会话仍降级 x11 抓原始像素；Wayland/无 x11
-                // 如实返回专用错误，不冒充授权拒绝。
-                match portal_fallback(self.wayland_session, self.x11_present) {
-                    PortalFallback::X11 => self.capture_x11().await,
-                    PortalFallback::Fail(_) => Err(AgentShellError::NotSupported(msg)),
-                }
-            }
             Err(e) => {
                 tracing::warn!("portal capture unavailable: {e}");
-                match portal_fallback(self.wayland_session, self.x11_present) {
+                match portal_fallback(self.wayland_session, self.x11_present, Some(&e)) {
                     PortalFallback::X11 => self.capture_x11().await,
                     PortalFallback::Fail(err) => Err(err),
                 }
@@ -313,27 +303,35 @@ impl CaptureDispatcher {
         }
     }
 
-    /// [`Self::capture`] 的 portal 段主体：ScreenCast → Screenshot。
+    /// [`Self::capture`] 的 portal 段主体：静默 Screenshot → ScreenCast → 交互 Screenshot。
     ///
-    /// `interactive=true` 时 Screenshot 先做非交互预探测（§13.1 建议 2）——
-    /// 已授权/免弹窗即时成功、无会话/自动化即时 Permission，两种情况都不
-    /// 弹窗、不吃交互超时预算；预探测失败才升级到交互弹窗。全部失败返回
-    /// `BackendUnavailable`，由调用方降级 x11。
+    /// 顺序即授权成本：先试**无弹窗**的静默 portal Screenshot，再按成本递增
+    /// 降级（ScreenCast → 交互 Screenshot）。ScreenCast 的 `Start` 必须由用户
+    /// 点授权弹窗，若先试它，portal 子预算（[`PORTAL_PROBE_BUDGET`]）会在弹窗
+    /// 上耗尽，静默可用路径永远轮不到——实测 KDE 6.7 Wayland：`screenshot -f`
+    /// 恒报「portal authorization unavailable」，而静默 Screenshot 同一会话下
+    /// 1s 内即可落盘有效 PNG。
     ///
-    /// `require_pixels` 为真时跳过 Screenshot 段——其只落全屏 PNG，调用方
-    /// （区域裁剪）需要原始像素帧，PNG 无法裁剪。Screenshot 可用却跳过时
-    /// 返回 [`AgentShellError::NotSupported`]（能力缺口，非 portal 故障），
-    /// 交由 [`Self::capture_portal_then_fallback`] 决定降级 x11 或如实报错。
+    /// `require_pixels`（区域裁剪）不再是能力缺口：静默 Screenshot 的 PNG 在
+    /// 本地解码为原始像素帧（[`decode_png_frame`]）后同样可裁剪。
+    ///
+    /// 全部失败返回 `BackendUnavailable`，由调用方降级 x11 或快速失败。
     async fn capture_portal(
         &self,
-        _target: CaptureTarget,
+        target: CaptureTarget,
         interactive: bool,
         require_pixels: bool,
     ) -> Result<CapturedFrame> {
-        // L1: portal ScreenCast（流式，daemon 复用会话）。feature 关闭时编译期排除。
+        // L1: 静默 portal Screenshot（无弹窗，跨 DE 唯一无需用户点击的路径）。
+        if let Some(frame) = self.screenshot_silent(require_pixels).await {
+            self.set_active(Some(ActiveBackend::ScreenshotPortal));
+            return Ok(frame);
+        }
+
+        // L2: portal ScreenCast（流式，daemon 复用会话）。feature 关闭时编译期排除。
         #[cfg(feature = "portal-screencast")]
         {
-            if let Some(s) = self.ensure_screencast_session(_target, interactive).await {
+            if let Some(s) = self.ensure_screencast_session(target, interactive).await {
                 match s.capture_frame().await {
                     Ok(frame) => {
                         self.set_active(Some(ActiveBackend::ScreenCast));
@@ -349,64 +347,75 @@ impl CaptureDispatcher {
             }
         }
 
-        // L2: portal Screenshot（PNG）。区域裁剪需原始像素帧，Screenshot 只落
-        // 全屏 PNG、无法裁剪：require_pixels 时跳过。Screenshot 可用却跳过是
-        // 能力缺口而非 portal 故障，返回专用错误——由调用方在原生 X11 会话
-        // 降级 x11，或 Wayland/无 x11 如实报 InvalidParams（而非冒充授权拒绝）。
-        match screenshot_segment(require_pixels, self.screenshot.available().await) {
-            ScreenshotSegment::SkipUnsupported => {
-                return Err(AgentShellError::NotSupported(
-                    "area crop requires ScreenCast or X11 pixels; portal Screenshot (PNG) \
-                     cannot be cropped"
-                        .into(),
-                ));
-            }
-            ScreenshotSegment::Capture => {
-                // 交互先非交互预探测（§13.1 建议 2 / Radian 审查）：已授权/免弹窗
-                // 即时成功、无会话即时 Permission，均不弹窗；黑/无效帧与超时视为
-                // 预探测失败，升级到交互弹窗。预探测受交互预算约束（5s/单次口径），
-                // 不单独吃满 8s×2 超时（否则 ScreenCast 弹窗耗尽 10s 后会被外层
-                // 总预算截断，授权弹窗永不弹出）。
-                if interactive {
-                    if let Some(frame) = self
-                        .screenshot_preprobe(portal_screenshot::SCREENSHOT_TIMEOUT_INTERACTIVE)
-                        .await
-                    {
-                        self.set_active(Some(ActiveBackend::ScreenshotPortal));
-                        return Ok(frame);
-                    }
-                }
-                match self.screenshot.capture(interactive).await {
-                    Ok(path) => {
-                        // 校验产物确为可解码的非黑 PNG：DDE 的 xdg-desktop-portal-dde
-                        // 委托 KWin 落盘 JPEG（实测 /tmp/kwin_screenshot_*.jpg），
-                        // portal 却把「成功」返回成 CapturedFrame::Png，默认流程不会
-                        // 触发 x11 兜底，daemon 按 PNG 解析报「not a PNG file」。
-                        // 非 PNG / 损坏 / 全黑一律视为 portal 不可用，降级 x11
-                        // （原生 X11 会话）或快速失败（Wayland / 无 x11）。
-                        match validated_screenshot_frame(path) {
-                            Some(p) => {
-                                self.set_active(Some(ActiveBackend::ScreenshotPortal));
-                                return Ok(CapturedFrame::Png(p));
-                            }
-                            None => {
-                                tracing::warn!(
-                                    "portal Screenshot returned a non-PNG/invalid artifact \
-                                     (e.g. JPEG from xdg-desktop-portal-dde); degrading to next backend"
-                                );
-                                self.set_active(None);
-                            }
+        // L3: 交互 portal Screenshot（弹授权窗；`interactive=false` 时无免弹窗
+        // 选项，不发起，避免静默路径反过来弹窗）。
+        if interactive {
+            match self.screenshot.capture(true).await {
+                Ok(path) => {
+                    // 校验产物确为可解码的非黑 PNG：DDE 的 xdg-desktop-portal-dde
+                    // 委托 KWin 落盘 JPEG（实测 /tmp/kwin_screenshot_*.jpg），
+                    // portal 却把「成功」返回成 CapturedFrame::Png，默认流程不会
+                    // 触发 x11 兜底，daemon 按 PNG 解析报「not a PNG file」。
+                    // 非 PNG / 损坏 / 全黑一律视为 portal 不可用，降级 x11
+                    // （原生 X11 会话）或快速失败（Wayland / 无 x11）。
+                    match validated_screenshot_frame(path) {
+                        Some(p) => {
+                            self.set_active(Some(ActiveBackend::ScreenshotPortal));
+                            return Ok(CapturedFrame::Png(p));
+                        }
+                        None => {
+                            tracing::warn!(
+                                "portal Screenshot returned a non-PNG/invalid artifact \
+                                 (e.g. JPEG from xdg-desktop-portal-dde); degrading to next backend"
+                            );
+                            self.set_active(None);
                         }
                     }
-                    Err(e) => tracing::warn!("screenshot portal failed, degrade: {e}"),
                 }
+                Err(e) => tracing::warn!("interactive screenshot portal failed, degrade: {e}"),
             }
-            ScreenshotSegment::Unavailable => {}
         }
 
         Err(AgentShellError::BackendUnavailable(
-            "portal capture unavailable (ScreenCast/Screenshot unreachable or denied)".into(),
+            "portal capture unavailable (Screenshot/ScreenCast unreachable or denied)".into(),
         ))
+    }
+
+    /// 静默（`interactive=false`）portal Screenshot：无弹窗落盘全屏 PNG。
+    ///
+    /// `require_pixels` 时把 PNG 解码为原始像素帧（区域裁剪需要像素），解码后
+    /// 立即删除门户落盘文件——daemon 侧不再需要它，避免每帧在 `~/Pictures`
+    /// 残留一份。
+    ///
+    /// 产物校验与降级口径同 [`validated_screenshot_frame`]：非 PNG（DDE 委托
+    /// KWin 落盘 JPEG）、损坏、全黑一律判不可用并清理临时文件；解码失败
+    /// （合法 PNG 但布局异常）同样清理并返回 `None`，由调用方继续降级链。
+    async fn screenshot_silent(&self, require_pixels: bool) -> Option<CapturedFrame> {
+        if !self.screenshot.available().await {
+            return None;
+        }
+        let path = match self.screenshot.capture(false).await {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::debug!("silent portal Screenshot unavailable: {e}");
+                return None;
+            }
+        };
+        let path = validated_screenshot_frame(path)?;
+        if !require_pixels {
+            return Some(CapturedFrame::Png(path));
+        }
+        match decode_png_frame(&path) {
+            Ok(frame) => {
+                let _ = std::fs::remove_file(&path);
+                Some(CapturedFrame::Pixels(frame))
+            }
+            Err(e) => {
+                tracing::warn!("portal Screenshot PNG decode failed ({e}); degrading");
+                let _ = std::fs::remove_file(&path);
+                None
+            }
+        }
     }
 
     /// X11 原生兜底（portal 不可用/超时/拒绝后）。
@@ -437,27 +446,6 @@ impl CaptureDispatcher {
         }
         self.set_active(Some(ActiveBackend::X11));
         Ok(CapturedFrame::Pixels(frame))
-    }
-
-    /// 非交互预探测（§13.1 建议 2 / Radian 审查）：已授权/免弹窗即时成功；
-    /// 无会话/自动化即时 Permission。黑/无效帧、超时、Permission 均视为
-    /// 「未授权」跳过（返回 `None`），由调用方升级到交互弹窗。
-    ///
-    /// 受 `budget` 约束（交互预算内的短探测）：超时视为跳过而非失败——避免
-    /// 预探测的 8s×2 超时在 ScreenCast 弹窗耗尽预算后被外层总预算截断，致
-    /// 授权弹窗永不弹出（Radian 审查 #1）。
-    async fn screenshot_preprobe(&self, budget: std::time::Duration) -> Option<CapturedFrame> {
-        match tokio::time::timeout(budget, self.screenshot.capture(false)).await {
-            Ok(Ok(path)) => validated_screenshot_frame(path).map(CapturedFrame::Png),
-            Ok(Err(e)) => {
-                tracing::debug!("screenshot non-interactive pre-probe failed: {e}");
-                None
-            }
-            Err(_) => {
-                tracing::debug!("screenshot non-interactive pre-probe timed out; escalate");
-                None
-            }
-        }
     }
 
     #[cfg(feature = "portal-screencast")]
@@ -516,13 +504,28 @@ impl CaptureDispatcher {
     /// 不短路复用已记录的 `active`——已记录后端也可能已失效（ScreenCast 会话
     /// 可在两次 capture 间失效、X11 连接可断开），必须逐级重验，失败即清状态
     /// 并继续降级链。区别于 [`Self::capture`]：不产出帧/文件，全程
-    /// `interactive=false`（不弹授权窗）。ScreenCast 仅在持有 `restore_token`
-    /// 时尝试静默恢复；Screenshot 走无对话框全屏路径；X11 直捕一帧验证
-    /// （全黑帧视为非可用——纯 Wayland 会话 XWayland root 无合成器内容）。
+    /// `interactive=false`（不弹授权窗）。顺序与 [`Self::capture_portal`] 一致：
+    /// 静默 Screenshot（无对话框）→ ScreenCast 静默恢复（仅持有 `restore_token`
+    /// 时）→ X11 直捕一帧验证（全黑帧视为非可用——纯 Wayland 会话 XWayland root
+    /// 无合成器内容）。
     ///
     /// 返回 `None` 表示无任何后端可非交互建立，并将 `active` 清空。
     pub async fn probe(&self) -> Option<ActiveBackend> {
-        // L1: ScreenCast 静默恢复（无 token 会弹窗，跳过）。feature 关闭时编译期排除。
+        // L1: 静默 portal Screenshot（无对话框）——与 [`Self::capture_portal`]
+        // 的降级顺序一致，doctor 报的「选中后端」才是 `screenshot -f` 实际会走的
+        // 那一个。探测只判可用性、不留产物：门户落盘的全屏截图（可能含敏感画面）
+        // 在此立即删除，否则每次 doctor 都会在用户图片目录累积一份。
+        if let Some(frame) = self.screenshot_silent(false).await {
+            if let CapturedFrame::Png(path) = &frame {
+                if let Err(e) = std::fs::remove_file(path) {
+                    tracing::debug!("probe screenshot cleanup failed {}: {e}", path.display());
+                }
+            }
+            self.set_active(Some(ActiveBackend::ScreenshotPortal));
+            return Some(ActiveBackend::ScreenshotPortal);
+        }
+
+        // L2: ScreenCast 静默恢复（无 token 会弹窗，跳过）。feature 关闭时编译期排除。
         #[cfg(feature = "portal-screencast")]
         {
             if let Some(s) = self
@@ -540,31 +543,6 @@ impl CaptureDispatcher {
                         self.set_active(None);
                     }
                 }
-            }
-        }
-
-        // L2: portal Screenshot（interactive=false 全屏、无对话框）。
-        if self.screenshot_ok {
-            match self.screenshot.capture(false).await {
-                Ok(path) => {
-                    // 探测产生的临时截图落盘（可能含敏感画面），验证后立即删除，
-                    // 避免每次 doctor 运行累积残留文件。全黑/无效帧判非可用
-                    // （与 X11 的 is_all_black 同口径）：portal Screenshot 返回
-                    // 全空帧时不能据此报「选中 portal-screenshot」。
-                    let usable = !is_png_black_or_invalid(&path);
-                    if let Err(e) = std::fs::remove_file(&path) {
-                        tracing::debug!("probe screenshot cleanup failed {}: {e}", path.display());
-                    }
-                    if usable {
-                        self.set_active(Some(ActiveBackend::ScreenshotPortal));
-                        return Some(ActiveBackend::ScreenshotPortal);
-                    }
-                    tracing::warn!(
-                        "portal Screenshot probe captured an all-black/invalid frame; \
-                         degrading to next backend"
-                    );
-                }
-                Err(e) => tracing::debug!("screenshot portal probe failed (non-interactive): {e}"),
             }
         }
 
@@ -679,7 +657,7 @@ pub async fn doctor_line(dispatcher: Option<&CaptureDispatcher>) -> String {
         None => format!("✗ {LABEL:<12}: 不可用（无 portal 且无原生 X11 会话，TTY？）"),
         Some(d) => {
             let active = d.probe().await;
-            let fallback = portal_fallback(d.wayland_session, d.x11_present);
+            let fallback = portal_fallback(d.wayland_session, d.x11_present, None);
             render_capture_doctor_line(LABEL, &d.available_backends(), active, fallback)
         }
     }
@@ -687,13 +665,11 @@ pub async fn doctor_line(dispatcher: Option<&CaptureDispatcher>) -> String {
 
 /// 渲染 capture doctor 行（纯函数，可单测）。
 ///
-/// `active` 为 [`CaptureDispatcher::probe`] 探测结果：`Some`=非交互探测已建会话，
-/// `None`=探测失败。失败去向复用 [`portal_fallback`]：Wayland 下 portal 是唯一授权
-/// 闸门，降级 x11 会静默抓 XWayland root（越权），故报「已拒绝 x11 兜底」；候选链
-/// 无 `x11`（纯 Wayland）时无兜底可拒，如实报无可用后端。
-///
-/// Wayland 且候选链含 ScreenCast 时，`Some(ScreenshotPortal)` 仅证 Screenshot 门户
-/// 非交互可用——真实 capture 优先走 ScreenCast 交互弹窗、无授权时永不回落，故回落 ⚠。
+/// `active` 为 [`CaptureDispatcher::probe`] 探测结果：`Some`=非交互探测已建立
+/// 且产物通过校验（帧非黑 / 文件为有效 PNG），即真实绑定；`None`=探测失败。
+/// 失败去向复用 [`portal_fallback`]：Wayland 下 portal 是唯一授权闸门，降级 x11
+/// 会静默抓 XWayland root（越权），故报「已拒绝 x11 兜底」；候选链无 `x11`
+/// （纯 Wayland）时无兜底可拒，如实报无可用后端。
 fn render_capture_doctor_line(
     label: &str,
     backends: &[&'static str],
@@ -701,20 +677,7 @@ fn render_capture_doctor_line(
     fallback: PortalFallback,
 ) -> String {
     let chain = backends.join(" → ");
-    // 仅当候选链确含 portal-screencast（`screencast_ok`）时，真实 capture 才先走
-    // ScreenCast 交互弹窗——feature 关闭或无 ScreenCast 门户的桌面上，路径直落
-    // Screenshot 预探测即成功，须保留 ✓。
-    let screencast_first_on_wayland = matches!(
-        &fallback,
-        PortalFallback::Fail(AgentShellError::Permission(_))
-    ) && backends.contains(&ActiveBackend::ScreenCast.name());
     match active {
-        Some(ActiveBackend::ScreenshotPortal) if screencast_first_on_wayland => {
-            format!(
-                "⚠ {label:<12}: {chain}（选中 {}，需 portal 交互授权才能真实捕获）",
-                ActiveBackend::ScreenshotPortal.name()
-            )
-        }
         Some(b) => format!("✓ {label:<12}: {chain}（选中 {}）", b.name()),
         None => match fallback {
             // Wayland + XWayland 候选链含 x11：portal 是唯一授权闸门，降级
@@ -875,13 +838,25 @@ enum PortalFallback {
 ///   XWayland root（越权），必须快速失败并给出明确报错。
 /// - 原生 X11 会话且 `x11_present`：降级 x11。
 /// - 无任何兜底：快速失败。
-fn portal_fallback(wayland: bool, x11_present: bool) -> PortalFallback {
+///
+/// `cause` 为 portal 段的真实失败原因，拼进 Wayland 快速失败文案——否则
+/// 用户只能看到「授权不可用」，无法区分「Screenshot 被拒」「ScreenCast 弹窗
+/// 超时」「portal 不可达」。
+fn portal_fallback(
+    wayland: bool,
+    x11_present: bool,
+    cause: Option<&AgentShellError>,
+) -> PortalFallback {
     if wayland {
-        PortalFallback::Fail(AgentShellError::Permission(
-            "portal authorization unavailable on Wayland; refusing to capture the screen \
-             (X11 fallback would grab XWayland root without authorization)"
+        PortalFallback::Fail(AgentShellError::Permission(match cause {
+            Some(c) => format!(
+                "portal capture unavailable on Wayland ({c}); refusing to capture the screen \
+                 (X11 fallback would grab XWayland root without authorization)"
+            ),
+            None => "portal authorization unavailable on Wayland; refusing to capture the screen \
+                     (X11 fallback would grab XWayland root without authorization)"
                 .into(),
-        ))
+        }))
     } else if x11_present {
         PortalFallback::X11
     } else {
@@ -924,27 +899,110 @@ fn validated_screenshot_frame(path: std::path::PathBuf) -> Option<std::path::Pat
     }
 }
 
-/// L2 portal Screenshot 段的去向（纯函数决策结果，可单测）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ScreenshotSegment {
-    /// Screenshot 可用但被跳过（`require_pixels=true`：PNG 无法裁剪）。
-    SkipUnsupported,
-    /// 尝试 Screenshot 捕获（`require_pixels=false` 且可用）。
-    Capture,
-    /// Screenshot 不可用，继续降级链。
-    Unavailable,
+/// 目标帧缓冲字节数（`width × 4 × height`，RGBA 展开后）。
+///
+/// 溢出（伪造 IHDR 声明 u32::MAX 级宽高）或超 [`PNG_DECODE_MAX_BYTES`] 一律
+/// 返回 `Err`，调用方据此判产物不可用并清理。抽成纯函数以便单测直接覆盖
+/// 两个分支——真实 PNG 走不到溢出分支（png crate 自身的 Limits 会先拒绝
+/// 伪造尺寸），但算术守卫不得依赖上游行为。
+fn png_frame_bytes(w: u32, h: u32) -> Result<usize> {
+    let stride = (w as usize) * 4;
+    let Some(bytes) = stride.checked_mul(h as usize) else {
+        return Err(AgentShellError::Capture(format!(
+            "png {w}x{h} size overflows usize"
+        )));
+    };
+    if bytes > PNG_DECODE_MAX_BYTES {
+        return Err(AgentShellError::Capture(format!(
+            "png {w}x{h} exceeds decode cap ({PNG_DECODE_MAX_BYTES} bytes)"
+        )));
+    }
+    Ok(bytes)
 }
 
-/// `require_pixels` 与 Screenshot 可用性共同决定 L2 段去向（纯函数，可单测）。
+/// 把 portal Screenshot 落盘的 PNG 解码为原始像素帧（区域裁剪需要像素）。
 ///
-/// `require_pixels=true`（区域裁剪）需要原始像素帧，Screenshot 只落全屏 PNG、
-/// 无法裁剪：可用也须跳过，返回 [`ScreenshotSegment::SkipUnsupported`]（能力缺口）。
-fn screenshot_segment(require_pixels: bool, screenshot_available: bool) -> ScreenshotSegment {
-    match (require_pixels, screenshot_available) {
-        (true, true) => ScreenshotSegment::SkipUnsupported,
-        (false, true) => ScreenshotSegment::Capture,
-        (_, false) => ScreenshotSegment::Unavailable,
+/// 输出统一为 [`PixelFormat::Rgba`]：KDE/GNOME 的 Screenshot 门户落盘
+/// `color_type=6`（RGBA8）PNG，逐行搬运即可；非 RGBA 的合法 PNG（RGB / 灰阶 /
+/// 灰阶+alpha，其它门户实现）在搬运时按通道展开——展开一次优于让调用方
+/// 处理五种布局。
+///
+/// 逐行流式解码（`next_row`）而非物化 `output_buffer_size()` 缓冲：8K 单帧
+/// 25MB+，且伪造 IHDR 声明超大宽高时该缓冲会按 isize::MAX 分配。目标帧缓冲
+/// 按声明尺寸预先封顶 [`PNG_DECODE_MAX_BYTES`]，超限直接判不可用。
+///
+/// 解码失败（损坏 / 截断 / bad CRC / 超限）返回 [`AgentShellError::Capture`]，
+/// 由调用方清理落盘文件并继续降级链。
+fn decode_png_frame(path: &std::path::Path) -> Result<Frame> {
+    use png::{ColorType, Decoder, Transformations};
+
+    let file = std::fs::File::open(path)
+        .map_err(|e| AgentShellError::Capture(format!("open {}: {e}", path.display())))?;
+    let mut decoder = Decoder::new(std::io::BufReader::new(file));
+    // 归一化为 8-bit 颜色：调色板 / tRNS / 低位深统一展开为 RGB(A)/灰阶(A)。
+    decoder.set_transformations(Transformations::normalize_to_color8());
+    let mut reader = decoder
+        .read_info()
+        .map_err(|e| AgentShellError::Capture(format!("png info: {e}")))?;
+    let (color_type, _depth) = reader.output_color_type();
+    let info = reader.info();
+    let (w, h) = (info.width, info.height);
+    if w == 0 || h == 0 {
+        return Err(AgentShellError::Capture(format!(
+            "png degenerate size {w}x{h}"
+        )));
     }
+    let channels = match color_type {
+        ColorType::Rgb => 3,
+        ColorType::Rgba => 4,
+        ColorType::Grayscale => 1,
+        ColorType::GrayscaleAlpha => 2,
+        // normalize_to_color8 已展开调色板，保留防御分支。
+        ColorType::Indexed => 1,
+    };
+    let (w_usize, h_usize) = (w as usize, h as usize);
+    let stride = w_usize * 4;
+    let frame_bytes = png_frame_bytes(w, h)?;
+    let mut data = vec![0u8; frame_bytes];
+    for row in 0..h_usize {
+        let Some(r) = reader
+            .next_row()
+            .map_err(|e| AgentShellError::Capture(format!("png row {row}: {e}")))?
+        else {
+            return Err(AgentShellError::Capture(format!(
+                "png truncated at row {row}/{h_usize}"
+            )));
+        };
+        let src = r.data();
+        if src.len() < w_usize * channels {
+            return Err(AgentShellError::Capture(format!(
+                "png short row {row}: {} < {}",
+                src.len(),
+                w_usize * channels
+            )));
+        }
+        let dst = &mut data[row * stride..(row + 1) * stride];
+        let (dst_px, _) = dst.as_chunks_mut::<4>();
+        for (px, out) in src.chunks_exact(channels).zip(dst_px) {
+            *out = match channels {
+                1 => [px[0], px[0], px[0], 255],
+                2 => [px[0], px[0], px[0], px[1]],
+                3 => [px[0], px[1], px[2], 255],
+                _ => [px[0], px[1], px[2], px[3]],
+            };
+        }
+    }
+    // 读尽 IDAT 后校验 trailer（缺 IEND / IDAT 不完整 / bad CRC 在此报错）。
+    reader
+        .finish()
+        .map_err(|e| AgentShellError::Capture(format!("png trailer: {e}")))?;
+    Ok(Frame {
+        data,
+        width: w,
+        height: h,
+        stride,
+        format: PixelFormat::Rgba,
+    })
 }
 
 #[cfg(test)]
@@ -1009,20 +1067,29 @@ mod tests {
 
     /// portal 失败后的降级决策（纯函数确定性测）：
     /// 原生 X11 会话降级 x11；Wayland 会话快速失败（拒绝静默抓 XWayland
-    /// root）；无 x11 兜底时快速失败并给出明确报错。
+    /// root）；无 x11 兜底时快速失败并给出明确报错。Wayland 快速失败文案必须
+    /// 带上 portal 段真实原因——否则「授权不可用」无法区分被拒/超时/不可达。
     #[test]
     fn portal_fallback_decides_x11_or_fail() {
         // 原生 X11 + DISPLAY 可达 → 降级 x11。
-        assert!(matches!(portal_fallback(false, true), PortalFallback::X11));
+        assert!(matches!(
+            portal_fallback(false, true, None),
+            PortalFallback::X11
+        ));
         // Wayland（即使 XWayland DISPLAY 存在）→ 快速失败，不静默抓屏。
-        match portal_fallback(true, true) {
+        let cause = AgentShellError::Timeout("capture exceeded 6s budget".into());
+        match portal_fallback(true, true, Some(&cause)) {
             PortalFallback::Fail(AgentShellError::Permission(msg)) => {
                 assert!(msg.contains("Wayland"), "unexpected msg: {msg}");
+                assert!(
+                    msg.contains("capture exceeded 6s budget"),
+                    "cause must be surfaced: {msg}"
+                );
             }
             other => panic!("expected Permission fail on Wayland, got {other:?}"),
         }
         // 无任何兜底（x11_present=false）→ 快速失败。
-        match portal_fallback(false, false) {
+        match portal_fallback(false, false, None) {
             PortalFallback::Fail(AgentShellError::BackendUnavailable(msg)) => {
                 assert!(
                     msg.contains("no native X11 session"),
@@ -1031,26 +1098,6 @@ mod tests {
             }
             other => panic!("expected BackendUnavailable, got {other:?}"),
         }
-    }
-
-    /// `require_pixels`（区域裁剪）与 Screenshot 可用性共同决定 L2 段去向：
-    /// require_pixels=true + 可用 → 跳过（SkipUnsupported，PNG 无法裁剪）；
-    /// 不可用 → 继续降级；require_pixels=false + 可用 → 捕获 PNG。
-    #[test]
-    fn screenshot_segment_skips_when_pixels_required() {
-        assert_eq!(
-            screenshot_segment(true, true),
-            ScreenshotSegment::SkipUnsupported
-        );
-        assert_eq!(
-            screenshot_segment(true, false),
-            ScreenshotSegment::Unavailable
-        );
-        assert_eq!(screenshot_segment(false, true), ScreenshotSegment::Capture);
-        assert_eq!(
-            screenshot_segment(false, false),
-            ScreenshotSegment::Unavailable
-        );
     }
 
     /// Wayland 会话判定：任一 env（`WAYLAND_DISPLAY` / `WAYLAND_SOCKET`）存在即真。
@@ -1433,6 +1480,84 @@ mod tests {
         assert!(is_png_black_or_invalid(&bad_crc));
     }
 
+    /// `decode_png_frame` 的通道映射：RGBA 直搬、RGB / 灰阶按通道展开——
+    /// 区域裁剪拿到的像素必须与 PNG 内容逐字节一致（含 alpha）。
+    #[test]
+    fn decode_png_frame_maps_channels_to_rgba() {
+        let dir = tempfile::tempdir().unwrap();
+        // 2x1 RGBA：不透明红 + 半透明绿（alpha 必须保留）。
+        let rgba = write_png(
+            dir.path(),
+            "rgba.png",
+            png::ColorType::Rgba,
+            2,
+            1,
+            &[255, 0, 0, 255, 0, 255, 0, 128],
+        );
+        let f = decode_png_frame(&rgba).unwrap();
+        assert_eq!((f.width, f.height, f.stride), (2, 1, 8));
+        assert_eq!(f.format, PixelFormat::Rgba);
+        assert_eq!(f.data, vec![255, 0, 0, 255, 0, 255, 0, 128]);
+
+        // 2x1 RGB（无 alpha 通道）→ 展开为不透明 RGBA。
+        let rgb = write_png(
+            dir.path(),
+            "rgb.png",
+            png::ColorType::Rgb,
+            2,
+            1,
+            &[1, 2, 3, 4, 5, 6],
+        );
+        let f = decode_png_frame(&rgb).unwrap();
+        assert_eq!(f.data, vec![1, 2, 3, 255, 4, 5, 6, 255]);
+
+        // 2x1 灰阶 → 三通道同值 + 不透明 alpha。
+        let gray = write_png(
+            dir.path(),
+            "gray.png",
+            png::ColorType::Grayscale,
+            2,
+            1,
+            &[7, 9],
+        );
+        let f = decode_png_frame(&gray).unwrap();
+        assert_eq!(f.data, vec![7, 7, 7, 255, 9, 9, 9, 255]);
+    }
+
+    /// 非 PNG、IHDR 超限（伪造超大宽高）必须报错而非返回部分帧或 panic：
+    /// 调用方据此清理门户落盘文件并继续降级链，不得把半帧当有效像素裁剪。
+    #[test]
+    fn decode_png_frame_rejects_invalid_and_oversized() {
+        let dir = tempfile::tempdir().unwrap();
+        let bad = dir.path().join("bad.png");
+        std::fs::write(&bad, b"not a png at all").unwrap();
+        assert!(decode_png_frame(&bad).is_err());
+
+        let big = write_oversized_png(dir.path(), "big.png", 20000, 20000);
+        assert!(decode_png_frame(&big).is_err());
+
+        let forged = write_oversized_png(dir.path(), "forged.png", u32::MAX, u32::MAX);
+        assert!(decode_png_frame(&forged).is_err());
+    }
+
+    /// 尺寸守卫的算术边界（纯函数直测）：`w × 4 × h` 溢出 usize 必须显式报错
+    /// 而非回绕后照常分配；超上限走封顶分支；正常尺寸放行。
+    #[test]
+    fn png_frame_bytes_guards_overflow_and_cap() {
+        let overflow = png_frame_bytes(u32::MAX, u32::MAX).unwrap_err();
+        assert!(
+            overflow.to_string().contains("overflows"),
+            "expected overflow diagnosis, got: {overflow}"
+        );
+        // 20000×20000×4 = 1.6 GB > 上限。
+        let capped = png_frame_bytes(20000, 20000).unwrap_err();
+        assert!(
+            capped.to_string().contains("decode cap"),
+            "expected cap diagnosis, got: {capped}"
+        );
+        assert_eq!(png_frame_bytes(1920, 1080).unwrap(), 1920 * 4 * 1080);
+    }
+
     #[test]
     fn render_capture_doctor_line_with_active_backend() {
         // 已建立真实会话（probe 返回 Some）→ ✓ + 选中后端名。
@@ -1451,11 +1576,10 @@ mod tests {
     }
 
     #[test]
-    fn render_capture_doctor_line_with_screenshot_portal_on_wayland_warns() {
-        // Wayland 下非交互探测只选中 Screenshot 门户（ScreenCast 无 token 需交互
-        // 弹窗）→ 真实 capture 会优先 ScreenCast 弹窗、无授权时永不回落，故回落
-        // ⚠ 并明示「需 portal 交互授权」，不冒充 ✓ 可捕获（QA gap：doctor 勾选
-        // 与实际 capture 失败不一致）。
+    fn render_capture_doctor_line_with_screenshot_portal_on_wayland_keeps_check() {
+        // Wayland 下非交互探测选中 Screenshot 门户，即 `probe()` 已真实落盘一帧
+        // 有效 PNG（全黑/损坏帧在 probe 内即被剔除）——静默 Screenshot 是真实
+        // capture 的第一段，doctor 勾选与实际捕获一致，不得回落 ⚠。
         let line = render_capture_doctor_line(
             "截图捕获",
             &["portal-screencast", "portal-screenshot"],
@@ -1464,10 +1588,9 @@ mod tests {
                 "portal authorization unavailable on Wayland".into(),
             )),
         );
-        assert!(line.starts_with("⚠ 截图捕获"), "{line}");
+        assert!(line.starts_with("✓ 截图捕获"), "{line}");
         assert!(line.contains("选中 portal-screenshot"), "{line}");
-        assert!(line.contains("需 portal 交互授权才能真实捕获"), "{line}");
-        assert!(!line.starts_with("✓"), "{line}");
+        assert!(!line.contains("需 portal 交互授权"), "{line}");
     }
 
     #[test]

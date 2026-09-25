@@ -166,8 +166,10 @@ async fn serve_connection(mut daemon: Daemon, idle_timeout: Duration) {
     if let Some(capture) = daemon.capture.as_ref() {
         capture.shutdown().await;
     }
-    // 卸载长驻事件脚本（避免瞬态 daemon 退出后 event_monitor 实例堆积）。
-    daemon.shutdown().await;
+    // 长驻事件脚本不随本进程退出卸载：CLI 每条命令一个瞬态 daemon，退出即卸载
+    // 会让 doctor 的事件脚本行在任何后续进程里恒为「未加载」——订阅过也报成
+    // 从未装配。脚本实例留在 KWin 侧，装配状态跨进程可观察；实例堆积由下次
+    // 装载前的固定名卸载（`unload_event_monitor`）收敛，同一时刻至多一个。
 }
 
 async fn write_line(out: &Arc<tokio::sync::Mutex<tokio::io::Stdout>>, line: String) {

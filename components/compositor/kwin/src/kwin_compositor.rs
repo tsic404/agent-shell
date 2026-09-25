@@ -256,7 +256,16 @@ impl KWinCompositor {
     }
 
     /// doctor 输出（§7.7 验证输出格式）。
+    ///
+    /// 同步入口：KWin 侧脚本状态未知（按「未加载」渲染）。daemon doctor 走
+    /// [`Self::doctor_lines_async`] 补齐该证据。
     pub fn doctor_lines(&self) -> Vec<String> {
+        self.doctor_lines_with(false)
+    }
+
+    /// doctor 输出主体；`loaded_in_kwin` 为 KWin 侧事件脚本装载态（异步探测后
+    /// 传入，见 [`Self::doctor_lines_async`]）。
+    fn doctor_lines_with(&self, loaded_in_kwin: bool) -> Vec<String> {
         let mut lines = Vec::new();
         if let Some(p) = &self.protocols {
             let bound = p.bound_count();
@@ -334,11 +343,10 @@ impl KWinCompositor {
             .unwrap_or(None);
         lines.push(match event_status {
             Some(Ok(())) => {
-                "✓ 事件脚本    : signals registered (windowAdded/windowRemoved/windowActivated OK)"
-                    .to_string()
+                "✓ 事件脚本    : 已装配（QTimer 轮询 windowList 差分 + workspace 信号）".to_string()
             }
             Some(Err(msg)) => {
-                format!("✗ 事件脚本    : signal registration failed: {msg}")
+                format!("✗ 事件脚本    : monitor failed to start: {msg}")
             }
             // 本组件未加载：若残留/外部实例曾发出注册标记（无等待者被记录），
             // 据此区分「加载后零注册」与真正的「未加载」。
@@ -349,6 +357,12 @@ impl KWinCompositor {
                 }
                 Some(RegistrationOutcome::Failed(msg)) => {
                     format!("✗ 事件脚本    : 外部实例信号注册失败: {msg}")
+                }
+                // 本进程未加载但 KWin 侧实例仍在：本会话已订阅过事件
+                //（脚本不随瞬态 daemon 退出卸载），如实报「已装配」。
+                None if loaded_in_kwin => {
+                    "✓ 事件脚本    : 已装配（KWin 侧 event_monitor 实例在运行；本进程未持有句柄）"
+                        .to_string()
                 }
                 None => {
                     "⚠ 事件脚本    : 未加载（懒启动，首次 events subscribe 时装配）".to_string()
@@ -366,10 +380,25 @@ impl KWinCompositor {
     /// `/Scripting` 实际可达。同步版本 [`Self::doctor_lines`] 保留给
     /// 内部状态渲染；daemon doctor 走本方法补齐证据后渲染。
     pub async fn doctor_lines_async(&self) -> Vec<String> {
-        if self.scripting_probe_state() != ScriptingProbe::Ok {
-            let _ = self.ensure_scripting_probe().await;
-        }
-        self.doctor_lines()
+        let scripting_ok = if self.scripting_probe_state() != ScriptingProbe::Ok {
+            self.ensure_scripting_probe().await.is_ok()
+        } else {
+            true
+        };
+        // 事件脚本活在 KWin 内、不随瞬态 daemon 退出消失，故「已装配」必须问
+        // KWin（`isScriptLoaded`）而不是只看本进程句柄——CLI 每条命令一个
+        // daemon，只看句柄会把订阅过的会话误报为「未加载（懒启动）」。
+        let loaded_in_kwin = if scripting_ok {
+            crate::dbus_bridge::event_monitor_loaded(
+                self.bridge.connection(),
+                crate::event_script::EVENT_MONITOR_PLUGIN,
+            )
+            .await
+            .unwrap_or(false)
+        } else {
+            false
+        };
+        self.doctor_lines_with(loaded_in_kwin)
     }
 
     /// 探测并缓存 `/Scripting` 可用性。
@@ -835,20 +864,6 @@ impl KWinCompositor {
             }
         }
         Ok(())
-    }
-
-    /// 卸载长驻事件脚本并清空句柄（daemon 退出前调用）。清理 KWin 侧残留的
-    /// `event_monitor` 实例——瞬态 daemon 退出时若不卸载，脚本实例在 KWin
-    /// 内永驻堆积，下次会话再加载新实例会让每条真实事件被重复投递 N 次。
-    ///
-    /// 无论 stop 成败都清空句柄（`take` 语义）；失败向上返回，由调用方记录，
-    /// 不在此处吞掉。
-    pub async fn shutdown_event_script(&self) -> crate::error::Result<()> {
-        let mut handle = self.event_handle.lock().await;
-        match handle.take() {
-            Some(mut h) => h.stop(self.bridge.connection()).await,
-            None => Ok(()),
-        }
     }
 
     /// 订阅原始事件流（§18.2）：确保事件脚本在跑，返回其 [`RawSource`]

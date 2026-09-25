@@ -88,17 +88,6 @@ impl CompositorBackend {
         }
     }
 
-    /// 会话后端清理（daemon 退出前调用）。KWin 会话卸载长驻事件脚本，
-    /// 避免瞬态 daemon 退出后 `event_monitor` 实例在 KWin 内堆积。
-    /// 卸载失败记录告警（不 panic）——下次会话启动的固定名清理会兜底收敛。
-    async fn shutdown(&self) {
-        if let Self::Kwin(c) = self {
-            if let Err(e) = c.shutdown_event_script().await {
-                tracing::warn!("event script unload failed: {e}");
-            }
-        }
-    }
-
     /// 取原始事件源（§18.2），区分三态：
     /// - KWin 会话：事件脚本启动成功 → [`RawSourceOutcome::Ready`]；失败
     ///   （/Scripting 未就绪、一次性队列已被占用）→ [`RawSourceOutcome::Failed`]。
@@ -314,12 +303,24 @@ impl Daemon {
         })
     }
 
-    /// 会话清理（daemon 退出前调用）：卸载合成器持有的长驻事件脚本，
-    /// 与 capture 的 ScreenCast 关闭同属退出钩子。
-    pub async fn shutdown(&self) {
-        if let Some(compositor) = self.compositor.as_ref() {
-            compositor.shutdown().await;
+    /// 事件回放（`events replay`）：先刷新窗口缓存，再按过滤器快照 ring。
+    ///
+    /// CLI 每条命令 fork 一个瞬态 daemon，ring 是**进程内**缓冲——新进程里它
+    /// 恒空，「回放历史事件」将永远返回 0 条。刷新窗口缓存会把「当前窗口集」
+    /// 经查询差分（[`Self::list_windows`] 的兜底数据源）写入 ring 与 hub，
+    /// 回放因此有可观测的真实事件。管线已启动（本进程订阅过）时差分关闭，
+    /// 此处只做快照，不重复发布。
+    ///
+    /// 合成器不可用（TTY / 无显示会话）时跳过刷新，如实返回 ring 现状。
+    pub async fn replay_events(&mut self, filter: &event::EventFilter) -> Vec<event::DesktopEvent> {
+        if let Err((code, msg)) = self.list_windows().await {
+            tracing::debug!(?code, "event replay window refresh skipped: {msg}");
         }
+        self.ring
+            .snapshot()
+            .into_iter()
+            .filter(|e| filter.matches(e))
+            .collect()
     }
 
     /// 当前会话对应的 [`event::EventSource`]（审查建议 4：X11 会话不得错标

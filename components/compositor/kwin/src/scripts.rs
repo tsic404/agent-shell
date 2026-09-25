@@ -63,6 +63,13 @@ pub fn push_event(expr: &str) -> String {
     )
 }
 
+/// 事件监视器轮询间隔（毫秒）。
+///
+/// 信号回调在部分 KWin 版本（实测 6.7.5）不触发，轮询是**保证通道**：间隔即
+/// 事件上限延迟。500ms 对「观察桌面变化」足够灵敏，单次轮询仅遍历窗口列表
+/// （实测 ~16 窗，开销可忽略）。
+pub(crate) const EVENT_POLL_INTERVAL_MS: u64 = 500;
+
 /// 预置脚本清单（14 个，设计文档 §7.4）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ScriptTemplate {
@@ -351,23 +358,35 @@ impl Compat {
                  }}\n{send}",
                 send = send_result("result"),
             ),
-            // 长驻事件脚本（§7.4）：只注册信号连接，每次事件触发推送一条；不 stop（event_script.rs）。
+            // 长驻事件脚本（§7.4）：workspace 信号 + QTimer 轮询兜底，不 stop（event_script.rs）。
             ScriptTemplate::EventMonitor => {
                 // 🔴1：必须走 push_event（无 req 字段）——send_result 会包上
                 // REQ_ID_TOKEN 且长驻脚本不经 token 替换，推送会被按查询
                 // 路由而静默丢弃。
                 let push = push_event("payload");
-                // 两版均无 activeWindowChanged 信号：KWin 6 为 windowAdded/
-                // windowRemoved/windowActivated，KWin 5 为 clientAdded/clientRemoved/
-                // clientActivated。用错信号名时 .connect 抛错会中止整个脚本装配，
-                // loadScript/run 却静默返回成功——因此把三个 connect 包进
-                // try/catch，成功推 __ready__、失败推 __error__，让 Rust 侧
-                // spawn_event_monitor 能以可见诊断替代 journalctl 排查。
+                // 信号名随 KWin 5/6 分派（KWin 6 windowAdded/windowRemoved/
+                // windowActivated；KWin 5 clientAdded/clientRemoved/clientActivated），
+                // 列表/活动窗口访问器同理（windowList/activeWindow vs clientList/activeClient）。
                 let (added, removed, activated) = if self.v6 {
                     ("windowAdded", "windowRemoved", "windowActivated")
                 } else {
                     ("clientAdded", "clientRemoved", "clientActivated")
                 };
+                let (list, active) = if self.v6 {
+                    ("workspace.windowList()", "workspace.activeWindow")
+                } else {
+                    ("workspace.clientList()", "workspace.activeClient")
+                };
+                // 信号只作低延迟通道，**不作为唯一来源**：实测 KWin 6.7.5 下
+                // 三个 connect 全部成功、脚本引擎存活（QTimer 回调正常），但
+                // windowAdded/windowActivated/windowRemoved 回调从不触发——
+                // 只靠信号会让订阅静默收不到任何窗口事件。故以 QTimer 轮询
+                // `windowList()` 差分作为**保证通道**，信号回调复用同一份状态
+                // （`__known`/`__active`）只做去重后的即时上报，两条路径不会重复。
+                //
+                // 关闭检测必须两阶段（先收集 `gone` 再逐个 `__closedId`）：在
+                // `for...in` 内 `delete __known[id]` 实测会让 QJSEngine 中断该
+                // 循环，windowClosed 一条都推不出去（开窗正常、关窗静默丢失）。
                 format!(
                     "function __push(payload) {{\n\
                      \x20   payload.occurred_at = Date.now();\n\
@@ -376,16 +395,62 @@ impl Compat {
                      function __wid(w) {{\n\
                      \x20   return w.internalId !== undefined ? w.internalId.toString() : String(w.id);\n\
                      }}\n\
+                     var __known = {{}};\n\
+                     var __active = null;\n\
+                     function __opened(w) {{\n\
+                     \x20   var id = __wid(w);\n\
+                     \x20   if (__known[id]) return;\n\
+                     \x20   __known[id] = true;\n\
+                     \x20   __push({{ event: \"windowOpened\", id: id }});\n\
+                     }}\n\
+                     function __closed(w) {{ __closedId(__wid(w)); }}\n\
+                     function __closedId(id) {{\n\
+                     \x20   if (!__known[id]) return;\n\
+                     \x20   __push({{ event: \"windowClosed\", id: id }});\n\
+                     \x20   delete __known[id];\n\
+                     }}\n\
+                     function __focused(w) {{\n\
+                     \x20   if (!w) return;\n\
+                     \x20   var id = __wid(w);\n\
+                     \x20   if (__active === id) return;\n\
+                     \x20   __active = id;\n\
+                     \x20   __push({{ event: \"windowFocused\", id: id }});\n\
+                     }}\n\
+                     function __tick() {{\n\
+                     \x20   var ws = {list};\n\
+                     \x20   var seen = {{}};\n\
+                     \x20   for (var i = 0; i < ws.length; i++) {{\n\
+                     \x20       seen[__wid(ws[i])] = true;\n\
+                     \x20       __opened(ws[i]);\n\
+                     \x20   }}\n\
+                     \x20   var gone = [];\n\
+                     \x20   for (var id in __known) {{\n\
+                     \x20       if (!seen[id]) gone.push(id);\n\
+                     \x20   }}\n\
+                     \x20   for (var i = 0; i < gone.length; i++) __closedId(gone[i]);\n\
+                     \x20   __focused({active});\n\
+                     }}\n\
                      try {{\n\
-                     \x20   workspace.{added}.connect(function(w) {{ __push({{ event: \"windowOpened\", id: __wid(w) }}); }});\n\
-                     \x20   workspace.{removed}.connect(function(w) {{ __push({{ event: \"windowClosed\", id: __wid(w) }}); }});\n\
-                     \x20   workspace.{activated}.connect(function(w) {{\n\
-                     \x20       if (w) __push({{ event: \"windowFocused\", id: __wid(w) }});\n\
-                     \x20   }});\n\
+                     \x20   workspace.{added}.connect(__opened);\n\
+                     \x20   workspace.{removed}.connect(__closed);\n\
+                     \x20   workspace.{activated}.connect(__focused);\n\
+                     }} catch (e) {{\n\
+                     \x20   __push({{ event: \"__signal_error__\", error: String(e) }});\n\
+                     }}\n\
+                     try {{\n\
+                     \x20   var __seed = {list};\n\
+                     \x20   for (var i = 0; i < __seed.length; i++) {{ __known[__wid(__seed[i])] = true; }}\n\
+                     \x20   var __aw = {active};\n\
+                     \x20   if (__aw) __active = __wid(__aw);\n\
+                     \x20   var __timer = new QTimer();\n\
+                     \x20   __timer.interval = {poll_ms};\n\
+                     \x20   __timer.timeout.connect(__tick);\n\
+                     \x20   __timer.start();\n\
                      \x20   __push({{ event: \"__ready__\" }});\n\
                      }} catch (e) {{\n\
                      \x20   __push({{ event: \"__error__\", error: String(e) }});\n\
-                     }}\n"
+                     }}\n",
+                    poll_ms = EVENT_POLL_INTERVAL_MS
                 )
             }
         }
@@ -525,12 +590,20 @@ mod tests {
         assert!(v6.contains("workspace.windowActivated.connect"));
         // 两版都没有 activeWindowChanged——用错会 .connect 抛错零注册。
         assert!(!v6.contains("activeWindowChanged"));
+        // 轮询是保证通道：信号回调在 KWin 6.7.5 实测不触发，只有信号会让
+        // 订阅静默收不到事件——脚本必须同时带 QTimer 轮询与版本正确的列表访问器。
+        assert!(v6.contains("new QTimer()"));
+        assert!(v6.contains("workspace.windowList()"));
+        assert!(v6.contains("workspace.activeWindow"));
+        assert!(v6.contains(&format!("__timer.interval = {EVENT_POLL_INTERVAL_MS};")));
 
         let v5 = ScriptTemplate::EventMonitor.render(false, &[]).unwrap();
         assert!(v5.contains("workspace.clientAdded.connect"));
         assert!(v5.contains("workspace.clientRemoved.connect"));
         assert!(v5.contains("workspace.clientActivated.connect"));
         assert!(!v5.contains("activeWindowChanged"));
+        assert!(v5.contains("workspace.clientList()"));
+        assert!(v5.contains("workspace.activeClient"));
 
         // 长驻脚本没有一次性结果回传语句。
         assert!(!v6.contains("JSON.stringify(result)"));
@@ -569,9 +642,10 @@ mod tests {
         assert!(v5.contains("payload.occurred_at = Date.now()"));
     }
 
-    /// 信号注册成功/失败必须在脚本内可见标记：try/catch 包住三个 connect，
-    /// 成功推 `__ready__`、异常推 `__error__`（携带异常文本）——这是
-    /// spawn_event_monitor 判定「订阅成功但零事件」的依据。
+    /// 脚本装配结果必须在脚本内可见：信号连接失败推 `__signal_error__`
+    /// （非致命——轮询仍保证事件），轮询启动失败推 `__error__`（致命，
+    /// subscribe 据此报错），成功推 `__ready__`——这是 spawn_event_monitor
+    /// 判定「订阅成功但零事件」的依据。
     #[test]
     fn event_monitor_reports_registration_markers() {
         let v6 = render_v6(ScriptTemplate::EventMonitor, &[]);
@@ -579,13 +653,74 @@ mod tests {
         assert!(v6.contains("} catch (e)"));
         assert!(v6.contains(r#"{ event: "__ready__" }"#));
         assert!(v6.contains(r#"{ event: "__error__", error: String(e) }"#));
+        assert!(v6.contains(r#"{ event: "__signal_error__", error: String(e) }"#));
         // 标记经 __push 推送，与普通事件共用同一 sendResult 通道。
         assert!(v6.matches("__push").count() >= 4);
 
-        // v5 同样具备注册标记（clientAdded/clientRemoved/clientActivated）。
+        // v5 同样具备装配标记（clientAdded/clientRemoved/clientActivated）。
         let v5 = ScriptTemplate::EventMonitor.render(false, &[]).unwrap();
         assert!(v5.contains(r#"{ event: "__ready__" }"#));
         assert!(v5.contains(r#"{ event: "__error__", error: String(e) }"#));
+    }
+
+    /// 首次快照必须静默播种（不推送既有窗口）：订阅语义是「从此刻起的变化」，
+    /// 否则每次 subscribe 都会把当前全部窗口当 WindowOpened 回放一遍。
+    #[test]
+    fn event_monitor_seeds_snapshot_silently() {
+        let v6 = render_v6(ScriptTemplate::EventMonitor, &[]);
+        let seed = v6
+            .split("var __seed = workspace.windowList();")
+            .nth(1)
+            .expect("seed block present");
+        let seed_until_timer = seed.split("var __timer").next().unwrap();
+        assert!(
+            !seed_until_timer.contains("__push"),
+            "seeding must not push events; got: {seed_until_timer}"
+        );
+        assert!(seed_until_timer.contains("__known[__wid(__seed[i])] = true"));
+    }
+
+    /// 关窗检测必须是**两阶段**（先收集 `gone` 再逐个上报）：在 `for...in` 内
+    /// 直接调 `__closedId` 会在 `delete __known[id]` 处让 QJSEngine 中断该循环，
+    /// windowClosed 一条都推不出去（实测 KDE 6.7.5 开窗正常、关窗静默丢失）。
+    /// 回退成单阶段必须让本测试变红。
+    #[test]
+    fn event_monitor_reports_closes_in_two_phases() {
+        let v6 = render_v6(ScriptTemplate::EventMonitor, &[]);
+        assert!(
+            v6.contains("var gone = [];"),
+            "no close sweep collector: {v6}"
+        );
+        assert!(
+            v6.contains("gone.push(id);"),
+            "sweep must collect ids: {v6}"
+        );
+        assert!(
+            v6.contains("__closedId(gone[i]);"),
+            "collected ids must be reported outside the loop: {v6}"
+        );
+
+        // for...in 循环体只做收集：体内出现 __closedId 即单阶段回退。
+        let (_, after_head) = v6
+            .split_once("for (var id in __known) {")
+            .expect("close sweep loop present");
+        let loop_body = after_head
+            .split_once('}')
+            .expect("close sweep loop body closed")
+            .0;
+        assert!(
+            !loop_body.contains("__closedId"),
+            "for...in body must only collect ids, not report: {loop_body}"
+        );
+        assert!(
+            loop_body.contains("gone.push(id)"),
+            "for...in body must collect: {loop_body}"
+        );
+
+        // v5 同一套两阶段模式（仅列表/活动窗口访问器不同）。
+        let v5 = ScriptTemplate::EventMonitor.render(false, &[]).unwrap();
+        assert!(v5.contains("var gone = [];"), "{v5}");
+        assert!(v5.contains("__closedId(gone[i]);"), "{v5}");
     }
 
     #[test]

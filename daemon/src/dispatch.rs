@@ -974,10 +974,9 @@ async fn events_unsubscribe(d: &mut Daemon, req: &Request) -> RpcResult {
 async fn events_replay(d: &mut Daemon, req: &Request) -> RpcResult {
     let filter = parse_event_filter(req)?;
     let events = d
-        .ring
-        .snapshot()
+        .replay_events(&filter)
+        .await
         .into_iter()
-        .filter(|e| filter.matches(e))
         .map(|e| serde_json::to_value(e).expect("DesktopEvent serializable"))
         .collect::<Vec<_>>();
     let count = events.len();

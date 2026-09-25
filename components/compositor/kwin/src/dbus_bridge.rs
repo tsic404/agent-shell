@@ -662,6 +662,18 @@ impl ResponseService {
                     self.deliver_registration(RegistrationOutcome::Failed(msg))
                         .await;
                 }
+                // 信号连接失败**非致命**：QTimer 轮询是保证通道，事件仍会到达。
+                // 只记诊断，不进事件队列（进队会被归一化当未知事件静默丢弃）。
+                Some("__signal_error__") => {
+                    let detail = value
+                        .get("error")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown");
+                    tracing::warn!(
+                        error = detail,
+                        "event script workspace signal connect failed; polling fallback active"
+                    );
+                }
                 _ => {
                     // 归一化前去重：残留 event_monitor 实例把同一条真实事件
                     // 推送 N 次——以完整 payload（含 occurred_at）判重，窗口内
@@ -998,6 +1010,25 @@ pub(crate) async fn unload_event_monitor(conn: &Connection, plugin_name: &str) -
         .await
         .map_err(|e| KWinError::Scripting(format!("scripting proxy: {e}")))?;
     scripting.unload_script(plugin_name).await
+}
+
+/// KWin 侧固定插件名事件脚本是否仍在装载列表（跨进程可观察的装配态）。
+///
+/// 脚本实例活在 KWin 内、不随瞬态 daemon 退出消失（daemon 退出钩子不再卸载
+/// 它），故 doctor 在任何进程里都能据此区分「订阅过、脚本已装配」与「从未
+/// 装配」——只看进程内句柄会把前者误报为未加载。
+pub(crate) async fn event_monitor_loaded(conn: &Connection, plugin_name: &str) -> Result<bool> {
+    let scripting = ScriptingProxy::new(conn)
+        .await
+        .map_err(|e| KWinError::Scripting(format!("scripting proxy: {e}")))?;
+    scripting
+        .inner
+        .call_method("isScriptLoaded", &(plugin_name,))
+        .await
+        .map_err(|e| KWinError::Scripting(format!("isScriptLoaded D-Bus call: {e}")))?
+        .body()
+        .deserialize()
+        .map_err(|e| KWinError::Scripting(format!("isScriptLoaded reply: {e}")))
 }
 
 /// `loadScript` 返回的 int32 脚本 id → 实例对象路径（版本分发的单一来源）。
