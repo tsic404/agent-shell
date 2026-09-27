@@ -5512,13 +5512,14 @@ systemctl --user status agent-shell
 | DE | 接口 | 说明 |
 |----|------|------|
 | **跨 DE** | `brightnessctl` CLI | 通用: `brightnessctl set 50%`, `brightnessctl info` |
+| **兜底** | 内核 backlight sysfs | `/sys/class/backlight/<dev>/{actual_brightness,brightness,max_brightness}` 直读直写；`brightnessctl` 缺失/失败时启用 |
 | **GNOME** | `org.gnome.SettingsDaemon.Power` | 属性 `ScreenBrightness`(0-100), `BrightnessSteps`; 方法 `StepUp`, `StepDown` |
 | **KDE** | `org.kde.Solid.PowerManagement` | 属性 `Brightness`(0-100), `BrightnessStep` |
 | **DDE** | `org.deepin.dde.Display1` | 属性 `Brightness`(map 显示器名→0-100), `MonitorBrightness`; 方法 `SetBrightness(monitor, brightness)` |
 | **Wayland** | `wlr-gamma-control` / `wlr-output-management` | 经 wlroots 协议（需 compositor 支持） |
 
 ```rust
-// 未实现（pending）：daemon 仅回执 not_implemented 占位（brightness.get/set）
+// 已实现：powerdevil → brightnessctl → 内核 backlight sysfs（components/power/src/brightness.rs）
 
 pub struct BrightnessController {
     // 实现根据 DE 选择后端

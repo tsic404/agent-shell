@@ -538,6 +538,8 @@ version = "0.1.0"
 dependencies = [
  "agent-shell-core",
  "async-trait",
+ "libc",
+ "tempfile",
  "tokio",
  "tracing",
  "zbus",
