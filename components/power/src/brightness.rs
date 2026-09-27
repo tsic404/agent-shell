@@ -23,6 +23,14 @@ const BRIGHTNESSCTL_MISSING: &str = "brightnessctl not installed — install it 
 const BACKLIGHT_PERMISSION_HINT: &str =
     "grant write access to /sys/class/backlight (add user to `video` group or add a udev rule)";
 
+/// sysfs 直写撞上只读挂载（EROFS：容器或加固挂载）时的可操作指引。
+const BACKLIGHT_READONLY_HINT: &str = "the sysfs mount is read-only — remount it read-write \
+     (`mount -o remount,rw /sys`) or run the container/host with /sys writable";
+
+/// sysfs 路径组件非目录（ENOTDIR：sysfs 未挂载或路径被同名文件占用）的指引。
+const BACKLIGHT_SYSFS_UNMOUNTED_HINT: &str = "a path component is not a directory — sysfs is \
+     probably not mounted at /sys, or the backlight device vanished (check `mount | grep sysfs`)";
+
 /// 亮度能力契约（daemon 持 `dyn BrightnessOps`，测试注入 fake）。
 #[async_trait]
 pub trait BrightnessOps: Send + Sync {
@@ -384,14 +392,24 @@ fn write_sysfs_brightness(root: &Path, name: &str, value: u8) -> Result<()> {
     std::fs::write(&path, target.to_string()).map_err(|e| sysfs_write_error(&path, &e))
 }
 
-/// sysfs 写失败的报错：权限不足追加授权指引，其余透出路径与 OS 错误。
+/// sysfs 写失败的报错：按内核错误类别追加可操作指引，其余透出路径与 OS 错误。
 fn sysfs_write_error(path: &Path, e: &std::io::Error) -> AgentShellError {
     let mut detail = format!("write {}: {e}", path.display());
-    if e.kind() == std::io::ErrorKind::PermissionDenied {
+    if let Some(hint) = sysfs_write_hint(e.kind()) {
         detail.push_str(" — ");
-        detail.push_str(BACKLIGHT_PERMISSION_HINT);
+        detail.push_str(hint);
     }
     AgentShellError::Other(detail.into())
+}
+
+/// 内核错误类别 → 下一步指引；未归类（如设备热插拔的 NotFound）返回 None，不猜原因。
+fn sysfs_write_hint(kind: std::io::ErrorKind) -> Option<&'static str> {
+    match kind {
+        std::io::ErrorKind::PermissionDenied => Some(BACKLIGHT_PERMISSION_HINT),
+        std::io::ErrorKind::ReadOnlyFilesystem => Some(BACKLIGHT_READONLY_HINT),
+        std::io::ErrorKind::NotADirectory => Some(BACKLIGHT_SYSFS_UNMOUNTED_HINT),
+        _ => None,
+    }
 }
 
 /// u32 → i32 饱和转换（sysfs 值可超 i32::MAX；截断会污染百分比计算）。
@@ -733,6 +751,31 @@ mod tests {
             "{msg}"
         );
         assert!(msg.contains("video"), "{msg}");
+    }
+
+    #[test]
+    fn sysfs_readonly_mount_error_carries_remount_hint() {
+        // 只读挂载下内核返回 EROFS（容器内 /sys ro 的真实形态）：正文不能只剩
+        // "Read-only file system"，须带路径与恢复动作。
+        let path = Path::new("/sys/class/backlight/amdgpu_bl1/brightness");
+        let e = std::io::Error::from_raw_os_error(libc::EROFS);
+        let msg = sysfs_write_error(path, &e).to_string();
+        assert!(msg.contains("Read-only file system"), "{msg}");
+        assert!(msg.contains(path.to_str().expect("ascii path")), "{msg}");
+        assert!(msg.contains("read-only"), "{msg}");
+        assert!(msg.contains("remount"), "{msg}");
+    }
+
+    #[test]
+    fn sysfs_not_a_directory_error_carries_mount_hint() {
+        // sysfs 未挂载（或路径被同名文件占用）时内核返回 ENOTDIR：需指出 sysfs
+        // 可能没挂上，而非只透传 "Not a directory"。
+        let path = Path::new("/sys/class/backlight/amdgpu_bl1/brightness");
+        let e = std::io::Error::from_raw_os_error(libc::ENOTDIR);
+        let msg = sysfs_write_error(path, &e).to_string();
+        assert!(msg.contains("Not a directory"), "{msg}");
+        assert!(msg.contains(path.to_str().expect("ascii path")), "{msg}");
+        assert!(msg.contains("not mounted"), "{msg}");
     }
 
     #[test]
