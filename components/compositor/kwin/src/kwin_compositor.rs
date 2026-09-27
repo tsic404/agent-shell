@@ -565,7 +565,7 @@ impl KWinCompositor {
     ///
     /// `w.frameGeometry = {...}` 对 x/y 同步生效、对 width/height 异步生效
     /// （下一帧 commit 才落地），因此首读可能抓到陈旧几何。首读不等待
-    /// （move 的 x/y 同步，避免无谓延迟），随后短重试等待异步几何落地；
+    /// （避免无谓延迟），随后按 [`Self::collect_window_rects`] 的预算短重试；
     /// 读错误按「本轮未命中」计入预算而非立即中断，重试耗尽相关维度仍无
     /// 变化才报 no-op（或报最后一轮的读错误）。
     async fn verify_window_geometry(
@@ -577,6 +577,36 @@ impl KWinCompositor {
         w: Option<i32>,
         h: Option<i32>,
     ) -> Result<()> {
+        let readouts = self
+            .collect_window_rects(id, |after| readback_ok(before, after, x, y, w, h))
+            .await;
+        settle_readback(readouts, before, x, y, w, h)
+    }
+
+    /// move 落点回读：请求的 x/y 都命中才算落地（判定见
+    /// [`settle_window_position`]），命中几何交 [`Self::verify_move_on_screen`]。
+    async fn verify_window_position(
+        &self,
+        id: &WindowId,
+        before: Rect,
+        x: i32,
+        y: i32,
+    ) -> Result<Rect> {
+        let readouts = self
+            .collect_window_rects(id, |after| {
+                rect_matches(after, Some(x), Some(y), None, None)
+            })
+            .await;
+        settle_window_position(readouts, before, x, y)
+    }
+
+    /// 回读重试：读窗口几何直到 `hit` 命中或重试预算耗尽，返回按时间序的全部
+    /// 读数（含读错误），交各语义的 settle 纯函数裁定。
+    async fn collect_window_rects(
+        &self,
+        id: &WindowId,
+        hit: impl Fn(Rect) -> bool,
+    ) -> Vec<Result<Rect>> {
         let mut readouts: Vec<Result<Rect>> =
             Vec::with_capacity(Self::READBACK_RETRIES as usize + 1);
         for attempt in 0..=Self::READBACK_RETRIES {
@@ -584,15 +614,39 @@ impl KWinCompositor {
                 tokio::time::sleep(Self::READBACK_RETRY_DELAY).await;
             }
             let r = self.read_window_rect(id).await;
-            let hit = r
-                .as_ref()
-                .is_ok_and(|after| readback_ok(before, *after, x, y, w, h));
+            let hit_now = r.as_ref().is_ok_and(|after| hit(*after));
             readouts.push(r);
-            if hit {
+            if hit_now {
                 break;
             }
         }
-        settle_readback(readouts, before, x, y, w, h)
+        readouts
+    }
+
+    /// 落点范围校验：移动落地后比对显示器布局，检测「完全落在屏幕外」。
+    ///
+    /// KWin 对越界坐标不做钳制（`99999999` 原样落地），这类落点不能静默
+    /// 返回成功——与 resize 的显式 no-op 报错对齐。显示器布局读不到时跳过
+    /// 校验并留痕：附加保障不得把可用的移动操作变成失败。
+    async fn verify_move_on_screen(&self, rect: Rect) -> Result<()> {
+        let monitors = match self.list_monitors().await {
+            Ok(m) if !m.is_empty() => m,
+            Ok(_) => {
+                tracing::warn!("kwin reported no monitors; skipping off-screen move validation");
+                return Ok(());
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "kwin monitor layout unavailable; skipping off-screen move validation"
+                );
+                return Ok(());
+            }
+        };
+        if is_rect_on_screen(rect, &monitors) {
+            return Ok(());
+        }
+        Err(off_screen_move_error(rect, &monitors))
     }
 
     /// 最小化(true)/还原(false)：协议 `set_state` 优先（发请求 → 冲刷队列 →
@@ -1217,10 +1271,79 @@ fn rect_changed(
         || (h.is_some() && before.height != after.height)
 }
 
+/// 矩形几何的 X11 记法（`宽x高±X±Y`）：诊断消息里落点与显示器布局同口径。
+///
+/// 负坐标按 X11 惯例前置符号（`1920x1080-1920+0`），不用 `+-1920`；
+/// 绝对值走 `unsigned_abs`，i32::MIN 不 panic。
+fn format_rect(rect: Rect) -> String {
+    let (sx, ax) = split_sign(rect.x);
+    let (sy, ay) = split_sign(rect.y);
+    format!("{}x{}{}{}{}{}", rect.width, rect.height, sx, ax, sy, ay)
+}
+
+/// 坐标 → (符号字符, 绝对值)：X11 记法的负号前置输出。
+fn split_sign(v: i32) -> (char, u32) {
+    if v < 0 {
+        ('-', v.unsigned_abs())
+    } else {
+        ('+', v.unsigned_abs())
+    }
+}
+
+/// 两矩形是否正面积重叠（纯函数）。
+///
+/// 走 i64 运算：坐标来自 CLI 的 i32 参数，i32 极值相加会溢出 panic（debug）
+/// 或回绕（release），比对前先升位。
+fn rects_overlap(a: Rect, b: Rect) -> bool {
+    let (ax, ay, aw, ah) = (
+        i64::from(a.x),
+        i64::from(a.y),
+        i64::from(a.width),
+        i64::from(a.height),
+    );
+    let (bx, by, bw, bh) = (
+        i64::from(b.x),
+        i64::from(b.y),
+        i64::from(b.width),
+        i64::from(b.height),
+    );
+    aw > 0
+        && ah > 0
+        && bw > 0
+        && bh > 0
+        && ax < bx + bw
+        && bx < ax + aw
+        && ay < by + bh
+        && by < ay + ah
+}
+
+/// 落点是否仍在屏上（纯函数）：与任一显示器正面积重叠即可见。
+///
+/// 部分越界（贴边只露一角、跨屏缝隙边缘）仍算可见——只有完全落在所有
+/// 显示器之外才判屏外，避免把合法的边缘位置误报。
+fn is_rect_on_screen(rect: Rect, monitors: &[MonitorInfo]) -> bool {
+    monitors.iter().any(|m| rects_overlap(rect, m.geometry))
+}
+
+/// 屏外落点错误（纯函数）：消息带实际落点与显示器布局——RPC 边界只保留
+/// 错误消息，调用方据此直接定位，无需回查。
+fn off_screen_move_error(rect: Rect, monitors: &[MonitorInfo]) -> KWinError {
+    let layout = monitors
+        .iter()
+        .map(|m| format!("{} {}", m.name, format_rect(m.geometry)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    KWinError::Scripting(format!(
+        "move landed off-screen: window is at {} outside every monitor ({layout})",
+        format_rect(rect)
+    ))
+}
+
 /// 单次回读是否通过（纯函数）：`before` 与回读 `after` 对比目标。
 ///
 /// 幂等请求（变更前已在目标）通过；否则相关维度必须发生变化——未变即
-/// 静默 no-op。合法钳制（min/max size 约束）属于变化，不算失败。
+/// 静默 no-op。合法钳制（min/max size 约束）属于变化，不算失败。move 的
+/// 落点判定走 [`settle_window_position`] 的精确命中，不套本容差。
 fn readback_ok(
     before: Rect,
     after: Rect,
@@ -1266,6 +1389,45 @@ fn settle_readback(
     Err(KWinError::Scripting(format!(
         "geometry readback mismatch: no change on requested dimensions; \
          requested x={x:?} y={y:?} w={w:?} h={h:?}, before={before:?} after={last_rect:?}"
+    )))
+}
+
+/// 落点回读判定（纯函数）：按时间序给定各轮回读结果，裁定最终校验结果。
+///
+/// 复用 [`rect_matches`] 的逐维精确比对——请求的 x/y 都到位才通过并返回该轮
+/// 几何。不套 [`readback_ok`] 的「相关维度有变化即通过」容差：那是给缩放钳制
+/// 留的，移动用它会放行「只落地一个轴」的中间几何（竖排双屏假通过、对角双屏
+/// 假拒绝——落点范围校验随后拿中间几何裁决）。
+///
+/// 序列耗尽：最后一轮是读错误则报之，否则报落点未达（带基准与末次几何）。
+fn settle_window_position(
+    readouts: impl IntoIterator<Item = Result<Rect>>,
+    before: Rect,
+    x: i32,
+    y: i32,
+) -> Result<Rect> {
+    let mut last_rect = before;
+    let mut last_err = None;
+    for r in readouts {
+        match r {
+            Ok(after) => {
+                last_rect = after;
+                last_err = None;
+                if rect_matches(after, Some(x), Some(y), None, None) {
+                    return Ok(after);
+                }
+            }
+            Err(e) => last_err = Some(e),
+        }
+    }
+    if let Some(e) = last_err {
+        return Err(e);
+    }
+    Err(KWinError::Scripting(format!(
+        "move readback mismatch: window did not reach requested position \
+         x={x} y={y}; before={} last={}",
+        format_rect(before),
+        format_rect(last_rect)
     )))
 }
 
@@ -1363,7 +1525,7 @@ impl WaylandCompositor for KWinCompositor {
 /// |------|---------|---------------|
 /// | focus/close | 发完即 Ok（入队后由下一次协议 roundtrip 带出；uuid 不存在时静默忽略） | 窗口不存在报错 |
 /// | minimize/unminimize | 冲刷队列 + 回读 `states`；未达目标态回退 Scripting | 窗口不存在报错；变更后回读 `states` 校验 |
-/// | move/resize/set_geometry | 不可用（协议无 set_geometry），始终 Scripting | 窗口不存在报错；v6 Wayland 下回读几何校验 |
+/// | move/resize/set_geometry | 不可用（协议无 set_geometry），始终 Scripting | 窗口不存在报错；v6 Wayland 下回读几何校验（move 另校验落点仍在屏上） |
 /// | maximize | 不可用，始终 Scripting | 窗口不存在报错 |
 #[async_trait]
 impl CompositorComponent for KWinCompositor {
@@ -1489,6 +1651,10 @@ impl CompositorComponent for KWinCompositor {
     /// 标志位为 0）；Wayland 会话协议无 set_geometry（§7.2），始终 Scripting——
     /// `/Scripting` 确证缺失（UnknownObject / 接口未广告）时报明确
     /// NotImplemented，瞬时不可达传播原始 probe 错误（保留重试提示）。
+    ///
+    /// 落地后回读几何：先要求 x/y 两个精确目标都到位（部分落地/静默 no-op
+    /// 都报错），再校验落点仍在屏上（完全越界报错）。X11 回读是内容几何、
+    /// 非根坐标，两项均不适用。
     async fn move_window(
         &self,
         id: &WindowId,
@@ -1513,9 +1679,9 @@ impl CompositorComponent for KWinCompositor {
             }
             Err(e) => return Err(e.into()),
         }
-        // 变更前回读基准几何，供回读 no-op 检测；仅 v6 有意义——v5 读写
-        // 基准不一致（写 frameGeometry、读 geometry），服务端装饰窗口会
-        // 误报。基准读不到时跳过校验，不阻断移动。
+        // 变更前回读基准几何：既是落地回读的通道探针（读不到跳过校验、不阻断
+        // 移动，同 resize/set_geometry），也为落点未达的报错提供基准；仅 v6
+        // 有意义——v5 读写基准不一致（写 frameGeometry、读 geometry）。
         let before = if self.version.is_v6() {
             self.read_window_rect(id).await.ok()
         } else {
@@ -1533,7 +1699,11 @@ impl CompositorComponent for KWinCompositor {
             .await?;
         Self::check_op(&v).map_err(AgentShellError::from)?;
         if let Some(before) = before {
-            self.verify_window_geometry(id, before, Some(x), Some(y), None, None)
+            let landed = self
+                .verify_window_position(id, before, x, y)
+                .await
+                .map_err(AgentShellError::from)?;
+            self.verify_move_on_screen(landed)
                 .await
                 .map_err(AgentShellError::from)?;
         }
@@ -2788,6 +2958,434 @@ mod tests {
                 Err(KWinError::Scripting(_))
             ),
             "persistent read error must surface after budget exhausted"
+        );
+    }
+
+    /// `settle_window_position`：move 落点要求 x/y 两个轴都命中——只落地一个轴
+    /// 的中间几何不算落地，必须继续重试；预算耗尽报落点未达（带请求坐标）。
+    #[test]
+    fn settle_window_position_requires_both_axes() {
+        let before = Rect {
+            x: 300,
+            y: 300,
+            width: 800,
+            height: 600,
+        };
+        // 中间几何：x 已落地、y 仍旧（部分落地）。
+        let half_landed = Rect {
+            x: 1700,
+            y: 300,
+            width: 800,
+            height: 600,
+        };
+        let landed = Rect {
+            x: 1700,
+            y: 5000,
+            width: 800,
+            height: 600,
+        };
+        // 部分落地不得中断回读：等到两轴都到位才返回该几何。
+        assert_eq!(
+            settle_window_position(vec![Ok(half_landed), Ok(landed)], before, 1700, 5000)
+                .expect("both axes landed after a half-landed read"),
+            landed
+        );
+        // 幂等：请求前已在目标（单轴中间几何不成立，直接命中）。
+        assert_eq!(
+            settle_window_position(vec![Ok(before)], before, 300, 300).expect("idempotent move"),
+            before
+        );
+        // 预算耗尽仍只落地一个轴 → Err，消息带请求坐标与末次几何。
+        let all_half: Vec<Result<Rect>> = (0..=KWinCompositor::READBACK_RETRIES)
+            .map(|_| Ok(half_landed))
+            .collect();
+        let err = settle_window_position(all_half, before, 1700, 5000)
+            .expect_err("half-landed geometry must not pass");
+        assert!(
+            matches!(err, KWinError::Scripting(_)),
+            "expected position mismatch, got {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("x=1700"), "must carry requested x: {msg}");
+        assert!(msg.contains("y=5000"), "must carry requested y: {msg}");
+        // 读错误计入预算：中间几何→读错误→命中 → Ok（瞬态失败被吸收）。
+        assert_eq!(
+            settle_window_position(
+                vec![
+                    Ok(half_landed),
+                    Err(KWinError::Scripting("transient".into())),
+                    Ok(landed),
+                ],
+                before,
+                1700,
+                5000
+            )
+            .expect("transient read error must be absorbed by the retry budget"),
+            landed
+        );
+        // 持续读错误 → Err(最后读错误)，不误报落点未达。
+        let all_err: Vec<Result<Rect>> = (0..=KWinCompositor::READBACK_RETRIES)
+            .map(|_| Err(KWinError::Scripting("boom".into())))
+            .collect();
+        assert!(matches!(
+            settle_window_position(all_err, before, 1700, 5000),
+            Err(KWinError::Scripting(_))
+        ));
+    }
+
+    /// 回归（竖排双屏假通过）：仅 x 落地的中间几何仍与上屏重叠，旧「任一维度
+    /// 有变化即通过」判定会把它当落点放行，屏外落地被静默吞掉；严格判定等到
+    /// 两轴都到位，落点确为屏外。
+    #[test]
+    fn move_landing_ignores_half_landed_geometry_on_stacked_monitors() {
+        // 竖排双屏：上屏 y ∈ [-1080, 0)，下屏 y ∈ [0, 1080)。
+        let monitors = vec![
+            test_monitor(
+                "DP-1",
+                Rect {
+                    x: 0,
+                    y: 0,
+                    width: 1920,
+                    height: 1080,
+                },
+            ),
+            test_monitor(
+                "DP-2",
+                Rect {
+                    x: 0,
+                    y: -1080,
+                    width: 1920,
+                    height: 1080,
+                },
+            ),
+        ];
+        let before = Rect {
+            x: 300,
+            y: 300,
+            width: 800,
+            height: 600,
+        };
+        let half_landed = Rect {
+            x: 1700,
+            y: 300,
+            width: 800,
+            height: 600,
+        };
+        let landed = Rect {
+            x: 1700,
+            y: 5000,
+            width: 800,
+            height: 600,
+        };
+        // 旧容差判定会在此放行中间几何（x 变了）——这正是被修掉的口径。
+        assert!(
+            readback_ok(before, half_landed, Some(1700), Some(5000), None, None),
+            "tolerant predicate accepts the half-landed geometry; move must not use it"
+        );
+        assert!(
+            is_rect_on_screen(half_landed, &monitors),
+            "half-landed geometry overlaps the upper screen — the old path would read it as on-screen"
+        );
+        // 严格判定：中间几何不算落地，命中几何确为屏外。
+        let settled = settle_window_position(vec![Ok(half_landed), Ok(landed)], before, 1700, 5000)
+            .expect("both axes landed");
+        assert_eq!(settled, landed);
+        assert!(
+            !is_rect_on_screen(settled, &monitors),
+            "the true landing must be flagged off-screen"
+        );
+    }
+
+    /// 回归（对角双屏假拒绝）：中间几何（y 已落地、x 仍旧）落在两屏之外，旧
+    /// 判定会把合法的最终落点误判为屏外；严格判定等到两轴都到位再裁决。
+    #[test]
+    fn move_landing_accepts_diagonal_layout_final_position() {
+        // 对角双屏：主屏 (0,0)，副屏在右下 (1920,1080)。
+        let monitors = vec![
+            test_monitor(
+                "DP-1",
+                Rect {
+                    x: 0,
+                    y: 0,
+                    width: 1920,
+                    height: 1080,
+                },
+            ),
+            test_monitor(
+                "DP-2",
+                Rect {
+                    x: 1920,
+                    y: 1080,
+                    width: 1920,
+                    height: 1080,
+                },
+            ),
+        ];
+        let before = Rect {
+            x: 300,
+            y: 300,
+            width: 800,
+            height: 600,
+        };
+        // x 已落地、y 仍旧：落在两屏之间的空档（旧路径据此误报屏外）。
+        let half_landed = Rect {
+            x: 2300,
+            y: 300,
+            width: 800,
+            height: 600,
+        };
+        let landed = Rect {
+            x: 2300,
+            y: 1500,
+            width: 800,
+            height: 600,
+        };
+        assert!(
+            !is_rect_on_screen(half_landed, &monitors),
+            "intermediate geometry sits outside both screens — the old path would reject it"
+        );
+        assert!(
+            is_rect_on_screen(landed, &monitors),
+            "the true landing is on the secondary screen"
+        );
+        let settled = settle_window_position(vec![Ok(half_landed), Ok(landed)], before, 2300, 1500)
+            .expect("both axes landed");
+        assert_eq!(settled, landed);
+    }
+
+    /// 单测用显示器信息：只填名称与几何，其余字段固定。
+    fn test_monitor(name: &str, geometry: Rect) -> MonitorInfo {
+        MonitorInfo {
+            id: MonitorId {
+                native_id: name.to_string(),
+                de_type: DesktopEnvironment::KDE,
+            },
+            name: name.to_string(),
+            geometry,
+            physical_geometry: geometry,
+            scale: 1.0,
+            is_primary: false,
+            workspace_id: None,
+        }
+    }
+
+    /// `is_rect_on_screen`：完全落在显示器之外的落点判屏外；部分越界
+    /// （贴边只露一角、跨越缝隙边缘）仍算可见——否则合法边缘位置会被误报。
+    #[test]
+    fn is_rect_on_screen_flags_only_fully_offscreen() {
+        let monitors = vec![
+            test_monitor(
+                "DP-1",
+                Rect {
+                    x: 0,
+                    y: 0,
+                    width: 1920,
+                    height: 1080,
+                },
+            ),
+            test_monitor(
+                "HDMI-A-1",
+                Rect {
+                    x: -1920,
+                    y: 0,
+                    width: 1920,
+                    height: 1080,
+                },
+            ),
+        ];
+        // 屏内 / 贴边只露一角 / 左屏负坐标 → 可见。
+        assert!(is_rect_on_screen(
+            Rect {
+                x: 100,
+                y: 100,
+                width: 800,
+                height: 600
+            },
+            &monitors
+        ));
+        assert!(is_rect_on_screen(
+            Rect {
+                x: 1919,
+                y: 300,
+                width: 800,
+                height: 600
+            },
+            &monitors
+        ));
+        assert!(is_rect_on_screen(
+            Rect {
+                x: -200,
+                y: 300,
+                width: 800,
+                height: 600
+            },
+            &monitors
+        ));
+        // 屏外落点（KWin 不钳制时的实际落地：坐标原样落在所有显示器之外）。
+        assert!(!is_rect_on_screen(
+            Rect {
+                x: 99999999,
+                y: 99999999,
+                width: 900,
+                height: 600
+            },
+            &monitors
+        ));
+        // 两屏之间的缝隙：与任一屏都无正面积交集 → 屏外。
+        assert!(!is_rect_on_screen(
+            Rect {
+                x: 1920,
+                y: -600,
+                width: 800,
+                height: 600
+            },
+            &monitors
+        ));
+        // 退化矩形（零尺寸）不算可见。
+        assert!(!is_rect_on_screen(
+            Rect {
+                x: 100,
+                y: 100,
+                width: 0,
+                height: 0
+            },
+            &monitors
+        ));
+        // 无显示器信息 → 无从判定可见。
+        assert!(!is_rect_on_screen(
+            Rect {
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 100
+            },
+            &[]
+        ));
+    }
+
+    /// 极端坐标（CLI 的 i32 参数可到极值）不得溢出 panic：重叠比对走 i64。
+    #[test]
+    fn is_rect_on_screen_survives_extreme_coordinates() {
+        let monitors = vec![test_monitor(
+            "DP-1",
+            Rect {
+                x: 0,
+                y: 0,
+                width: 1920,
+                height: 1080,
+            },
+        )];
+        assert!(!is_rect_on_screen(
+            Rect {
+                x: i32::MAX,
+                y: i32::MAX,
+                width: i32::MAX,
+                height: i32::MAX,
+            },
+            &monitors
+        ));
+        assert!(!is_rect_on_screen(
+            Rect {
+                x: i32::MIN,
+                y: i32::MIN,
+                width: 100,
+                height: 100,
+            },
+            &monitors
+        ));
+    }
+
+    /// `format_rect`：X11 记法的符号必须前置——负坐标输出 `-1920` 而不是
+    /// `+-1920`，否则诊断消息里的落点/显示器布局无法直接复用。
+    #[test]
+    fn format_rect_renders_x11_signs() {
+        assert_eq!(
+            format_rect(Rect {
+                x: 0,
+                y: 0,
+                width: 1920,
+                height: 1080
+            }),
+            "1920x1080+0+0"
+        );
+        assert_eq!(
+            format_rect(Rect {
+                x: -1920,
+                y: 40,
+                width: 1920,
+                height: 1080
+            }),
+            "1920x1080-1920+40"
+        );
+        assert_eq!(
+            format_rect(Rect {
+                x: 100,
+                y: -120,
+                width: 800,
+                height: 600
+            }),
+            "800x600+100-120"
+        );
+        // i32::MIN 取绝对值不得 panic。
+        assert_eq!(
+            format_rect(Rect {
+                x: i32::MIN,
+                y: i32::MIN,
+                width: 10,
+                height: 10
+            }),
+            "10x10-2147483648-2147483648"
+        );
+    }
+
+    /// 屏外报错消息是调用方唯一可见的诊断：必须点名 off-screen 并带上实际
+    /// 落点与显示器布局（RPC 边界只保留 message，折叠为后端错误码）；负坐标
+    /// 显示器/落点按 X11 记法带符号。
+    #[test]
+    fn off_screen_move_error_names_landed_rect_and_monitor_layout() {
+        let monitors = vec![
+            test_monitor(
+                "DP-1",
+                Rect {
+                    x: 0,
+                    y: 0,
+                    width: 1920,
+                    height: 1080,
+                },
+            ),
+            test_monitor(
+                "HDMI-A-1",
+                Rect {
+                    x: -1920,
+                    y: 0,
+                    width: 1920,
+                    height: 1080,
+                },
+            ),
+        ];
+        let msg = off_screen_move_error(
+            Rect {
+                x: 99999999,
+                y: 99999999,
+                width: 900,
+                height: 600,
+            },
+            &monitors,
+        )
+        .to_string();
+
+        assert!(msg.contains("off-screen"), "must name off-screen: {msg}");
+        assert!(
+            msg.contains("900x600+99999999+99999999"),
+            "must carry landed rect: {msg}"
+        );
+        assert!(
+            msg.contains("DP-1 1920x1080+0+0"),
+            "must carry monitor layout: {msg}"
+        );
+        assert!(
+            msg.contains("HDMI-A-1 1920x1080-1920+0"),
+            "negative monitor origin must use an X11 sign prefix: {msg}"
         );
     }
 
