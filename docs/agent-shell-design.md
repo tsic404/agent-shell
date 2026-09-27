@@ -5520,6 +5520,8 @@ systemctl --user status agent-shell
 
 ```rust
 // 已实现：powerdevil → brightnessctl → 内核 backlight sysfs（components/power/src/brightness.rs）
+// sysfs 根目录可经 AGENT_SHELL_BACKLIGHT_SYSFS_ROOT（绝对路径）覆盖：CI 端到端
+// 测试据此注入空目录/假背光设备，把降级链分类与宿主背光硬件解耦；生产不设置。
 
 pub struct BrightnessController {
     // 实现根据 DE 选择后端

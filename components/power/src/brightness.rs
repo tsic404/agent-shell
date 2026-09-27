@@ -14,6 +14,21 @@ use zbus::proxy;
 /// 内核 backlight sysfs 根目录（`brightnessctl` 缺失或失败时的兜底数据源）。
 const SYSFS_BACKLIGHT_ROOT: &str = "/sys/class/backlight";
 
+/// 覆盖 sysfs 根目录的环境变量（须绝对路径，否则忽略）。
+///
+/// 仅供 CI 端到端测试：跨进程验证降级链分类时，宿主真实背光设备会让 sysfs
+/// 层抢先成功，必须能把该层指到空目录/假设备目录。生产不设置即内核默认路径。
+const SYSFS_ROOT_ENV: &str = "AGENT_SHELL_BACKLIGHT_SYSFS_ROOT";
+
+/// sysfs 根目录：`SYSFS_ROOT_ENV` 覆盖（仅绝对路径）→ 内核默认路径。
+fn sysfs_root() -> PathBuf {
+    std::env::var(SYSFS_ROOT_ENV)
+        .ok()
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .unwrap_or_else(|| PathBuf::from(SYSFS_BACKLIGHT_ROOT))
+}
+
 /// `brightnessctl` 缺失时的错误正文：按包管理器给出可直接执行的安装命令。
 const BRIGHTNESSCTL_MISSING: &str = "brightnessctl not installed — install it (Arch: \
      `pacman -S brightnessctl`; Debian/Ubuntu: `apt install brightnessctl`; Fedora: \
@@ -71,7 +86,7 @@ impl BrightnessController {
         Self {
             conn,
             brightnessctl_bin: PathBuf::from("brightnessctl"),
-            sysfs_root: PathBuf::from(SYSFS_BACKLIGHT_ROOT),
+            sysfs_root: sysfs_root(),
         }
     }
 
