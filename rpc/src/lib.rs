@@ -360,7 +360,6 @@ pub struct RpcError {
 pub enum RpcErrorCode {
     ParseError = -32700,
     InvalidRequest = -32600,
-    MethodNotFound = -32601,
     InvalidParams = -32602,
     InternalError = -32603,
     /// daemon 未运行且自动激活失败。
@@ -377,6 +376,9 @@ pub enum RpcErrorCode {
     ConfirmationRequired = 1006,
     /// 特权操作授权失败（polkit 拒绝/不可用）。
     AuthenticationRequired = 1007,
+    /// 未知方法。取自定义段而非规范码 -32601：调用方按项目码表分派，
+    /// 方法级错误混入规范段会让这一支落在分派表外。
+    MethodNotFound = 1008,
 }
 
 // ───────────────────────── 载荷定义 ─────────────────────────

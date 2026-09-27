@@ -1930,6 +1930,13 @@ mod tests {
         let resp = dispatch(&mut d, &req("bogus.method", None)).await;
         let err = resp.error.expect("error");
         assert_eq!(err.code, RpcErrorCode::MethodNotFound as i32);
+        // 兜底码必须落在应用自定义段（1000+）：规范保留段（-32768..-32000）
+        // 的码在调用方分派表外。
+        assert!(
+            err.code >= 1000,
+            "unknown method must use an app-segment code, got {}",
+            err.code
+        );
         assert!(err.message.contains("bogus.method"));
     }
 
