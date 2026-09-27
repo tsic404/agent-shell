@@ -721,16 +721,18 @@ async fn kbd(c: &mut DaemonClient, cmd: cli::KbdCommand) -> CmdResult {
 // ───────────────────────── secret ─────────────────────────
 
 async fn secret(c: &mut DaemonClient, cmd: cli::SecretCommand) -> CmdResult {
-    match cmd {
+    // 写/读都回显 daemon 载荷：secret 后端未实现时回执 `status=not_implemented`
+    // （§21.32 待接线），静默 rc=0 会被读成「已写入」。
+    let r = match cmd {
         cli::SecretCommand::Set { key, value } => {
             c.call(method::SECRET_SET, json!({ "key": key, "value": value }))
-                .await?;
+                .await?
         }
         cli::SecretCommand::Get { key } => {
-            let r = c.call(method::SECRET_GET, json!({ "key": key })).await?;
-            println!("{}", serde_json::to_string_pretty(&r).unwrap_or_default());
+            c.call(method::SECRET_GET, json!({ "key": key })).await?
         }
-    }
+    };
+    println!("{}", serde_json::to_string_pretty(&r).unwrap_or_default());
     Ok(0)
 }
 
