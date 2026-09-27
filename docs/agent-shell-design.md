@@ -5518,7 +5518,7 @@ systemctl --user status agent-shell
 | **Wayland** | `wlr-gamma-control` / `wlr-output-management` | 经 wlroots 协议（需 compositor 支持） |
 
 ```rust
-// 未实现（pending）：daemon 仅 stub_ok 占位（brightness.get/set）
+// 未实现（pending）：daemon 仅回执 not_implemented 占位（brightness.get/set）
 
 pub struct BrightnessController {
     // 实现根据 DE 选择后端
@@ -5559,7 +5559,7 @@ Agent 常需要浏览文件系统（"打开这个文件"、"找到 Downloads 目
 | **基础文件操作** | 直接文件系统访问 | agent 本身有文件工具，这里是"桌面角度"的封装 |
 
 ```rust
-// 未实现（pending）：daemon 仅 stub_ok 占位（file.pick/trash/open_directory）
+// 未实现（pending）：daemon 仅回执 not_implemented 占位（file.pick/trash/open_directory）
 
 pub struct FilesystemService { /* ... */ }
 
@@ -5600,7 +5600,7 @@ impl FilesystemService {
 | 浏览器 | `xdg-settings get default-web-browser` | 查询默认浏览器 |
 
 ```rust
-// 未实现（pending）：daemon 仅 stub_ok 占位（mime.get/set/default_browser）
+// 未实现（pending）：daemon 仅回执 not_implemented 占位（mime.get/set/default_browser）
 
 pub struct MimeService;
 
@@ -5699,7 +5699,7 @@ if let Some(token) = &activation_token {
 | `org.bluez.Agent1` | 自定义 | 配对代理: `RequestPinCode`, `RequestConfirmation`, `AuthorizeService` |
 
 ```rust
-// 未实现（pending）：daemon 仅 stub_ok 占位（bluetooth.*）
+// 未实现（pending）：daemon 仅回执 not_implemented 占位（bluetooth.*）
 
 pub struct BluetoothManager {
     adapter: BluezAdapter1Proxy,
@@ -5759,7 +5759,7 @@ pub struct BtDevice {
 | **发行版 CLI** | `apt` / `dnf` / `pacman` | 直接调用，注意权限 |
 
 ```rust
-// 未实现（pending）：daemon 仅 stub_ok 占位（flatpak.list/install、software.updates）
+// 未实现（pending）：daemon 仅回执 not_implemented 占位（flatpak.list/install、software.updates）
 
 pub struct SoftwareManager {
     pkgkit: PackageKitProxy,     // org.freedesktop.PackageKit
@@ -5807,7 +5807,7 @@ impl SoftwareManager {
 用途：agent 安全存储 API 密钥、WiFi 密码、数据库凭证。
 
 ```rust
-// 未实现（pending）：daemon 仅 stub_ok 占位（secret.set/get）
+// 未实现（pending）：daemon 仅回执 not_implemented 占位（secret.set/get）
 
 pub struct SecretService {
     service: SecretServiceProxy,   // org.freedesktop.Secret.Service
@@ -5842,6 +5842,12 @@ impl SecretService {
 ```
 
 **注意**：GNOME Keyring 默认锁定，需要 `Unlock`（可能弹窗/polkit）。KDE Wallet 同理。此模块应标记为"需要用户交互"的能力。
+
+**占位期回执**：`secret.set/get` 已登记 L3 级别，但后端未接线——安全门禁判 `Confirm`
+时回执 `{"status": "not_implemented", "service": "secret.set"}`（rc=0），而非
+`rpc error 1006`：「需确认」会被读成「确认后可用」，而占位没有可授权的执行路径。
+后端接线时从 `daemon/src/dispatch.rs` 的 `placeholder_service` 表摘除两条目，
+L3 确认门禁与真实后端同时生效。
 
 ---
 
@@ -6608,7 +6614,7 @@ agent-shell doctor
 **Phase 3：系统服务（2-3 周）— 🟡 部分实现/部分接线**
 - services 组件 crate 已合入：`components/audio|network|power|notification|appearance|clipboard|launcher`（PR #6/#8/#9）
 - 基础设施 crate 已合入：`components/systemd|logind`（PR #6）
-- daemon 侧大量方法仍为 `stub_ok`（`daemon/src/dispatch.rs:78-101`：brightness/file/mime/bluetooth/flatpak/software/touchpad/kbd/secret/shortcut/timer）
+- daemon 侧大量方法仍为占位回执 `not_implemented`（`daemon/src/dispatch.rs` 的 `placeholder_service` 表：file/mime/bluetooth/flatpak/software/touchpad/kbd/secret/shortcut/timer）
 - 验收「全部 CLI 命令在 DDE 实测通过」未达成
 
 **Phase 4：跨 DE + MCP 打磨（2 周）— 🟡 部分实现/部分接线**

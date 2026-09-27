@@ -50,6 +50,13 @@ pub async fn dispatch(daemon: &mut Daemon, req: &Request) -> Response {
                 return Response::err(req.id, RpcErrorCode::Denied, reason);
             }
             PermissionDecision::Confirm(mode) => {
+                // 未实现占位没有可授权的执行路径：确认语义不成立。「需确认」
+                // 会被读成「确认后可用」，而该操作连后端都没有——回执未实现
+                // 状态。占位接线后从 [`placeholder_service`] 摘除，本分支自然
+                // 回到 ConfirmationRequired。
+                if let Some(service) = placeholder_service(&req.method) {
+                    return Response::ok(req.id, not_implemented_payload(service));
+                }
                 return Response::err(
                     req.id,
                     RpcErrorCode::ConfirmationRequired,
@@ -90,28 +97,8 @@ pub async fn dispatch(daemon: &mut Daemon, req: &Request) -> Response {
         method::SECURITY_AUDIT => security_audit(daemon, req).await,
         method::BRIGHTNESS_GET => brightness_get(daemon).await,
         method::BRIGHTNESS_SET => brightness_set(daemon, req).await,
-        method::FILE_PICK => stub_ok("file.pick"),
-        method::FILE_TRASH => stub_ok("file.trash"),
-        method::FILE_OPEN_DIR => stub_ok("file.open_directory"),
-        method::MIME_GET => stub_ok("mime.get"),
-        method::MIME_SET => stub_ok("mime.set"),
-        method::MIME_DEFAULT_BROWSER => stub_ok("mime.default_browser"),
-        method::BLUETOOTH_SCAN => stub_ok("bluetooth.scan"),
-        method::BLUETOOTH_CONNECT => stub_ok("bluetooth.connect"),
-        method::BLUETOOTH_DISCONNECT => stub_ok("bluetooth.disconnect"),
-        method::BLUETOOTH_LIST => stub_ok("bluetooth.list"),
-        method::FLATPAK_LIST => stub_ok("flatpak.list"),
-        method::FLATPAK_INSTALL => stub_ok("flatpak.install"),
-        method::SOFTWARE_UPDATES => stub_ok("software.updates"),
-        method::TOUCHPAD_STATUS => stub_ok("touchpad.status"),
-        method::TOUCHPAD_SET => stub_ok("touchpad.set"),
-        method::KBD_LAYOUT_LIST => stub_ok("kbd.layout.list"),
-        method::KBD_LAYOUT_SET => stub_ok("kbd.layout.set"),
-        method::SECRET_SET => stub_ok("secret.set"),
-        method::SECRET_GET => stub_ok("secret.get"),
-        method::SHORTCUT_BIND => stub_ok("shortcut.bind"),
-        method::SHORTCUT_TRIGGER => stub_ok("shortcut.trigger"),
-        method::TIMER_LIST => stub_ok("timer.list"),
+        // 未实现服务（§21.35，待 Phase 3 接线）不在此逐条登记：兜底分支按
+        // [`placeholder_service`] 回执 not_implemented，安全门禁读同一张表。
         // ── GNOME Shell 扩展（§8.1 安装/启用）──
         method::EXTENSION_STATUS => extension_status().await,
         method::EXTENSION_INSTALL => extension_install().await,
@@ -133,13 +120,16 @@ pub async fn dispatch(daemon: &mut Daemon, req: &Request) -> Response {
         method::UNMOUNT => unmount(daemon, req).await,
         method::SYSCTL_GET => sysctl_get(daemon, req).await,
         method::SYSCTL_SET => sysctl_set(daemon, req).await,
-        other => {
-            return Response::err(
-                req.id,
-                RpcErrorCode::MethodNotFound,
-                format!("unknown method: {other}"),
-            )
-        }
+        other => match placeholder_service(other) {
+            Some(service) => Ok(not_implemented_payload(service)),
+            None => {
+                return Response::err(
+                    req.id,
+                    RpcErrorCode::MethodNotFound,
+                    format!("unknown method: {other}"),
+                )
+            }
+        },
     };
     let executed = result.is_ok();
     if let Some(op) = gated_op {
@@ -925,9 +915,54 @@ async fn security_audit(d: &mut Daemon, req: &Request) -> RpcResult {
     Ok(json!({"entries": entries}))
 }
 
-/// stub_ok — 扩展系统服务的占位响应（§21.35，待 Phase 3 接线）。
-fn stub_ok(name: &str) -> RpcResult {
-    Ok(json!({"status": "not_implemented", "service": name}))
+/// 未实现服务方法表（方法名 → 占位回执服务名，§21.35 待 Phase 3 接线）。
+///
+/// 表是「未实现方法」的唯一真值源，两处消费：dispatch 兜底分支（回执
+/// not_implemented）与安全门禁的 Confirm 分支（占位无可授权执行路径，不得
+/// 把占位回执换成 `ConfirmationRequired`）。后端接线时删条目即可，两处行为
+/// 同步恢复——级别表里为后端预留的目标级别（如 secret.* 的 L3）随之生效。
+/// 测试遍历本表逐条 dispatch（`every_placeholder_method_reports_not_implemented`），
+/// 故条目错误（漏登记/方法名笔误）会以 MethodNotFound 显形，而非静默漏测。
+const PLACEHOLDER_SERVICES: &[(&str, &str)] = &[
+    // 文件 / MIME（§21.28–21.29）
+    (method::FILE_PICK, "file.pick"),
+    (method::FILE_TRASH, "file.trash"),
+    (method::FILE_OPEN_DIR, "file.open_directory"),
+    (method::MIME_GET, "mime.get"),
+    (method::MIME_SET, "mime.set"),
+    (method::MIME_DEFAULT_BROWSER, "mime.default_browser"),
+    // 蓝牙 / 软件（§21.30）
+    (method::BLUETOOTH_SCAN, "bluetooth.scan"),
+    (method::BLUETOOTH_CONNECT, "bluetooth.connect"),
+    (method::BLUETOOTH_DISCONNECT, "bluetooth.disconnect"),
+    (method::BLUETOOTH_LIST, "bluetooth.list"),
+    (method::FLATPAK_LIST, "flatpak.list"),
+    (method::FLATPAK_INSTALL, "flatpak.install"),
+    (method::SOFTWARE_UPDATES, "software.updates"),
+    // 触控板 / 键盘布局 / 密钥环（§21.31–21.32）
+    (method::TOUCHPAD_STATUS, "touchpad.status"),
+    (method::TOUCHPAD_SET, "touchpad.set"),
+    (method::KBD_LAYOUT_LIST, "kbd.layout.list"),
+    (method::KBD_LAYOUT_SET, "kbd.layout.set"),
+    (method::SECRET_SET, "secret.set"),
+    (method::SECRET_GET, "secret.get"),
+    // 快捷键 / timer（§21.33–21.34）
+    (method::SHORTCUT_BIND, "shortcut.bind"),
+    (method::SHORTCUT_TRIGGER, "shortcut.trigger"),
+    (method::TIMER_LIST, "timer.list"),
+];
+
+/// 未实现服务方法 → 占位回执服务名（§21.35）。
+fn placeholder_service(method_name: &str) -> Option<&'static str> {
+    PLACEHOLDER_SERVICES
+        .iter()
+        .find(|(name, _)| *name == method_name)
+        .map(|(_, service)| *service)
+}
+
+/// 占位回执载荷：`status=not_implemented` + 服务名（§21.35）。
+fn not_implemented_payload(service: &str) -> Value {
+    json!({"status": "not_implemented", "service": service})
 }
 
 /// 事件订阅（§22.5 D4）：解析过滤器、创建订阅句柄，返回 subscriber_id。
@@ -1899,6 +1934,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn every_placeholder_method_reports_not_implemented() {
+        // 兜底分支是 L0/L1 占位方法的唯一入口（L3 占位走门禁短路，覆盖不到）。
+        // 遍历全表逐条 dispatch：条目误删/方法名笔误会退化成 MethodNotFound 而非
+        // 占位回执，且回执的 service 必须与表值一致（表是唯一真值源）。
+        //
+        // 用例集合取自表本身，故条目删除会静默缩小覆盖——条目数在此钉住：表是
+        // 占位方法的唯一登记处，后端接线（删条目）须同步本行。
+        assert_eq!(PLACEHOLDER_SERVICES.len(), 22);
+        let mut d = test_daemon().await;
+        for &(method_name, service) in PLACEHOLDER_SERVICES {
+            let resp = dispatch(
+                &mut d,
+                &req(method_name, Some(json!({ "key": "k", "value": "v" }))),
+            )
+            .await;
+            let v = resp
+                .result
+                .unwrap_or_else(|| panic!("{method_name}: 占位回执不得为错误"));
+            assert_eq!(v["status"], "not_implemented", "{method_name}");
+            assert_eq!(v["service"], service, "{method_name}");
+        }
+    }
+
+    #[tokio::test]
+    async fn placeholder_above_confirm_level_reports_not_implemented() {
+        // secret.set/get 是未实现占位（§21.32），但级别表登记 L3 → 默认策略判
+        // Confirm。占位没有可授权的执行路径：回执必须是 not_implemented——
+        // `ConfirmationRequired` 会被读成「确认后可用」。
+        let mut d = test_daemon().await;
+        for (method_name, service) in [
+            (method::SECRET_SET, "secret.set"),
+            (method::SECRET_GET, "secret.get"),
+        ] {
+            let params = Some(json!({ "key": "db-credentials", "value": "user:pass" }));
+            let resp = dispatch(&mut d, &req(method_name, params)).await;
+            let v = resp.result.expect("占位回执不得为错误");
+            assert_eq!(v["status"], "not_implemented");
+            assert_eq!(v["service"], service);
+        }
+    }
+
+    #[tokio::test]
     async fn daemon_status_omits_windows_cached_when_cold() {
         // 窗口缓存是 TTL 短缓存；冷缓存（从未 windows.list）时 `windows_cached`
         // 必须省略而非输出恒 0——0 会把「无缓存」误读为「0 个窗口」。
@@ -2124,7 +2201,7 @@ mod tests {
     #[tokio::test]
     async fn brightness_get_returns_states_from_backend() {
         // 注入 fake 亮度后端：查询直达后端并投影为 JSON 数组，证明
-        // brightness.get 已从 stub_ok 接线到真实组件。
+        // brightness.get 已从占位回执接线到真实组件。
         let mut d = test_daemon().await;
         d.brightness = Some(std::sync::Arc::new(FakeBrightness {
             states: vec![agent_shell_core::services::BrightnessState {
@@ -2145,7 +2222,7 @@ mod tests {
     #[tokio::test]
     async fn brightness_set_dispatches_value_to_backend() {
         // 合法 0-100 值放行后直达后端 set：fake 记录调用值，证明
-        // brightness.set 已从 stub_ok 接线到真实组件。
+        // brightness.set 已从占位回执接线到真实组件。
         let mut d = test_daemon().await;
         let inner = std::sync::Arc::new(FakeBrightness {
             states: Vec::new(),
