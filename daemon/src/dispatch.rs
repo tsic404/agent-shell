@@ -285,8 +285,8 @@ async fn doctor(d: &mut Daemon) -> RpcResult {
         }
         Err(()) => lines.push("✗ 合成器         : unavailable in this session".into()),
     }
-    // 3. AT-SPI Registry 可达性（busctl，与单进程版同口径）。
-    lines.push(crate::a11y::atspi_line());
+    // 3. AT-SPI 存活性（分级探测：session bus → a11y bus → Registry）。
+    lines.push(crate::a11y::atspi_line().await);
     // 4. capture 组件（三级降级链状态，§13）。
     lines.push(agent_shell_capture::doctor_line(d.capture.as_ref()).await);
     // 5. input 组件（libei → ydotool → uinput → XTest 降级链，§12）。
@@ -679,9 +679,7 @@ async fn screenshot_capture(daemon: &mut Daemon, req: &Request) -> RpcResult {
 // ───────────────────────── a11y ─────────────────────────
 
 async fn a11y_status() -> RpcResult {
-    let line = tokio::task::spawn_blocking(crate::a11y::atspi_line)
-        .await
-        .map_err(|e| (RpcErrorCode::InternalError, e.to_string()))?;
+    let line = crate::a11y::atspi_line().await;
     let available = line.starts_with('✓');
     let r = A11yStatusResult {
         available,

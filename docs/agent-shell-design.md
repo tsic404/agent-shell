@@ -2639,19 +2639,55 @@ Agent Shell
 ```rust
 // components/a11y/src/atspi_bridge.rs
 
-pub struct AtspiBridge { conn: zbus::Connection }
+/// 连接惰性建立 + 失效（a11y bus 重启）自动重连；`deferred()` 只建槽位不连。
+pub struct AtspiBridge { inner: Arc<BridgeInner> }  // session/conn: RwLock<Option<Connection>>
 
 impl AtspiBridge {
-    /// 连接 a11y bus（session bus → org.a11y.Bus.GetAddress → a11y bus）
+    /// 立即连接（socket 候选 → session bus org.a11y.Bus.GetAddress → a11y bus）
     pub async fn connect() -> Result<Self> { ... }
 
-    /// 共享连接的克隆构造（component.rs 的 Arc 包装用）
+    /// 装配期被动探测：`org.a11y.Bus` 已注册或可激活即支持（不连接、不激活）
+    pub async fn launcher_state() -> Option<LauncherState> { ... }
+
+    /// 共享的地址解析链（doctor 与桥接同用）：socket 候选 → GetAddress → dial；
+    /// `LauncherActivation::Forbidden` 时仅「可激活」不拉起 launcher
+    pub async fn dial_a11y_bus(
+        session: &zbus::Connection,
+        activation: LauncherActivation,
+    ) -> A11yBusOutcome { ... }
+
+    /// Registry 是否实际可达（被动，fail-closed：仅「可激活」→ false）
+    pub async fn registry_reachable(&self) -> bool { ... }
+
+    /// 共享连接槽位的克隆构造（component.rs 的 Arc 包装用）
     pub fn clone_bridge(&self) -> Self { ... }
 
-    /// 枚举所有应用窗口（无障碍树遍历入口）
+    /// 枚举所有应用窗口（无障碍树遍历入口；连接层失败清槽重连重试一次）
     pub async fn all_windows(&self) -> Result<Vec<WindowNode>> { ... }
 }
 ```
+
+**连接与存活性**（2026-09 实测）：a11y bus 的公开 socket 是
+`$XDG_RUNTIME_DIR/at-spi/bus_0`，按 runtime dir 共享。任何在**另一条
+session bus**（`dbus-run-session`、测试用私有 dbus-daemon）上激活
+`org.a11y.Bus` 的进程，都会让新 launcher 接管该 socket，正在服务的 a11y
+bus 被换掉——该会话其它客户端的新连接随即被拒（`Connection refused`），
+`doctor` 的 AT-SPI 行因此漂移。故：
+
+- 装配期（`AtSpiComponent::probe`）只做被动判定，不建连接、不激活 a11y bus
+  （退化态下同步连接会把装配拖到 GetAddress 挂满超时）；
+- 地址解析先试已存在的 socket（含 `AT_SPI_BUS_ADDRESS`，与工具包同源），
+  全部不可达才向 `org.a11y.Bus.GetAddress` 索取；已注册 launcher 不可能触发
+  激活，其 GetAddress 用普通调用上限（5s），未注册才放宽到懒激活例外（30s）；
+- 连接随用随建：首次 `locate`/`click` 建立；读路径（树枚举）遇连接层失败
+  （socket I/O、断连）清空连接槽位并整体重试一次——不等 zbus 异步置
+  `closed`，会话内 a11y bus 重启后首个查询即恢复；
+- `A11yComponent::registry_available` 为**被动 + fail-closed**：只用存活连接
+  或被动探测到的 a11y bus 作答，a11y bus 仅「可激活」（未启动）时为 false；
+- `doctor` / `a11y.status` 与桥接共用同一条地址解析链，分级报告失败阶段
+  （session bus → a11y bus → Registry）；Registry 未运行但可激活时按需启动
+  （会话内重启恢复，状态行注明 `Registry started on demand`）；总线 socket
+  已被替换时报告 `stale a11y bus socket — restart at-spi-dbus-bus.service`。
 
 ### 14.3 语义定位引擎
 
@@ -3695,6 +3731,7 @@ impl<T> FallbackChain<T> {
 |------|---------|---------|--------------|
 | D-Bus 调用（窗口查询） | 5s | 2 | 500ms ×2 |
 | AT-SPI a11y bus 懒激活 (GetAddress) | 30s | 0 | — |
+| AT-SPI Registry 激活 (StartServiceByName) | 10s | 0 | — |
 | KWin Scripting run_script | 5s | 1 | 1000ms |
 | hyprctl socket 请求 | 2s | 2 | 200ms ×2 |
 | portal ScreenCast 会话 | 10s | 1 | 2000ms |
