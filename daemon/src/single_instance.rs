@@ -37,9 +37,7 @@ impl SingleInstanceLock {
     /// 获取单实例锁。锁被前一个 daemon 持有时排队等待（有界），超时方返回
     /// `daemon already running`。
     pub fn acquire() -> Result<Self, String> {
-        let dir = runtime_dir();
-        let path = dir.join("agent-shell.lock");
-        Self::acquire_at(&path, LOCK_WAIT_TIMEOUT)
+        Self::acquire_at(&default_lock_path(), LOCK_WAIT_TIMEOUT)
     }
 
     /// 在指定路径、指定等待窗口内获取锁（生产走 [`acquire`]，测试用临时路径
@@ -121,6 +119,12 @@ pub fn runtime_dir() -> PathBuf {
     PathBuf::from(format!("/run/user/{uid}"))
 }
 
+/// 默认锁文件路径 `$XDG_RUNTIME_DIR/agent-shell.lock`。独立于 [`SingleInstanceLock::acquire`]
+/// 存在，使路径构造可被单测覆盖——测试只能做路径级断言，触碰全局锁即与常驻 daemon 竞争。
+fn default_lock_path() -> PathBuf {
+    runtime_dir().join("agent-shell.lock")
+}
+
 /// 获取状态目录路径 `~/.local/state/agent-shell/`。
 pub fn state_dir() -> PathBuf {
     if let Ok(dir) = std::env::var("XDG_STATE_HOME") {
@@ -143,6 +147,18 @@ mod tests {
     }
 
     #[test]
+    fn test_default_lock_path_is_runtime_dir_lock_file() {
+        // 路径级断言：不取锁、不改 `XDG_RUNTIME_DIR`（并行测试下改环境变量本身就是
+        // 新的 flaky 源），只钉住「runtime_dir() 下名为 agent-shell.lock」这一约定。
+        let path = default_lock_path();
+        assert_eq!(path, runtime_dir().join("agent-shell.lock"));
+        assert_eq!(
+            path.file_name(),
+            Some(std::ffi::OsStr::new("agent-shell.lock"))
+        );
+    }
+
+    #[test]
     fn test_state_dir_ends_with_agent_shell() {
         let dir = state_dir();
         assert!(dir.to_string_lossy().ends_with("agent-shell"));
@@ -151,9 +167,18 @@ mod tests {
     #[test]
     fn lock_acquire_and_release_roundtrip() {
         // 获取 → Drop 释放 flock 后可重新获取（锁文件常驻，不删除）。
-        let lock = SingleInstanceLock::acquire().expect("first acquire");
+        // 独立临时锁路径：默认 `$XDG_RUNTIME_DIR/agent-shell.lock` 会被同宿主
+        // 常驻 daemon 或并行测试进程占用，全量测试下必然等到窗口耗尽而误报。
+        // 窗口取短值：私有路径无竞争，取得锁即时成功；若 Drop 未释放 flock，
+        // 重新获取在窗口内失败暴露回归，而非挂在默认 30s 等待上。
+        const ROUNDTRIP_WAIT: Duration = Duration::from_millis(500);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("agent-shell.lock");
+
+        let lock = SingleInstanceLock::acquire_at(&path, ROUNDTRIP_WAIT).expect("first acquire");
         drop(lock);
-        let relock = SingleInstanceLock::acquire().expect("reacquire after release");
+        let relock =
+            SingleInstanceLock::acquire_at(&path, ROUNDTRIP_WAIT).expect("reacquire after release");
         drop(relock);
     }
 
