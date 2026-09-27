@@ -595,6 +595,106 @@ impl KWinCompositor {
         settle_readback(readouts, before, x, y, w, h)
     }
 
+    /// 最小化(true)/还原(false)：协议 `set_state` 优先（发请求 → 冲刷队列 →
+    /// 回读 `states`），协议通道未确认变更时按降级链回退 Scripting，两通道
+    /// 都未生效才报错——「请求没生效」不再被当作成功吞掉。
+    async fn set_minimized(&self, id: &WindowId, minimized: bool) -> Result<()> {
+        if let Some(p) = self.protocols.clone() {
+            if let Some(wm) = p.window_mgmt.as_ref() {
+                match self.protocol_set_minimized(&p, wm, id, minimized).await {
+                    Ok(()) => return Ok(()),
+                    Err(e) => tracing::warn!(
+                        error = %e,
+                        minimized,
+                        "kwin window_mgmt set_state unconfirmed; falling back to Scripting"
+                    ),
+                }
+            }
+        }
+        let v = self
+            .query(
+                ScriptTemplate::MinimizeWindow,
+                &[
+                    ("ID", json!(id.native_id)),
+                    ("NUM", json!(u8::from(minimized))),
+                ],
+            )
+            .await?;
+        Self::check_op(&v)?;
+        self.verify_window_minimized(id, minimized).await
+    }
+
+    /// 协议通道最小化/还原：`set_state` 是「发完即忘」请求，而私有协议队列
+    /// 没有派发线程——不冲刷则请求留在客户端缓冲里，compositor 从未收到
+    /// （表现为 exit 0 的静默 no-op），故发完立即冲刷（阻塞 roundtrip，
+    /// 返回即代表 compositor 已处理该请求）再做状态回读校验。
+    async fn protocol_set_minimized(
+        &self,
+        protocols: &Arc<KWinProtocols>,
+        wm: &WindowManagement,
+        id: &WindowId,
+        minimized: bool,
+    ) -> Result<()> {
+        // 作用域块：`win` 代理在此结束（drop 入队 `destroy` 请求），
+        // 一次冲刷把 get_window_by_uuid + set_state + destroy 全部发出。
+        {
+            let qh = protocols.queue_handle();
+            let win = wm.get_window_by_uuid(&qh, &id.native_id);
+            wm.set_minimized(&win, minimized);
+        }
+        Self::flush_protocols(protocols)
+            .await
+            .map_err(KWinError::from)?;
+        self.verify_window_minimized(id, minimized).await
+    }
+
+    /// 冲刷私有协议队列：roundtrip 是同步阻塞调用，经 `spawn_blocking` 移出
+    /// tokio worker（§19）。队列无独立派发线程，`set_state` 这类「发完即忘」
+    /// 请求只有冲刷后才会离开客户端缓冲。
+    ///
+    /// 返回 core 错误类型（与 [`KWinProtocols::flush_queue`] 一致），调用方按
+    /// 本 crate 的 `Result` 归一。
+    async fn flush_protocols(
+        protocols: &Arc<KWinProtocols>,
+    ) -> agent_shell_core::error::Result<()> {
+        let p = Arc::clone(protocols);
+        tokio::task::spawn_blocking(move || p.flush_queue())
+            .await
+            .map_err(|e| AgentShellError::Other(format!("kwin protocol flush join: {e}").into()))?
+    }
+
+    /// 读回窗口状态集合（`states` 多状态可共存）。
+    async fn read_window_states(&self, id: &WindowId) -> Result<Vec<WindowState>> {
+        let info = self.get_window_info(id).await.map_err(KWinError::from)?;
+        Ok(info.states)
+    }
+
+    /// 回读校验：最小化/还原后读回 `states`，检测「请求已送达但窗口状态
+    /// 未变」的静默 no-op。
+    ///
+    /// KWin 在合成器主线程执行 minimize/unminimize，状态下一轮事件循环才
+    /// 更新——立即回读可能拿到旧状态，故按 [`Self::READBACK_RETRY_DELAY`]
+    /// 短重试；读错误按「本轮未命中」计入预算，重试耗尽仍未达目标态才报错
+    /// （或报最后一轮的读错误）。
+    async fn verify_window_minimized(&self, id: &WindowId, minimized: bool) -> Result<()> {
+        let mut readouts: Vec<Result<Vec<WindowState>>> =
+            Vec::with_capacity(Self::READBACK_RETRIES as usize + 1);
+        for attempt in 0..=Self::READBACK_RETRIES {
+            if attempt > 0 {
+                tokio::time::sleep(Self::READBACK_RETRY_DELAY).await;
+            }
+            let r = self.read_window_states(id).await;
+            let hit = r
+                .as_ref()
+                .is_ok_and(|states| state_matches(states, minimized));
+            readouts.push(r);
+            if hit {
+                break;
+            }
+        }
+        settle_state_readback(readouts, minimized)
+    }
+
     // ───────────────────────── X11 EWMH 枚举 ─────────────────────────
 
     /// `_NET_CLIENT_LIST_STACKING`（缺失回退 `_NET_CLIENT_LIST`）。
@@ -1169,6 +1269,50 @@ fn settle_readback(
     )))
 }
 
+/// 状态是否已达最小化目标（纯函数）：最小化要求 `Minimized` 在集合内，还原
+/// 要求其不在；请求前已处目标态（幂等）同样通过。
+fn state_matches(states: &[WindowState], minimized: bool) -> bool {
+    states.contains(&WindowState::Minimized) == minimized
+}
+
+/// 状态回读重试判定（纯函数）：按时间序给定各轮回读结果，裁定最终校验结果。
+///
+/// - `Ok(states)` 已达目标态 → 立即通过；
+/// - `Ok(states)` 未达目标 → 陈旧读，继续下一轮；
+/// - `Err(e)` → 本轮未命中（读通道瞬态失败），继续下一轮；
+/// - 序列耗尽 → 最后一轮是读错误则报之，否则报状态未变 no-op。
+fn settle_state_readback(
+    readouts: impl IntoIterator<Item = Result<Vec<WindowState>>>,
+    minimized: bool,
+) -> Result<()> {
+    let mut last_states: Vec<WindowState> = Vec::new();
+    let mut last_err = None;
+    for r in readouts {
+        match r {
+            Ok(states) => {
+                last_states = states;
+                last_err = None;
+                if state_matches(&last_states, minimized) {
+                    return Ok(());
+                }
+            }
+            Err(e) => last_err = Some(e),
+        }
+    }
+    if let Some(e) = last_err {
+        return Err(e);
+    }
+    let want = if minimized {
+        "Minimized present"
+    } else {
+        "Minimized absent"
+    };
+    Err(KWinError::Scripting(format!(
+        "minimize readback mismatch: window did not reach the requested state \
+         (expected {want}), last states={last_states:?}"
+    )))
+}
+
 /// 协议通道的窗口列表：stacking order uuids → get_window_by_uuid → 事件聚合。
 #[async_trait]
 impl DesktopComponent for KWinCompositor {
@@ -1213,21 +1357,14 @@ impl WaylandCompositor for KWinCompositor {
     }
 }
 
-/// 通道间错误语义（§7.2 矩阵的显式化，🟡2）：
+/// 通道间错误语义（§7.2 矩阵的显式化）：
 ///
 /// | 操作 | 协议路径 | Scripting 路径 |
 /// |------|---------|---------------|
-/// | focus/minimize/unminimize/close | 发完即 Ok（wayland 请求无回执）；uuid 不存在时 compositor 静默忽略，**不报错** | 窗口不存在返回 `Window not found` 错误 |
-/// | move/resize/set_geometry | 不可用（协议无 set_geometry），始终 Scripting | 窗口不存在报错；v6 Wayland 下变更后回读几何校验，静默 no-op 报错 |
+/// | focus/close | 发完即 Ok（入队后由下一次协议 roundtrip 带出；uuid 不存在时静默忽略） | 窗口不存在报错 |
+/// | minimize/unminimize | 冲刷队列 + 回读 `states`；未达目标态回退 Scripting | 窗口不存在报错；变更后回读 `states` 校验 |
+/// | move/resize/set_geometry | 不可用（协议无 set_geometry），始终 Scripting | 窗口不存在报错；v6 Wayland 下回读几何校验 |
 /// | maximize | 不可用，始终 Scripting | 窗口不存在报错 |
-///
-/// 即：协议通道「乐观发送」，Scripting 通道「确认式」。同一 uuid 在
-/// 两通道下的失败表现不同——调用方以 `get_window_info` 预校验可消除
-/// 差异；协议通道在 T3b 事件聚合落地后统一为确认式。move/resize/
-/// set_geometry 在 v6 Wayland 会话下额外回读几何对比（v5 读写基准
-/// frame/client 不一致、X11 读回为内容几何，均跳过），显式检测「脚本
-/// 返回 success 但几何未变」的静默 no-op（如无 seat 焦点的 D-Bus
-/// `PlasmaWindow.RequestMove`/`RequestResize`）。
 #[async_trait]
 impl CompositorComponent for KWinCompositor {
     fn capabilities(&self) -> BackendCapabilities {
@@ -1450,41 +1587,19 @@ impl CompositorComponent for KWinCompositor {
         Ok(())
     }
 
-    /// 最小化(true)/还原(false)：协议 set_state 位操作优先。
+    /// 最小化：协议 `set_state` 优先，回读 `states` 确认变更；协议通道未
+    /// 确认时回退 Scripting，两通道都未生效才报错（不静默成功）。
     async fn minimize_window(&self, id: &WindowId) -> agent_shell_core::error::Result<()> {
-        if let Some(p) = self.protocols() {
-            if let Some(wm) = p.window_mgmt.as_ref() {
-                let qh = p.queue_handle();
-                let win = wm.get_window_by_uuid(&qh, &id.native_id);
-                wm.set_minimized(&win, true);
-                return Ok(());
-            }
-        }
-        let v = self
-            .query(
-                ScriptTemplate::MinimizeWindow,
-                &[("ID", json!(id.native_id)), ("NUM", json!(1))],
-            )
-            .await?;
-        Self::check_op(&v).map_err(KWinError::into)
+        self.set_minimized(id, true)
+            .await
+            .map_err(AgentShellError::from)
     }
 
+    /// 还原（取消最小化）：同 [`Self::minimize_window`]。
     async fn unminimize_window(&self, id: &WindowId) -> agent_shell_core::error::Result<()> {
-        if let Some(p) = self.protocols() {
-            if let Some(wm) = p.window_mgmt.as_ref() {
-                let qh = p.queue_handle();
-                let win = wm.get_window_by_uuid(&qh, &id.native_id);
-                wm.set_minimized(&win, false);
-                return Ok(());
-            }
-        }
-        let v = self
-            .query(
-                ScriptTemplate::MinimizeWindow,
-                &[("ID", json!(id.native_id)), ("NUM", json!(0))],
-            )
-            .await?;
-        Self::check_op(&v).map_err(KWinError::into)
+        self.set_minimized(id, false)
+            .await
+            .map_err(AgentShellError::from)
     }
 
     /// 最大化：协议不支持（§7.2），始终 Scripting。
@@ -2672,6 +2787,70 @@ mod tests {
                 settle_readback(all_err, before, None, None, Some(1234), Some(777)),
                 Err(KWinError::Scripting(_))
             ),
+            "persistent read error must surface after budget exhausted"
+        );
+    }
+
+    /// `state_matches`：方向敏感——最小化要求 `Minimized` 在集合内，还原要求
+    /// 不在；方向写反会让回读校验恒真（静默 no-op 又被放过）。
+    #[test]
+    fn state_matches_pins_both_directions() {
+        let minimized = vec![WindowState::Normal, WindowState::Minimized];
+        let restored = vec![WindowState::Normal];
+        assert!(state_matches(&minimized, true));
+        assert!(!state_matches(&minimized, false));
+        assert!(state_matches(&restored, false));
+        assert!(!state_matches(&restored, true));
+        // 多状态共存：Minimized 与 Maximized 同时在场仍算已最小化。
+        assert!(state_matches(
+            &[WindowState::Minimized, WindowState::Maximized],
+            true
+        ));
+    }
+
+    /// `settle_state_readback`：陈旧读→重试→命中 → Ok；预算耗尽仍还原 →
+    /// Err；读错误计入预算（陈旧→错误→命中 → Ok；持续错误 → Err）。
+    #[test]
+    fn settle_state_readback_retries_stale_then_hit_and_absorbs_read_errors() {
+        let restored = vec![WindowState::Normal];
+        let minimized = vec![WindowState::Normal, WindowState::Minimized];
+        // 最小化异步生效：首读仍还原、次读命中 → Ok。
+        assert!(
+            settle_state_readback(vec![Ok(restored.clone()), Ok(minimized.clone())], true).is_ok()
+        );
+        // 幂等：请求前已处目标态（已最小化再 minimize）直接通过。
+        assert!(settle_state_readback(vec![Ok(minimized.clone())], true).is_ok());
+        // 预算耗尽（0..=RETRIES 共 4 轮）仍还原 → Err(no-op)。
+        let all_stale: Vec<Result<Vec<WindowState>>> = (0..=KWinCompositor::READBACK_RETRIES)
+            .map(|_| Ok(restored.clone()))
+            .collect();
+        let err = settle_state_readback(all_stale, true)
+            .expect_err("exhausted budget with unchanged state must fail");
+        assert!(
+            matches!(err, KWinError::Scripting(_)),
+            "expected no-op mismatch, got {err:?}"
+        );
+        // 还原方向：状态一直是最小化 → Err（未达目标态）。
+        assert!(
+            settle_state_readback(vec![Ok(minimized.clone())], false).is_err(),
+            "unminimize must not pass while Minimized is still present"
+        );
+        // 读错误计入预算：陈旧→读错误→命中 → Ok（瞬态往返失败被吸收）。
+        assert!(settle_state_readback(
+            vec![
+                Ok(restored),
+                Err(KWinError::Scripting("transient".into())),
+                Ok(minimized),
+            ],
+            true
+        )
+        .is_ok());
+        // 持续读错误 → Err(最后读错误)，而非误报 no-op。
+        let all_err: Vec<Result<Vec<WindowState>>> = (0..=KWinCompositor::READBACK_RETRIES)
+            .map(|_| Err(KWinError::Scripting("boom".into())))
+            .collect();
+        assert!(
+            settle_state_readback(all_err, true).is_err(),
             "persistent read error must surface after budget exhausted"
         );
     }
