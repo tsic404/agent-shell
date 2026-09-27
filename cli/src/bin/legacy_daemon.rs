@@ -33,6 +33,8 @@ fn main() {
         let resp = if method == "info.show" {
             legacy_info_response(id)
         } else {
+            // 兜底码保持旧 daemon 的规范码 -32601（新 daemon 已改用自定义 1008）：
+            // 夹具复刻旧线格式，不得跟随新码改动。
             serde_json::json!({
                 "jsonrpc": "2.0",
                 "id": id,
