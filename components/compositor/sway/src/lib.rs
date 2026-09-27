@@ -252,6 +252,59 @@ impl SwayCompositor {
     }
 }
 
+/// 还原经 IPC 通道：sway 的 `scratchpad show` 是 toggle，对已 show 的窗口会
+/// 再次隐藏，故先查 GET_TREE 判定目标是否仍藏在 scratchpad，已还原则返回
+/// 空操作（幂等，与其余合成器的状态设置语义对齐）。
+///
+/// RUN_COMMAND 的回执即 sway 主循环同步执行完毕的确认（单线程事件循环，
+/// 无排队滞后），无需额外回读校验。
+async fn unminimize_via_ipc(ipc: &SwayIpc, native_id: &str) -> Result<()> {
+    let tree = ipc.roundtrip(IpcCommand::GetTree, "").await?;
+    if !scratchpad_hidden(&tree, native_id) {
+        return Ok(());
+    }
+    ipc.run_command(&format!("[con_id=\"{native_id}\"] scratchpad show"))
+        .await
+}
+
+/// 目标窗口是否仍藏在 scratchpad 中——sway 侧 `container_is_scratchpad_hidden`
+/// 的树侧等价判定：隐藏的 scratchpad 容器挂在特殊工作区 `__i3_scratch`
+/// （`__i3` 输出）下，`scratchpad show` 之后回到真实工作区。
+fn scratchpad_hidden(tree: &Value, native_id: &str) -> bool {
+    /// sway 用于收纳隐藏 scratchpad 容器的特殊工作区名（ipc-json 输出）。
+    const SCRATCH_WORKSPACE: &str = "__i3_scratch";
+    const MAX_DEPTH: usize = 64;
+
+    fn walk(node: &Value, id: u64, in_scratch: bool, depth: usize) -> bool {
+        if depth > MAX_DEPTH {
+            return false;
+        }
+        let in_scratch =
+            in_scratch || node.get("name").and_then(Value::as_str) == Some(SCRATCH_WORKSPACE);
+        let is_target = node.get("id").and_then(Value::as_u64) == Some(id);
+        if in_scratch
+            && is_target
+            && node
+                .get("scratchpad_state")
+                .and_then(Value::as_str)
+                .is_some_and(|s| s != "none")
+        {
+            return true;
+        }
+        ["nodes", "floating_nodes"].iter().any(|key| {
+            node.get(key)
+                .and_then(Value::as_array)
+                .is_some_and(|children| children.iter().any(|c| walk(c, id, in_scratch, depth + 1)))
+        })
+    }
+
+    // con_id 恒为数字；非数字 id 不可能命中任何容器。
+    let Ok(id) = native_id.parse::<u64>() else {
+        return false;
+    };
+    walk(tree, id, false, 0)
+}
+
 /// GET_TREE 节点递归展平（深度上界防御异常环状树——sway 正常树深有限）。
 fn collect_windows(node: &Value, depth: usize, out: &mut Vec<WindowInfo>) {
     const MAX_DEPTH: usize = 64;
@@ -416,7 +469,7 @@ impl CompositorComponent for SwayCompositor {
     }
 
     async fn unminimize_window(&self, id: &WindowId) -> Result<()> {
-        self.dispatch(&id.native_id, "scratchpad show").await
+        unminimize_via_ipc(&self.ipc, &id.native_id).await
     }
 
     async fn maximize_window(&self, id: &WindowId) -> Result<()> {
@@ -586,5 +639,137 @@ mod tests {
         if let Some(v) = prev {
             std::env::set_var("SWAYSOCK", v);
         }
+    }
+
+    /// 含 scratchpad 三态的 GET_TREE 快照：普通窗口（10）、已 show 的
+    /// scratchpad 窗口（20）、非当前工作区窗口（40）、仍藏在 `__i3_scratch`
+    /// 下的 scratchpad 窗口（30）。
+    const TREE_WITH_SCRATCHPAD: &str = r#"{
+        "id": 1, "type": "root", "name": "root",
+        "nodes": [
+            {"id": 2, "type": "output", "name": "HEADLESS-1", "nodes": [
+                {"id": 3, "type": "workspace", "name": "1", "floating_nodes": [
+                    {"id": 20, "app_id": "calc", "pid": 300, "name": "calc",
+                     "visible": true, "scratchpad_state": "fresh",
+                     "type": "floating_con",
+                     "rect": {"x": 100, "y": 100, "width": 400, "height": 300}}
+                ], "nodes": [
+                    {"id": 10, "app_id": "foot", "pid": 100, "name": "term",
+                     "visible": true, "scratchpad_state": "none",
+                     "rect": {"x": 0, "y": 0, "width": 800, "height": 600}}
+                ]},
+                {"id": 4, "type": "workspace", "name": "2", "floating_nodes": [],
+                 "nodes": [
+                    {"id": 40, "app_id": "vim", "pid": 400, "name": "vim",
+                     "visible": false, "scratchpad_state": "none",
+                     "rect": {"x": 0, "y": 0, "width": 800, "height": 600}}
+                ]}
+            ]},
+            {"id": 5, "type": "output", "name": "__i3", "nodes": [
+                {"id": 6, "type": "workspace", "name": "__i3_scratch", "nodes": [],
+                 "floating_nodes": [
+                    {"id": 30, "app_id": "htop", "pid": 500, "name": "htop",
+                     "visible": false, "scratchpad_state": "fresh",
+                     "type": "floating_con",
+                     "rect": {"x": 0, "y": 0, "width": 800, "height": 600}}
+                ]}
+            ]}
+        ],
+        "floating_nodes": []
+    }"#;
+
+    #[test]
+    fn scratchpad_hidden_matches_only_container_under_scratch_workspace() {
+        let tree: Value = serde_json::from_str(TREE_WITH_SCRATCHPAD).unwrap();
+        assert!(
+            scratchpad_hidden(&tree, "30"),
+            "container under __i3_scratch is hidden"
+        );
+        assert!(
+            !scratchpad_hidden(&tree, "20"),
+            "shown scratchpad container is back on a real workspace"
+        );
+        // 非当前工作区的窗口 visible=false，但不是 scratchpad 容器——
+        // 误判会把它当隐藏窗口处理。
+        assert!(!scratchpad_hidden(&tree, "40"), "plain window elsewhere");
+        assert!(!scratchpad_hidden(&tree, "10"), "plain visible window");
+        assert!(!scratchpad_hidden(&tree, "999"), "absent id");
+        assert!(!scratchpad_hidden(&tree, "abc"), "non-numeric id");
+    }
+
+    /// 假 sway IPC 服务端：GET_TREE 回固定树，RUN_COMMAND 记录命令并回成功。
+    /// 返回 (socket 路径, 已收命令)。
+    async fn spawn_fake_sway(
+        tree: &'static str,
+    ) -> (std::path::PathBuf, Arc<parking_lot::Mutex<Vec<String>>>) {
+        static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "agent-shell-sway-{}-{seq}.sock",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let listener = tokio::net::UnixListener::bind(&path).expect("bind fake sway socket");
+        let commands: Arc<parking_lot::Mutex<Vec<String>>> =
+            Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&commands);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let Ok((reply_type, body)) = crate::ipc::read_message(&mut stream).await else {
+                    break;
+                };
+                // sway-ipc(7)：GET_TREE=4 求树，RUN_COMMAND=0 带命令文本。
+                if reply_type == 4 {
+                    let _ = crate::ipc::write_message(&mut stream, IpcCommand::GetTree, tree).await;
+                } else {
+                    recorded.lock().push(body);
+                    let _ = crate::ipc::write_message(
+                        &mut stream,
+                        IpcCommand::RunCommand,
+                        r#"[{"success": true}]"#,
+                    )
+                    .await;
+                }
+            }
+        });
+        (path, commands)
+    }
+
+    #[tokio::test]
+    async fn unminimize_sends_scratchpad_show_only_for_hidden_container() {
+        let (path, commands) = spawn_fake_sway(TREE_WITH_SCRATCHPAD).await;
+        let ipc = SwayIpc::with_socket_path(path.clone());
+        unminimize_via_ipc(&ipc, "30")
+            .await
+            .expect("hidden scratchpad window restores");
+        assert_eq!(
+            commands.lock().as_slice(),
+            ["[con_id=\"30\"] scratchpad show".to_string()]
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn unminimize_is_noop_for_already_visible_window() {
+        // 回归：`scratchpad show` 是 toggle——对已还原（可见）的窗口重发会把
+        // 它再次藏进 scratchpad，故已可见时必须完全不发命令。
+        let (path, commands) = spawn_fake_sway(TREE_WITH_SCRATCHPAD).await;
+        let ipc = SwayIpc::with_socket_path(path.clone());
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            unminimize_via_ipc(&ipc, "20"),
+        )
+        .await
+        .expect("no hang")
+        .expect("already visible restore returns Ok");
+        // 命令是同步 roundtrip，若发过必然已记录在案。
+        assert!(
+            commands.lock().is_empty(),
+            "must not re-toggle an already visible scratchpad window"
+        );
+        let _ = std::fs::remove_file(&path);
     }
 }

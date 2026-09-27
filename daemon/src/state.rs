@@ -441,6 +441,7 @@ impl Daemon {
             K::Move => comp.move_window(&id, x, y).await,
             K::Resize => comp.resize_window(&id, w, h).await,
             K::Minimize => comp.minimize_window(&id).await,
+            K::Restore => comp.unminimize_window(&id).await,
             K::Close => comp.close_window(&id).await,
         };
         r.map_err(|e| (agent_shell_rpc::RpcErrorCode::BackendError, e.to_string()))
