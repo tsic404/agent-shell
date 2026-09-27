@@ -188,6 +188,9 @@ pub enum WindowsCommand {
     },
     /// 最小化窗口
     Minimize { target: String },
+    /// 还原最小化窗口（`unminimize` 为等价别名）
+    #[command(alias = "unminimize")]
+    Restore { target: String },
     /// 关闭窗口
     Close { target: String },
     /// 等待 app_id/标题窗口出现（轮询 windows.list）
@@ -1215,6 +1218,20 @@ mod tests {
                 assert!(match_mode.is_none());
             }
             other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn windows_restore_parses_both_spellings() {
+        // `restore` 为规范名，`unminimize` 保留为别名（issue 两种命名都出现）。
+        for sub in ["restore", "unminimize"] {
+            let cli = Cli::try_parse_from(["agent-shell", "windows", sub, "Kate"]).expect("parse");
+            match cli.command {
+                Some(Command::Windows(WindowsCommand::Restore { target })) => {
+                    assert_eq!(target, "Kate");
+                }
+                other => panic!("unexpected command: {other:?}"),
+            }
         }
     }
 

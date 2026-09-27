@@ -81,7 +81,7 @@ pub mod method {
     pub const WINDOWS_LIST: &str = "windows.list";
     /// 单窗查询。
     pub const WINDOW_INFO: &str = "windows.info";
-    /// 窗口写操作（focus/move/resize/minimize/close，按 params.op 分派）。
+    /// 窗口写操作（focus/move/resize/minimize/restore/close，按 params.op 分派）。
     pub const WINDOW_OP: &str = "windows.op";
     /// 工作区列表。
     pub const WORKSPACES_LIST: &str = "workspaces.list";
@@ -452,6 +452,8 @@ pub enum WindowOpKind {
     Move,
     Resize,
     Minimize,
+    /// 还原最小化窗口（幂等：目标已还原同样成功）。
+    Restore,
     Close,
 }
 
@@ -938,6 +940,14 @@ mod tests {
         assert_eq!(
             serde_json::to_value(WindowOpKind::Minimize).expect("ser"),
             json!("minimize")
+        );
+        assert_eq!(
+            serde_json::to_value(WindowOpKind::Restore).expect("ser"),
+            json!("restore")
+        );
+        assert_eq!(
+            serde_json::from_value::<WindowOpKind>(json!("restore")).expect("de"),
+            WindowOpKind::Restore
         );
         assert_eq!(
             serde_json::from_value::<WindowOpKind>(json!("focus")).expect("de"),

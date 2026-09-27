@@ -3148,6 +3148,7 @@ agent-shell window focus <target>
 agent-shell window move <target> X Y
 agent-shell window resize <target> W H
 agent-shell window minimize <target>
+agent-shell windows restore <target>        # 还原最小化；`unminimize` 为等价别名
 agent-shell window close <target>
 agent-shell window geometry <target> X Y W H
 

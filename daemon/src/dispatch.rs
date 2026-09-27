@@ -161,6 +161,7 @@ fn operation_for(method_name: &str, params: &Option<Value>) -> Option<Operation>
             Some("move") => Operation::new("windows.move", L1),
             Some("resize") => Operation::new("windows.resize", L1),
             Some("minimize") => Operation::new("windows.minimize", L1),
+            Some("restore") => Operation::new("windows.restore", L1),
             _ => return None, // 非法/缺省 op 交 handler 报 InvalidParams。
         });
     }
@@ -2955,6 +2956,30 @@ mod tests {
             .allow
             .insert("*".into(), vec![PermissionLevel::L1]);
         let resp = dispatch(&mut d, &req(method::SCREENSHOT_CAPTURE, Some(json!({})))).await;
+        assert_eq!(
+            resp.error.expect("error").code,
+            RpcErrorCode::ConfirmationRequired as i32
+        );
+    }
+
+    #[tokio::test]
+    async fn window_restore_op_is_gated_above_whitelist_level() {
+        // 漏配 operation_for 的 op 会绕过权限 gate 直达后端；L0 白名单下
+        // 仍返回确认态，证明 windows.restore 与 minimize 同级受管。
+        let mut d = test_daemon().await;
+        d.security
+            .config
+            .permissions
+            .allow
+            .insert("*".into(), vec![PermissionLevel::L0]);
+        let resp = dispatch(
+            &mut d,
+            &req(
+                method::WINDOW_OP,
+                Some(json!({ "op": "restore", "target": "{uuid}" })),
+            ),
+        )
+        .await;
         assert_eq!(
             resp.error.expect("error").code,
             RpcErrorCode::ConfirmationRequired as i32

@@ -249,6 +249,7 @@ async fn windows(out: OutputFormat, c: &mut DaemonClient, cmd: cli::WindowsComma
             height,
         } => window_op(c, out, target, WindowOpKind::Resize, [0, 0, width, height]).await,
         W::Minimize { target } => window_op(c, out, target, WindowOpKind::Minimize, [0; 4]).await,
+        W::Restore { target } => window_op(c, out, target, WindowOpKind::Restore, [0; 4]).await,
         W::Close { target } => window_op(c, out, target, WindowOpKind::Close, [0; 4]).await,
         W::Wait {
             app_id,
