@@ -13,3 +13,7 @@ pub use agent_shell_power::{probe_first_existing, service_exists};
 mod assemble;
 
 pub use assemble::{KdeBackend, SessionType};
+
+pub mod native_input;
+
+pub use native_input::KWinNativeInput;

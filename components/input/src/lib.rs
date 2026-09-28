@@ -6,14 +6,14 @@
 //! TTY 环境探测不到任何后端时 `active = None`，对外方法返回 BackendUnavailable
 //! 而非 panic。
 mod dispatcher;
-pub(crate) mod keymap;
+pub mod keymap;
 mod libei;
 mod uinput;
 mod xdotool;
 mod xtest;
 mod ydotool;
 
-pub use dispatcher::{InputDispatcher, InputService};
+pub use dispatcher::{InputDispatcher, InputService, Op};
 pub use libei::LibeiInput;
 pub use uinput::UinputInput;
 pub use xdotool::XdotoolInput;
@@ -45,7 +45,15 @@ impl InputComponentHandle {
     /// 不构造本类型。空链错误携带首选后端（libei）探测失败原因，供 daemon
     /// 保存并在 `input_send` 透出可诊断错误。
     pub async fn detect(de_type: DesktopEnvironment) -> Result<Self> {
-        let dispatcher = InputDispatcher::new(de_type).await?;
+        Self::detect_with_native(de_type, None).await
+    }
+
+    /// 按 DE 探测降级链（含 DE 原生注入候选），选出 active 后端。
+    pub async fn detect_with_native(
+        de_type: DesktopEnvironment,
+        native: Option<Box<dyn InputService>>,
+    ) -> Result<Self> {
+        let dispatcher = InputDispatcher::new_with_native(de_type, native).await?;
         Self::assemble(dispatcher, de_type)
     }
 
@@ -127,6 +135,18 @@ pub async fn detect(de_type: DesktopEnvironment) -> Result<InputComponentHandle>
     InputComponentHandle::detect(de_type).await
 }
 
+/// 带 DE 原生注入通道的装配入口（daemon 用）。
+///
+/// `native`：DE 原生协议候选（KDE Wayland → `org_kde_kwin_fake_input`），可用时
+/// 作为链首；`None` 时链从 libei 开始。原生协议无 portal 弹窗、无 /dev/uinput
+/// 权限要求，是 Wayland 会话唯一能保证注入生效的通道（KDE 忽略 XWayland XTEST）。
+pub async fn detect_with_native(
+    de_type: DesktopEnvironment,
+    native: Option<Box<dyn InputService>>,
+) -> Result<InputComponentHandle> {
+    InputComponentHandle::detect_with_native(de_type, native).await
+}
+
 /// 探测输入后端并返回可选的首选后端（libei）探测根因。
 ///
 /// daemon 装配用：`detect` 空链失败时无法区分「有具体根因」（如 portal 缺
@@ -136,7 +156,15 @@ pub async fn detect(de_type: DesktopEnvironment) -> Result<InputComponentHandle>
 pub async fn detect_with_reason(
     de_type: DesktopEnvironment,
 ) -> (Result<InputComponentHandle>, Option<String>) {
-    let dispatcher = match InputDispatcher::new(de_type).await {
+    detect_with_reason_and_native(de_type, None).await
+}
+
+/// 同 [`detect_with_reason`]，额外接受 DE 原生注入候选（链首）。
+pub async fn detect_with_reason_and_native(
+    de_type: DesktopEnvironment,
+    native: Option<Box<dyn InputService>>,
+) -> (Result<InputComponentHandle>, Option<String>) {
+    let dispatcher = match InputDispatcher::new_with_native(de_type, native).await {
         Ok(d) => d,
         Err(e) => return (Err(e), None),
     };

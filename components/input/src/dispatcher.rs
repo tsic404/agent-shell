@@ -1,12 +1,17 @@
 //! `InputService` trait 与 `InputDispatcher`（设计文档 §12.2）。
 //!
-//! 降级链构造顺序（§12.1/§12.2）：libei（Wayland 首选）→ ydotool（需 /dev/uinput）→
-//! uinput 直写（无 ydotool 时替代）→ XTest（仅原生 X11）→ xdotool（`DISPLAY` 存在
-//! 即压入）；取第一个 `is_available()` 者为 active，全不可用则 active=None（返回
-//! 错误、不 panic）。
+//! 降级链构造顺序（§12.1/§12.2）：**DE 原生协议**（KDE Wayland 为
+//! `org_kde_kwin_fake_input`，由装配层作为 `native` 候选传入）→ libei（Wayland）
+//! → ydotool（需 /dev/uinput）→ uinput 直写（无 ydotool 时替代）→ XTest（仅原生
+//! X11）→ xdotool（`DISPLAY` 存在即压入，KDE Wayland 除外——KWin 忽略 XWayland
+//! 的 XTEST 注入）；取第一个 `is_available()` 者为 active，全不可用则 active=None
+//! （返回错误、不 panic）。
 //! **操作期降级**：libei 的 is_available 仅验证 portal 在场、会话延迟到首次注入
-//! （`ensure_ready`），建立失败或能力缺失即摘除回落且不重复弹窗；注入期错误直接返回、
-//! 不降级重放。超时/重试（§19）由各后端命令执行层统一施加。
+//! （`ensure_ready`），瞬态失败按 §19 重试（`INPUT_RETRIES`）后才摘除回落，授权
+//! 未授予（`Permission`，含弹窗未确认）不重试；注入期错误直接返回、不降级重放。
+//! **能力缺口**：`InputService::supports` 为 false 的候选只跳过本次操作、不摘除
+//! （后端可能仅缺某一类操作能力），整链无候选支持该操作时返回可诊断错误。
+//! 超时/重试（§19）由各后端命令执行层统一施加。
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -50,8 +55,22 @@ pub trait InputService: Send + Sync {
     /// 会话，默认 `Ok(())` 忽略 `op`。dispatcher 在执行注入操作前先调用本
     /// 方法：失败（含能力缺失）发生在任何注入之前，可安全降级重放；注入期
     /// 错误则直接返回调用方，不重放（避免重复键击/点击/文本）。
+    ///
+    /// 瞬态失败（连接/会话未就绪）由 dispatcher 按 §19 重试后再降级；授权
+    /// 类失败（[`AgentShellError::Permission`]，含弹窗未确认）不重试——重试
+    /// 只会重复弹窗。
     async fn ensure_ready(&self, _op: Op<'_>) -> Result<()> {
         Ok(())
+    }
+
+    /// 该后端是否具备执行 `op` 的能力（纯能力声明，不触碰通道）。
+    ///
+    /// dispatcher 对返回 false 的候选**只跳过本次操作**、不摘除：后端可能
+    /// 仅缺某一类操作的能力（uinput 直写的绝对指针需要桌面尺寸、ydotool 的
+    /// 绝对移动要求其 uinput 设备声明 ABS 轴），摘除会让后续 `type`/`key`
+    /// 一起失去该后端。默认 true——通道可用性由 `ensure_ready` 判定。
+    fn supports(&self, _op: Op<'_>) -> bool {
+        true
     }
 
     /// 注入按键组合。
@@ -209,9 +228,58 @@ fn xdotool_candidate(display: Option<&std::ffi::OsStr>, has_xdotool: bool) -> bo
     display.is_some() && has_xdotool
 }
 
+/// X11 注入通道（XTest / xdotool）在本会话是否可用。
+///
+/// KWin Wayland **忽略来自 XWayland 的 XTEST 注入**（实测 KDE Plasma 6.7.5：
+/// 聚焦窗口下 `xdotool type/key` 对桌面零效果，命令与 X 请求均返回成功）——
+/// 压入这类候选只会在整链降级到它时给出「rc=0 但无效果」的静默 no-op。KDE
+/// Wayland 的原生注入通道是 `org_kde_kwin_fake_input`（链首 native 候选），
+/// 故该会话不压入 X11 注入候选。其余 DE 保留：wlroots 系合成器转发 XTEST，
+/// 原生 X11 会话本就以 XTest 为主通道。
+fn x11_injection_usable(de_type: DesktopEnvironment) -> bool {
+    x11_injection_usable_for(de_type, is_wayland_session())
+}
+
+/// [`x11_injection_usable`] 的纯逻辑（脱离环境变量，供测试覆盖判定矩阵）。
+fn x11_injection_usable_for(de_type: DesktopEnvironment, is_wayland: bool) -> bool {
+    !(de_type == DesktopEnvironment::KDE && is_wayland)
+}
+
+/// 会话是否为 Wayland（与 §16.1 判定同源：`WAYLAND_DISPLAY`/`WAYLAND_SOCKET`）。
+fn is_wayland_session() -> bool {
+    std::env::var_os("WAYLAND_DISPLAY").is_some() || std::env::var_os("WAYLAND_SOCKET").is_some()
+}
+
+/// 通道建立失败是否值得重试（瞬时故障 vs 需人工干预）。
+///
+/// 可重试：DBus/EIS/进程命令的瞬时故障（会话尚未 STARTED、socket 竞争、命令超时）
+/// ——立即降级会让「portal 会话延迟建立」这类可恢复故障被永久摘除（QA 复现的
+/// libei 首连失败路径）。
+/// 不可重试：`Permission`（含 portal 弹窗 30s 未确认——重试只会重复弹窗）与
+/// 结构性不可用（`BackendUnavailable`：缺二进制、缺协议、权限不足）。
+fn is_transient_setup_failure(e: &AgentShellError) -> bool {
+    matches!(
+        e,
+        AgentShellError::DBus(_) | AgentShellError::Input(_) | AgentShellError::Timeout(_)
+    )
+}
+
 impl InputDispatcher {
     /// 按 DE 探测候选集合并选出第一个可用的 active 后端。
     pub async fn new(de_type: DesktopEnvironment) -> Result<Self> {
+        Self::new_with_native(de_type, None).await
+    }
+
+    /// 带 DE 原生注入通道的装配入口。
+    ///
+    /// `native`（如 KDE 的 `org_kde_kwin_fake_input`）可用时作为**链首候选**：
+    /// 原生协议不经 portal 授权弹窗、不依赖 `/dev/uinput` 权限，是 Wayland 会话
+    /// 唯一能保证「注入即生效」的通道（KWin 忽略 XWayland 的 XTEST 注入）。
+    /// `None` 时链从 libei 开始（非 KDE / 原生协议未绑定）。
+    pub async fn new_with_native(
+        de_type: DesktopEnvironment,
+        native: Option<Box<dyn InputService>>,
+    ) -> Result<Self> {
         let mut backends: Vec<Box<dyn InputService>> = Vec::new();
         // 首选后端探测失败的可诊断根因（仅「portal 在场但缺 ConnectToEIS」这类
         // 能力缺失；headless 无 portal / 无 session bus 是常态，不记录）。供整链
@@ -219,6 +287,13 @@ impl InputDispatcher {
         let mut probe_failure = None;
         // 降级后端（uinput 直写）探测失败原因，与 probe_failure 一并透出。
         let mut fallback_failure = None;
+
+        // 0. DE 原生注入通道（Wayland 会话首选）：KDE → org_kde_kwin_fake_input。
+        //    无 portal 弹窗、无 uinput 权限要求；未绑定（未安装授权 .desktop /
+        //    协议被过滤）时不入链，链自动退到 libei。
+        if let Some(native) = native {
+            backends.push(native);
+        }
 
         // 1. libei/EIS（Wayland 首选）：portal RemoteDesktop → EI 协议。
         //    探测失败（无 portal / 缺 ConnectToEIS / 非 Wayland）不阻塞后续候选。
@@ -261,6 +336,8 @@ impl InputDispatcher {
         }
 
         // 4. XTest 扩展（X11 原生）：连接失败不压入。
+        //    该候选只在 `X11Generic`（原生 X11 会话）入链，故 KDE Wayland 的
+        //    X11 注入排除（`x11_injection_usable`）无需在此重复判定。
         if de_type == DesktopEnvironment::X11Generic {
             if let Ok(xtest) = super::xtest::XTestInput::new() {
                 backends.push(Box::new(xtest));
@@ -271,10 +348,12 @@ impl InputDispatcher {
         //    不依赖 `de_type.supports_x11()`：Wayland-only DE（Hyprland/Sway/
         //    WLRWayland）在 XWayland 会话下同样可经 xdotool 注入，作为
         //    ydotool 之下的最后兜底（此前 Wayland 会话无此级时 input 全不可用）。
+        //    KDE Wayland 例外见 `x11_injection_usable`。
         if xdotool_candidate(
             std::env::var_os("DISPLAY").as_deref(),
             which::which("xdotool").is_ok(),
-        ) {
+        ) && x11_injection_usable(de_type)
+        {
             backends.push(Box::new(super::xdotool::XdotoolInput::new()));
         }
 
@@ -384,24 +463,40 @@ impl InputDispatcher {
         }
     }
 
-    /// 在降级链上执行一次注入操作：先逐个后端建立通道（`ensure_ready`），
-    /// 失败即摘除并试下一候选；通道就绪后注入一次，注入期错误直接返回，
-    /// 不降级重放（避免已注入部分事件后回落造成的重复键击/点击/文本）。
+    /// 在降级链上执行一次注入操作：先按 `supports` 跳过能力缺口候选（不摘除），
+    /// 再逐个后端建立通道（`ensure_ready`，瞬态失败按 §19 重试后仍失败即摘除）；
+    /// 通道就绪后注入一次，注入期错误直接返回，不降级重放（避免已注入部分事件
+    /// 后回落造成的重复键击/点击/文本）。
     async fn dispatch(&self, op: Op<'_>) -> Result<()> {
         let mut idx = self.current_active();
         let mut last_err = None;
+        let mut unsupported = 0usize;
         while let Some(i) = idx {
             let backend = self.backends[i].as_ref();
+            if !backend.supports(op) {
+                // 能力缺口：只跳过本次操作，不摘除、不污染 active（见 trait 文档）。
+                tracing::debug!(
+                    backend = self.backends[i].name(),
+                    "input: backend lacks capability for this op; trying next candidate"
+                );
+                unsupported += 1;
+                idx = self.next_index(i);
+                continue;
+            }
             // 通道建立/能力校验失败发生在任何注入之前——可安全降级重放。
-            if let Err(e) = backend.ensure_ready(op).await {
+            if let Err(e) = self.ensure_ready_retrying(i, op).await {
                 tracing::warn!(
                     backend = self.backends[i].name(),
                     error = %e,
                     "input: backend setup failed; demoting to next candidate"
                 );
                 last_err = Some(e);
+                // 摘除只在 `i` 仍是 active 时真正推进 active 指针（持久化随之更新）；
+                // 游标一律单调前进、**不回读** `current_active()`——失败候选位于
+                // active 之后时 demote 不推进，回读会退回到已跳过的候选：与能力
+                // 缺口跳过叠加即成死循环，永不返回要求的显式错误。
                 self.demote(i);
-                idx = self.current_active();
+                idx = self.next_index(i);
                 continue;
             }
             // 通道就绪：注入一次。注入期错误不再降级重放。
@@ -413,11 +508,57 @@ impl InputDispatcher {
                 Op::Scroll(dx, dy) => backend.mouse_scroll(dx, dy).await,
             };
         }
-        Err(last_err.unwrap_or_else(|| {
+        Err(last_err.unwrap_or_else(|| self.no_candidate_error(unsupported)))
+    }
+
+    /// `ensure_ready` 的通道建立重试（§19：首次 + 重试共 `INPUT_RETRIES` 次）。
+    ///
+    /// 只重试瞬态失败（连接/会话尚未就绪、DBus/EIS 竞态）：立即降级会让「portal
+    /// 会话延迟建立」这类可恢复故障被永久摘除。授权类失败（`Permission`，含
+    /// portal 弹窗未确认）不重试——重试只会重复弹窗。
+    async fn ensure_ready_retrying(&self, i: usize, op: Op<'_>) -> Result<()> {
+        let backend = self.backends[i].as_ref();
+        let mut attempt = 0u32;
+        loop {
+            match backend.ensure_ready(op).await {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    attempt += 1;
+                    if attempt >= INPUT_RETRIES || !is_transient_setup_failure(&e) {
+                        return Err(e);
+                    }
+                    tracing::debug!(
+                        backend = self.backends[i].name(),
+                        attempt,
+                        error = %e,
+                        "input: transient setup failure; retrying"
+                    );
+                    tokio::time::sleep(Duration::from_millis(100 * u64::from(attempt))).await;
+                }
+            }
+        }
+    }
+
+    /// 链上无候选支持该操作（全部候选能力缺口）时的错误。
+    ///
+    /// 与「候选建立失败」区分：前者是能力问题（如 uinput 直写无法定位绝对坐标），
+    /// 文案须指向缺什么，而非笼统 "no available backend"。
+    fn no_candidate_error(&self, unsupported: usize) -> AgentShellError {
+        if unsupported > 0 {
+            AgentShellError::BackendUnavailable(format!(
+                "input: no backend supports this operation in this session \
+                 ({unsupported} candidate(s) lack the capability)"
+            ))
+        } else {
             AgentShellError::BackendUnavailable(
                 "input: no available backend in this session".into(),
             )
-        }))
+        }
+    }
+
+    /// 链上 `i` 之后的下一候选下标（能力缺口跳过用，不改动 active）。
+    fn next_index(&self, i: usize) -> Option<usize> {
+        (i + 1 < self.backends.len()).then_some(i + 1)
     }
 
     /// 注入按键组合（经降级链，失败自动回落）。
@@ -697,6 +838,222 @@ mod tests {
             "无 xdotool 不压入"
         );
         assert!(xdotool_candidate(Some(std::ffi::OsStr::new(":0")), true));
+    }
+
+    /// 能力缺口候选：只对 `Op::Move` 声明不支持（模拟 uinput 直写无桌面尺寸）。
+    struct MoveUnsupportedBackend {
+        injected: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl InputService for MoveUnsupportedBackend {
+        fn name(&self) -> &'static str {
+            "move-gap"
+        }
+        async fn is_available(&self) -> bool {
+            true
+        }
+        fn supports(&self, op: Op<'_>) -> bool {
+            !matches!(op, Op::Move(..))
+        }
+        async fn send_key(&self, _combo: &KeyCombo) -> Result<()> {
+            self.injected.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+        async fn type_text(&self, _text: &str, _delay_ms: u32) -> Result<()> {
+            Ok(())
+        }
+        async fn mouse_move(&self, _x: i32, _y: i32) -> Result<()> {
+            unreachable!("dispatcher must skip unsupported op, not call it")
+        }
+        async fn mouse_click(&self, _button: MouseButton) -> Result<()> {
+            Ok(())
+        }
+        async fn mouse_scroll(&self, _dx: i32, _dy: i32) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    /// 瞬态建立失败的假后端：前 `fail_times` 次 `ensure_ready` 报 DBus 故障。
+    struct FlakySetupBackend {
+        fail_times: usize,
+        attempts: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl InputService for FlakySetupBackend {
+        fn name(&self) -> &'static str {
+            "flaky"
+        }
+        async fn is_available(&self) -> bool {
+            true
+        }
+        async fn ensure_ready(&self, _op: Op<'_>) -> Result<()> {
+            let n = self.attempts.fetch_add(1, Ordering::SeqCst);
+            if n < self.fail_times {
+                Err(AgentShellError::DBus("session not started yet".into()))
+            } else {
+                Ok(())
+            }
+        }
+        async fn send_key(&self, _combo: &KeyCombo) -> Result<()> {
+            Ok(())
+        }
+        async fn type_text(&self, _text: &str, _delay_ms: u32) -> Result<()> {
+            Ok(())
+        }
+        async fn mouse_move(&self, _x: i32, _y: i32) -> Result<()> {
+            Ok(())
+        }
+        async fn mouse_click(&self, _button: MouseButton) -> Result<()> {
+            Ok(())
+        }
+        async fn mouse_scroll(&self, _dx: i32, _dy: i32) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    /// 授权未授予的假后端（portal 弹窗未确认）：`ensure_ready` 报 Permission。
+    struct ConsentDeniedBackend {
+        attempts: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl InputService for ConsentDeniedBackend {
+        fn name(&self) -> &'static str {
+            "consent-denied"
+        }
+        async fn is_available(&self) -> bool {
+            true
+        }
+        async fn ensure_ready(&self, _op: Op<'_>) -> Result<()> {
+            self.attempts.fetch_add(1, Ordering::SeqCst);
+            Err(AgentShellError::Permission(
+                "portal RemoteDesktop Start 授权未在 30s 内确认".into(),
+            ))
+        }
+        async fn send_key(&self, _combo: &KeyCombo) -> Result<()> {
+            Ok(())
+        }
+        async fn type_text(&self, _text: &str, _delay_ms: u32) -> Result<()> {
+            Ok(())
+        }
+        async fn mouse_move(&self, _x: i32, _y: i32) -> Result<()> {
+            Ok(())
+        }
+        async fn mouse_click(&self, _button: MouseButton) -> Result<()> {
+            Ok(())
+        }
+        async fn mouse_scroll(&self, _dx: i32, _dy: i32) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn capability_gap_skips_op_without_demoting_backend() {
+        // uinput 直写无法定位绝对坐标：`mouse_move` 应跳到支持该操作的候选，
+        // 而该后端对 `send_key` 仍保持 active（不被摘除）。
+        let injected = Arc::new(AtomicUsize::new(0));
+        let gap = MoveUnsupportedBackend {
+            injected: Arc::clone(&injected),
+        };
+        let ok = FakeBackend::new("ok", 0);
+        let d = dispatch_with(vec![Box::new(gap), Box::new(ok)], Some(0));
+
+        d.mouse_move(100, 200).await.expect("falls through to ok");
+        assert_eq!(
+            d.active_backend_name(),
+            Some("move-gap"),
+            "capability gap must not demote the backend"
+        );
+
+        d.send_key(&combo(true))
+            .await
+            .expect("gap backend handles keys");
+        assert_eq!(injected.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn capability_skip_then_setup_failure_terminates() {
+        // 回归（审查阻塞项 2）：能力缺口跳过推进了游标，其后候选建立失败时若回读
+        // `current_active()` 会退回到已跳过的候选——「跳过 + 失败」交替即死循环，
+        // 永远拿不到要求的显式错误。游标必须单调前进。
+        let gap = MoveUnsupportedBackend {
+            injected: Arc::new(AtomicUsize::new(0)),
+        };
+        let dead = SetupFailingBackend; // ensure_ready 恒失败（BackendUnavailable）
+        let d = dispatch_with(vec![Box::new(gap), Box::new(dead)], Some(0));
+        let outcome = tokio::time::timeout(Duration::from_secs(5), d.mouse_move(1, 1)).await;
+        let err = outcome
+            .expect("dispatch must terminate instead of backtracking forever")
+            .unwrap_err();
+        assert!(
+            matches!(err, AgentShellError::BackendUnavailable(_)),
+            "{err:?}"
+        );
+        // 能力缺口候选未摘除（active 仍是它）：后续 type/key 仍可用该后端。
+        assert_eq!(d.active_backend_name(), Some("move-gap"));
+    }
+
+    #[tokio::test]
+    async fn no_capable_candidate_reports_capability_gap() {
+        // 全链能力缺口：错误必须指向能力缺口（而非「无可用后端」），
+        // 且不得静默返回 Ok。
+        let gap = MoveUnsupportedBackend {
+            injected: Arc::new(AtomicUsize::new(0)),
+        };
+        let d = dispatch_with(vec![Box::new(gap)], Some(0));
+        let err = d.mouse_move(1, 1).await.unwrap_err();
+        assert!(
+            matches!(&err, AgentShellError::BackendUnavailable(m) if m.contains("capability")),
+            "got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn transient_setup_failure_is_retried_before_demote() {
+        // QA 复现：libei 首连（portal 会话延迟建立）瞬态失败即被摘除 → 后端
+        // 永久丢失。瞬态失败须先重试，成功则保持 active。
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let flaky = FlakySetupBackend {
+            fail_times: 1,
+            attempts: Arc::clone(&attempts),
+        };
+        let d = dispatch_with(vec![Box::new(flaky)], Some(0));
+        d.send_key(&combo(true)).await.expect("retry recovers");
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            2,
+            "1 retry after 1 failure"
+        );
+        assert_eq!(d.active_backend_name(), Some("flaky"));
+    }
+
+    #[tokio::test]
+    async fn permission_setup_failure_demotes_without_retry() {
+        // 授权未授予（弹窗未确认）不是瞬态故障：重试只会重复弹窗，直接降级。
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let denied = ConsentDeniedBackend {
+            attempts: Arc::clone(&attempts),
+        };
+        let ok = FakeBackend::new("ok", 0);
+        let d = dispatch_with(vec![Box::new(denied), Box::new(ok)], Some(0));
+        d.send_key(&combo(true)).await.expect("falls back to ok");
+        assert_eq!(attempts.load(Ordering::SeqCst), 1, "no retry on Permission");
+        assert_eq!(d.active_backend_name(), Some("ok"));
+    }
+
+    #[test]
+    fn kwin_wayland_excludes_x11_injection_candidates() {
+        // KWin Wayland 忽略 XWayland XTEST 注入（实测零效果且 rc=0）——
+        // 该会话不得压入 XTest/xdotool 候选；其余 DE/会话保留 X11 注入链。
+        assert!(!x11_injection_usable_for(DesktopEnvironment::KDE, true));
+        assert!(x11_injection_usable_for(DesktopEnvironment::KDE, false));
+        assert!(x11_injection_usable_for(DesktopEnvironment::Hyprland, true));
+        assert!(x11_injection_usable_for(
+            DesktopEnvironment::X11Generic,
+            false
+        ));
     }
 
     #[test]

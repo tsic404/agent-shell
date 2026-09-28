@@ -16,7 +16,7 @@ use agent_shell_core::types::{KeyCombo, MouseButton};
 use async_trait::async_trait;
 use tokio::process::Command;
 
-use super::dispatcher::{InputService, INPUT_RETRIES, INPUT_TIMEOUT};
+use super::dispatcher::{InputService, Op, INPUT_RETRIES, INPUT_TIMEOUT};
 use crate::keymap::combo_to_press_sequence;
 
 /// ydotool 命令封装后端。
@@ -107,6 +107,40 @@ fn failure_detail(stdout: &str, stderr: &str) -> Option<String> {
     }
 }
 
+/// ydotoold 绝对移动能力（进程级缓存：`supports` 在每次注入的热路径上被调用，
+/// 现场探测会把 sysfs 读取带进热路径；设备能力在进程生命周期内稳定）。
+static YDOTOOLD_CAN_MOVE_ABSOLUTE: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| ydotoold_absolute_pointer_capable() != Some(false));
+
+/// ydotoold 虚拟设备是否声明了 ABS 轴（绝对定位能力）。
+///
+/// `ydotool mousemove -a` 写的是目标设备的 `ABS_X`/`ABS_Y`：设备未声明 ABS 轴时
+/// ydotool 仍以 **0 退出**、指针纹丝不动（实测默认 ydotoold 设备
+/// `/sys/class/input/input15/capabilities/abs == 0`）——正是「rc=0 但无效果」的
+/// 静默 no-op。设备名可配置，故按 `ydotoold` 名称前缀在 sysfs 匹配；匹配不到
+/// 返回 `None`（不臆断，交由调用方保持乐观默认）。
+fn ydotoold_absolute_pointer_capable() -> Option<bool> {
+    const DEVICE_NAME_PREFIX: &str = "ydotoold";
+    let entries = std::fs::read_dir("/sys/class/input").ok()?;
+    for entry in entries.flatten() {
+        let dir = entry.path();
+        let Ok(name) = std::fs::read_to_string(dir.join("name")) else {
+            continue;
+        };
+        if !name.trim().starts_with(DEVICE_NAME_PREFIX) {
+            continue;
+        }
+        let bitmap = std::fs::read_to_string(dir.join("capabilities/abs")).unwrap_or_default();
+        return Some(abs_bitmap_is_nonzero(&bitmap));
+    }
+    None
+}
+
+/// sysfs `capabilities/abs` 位图串 → 是否声明了任意 ABS 轴（全 `0` = 无）。
+fn abs_bitmap_is_nonzero(bitmap: &str) -> bool {
+    bitmap.trim().chars().any(|c| c != '0')
+}
+
 #[async_trait]
 impl InputService for YdotoolInput {
     fn name(&self) -> &'static str {
@@ -130,6 +164,13 @@ impl InputService for YdotoolInput {
             Ok(()) => ComponentHealth::Healthy,
             Err(e) => ComponentHealth::Degraded(format!("ydotool --help: {e}")),
         }
+    }
+
+    fn supports(&self, op: Op<'_>) -> bool {
+        // 绝对移动要求 ydotoold 设备声明 ABS 轴；未声明时 `ydotool mousemove -a`
+        // 静默失败（退 0 且指针不动）。仅在有确证（sysfs 明确报无 ABS）时声明
+        // 能力缺口，探测不到设备时保持乐观——避免误摘除可用的降级级。
+        !matches!(op, Op::Move(..)) || *YDOTOOLD_CAN_MOVE_ABSOLUTE
     }
 
     async fn send_key(&self, combo: &KeyCombo) -> Result<()> {
@@ -190,6 +231,16 @@ impl InputService for YdotoolInput {
 mod tests {
     use super::*;
     use agent_shell_core::types::{Key, KeyName, ModifierMask};
+
+    #[test]
+    fn abs_bitmap_detection_matches_sysfs_format() {
+        // sysfs `capabilities/abs` 是十六进制位图；全 0 = 设备无 ABS 轴
+        // （ydotoold 默认设备即如此 → `mousemove -a` 静默无效）。
+        assert!(!abs_bitmap_is_nonzero("0"));
+        assert!(!abs_bitmap_is_nonzero("000\n"));
+        assert!(abs_bitmap_is_nonzero("3"));
+        assert!(abs_bitmap_is_nonzero("8000000000000000000000000000\n"));
+    }
 
     #[test]
     fn click_masks_match_ydotool_bitmask_semantics() {

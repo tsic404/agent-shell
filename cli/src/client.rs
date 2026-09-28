@@ -572,17 +572,23 @@ impl DaemonClient {
             .map(|_| ())
     }
 
+    /// 注入输入，返回实际生效的后端名（daemon 回传）。
     pub async fn input(
         &mut self,
         kind: agent_shell_rpc::InputKind,
         payload: Value,
-    ) -> Result<(), String> {
-        self.call(
-            method::INPUT_SEND,
-            json!({ "kind": kind, "payload": payload }),
-        )
-        .await
-        .map(|_| ())
+    ) -> Result<String, String> {
+        let v = self
+            .call(
+                method::INPUT_SEND,
+                json!({ "kind": kind, "payload": payload }),
+            )
+            .await?;
+        // 老 daemon（无 backend 字段）不应让新 CLI 报错：缺字段回退 "unknown"。
+        Ok(v.get("backend")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown")
+            .to_string())
     }
 
     pub async fn screenshot(

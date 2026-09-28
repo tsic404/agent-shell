@@ -665,7 +665,10 @@ async fn input_send(d: &mut Daemon, req: &Request) -> RpcResult {
         (RpcErrorCode::BackendUnavailable, msg.to_string())
     })?;
     crate::input::execute(input.dispatcher(), op).await?;
-    Ok(json!({ "ok": true }))
+    // 回传实际注入后端（降级链可能已在本调用内推进 active）：CLI 据此打印
+    // "injected via …"，用户可分辨原生协议注入与降到 X11/uinput 的兜底注入。
+    let backend = input.backend_name().unwrap_or("unknown");
+    Ok(json!({ "ok": true, "backend": backend }))
 }
 
 // ───────────────────────── screenshot ─────────────────────────
