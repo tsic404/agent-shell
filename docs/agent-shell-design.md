@@ -3179,6 +3179,12 @@ agent-shell info         # DE/backend/能力报告
 
 # REPL
 agent-shell              # 交互模式（tab 补全）
+
+# 全局
+agent-shell --output-format json <command>   # 结构化输出（table 为默认）
+agent-shell --retry N <command>              # 连接提前关闭时重建重试
+agent-shell --socket <path> <command>        # 直连已运行的 daemon 端点
+                                             # （AGENT_SHELL_SOCKET 等价；默认自动拉起瞬态 daemon）
 ```
 
 ### 17.3 MCP 服务器（工具定义）
@@ -6131,8 +6137,10 @@ function winDesktops(w) {
 - D-Bus session activation：首个需要 daemon 的操作自动拉起（`agent-shell.service` systemd user unit, `Restart=on-failure`）
 - 空闲超时退出（默认 30min，可配置）：避免常驻浪费
 - 手动调试：直接运行 `agent-shell-daemon`，从 stdin 读 JSON-RPC、stdin EOF 即退出
+- 显式端点：`agent-shell-daemon --socket <path>` 监听 Unix socket 常驻服务（多连接、空闲超时退出），CLI 用 `--socket <path>` 或 `AGENT_SHELL_SOCKET` 直连（§17.1 Unix Socket 形态）。无图形会话（QA/CI）与常驻实例场景的入口——CLI 不再 spawn 瞬态 daemon，也不参与会话单实例锁
+- 锁覆盖：`--lock-path <path>` / `AGENT_SHELL_LOCK` 把单实例锁换到独立命名空间（同路径仍互斥），`--no-lock` 完全跳过（并行测试实例）。无该覆盖时，CLI spawn 的瞬态 daemon 继承会话锁，常驻实例持锁会让每条命令等满 30s 后失败
 
-**CLI-Daemon 协议**：JSON-RPC 2.0 over stdio（daemon 与 CLI 进程互连），与 MCP 传输同构，复用序列化代码：
+**CLI-Daemon 协议**：JSON-RPC 2.0 行分隔（传输可为 daemon 与 CLI 进程间的 stdio 管道，或 `--socket` 的 Unix socket），与 MCP 传输同构，复用序列化代码：
 
 ```json
 {"jsonrpc": "2.0", "id": 1, "method": "windows.list"}
@@ -7086,5 +7094,7 @@ fn acquire_lock() -> Result<File> {
     Ok(file)  // 持有锁直到进程退出
 }
 ```
+
+锁路径可用 `--lock-path <path>` 或 `AGENT_SHELL_LOCK` 覆盖（独立命名空间，同路径仍互斥），`--no-lock` 跳过获取——并行测试实例、无图形会话 QA 与 `--socket` 显式端点实例的入口。默认路径下这些覆盖不生效，会话语义不变。
 
 **事件分发**：多 session 下事件仅推送到当前 session 内的 daemon，不跨 session 转发。rootd 是系统级单例，处理所有 session 的提权请求，通过 `UID` 参数区分调用者。
