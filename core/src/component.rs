@@ -13,7 +13,7 @@ use crate::error::Result;
 use crate::event::EventStream;
 use crate::services::{
     AppInfo, AppTarget, AudioDevice, AudioState, BatteryState, ColorScheme, MonitorLayout,
-    NetworkState, NotificationSpec, SystemdUnit, WifiNetwork,
+    NetworkState, NotificationSpec, SystemdTimer, SystemdUnit, WifiNetwork,
 };
 use crate::types::{
     MonitorId, Rect, SessionInfo, UnitStatus, WindowId, WindowInfo, WorkspaceId, WorkspaceInfo,
@@ -183,6 +183,9 @@ pub trait SystemComponent: DesktopComponent {
 
     /// 列出已加载单元。
     async fn list_units(&self) -> Result<Vec<SystemdUnit>>;
+
+    /// 列出 timer 单元（含下次/上次触发时间，§21.34）。
+    async fn list_timers(&self) -> Result<Vec<SystemdTimer>>;
 
     /// 启动单元。
     async fn start_unit(&self, name: &str) -> Result<()>;

@@ -1,0 +1,16 @@
+[package]
+name = "agent-shell-mime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "agent-shell MIME / default-application component (xdg-mime, xdg-settings, mimeapps.list)"
+
+[dependencies]
+agent-shell-core.workspace = true
+async-trait.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

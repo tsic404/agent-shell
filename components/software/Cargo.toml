@@ -1,0 +1,16 @@
+[package]
+name = "agent-shell-software"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "agent-shell software component (Flatpak CLI)"
+
+[dependencies]
+agent-shell-core.workspace = true
+async-trait.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

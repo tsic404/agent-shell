@@ -28,21 +28,25 @@ pub struct SystemdUnit {
 }
 
 /// systemd timer 单元信息。
+///
+/// 触发时间字段是 `Option`：`None` = 属性读取失败（值未知），`Some("")` =
+/// systemd 的「未安排」哨兵（realtime 属性为 0）。二者不可合并——把读失败折叠
+/// 成 0 会让消费者把「读不到」当成「确实没有下次触发」。
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SystemdTimer {
     /// timer 单元名称（如 "backup.timer"）
     pub name: String,
-    /// 下次触发时间（ISO 时间字符串，realtime）
-    pub next_elapse_real: String,
-    /// 上次触发时间（ISO 时间字符串，realtime）
-    pub last_trigger_real: String,
-    /// 单元文件路径
-    pub unit_path: String,
-    /// 下次触发时间（monotonic，μs）
-    pub next_elapse_monotonic: u64,
-    /// 上次触发时间（monotonic，μs）
-    pub last_trigger_monotonic: u64,
-    /// 是否正在运行
+    /// 下次触发时间（ISO-8601 UTC；未安排为空串，读取失败为 None）
+    pub next_elapse_real: Option<String>,
+    /// 上次触发时间（ISO-8601 UTC；从未触发为空串，读取失败为 None）
+    pub last_trigger_real: Option<String>,
+    /// 单元文件路径（读取失败为 None）
+    pub unit_path: Option<String>,
+    /// 下次触发时间（monotonic，μs；读取失败为 None）
+    pub next_elapse_monotonic: Option<u64>,
+    /// 上次触发时间（monotonic，μs；读取失败为 None）
+    pub last_trigger_monotonic: Option<u64>,
+    /// 是否正在运行（active 状态；timer 无独立运行态）
     pub running: bool,
 }
 
@@ -198,6 +202,109 @@ pub struct BtDevice {
     pub rssi: Option<i16>,
     /// 服务 UUID 列表
     pub uuids: Vec<String>,
+}
+
+// ───────────────────────── 默认应用（§21.27） ─────────────────────────
+
+/// 默认应用解析结果（`mime.get` / `mime.default_browser`）。
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DefaultAppResolution {
+    /// 查询目标：MIME 类型（如 `text/html`），或 `web-browser`。
+    pub target: String,
+    /// 命中的 .desktop ID（如 `firefox.desktop`）；未配置为 None。
+    pub desktop_id: Option<String>,
+    /// 数据来源（`xdg-mime` / `xdg-settings` / `mimeapps.list`）。
+    pub source: String,
+}
+
+// ───────────────────────── 触控板 / 键盘布局（§21.31） ─────────────────────────
+
+/// 单个触控板设备状态。
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TouchpadDevice {
+    /// 设备 sysname（KWin 通道；全局设置来源为 None）。
+    pub sysname: Option<String>,
+    /// 设备名。
+    pub name: String,
+    /// 是否启用。
+    pub enabled: bool,
+    /// 自然滚动是否开启（后端不提供该维度时为 None）。
+    pub natural_scroll: Option<bool>,
+    /// 点击手势是否开启（后端不提供该维度时为 None）。
+    pub tap_to_click: Option<bool>,
+}
+
+/// 触控板状态（`touchpad.status`）。
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TouchpadStatus {
+    /// 数据来源（如 `kde-kwin` / `gnome-gsettings`）。
+    pub source: String,
+    /// 生效值（首个触控板 / 全局设置）；无设备或后端不提供时为 None。
+    pub enabled: Option<bool>,
+    /// 生效的自然滚动值（同上）。
+    pub natural_scroll: Option<bool>,
+    /// 生效的点击手势值（同上）。
+    pub tap_to_click: Option<bool>,
+    /// 逐设备明细（后端只有全局设置时为空）。
+    pub devices: Vec<TouchpadDevice>,
+}
+
+/// 单个键盘布局。
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct KeyboardLayout {
+    /// 配置列表中的序号（0 基）。
+    pub index: u32,
+    /// 布局代码（如 `us`）。
+    pub layout: String,
+    /// 变体（如 `intl`）；无变体为 None。
+    pub variant: Option<String>,
+    /// 展示名（后端提供时才填充）。
+    pub display_name: Option<String>,
+}
+
+/// 键盘布局列表（`kbd.layout.list`）。
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct KeyboardLayouts {
+    /// 数据来源（如 `kde-kxkbrc` / `gnome-gsettings` / `x11-setxkbmap`）。
+    pub source: String,
+    /// 当前生效布局序号；后端不提供时为 None。
+    pub active_index: Option<u32>,
+    /// 布局列表。
+    pub layouts: Vec<KeyboardLayout>,
+}
+
+// ───────────────────────── 软件包（§21.30） ─────────────────────────
+
+/// 已安装 Flatpak 应用。
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct FlatpakApp {
+    /// 应用 ID（如 `org.mozilla.firefox`）。
+    pub app_id: String,
+    /// 应用名。
+    pub name: String,
+    /// 来源 remote（如 `flathub`）。
+    pub origin: String,
+    /// 版本号。
+    pub version: String,
+    /// 分支（如 `stable`）。
+    pub branch: String,
+    /// 安装位置（`system` / `user`）。
+    pub installation: String,
+}
+
+// ───────────────────────── 全局快捷键（§21.33） ─────────────────────────
+
+/// 快捷键绑定结果（`shortcut.bind`）。
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ShortcutBinding {
+    /// 生效后端（`kde-kglobalaccel` / `gnome-gsettings` / `hyprland`）。
+    pub backend: String,
+    /// 后端组件标识（KDE = kglobalaccel 组件唯一名；其余为 None）。
+    pub component: Option<String>,
+    /// 绑定后的组合键规范形式（如 `meta+t`）。
+    pub combo: String,
+    /// 绑定到动作（命令）。
+    pub action: String,
 }
 
 // ───────────────────────── 应用启动器 ─────────────────────────

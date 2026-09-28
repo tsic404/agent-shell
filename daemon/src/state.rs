@@ -12,7 +12,9 @@ use agent_shell_backend_dde::{CompositorKind, DdeCompositor};
 use agent_shell_capture::CaptureDispatcher;
 use agent_shell_compositor_kwin::KWinCompositor;
 use agent_shell_compositor_mutter::{GnomePathKind, MutterCompositor};
-use agent_shell_core::component::{BackendCapabilities, CompositorComponent, DesktopComponent};
+use agent_shell_core::component::{
+    BackendCapabilities, CompositorComponent, DesktopComponent, SystemComponent,
+};
 use agent_shell_core::types::{WindowInfo, WorkspaceInfo};
 use agent_shell_power::{BrightnessController, BrightnessOps};
 use event::{EventHub, EventRing};
@@ -193,6 +195,18 @@ pub struct Daemon {
     pub a11y: Option<std::sync::Arc<dyn A11yOps>>,
     /// 亮度控制器（KDE powerdevil 优先，brightnessctl 公共降级；§21.25）。
     pub brightness: Option<std::sync::Arc<dyn BrightnessOps>>,
+    /// 默认应用查询（xdg-mime / xdg-settings / mimeapps.list；§21.27）。
+    pub mime: Option<std::sync::Arc<dyn agent_shell_mime::MimeOps>>,
+    /// 蓝牙设备查询（BlueZ ObjectManager；§21.29）。
+    pub bluetooth: Option<std::sync::Arc<dyn agent_shell_bluetooth::BluetoothOps>>,
+    /// 软件管理（flatpak CLI；§21.30，v1 只读）。
+    pub software: Option<std::sync::Arc<dyn agent_shell_software::SoftwareOps>>,
+    /// 触控板 / 键盘布局（KWin / gsettings / setxkbmap 按 DE 选路；§21.31）。
+    pub peripherals: Option<std::sync::Arc<dyn agent_shell_peripherals::PeripheralsOps>>,
+    /// 全局快捷键绑定（KGlobalAccel / gsettings / hyprctl；§21.33）。
+    pub shortcut: Option<std::sync::Arc<dyn agent_shell_shortcut::ShortcutOps>>,
+    /// systemd 组件（timer 查询；§21.34）。
+    pub systemd: Option<std::sync::Arc<dyn SystemComponent>>,
     /// 事件枢纽（§22.5 D4：订阅者 fan-out 中心）。
     pub hub: EventHub,
     /// 事件环形缓冲（§22.5 D4：CLI `events --replay`）。
@@ -261,6 +275,26 @@ impl Daemon {
         let token_store: std::sync::Arc<dyn agent_shell_capture::TokenStore> =
             std::sync::Arc::clone(&portal_sessions) as _;
         let caller_id = std::env::var("AGENT_SHELL_AGENT_ID").unwrap_or_else(|_| "*".to_string());
+        // 扩展系统服务组件（§21.27–§21.34）：逐个独立装配，单个失败不阻塞
+        // daemon——doctor 需要 daemon 存活以报告诊断，方法级在 None 时返回
+        // BackendUnavailable 而非静默降级。
+        let bluetooth = match agent_shell_bluetooth::BluezClient::new().await {
+            Ok(client) => Some(std::sync::Arc::new(client)
+                as std::sync::Arc<dyn agent_shell_bluetooth::BluetoothOps>),
+            Err(e) => {
+                tracing::warn!("bluetooth assemble failed: {e}");
+                None
+            }
+        };
+        let systemd = match agent_shell_systemd::SystemdComponent::connect().await {
+            Ok(component) => {
+                Some(std::sync::Arc::new(component) as std::sync::Arc<dyn SystemComponent>)
+            }
+            Err(e) => {
+                tracing::warn!("systemd assemble failed: {e}");
+                None
+            }
+        };
         let security =
             agent_shell_core::security::SecurityManager::load_default().unwrap_or_else(|e| {
                 tracing::warn!("security config load failed, falling back to defaults: {e}");
@@ -284,6 +318,20 @@ impl Daemon {
                 .await
                 .map(|a| std::sync::Arc::new(a) as std::sync::Arc<dyn A11yOps>),
             brightness: Some(std::sync::Arc::new(BrightnessController::new().await)),
+            mime: Some(std::sync::Arc::new(
+                agent_shell_mime::XdgMimeService::new().await,
+            )),
+            bluetooth,
+            software: Some(std::sync::Arc::new(
+                agent_shell_software::FlatpakClient::new(),
+            )),
+            peripherals: Some(std::sync::Arc::new(
+                agent_shell_peripherals::DesktopPeripherals::new().await,
+            )),
+            shortcut: Some(std::sync::Arc::new(
+                agent_shell_shortcut::ShortcutBinder::new().await,
+            )),
+            systemd,
             rootd_connect: crate::rootd_client::connector(),
             hub: EventHub::new(),
             ring: EventRing::default(),
@@ -804,6 +852,12 @@ mod tests {
             rootd_connect: crate::rootd_client::connector(),
             a11y: None,
             brightness: None,
+            mime: None,
+            bluetooth: None,
+            software: None,
+            peripherals: None,
+            shortcut: None,
+            systemd: None,
             hub: EventHub::new(),
             ring: EventRing::default(),
             subscriptions: Vec::new(),

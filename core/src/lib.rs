@@ -15,6 +15,7 @@ pub mod fallback;
 pub mod registry;
 pub mod security;
 pub mod services;
+pub mod time;
 pub mod types;
 
 pub use component::{
@@ -31,9 +32,10 @@ pub use event::{
 pub use registry::{BackendKind, ComponentRegistry};
 pub use services::{
     AccessibilityChange, AppInfo, AppTarget, AudioDevice, AudioDeviceType, AudioState,
-    BatteryState, BrightnessState, BtDevice, ColorScheme, Connectivity, MonitorConfig,
-    MonitorTransform, NetworkState, NotificationSpec, NotificationUrgency, PowerState,
-    SystemdTimer, SystemdUnit, WifiNetwork,
+    BatteryState, BrightnessState, BtDevice, ColorScheme, Connectivity, DefaultAppResolution,
+    FlatpakApp, KeyboardLayout, KeyboardLayouts, MonitorConfig, MonitorTransform, NetworkState,
+    NotificationSpec, NotificationUrgency, PowerState, ShortcutBinding, SystemdTimer, SystemdUnit,
+    TouchpadDevice, TouchpadStatus, WifiNetwork,
 };
 pub use types::{
     CaptureTarget, DesktopEnvironment, Key, KeyCombo, KeyName, MonitorId, MonitorInfo, MouseButton,

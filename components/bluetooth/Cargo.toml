@@ -1,19 +1,18 @@
 [package]
-name = "agent-shell-systemd"
+name = "agent-shell-bluetooth"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "agent-shell systemd init-system component (org.freedesktop.systemd1.Manager)"
+description = "agent-shell Bluetooth component (BlueZ org.bluez ObjectManager)"
 
 [dependencies]
 agent-shell-core.workspace = true
-agent-shell-logind.workspace = true
 async-trait.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 zbus.workspace = true
+zvariant.workspace = true
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 libc.workspace = true

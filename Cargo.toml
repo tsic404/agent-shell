@@ -16,6 +16,11 @@ members = [
     "components/systemd",
     "components/logind",
     "components/power",
+    "components/mime",
+    "components/bluetooth",
+    "components/software",
+    "components/peripherals",
+    "components/shortcut",
     "components/notification",
     "components/appearance",
     "components/launcher",
@@ -48,6 +53,11 @@ repository = "https://github.com/tsic404/agent-shell"
 
 [workspace.dependencies]
 agent-shell-core = { path = "core" }
+agent-shell-mime = { path = "components/mime" }
+agent-shell-bluetooth = { path = "components/bluetooth" }
+agent-shell-software = { path = "components/software" }
+agent-shell-peripherals = { path = "components/peripherals" }
+agent-shell-shortcut = { path = "components/shortcut" }
 agent-shell-audio = { path = "components/audio" }
 agent-shell-network = { path = "components/network" }
 agent-shell-backend-dde = { path = "backends/dde", default-features = false }
