@@ -318,7 +318,8 @@ impl CaptureDispatcher {
     /// 全部失败返回 `BackendUnavailable`，由调用方降级 x11 或快速失败。
     async fn capture_portal(
         &self,
-        target: CaptureTarget,
+        // 仅 `portal-screencast` 分支读取；关闭时 ScreenCast 段整体编译期排除。
+        _target: CaptureTarget,
         interactive: bool,
         require_pixels: bool,
     ) -> Result<CapturedFrame> {
@@ -331,7 +332,7 @@ impl CaptureDispatcher {
         // L2: portal ScreenCast（流式，daemon 复用会话）。feature 关闭时编译期排除。
         #[cfg(feature = "portal-screencast")]
         {
-            if let Some(s) = self.ensure_screencast_session(target, interactive).await {
+            if let Some(s) = self.ensure_screencast_session(_target, interactive).await {
                 match s.capture_frame().await {
                     Ok(frame) => {
                         self.set_active(Some(ActiveBackend::ScreenCast));
