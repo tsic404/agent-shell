@@ -279,7 +279,7 @@ pub struct ScreenshotCommand {
 
 #[derive(Subcommand, Debug)]
 pub enum A11yCommand {
-    /// a11y bus 与 AT-SPI Registry 可达性报告
+    /// a11y bus 与 AT-SPI Registry 可达性报告（Registry 已退出时会按需拉起）
     Status,
     /// 语义查询（role/name 过滤；--all 允许省略过滤查询全树）
     Query {

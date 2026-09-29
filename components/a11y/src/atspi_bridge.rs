@@ -1,9 +1,10 @@
 //! AT-SPI D-Bus 桥接（设计文档 §14.2 `a11y::atspi_bridge`）。
 //!
-//! 连接目标是 **a11y bus**（非 session bus）：先在 session bus 上调
-//! `org.a11y.Bus.GetAddress()` 拿到 a11y 总线地址（如
-//! `unix:path=$XDG_RUNTIME_DIR/at-spi/bus_0`），再直连该地址。Registry
-//! 服务名 `org.a11y.atspi.Registry`，桌面根对象路径
+//! 连接目标是 **a11y bus**（非 session bus）：先试已存在的 socket 候选
+//! （`AT_SPI_BUS_ADDRESS` → `$XDG_RUNTIME_DIR/at-spi/bus_0` → `bus`），全部
+//! 不可达才在 session bus 上调 `org.a11y.Bus.GetAddress()`——只有这一步会
+//! 懒激活 a11y bus（激活有会话级副作用，见 [`AtspiBridge`] 类型文档）。
+//! Registry 服务名 `org.a11y.atspi.Registry`，桌面根对象路径
 //! `/org/a11y/atspi/accessible/root`（at-spi-2.0 atspi-constants.h）。
 //!
 //! 协议要点（对 at-spi2-registryd / Qt atspi 实现实测）：
@@ -30,18 +31,23 @@ pub const BUS_SERVICE: &str = "org.a11y.Bus";
 pub const STATUS_IFACE: &str = "org.a11y.Status";
 /// `org.a11y.Status` 所在对象路径（at-spi2-core bus launcher 注册处）。
 pub const STATUS_PATH: &str = "/org/a11y/bus";
+/// a11y bus 地址环境变量（at-spi2 与工具包共用；未设置时回落 well-known socket）。
+pub const AT_SPI_BUS_ADDRESS_ENV: &str = "AT_SPI_BUS_ADDRESS";
 /// 坐标类型：屏幕坐标（AT_SPI_COORD_TYPE_SCREEN = 0）。
 const COORD_TYPE_SCREEN: u32 = 0;
 /// 语义遍历最大深度保护（深层 Web 树可达数十层）。
 pub const MAX_TRAVERSE_DEPTH: u8 = 24;
 /// session bus 普通方法调用超时（`NameHasOwner`/`ListActivatableNames`
 /// 预检），对齐 §19 D-Bus 5s。
-const SESSION_CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+pub const SESSION_CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 /// `GetAddress` 懒激活超时例外：首次调用会启动私有 a11y bus（dbus-daemon +
 /// registryd），真实会话里需数秒、加载中的会话更久，普通 5s 会在激活完成前
 /// 中止调用、留下 stale socket（Connection refused）。放宽到 30s，仍远低于
 /// dbus-daemon 激活超时 ~120s。
-const GET_ADDRESS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+pub const GET_ADDRESS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// a11y bus socket 连接超时：stale socket 立即 `ECONNREFUSED`，超时只用于
+/// 防对端挂死（socket 存在但无人 accept/认证）。
+pub const BUS_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// 会话 AT-SPI 启用态（`org.a11y.Status`）。
 ///
@@ -67,86 +73,88 @@ impl SessionA11yStatus {
 
 /// AT-SPI D-Bus 桥接。
 ///
-/// 持有到 a11y bus 的独立连接；所有树查询都经由本桥接的引用寻址
-/// `(bus_name, path)` 完成。另持 session bus 连接——启用开关
-/// （[`STATUS_IFACE`]）只存在于 session bus，a11y bus 上没有该对象。
-/// `Clone` 语义为共享同一连接（zbus::Connection 内部是 Arc）。
+/// 持 session bus 与 a11y bus 两条连接：启用开关（[`STATUS_IFACE`]）只在
+/// session bus 上，树查询走 a11y bus。两条连接**惰性建立**——装配期探测
+/// 不触碰 D-Bus：激活 a11y bus 是会话级副作用（`$XDG_RUNTIME_DIR/at-spi/bus_0`
+/// 按 runtime dir 共享，嵌套 session bus 里激活会把正在服务的 a11y bus
+/// 换掉，会话内其它客户端的新连接随即被拒），只有真正使用无障碍时才解析
+/// 地址并连接。缓存连接失效（a11y bus 重启）后下次使用自动重连。
+/// `Clone` 语义为共享同一连接槽位。
 #[derive(Clone)]
 pub struct AtspiBridge {
-    conn: zbus::Connection,
-    session: zbus::Connection,
+    inner: std::sync::Arc<BridgeInner>,
+}
+
+/// 连接槽位：惰性建立 + 失效重连的共享状态。
+struct BridgeInner {
+    conn: tokio::sync::RwLock<Option<zbus::Connection>>,
+    session: tokio::sync::RwLock<Option<zbus::Connection>>,
+}
+
+impl BridgeInner {
+    fn new() -> Self {
+        Self {
+            conn: tokio::sync::RwLock::new(None),
+            session: tokio::sync::RwLock::new(None),
+        }
+    }
 }
 
 impl AtspiBridge {
-    /// 连接 a11y bus。
+    /// 延迟连接句柄：不触碰 D-Bus；首次 [`Self::ensure_connected`] 才建立连接。
+    pub fn deferred() -> Self {
+        Self {
+            inner: std::sync::Arc::new(BridgeInner::new()),
+        }
+    }
+
+    /// 连接 a11y bus（等价 `deferred()` 后立即 [`Self::ensure_connected`]）。
     ///
-    /// 失败（session bus 不通、a11y bus 未启动、Registry 无 owner）
+    /// 失败（session bus 不通、a11y bus 不可达、`org.a11y.Bus` 缺失）
     /// 统一归一为 [`AgentShellError::BackendUnavailable`]——装配层据此
     /// 判定组件 Unavailable 而非崩溃。
     pub async fn connect() -> Result<Self> {
-        let session = zbus::connection::Builder::session()
+        let bridge = Self::deferred();
+        bridge.ensure_connected().await?;
+        Ok(bridge)
+    }
+
+    /// 确保两条连接就绪：已连接且未失效时复用，否则（重）连接。
+    pub async fn ensure_connected(&self) -> Result<()> {
+        let _ = self.session().await?;
+        self.conn().await.map(|_| ())
+    }
+
+    /// 共享连接槽位的克隆构造（component.rs 的 Arc 包装用）。
+    pub fn clone_bridge(&self) -> Self {
+        self.clone()
+    }
+
+    /// session bus 连接（惰性建立 + 失效重连）。
+    async fn session(&self) -> Result<zbus::Connection> {
+        let mut slot = self.inner.session.write().await;
+        if let Some(conn) = slot.as_ref().filter(|c| !c.is_closed()) {
+            return Ok(conn.clone());
+        }
+        let conn = zbus::connection::Builder::session()
             .map_err(|e| AgentShellError::BackendUnavailable(format!("session bus: {e}")))?
             .build()
             .await
             .map_err(|e| AgentShellError::BackendUnavailable(format!("session bus: {e}")))?;
-
-        let dbus = zbus::fdo::DBusProxy::new(&session)
-            .await
-            .map_err(|e| AgentShellError::BackendUnavailable(format!("DBusProxy: {e}")))?;
-        let bus_name = BUS_SERVICE
-            .try_into()
-            .map_err(|e| AgentShellError::BackendUnavailable(format!("bad bus name: {e}")))?;
-        let has_owner = call_bounded(
-            dbus.name_has_owner(bus_name),
-            SESSION_CALL_TIMEOUT,
-            "NameHasOwner",
-        )
-        .await?;
-
-        // 无 owner 时查询可激活列表：可激活 → GetAddress 按需启动 a11y bus；
-        // 不可激活 → 提前返回，不触发激活（避免 ~120s 停顿）。
-        let activatable: Vec<zbus::names::OwnedBusName> = if has_owner {
-            Vec::new()
-        } else {
-            call_bounded(
-                dbus.list_activatable_names(),
-                SESSION_CALL_TIMEOUT,
-                "ListActivatableNames",
-            )
-            .await?
-        };
-        if !should_probe_address(has_owner, &activatable) {
-            return Err(AgentShellError::BackendUnavailable(
-                "org.a11y.Bus not owned and not activatable; AT-SPI support disabled".into(),
-            ));
-        }
-
-        let bus = zbus::Proxy::new(&session, BUS_SERVICE, "/org/a11y/bus", "org.a11y.Bus")
-            .await
-            .map_err(|e| AgentShellError::BackendUnavailable(format!("org.a11y.Bus: {e}")))?;
-        // 返回签名是 s（实测 busctl），不是 v
-        let address: String = call_bounded(
-            bus.call("GetAddress", &()),
-            GET_ADDRESS_TIMEOUT,
-            "org.a11y.Bus.GetAddress",
-        )
-        .await?;
-
-        let conn = zbus::connection::Builder::address(address.as_str())
-            .map_err(|e| AgentShellError::BackendUnavailable(format!("a11y bus addr: {e}")))?
-            .build()
-            .await
-            .map_err(|e| AgentShellError::BackendUnavailable(format!("a11y bus dial: {e}")))?;
-
-        Ok(Self { conn, session })
+        *slot = Some(conn.clone());
+        Ok(conn)
     }
 
-    /// 共享连接的克隆构造（component.rs 的 Arc 包装用）。
-    pub fn clone_bridge(&self) -> Self {
-        Self {
-            conn: self.conn.clone(),
-            session: self.session.clone(),
+    /// a11y bus 连接（惰性建立 + 失效重连；地址解析见 [`dial_a11y`]）。
+    async fn conn(&self) -> Result<zbus::Connection> {
+        let mut slot = self.inner.conn.write().await;
+        if let Some(conn) = slot.as_ref().filter(|c| !c.is_closed()) {
+            return Ok(conn.clone());
         }
+        let session = self.session().await?;
+        let conn = dial_a11y(&session).await?;
+        *slot = Some(conn.clone());
+        Ok(conn)
     }
 
     /// 读会话 AT-SPI 启用态（session bus [`STATUS_IFACE`]）。
@@ -154,7 +162,8 @@ impl AtspiBridge {
     /// 属性缺失（老 at-spi2 无 `IsEnabled`）或读取失败按 false 处理——调用方
     /// [`Self::ensure_enabled`] 据此尝试置位，失败也不阻断树查询。
     pub async fn session_status(&self) -> Result<SessionA11yStatus> {
-        let proxy = zbus::Proxy::new(&self.session, BUS_SERVICE, STATUS_PATH, STATUS_IFACE)
+        let session = self.session().await?;
+        let proxy = zbus::Proxy::new(&session, BUS_SERVICE, STATUS_PATH, STATUS_IFACE)
             .await
             .map_err(|e| AgentShellError::DBus(format!("org.a11y.Status proxy: {e}")))?;
         Ok(SessionA11yStatus {
@@ -182,8 +191,9 @@ impl AtspiBridge {
         if self.session_status().await?.is_active() {
             return Ok(false);
         }
+        let session = self.session().await?;
         let props = zbus::Proxy::new(
-            &self.session,
+            &session,
             BUS_SERVICE,
             STATUS_PATH,
             "org.freedesktop.DBus.Properties",
@@ -219,7 +229,43 @@ impl AtspiBridge {
     }
 
     fn err<T>(r: zbus::Result<T>, what: &'static str) -> Result<T> {
-        r.map_err(|e| AgentShellError::DBus(format!("atspi {what}: {e}")))
+        r.map_err(|e| map_call_error(e, what))
+    }
+
+    /// 读路径重试：连接层失败时清空连接槽位并整体重试一次。
+    ///
+    /// a11y bus 重启后 zbus 异步置 `closed`：在该窗口内复用缓存连接会一直
+    /// 失败（实测 `Broken pipe`）。这里不依赖 zbus 的时序，见错误即清槽重连。
+    /// **只用于幂等读操作**——元素动作（click/set_text）重试可能重复投递。
+    async fn retry_on_connection_loss<T, F, Fut>(&self, mut op: F) -> Result<T>
+    where
+        F: FnMut() -> Fut,
+        Fut: Future<Output = Result<T>>,
+    {
+        match op().await {
+            Err(e) if self.should_reconnect(&e).await => {
+                tracing::debug!("atspi connection lost; reconnecting and retrying once");
+                *self.inner.conn.write().await = None;
+                op().await
+            }
+            other => other,
+        }
+    }
+
+    /// 是否清槽重连：已建立过连接，且（连接已关闭 或 错误来自连接层——
+    /// [`map_call_error`] 把连接层失败归一为 `BackendUnavailable`）。
+    async fn should_reconnect(&self, e: &AgentShellError) -> bool {
+        let cached_closed = self
+            .inner
+            .conn
+            .read()
+            .await
+            .as_ref()
+            .map(|conn| conn.is_closed());
+        should_clear_connection(
+            cached_closed,
+            matches!(e, AgentShellError::BackendUnavailable(_)),
+        )
     }
 
     /// 构造指向指定 `(bus_name, path)` 的通用 Proxy。
@@ -233,7 +279,8 @@ impl AtspiBridge {
         path: &'a str,
         interface: &'a str,
     ) -> Result<zbus::Proxy<'a>> {
-        let b = zbus::proxy::Builder::<zbus::Proxy<'a>>::new(&self.conn)
+        let conn = self.conn().await?;
+        let b = zbus::proxy::Builder::<zbus::Proxy<'a>>::new(&conn)
             .destination(bus_name.to_owned())
             .and_then(|b| b.path(path))
             .map(|b| b.interface(interface))
@@ -260,7 +307,7 @@ impl AtspiBridge {
         let r: R = proxy
             .call(method, body)
             .await
-            .map_err(|e| AgentShellError::DBus(format!("atspi {what}: {e}")))?;
+            .map_err(|e| map_call_error(e, what))?;
         Ok(r)
     }
 
@@ -344,7 +391,10 @@ impl AtspiBridge {
         let Ok(path_obj) = zbus::zvariant::ObjectPath::try_from(path) else {
             return false;
         };
-        let proxy = zbus::fdo::IntrospectableProxy::builder(&self.conn)
+        let Ok(conn) = self.conn().await else {
+            return false;
+        };
+        let proxy = zbus::fdo::IntrospectableProxy::builder(&conn)
             .destination(bus_name)
             .and_then(|b| b.path(path_obj));
         let Ok(proxy) = proxy else { return false };
@@ -374,6 +424,12 @@ impl AtspiBridge {
     /// 获取桌面根下的全部应用节点（等价设计的 `get_desktop()`；
     /// at-spi2 的 Registry 单桌面对象，根的直接子节点即应用列表）。
     pub async fn list_applications(&self) -> Result<Vec<ApplicationNode>> {
+        self.retry_on_connection_loss(|| self.list_applications_once())
+            .await
+    }
+
+    /// [`Self::list_applications`] 本体（无重试，避免与包装层互相递归）。
+    async fn list_applications_once(&self) -> Result<Vec<ApplicationNode>> {
         let count = self.child_count(REGISTRY_SERVICE, ROOT_PATH).await?;
         let mut apps = Vec::with_capacity(count.max(0) as usize);
         for i in 0..count {
@@ -401,7 +457,8 @@ impl AtspiBridge {
     /// 经 DBus daemon 解析总线名的进程 PID。
     async fn pid_of(&self, bus_name: &str) -> Option<u32> {
         let bus: zbus::names::BusName = bus_name.try_into().ok()?;
-        let dbus = zbus::fdo::DBusProxy::new(&self.conn).await.ok()?;
+        let conn = self.conn().await.ok()?;
+        let dbus = zbus::fdo::DBusProxy::new(&conn).await.ok()?;
         dbus.get_connection_unix_process_id(bus).await.ok()
     }
 
@@ -461,8 +518,14 @@ impl AtspiBridge {
 
     /// 全桌面窗口枚举（语义定位的搜索空间）。
     pub async fn all_windows(&self) -> Result<Vec<WindowNode>> {
+        self.retry_on_connection_loss(|| self.all_windows_once())
+            .await
+    }
+
+    /// [`Self::all_windows`] 本体（无重试——内层一律走 `*_once`，避免重试叠加）。
+    async fn all_windows_once(&self) -> Result<Vec<WindowNode>> {
         let mut out = Vec::new();
-        for app in self.list_applications().await? {
+        for app in self.list_applications_once().await? {
             out.extend(self.app_windows(&app).await?);
         }
         Ok(out)
@@ -514,6 +577,12 @@ impl AtspiBridge {
 
     /// 枚举直接子元素（完整 ElementNode 视图）。
     pub async fn children(&self, node: &ElementNode) -> Result<Vec<ElementNode>> {
+        self.retry_on_connection_loss(|| self.children_once(node))
+            .await
+    }
+
+    /// [`Self::children`] 本体（无重试）。
+    async fn children_once(&self, node: &ElementNode) -> Result<Vec<ElementNode>> {
         let count = self.child_count(&node.bus_name, &node.path).await?;
         let mut out = Vec::new();
         for i in 0..count {
@@ -542,25 +611,351 @@ impl AtspiBridge {
         Ok(out)
     }
 
-    /// a11y 总线是否可用（探测装配用；不触发服务激活）。
+    /// Registry 是否**实际可达**（**被动**：不激活 a11y bus，fail-closed）。
     ///
-    /// 注意：实际检查的是 session bus 上 `org.a11y.Bus`（[`BUS_SERVICE`])
-    /// 是否有 owner——它是 a11y 总线的启动入口，存在即代表 AT-SPI 支持
-    /// 已启用；不直接探测 `org.a11y.atspi.Registry`（Registry 在 a11y
-    /// 总线上而非 session 总线，直接 name_has_owner 会误判）。
-    pub async fn bus_available() -> bool {
-        let Ok(session) = zbus::Connection::session().await else {
-            return false;
+    /// 有存活连接时用该连接上的注册结果；否则被动连接 a11y bus（socket 候选 →
+    /// 已注册 launcher 的 GetAddress，均不激活）后查注册。两者皆无（a11y bus
+    /// 仅「可激活」未启动 / 候选与地址都不可达）→ `false`：契约
+    /// [`A11yComponent::registry_available`] 问的是「Registry 是否可达」，不能用
+    /// 「支持存在」作答——与 daemon 探测同状态报 `a11y bus not started` 一致。
+    ///
+    /// [`A11yComponent::registry_available`]: agent_shell_core::component::A11yComponent::registry_available
+    pub async fn registry_reachable(&self) -> bool {
+        let cached = self.cached_registry_owned().await;
+        let probed = match cached {
+            Some(_) => None,
+            None => match self.passive_bus().await {
+                Some(bus) => Self::registry_owned(&bus).await,
+                None => None,
+            },
         };
-        let Ok(dbus) = zbus::fdo::DBusProxy::new(&session).await else {
-            return false;
-        };
-        // BUS_SERVICE 是编译期常量且为合法总线名；解析失败时保守返回 false
-        let Ok(name) = BUS_SERVICE.try_into() else {
-            return false;
-        };
-        matches!(dbus.name_has_owner(name).await, Ok(true))
+        registry_reachability(cached, probed)
     }
+
+    /// 缓存连接上的 Registry 注册查询（`None` = 无存活连接）。
+    async fn cached_registry_owned(&self) -> Option<bool> {
+        let conn = self
+            .inner
+            .conn
+            .read()
+            .await
+            .clone()
+            .filter(|c| !c.is_closed())?;
+        Self::registry_owned(&conn).await
+    }
+
+    /// 被动连接 a11y bus（不激活）：socket 候选 → 已注册 launcher 的地址。
+    async fn passive_bus(&self) -> Option<zbus::Connection> {
+        let session = self.session().await.ok()?;
+        Self::dial_a11y_bus(&session, LauncherActivation::Forbidden)
+            .await
+            .connected()
+    }
+
+    /// a11y bus 上 Registry 名称是否已注册（`None` = 查询失败）。
+    async fn registry_owned(conn: &zbus::Connection) -> Option<bool> {
+        let dbus = zbus::fdo::DBusProxy::new(conn).await.ok()?;
+        let name = REGISTRY_SERVICE.try_into().ok()?;
+        dbus.name_has_owner(name).await.ok()
+    }
+
+    /// 读 `org.a11y.Bus` 注册状态（被动：`NameHasOwner` +
+    /// `ListActivatableNames`；`None` = session bus 不可达）。
+    ///
+    /// 装配期只依赖本判定（[`crate::component::AtSpiComponent::probe`]），
+    /// 不激活 a11y bus。
+    pub async fn launcher_state() -> Option<LauncherState> {
+        let session = zbus::Connection::session().await.ok()?;
+        Self::launcher_state_on(&session).await
+    }
+
+    /// 同 [`Self::launcher_state`]，复用调用方已有的 session bus 连接
+    /// （探测路径避免再开一条连接）。
+    pub async fn launcher_state_on(session: &zbus::Connection) -> Option<LauncherState> {
+        let dbus = zbus::fdo::DBusProxy::new(session).await.ok()?;
+        // BUS_SERVICE 是编译期常量且为合法总线名；解析失败时保守返回 None
+        let name = BUS_SERVICE.try_into().ok()?;
+        let has_owner = dbus.name_has_owner(name).await.ok()?;
+        let activatable = if has_owner {
+            false
+        } else {
+            dbus.list_activatable_names()
+                .await
+                .ok()?
+                .iter()
+                .any(|n| n.as_str() == BUS_SERVICE)
+        };
+        Some(LauncherState {
+            has_owner,
+            activatable,
+        })
+    }
+
+    /// 解析并连接 a11y bus（被动优先）：socket 候选（`AT_SPI_BUS_ADDRESS` /
+    /// `$XDG_RUNTIME_DIR/at-spi/{bus_0,bus}`）→ 已注册 launcher 的 GetAddress → dial。
+    ///
+    /// doctor 与桥接共用本函数，只有文案各自差异化。`activation` 决定 launcher
+    /// 仅「可激活」时是否允许 `GetAddress` 把它拉起：装配/探测传
+    /// [`LauncherActivation::Forbidden`]（不产生副作用），使用路径传
+    /// [`LauncherActivation::Allowed`]。
+    pub async fn dial_a11y_bus(
+        session: &zbus::Connection,
+        activation: LauncherActivation,
+    ) -> A11yBusOutcome {
+        let mut candidate_err = None;
+        for addr in bus_address_candidates() {
+            match dial(&addr).await {
+                Ok(conn) => return A11yBusOutcome::Connected(conn),
+                Err(e) => candidate_err = Some(e),
+            }
+        }
+        match launcher_address(session, activation).await {
+            Ok(address) => match dial(&address).await {
+                Ok(conn) => A11yBusOutcome::Connected(conn),
+                Err(reason) => A11yBusOutcome::Unreachable { address, reason },
+            },
+            Err(LauncherAddressError::NotStarted) => A11yBusOutcome::NotStarted,
+            Err(LauncherAddressError::Unsupported) => A11yBusOutcome::Unsupported,
+            Err(LauncherAddressError::Failed(reason)) => A11yBusOutcome::AddressUnavailable {
+                reason: match candidate_err {
+                    Some(candidate_err) => {
+                        format!("{reason}; candidates also unreachable ({candidate_err})")
+                    }
+                    None => reason,
+                },
+            },
+        }
+    }
+}
+
+/// Registry 可达性判定（被动路径；纯函数，单测锚定 fail-closed 契约）：
+/// 优先用存活连接的查询结果，其次用被动探测到的连接，两者皆无 → 不可达。
+fn registry_reachability(cached: Option<bool>, probed: Option<bool>) -> bool {
+    cached.or(probed).unwrap_or(false)
+}
+
+/// 是否清槽重连（纯函数，单测锚定重试边界）：
+/// - 从未建立过连接（`None`）→ 不重连（连接失败交给调用方原样上抛）；
+/// - 连接已关闭 或 错误来自连接层 → 清槽重连重试一次。
+fn should_clear_connection(cached_closed: Option<bool>, error_is_connection: bool) -> bool {
+    match cached_closed {
+        Some(closed) => closed || error_is_connection,
+        None => false,
+    }
+}
+
+/// session bus 上 `org.a11y.Bus` 的注册状态（`None` = session bus 不可达）。
+#[derive(Clone, Copy)]
+pub struct LauncherState {
+    /// `org.a11y.Bus` 已注册（a11y bus 正在运行或已启动过）。
+    pub has_owner: bool,
+    /// `org.a11y.Bus` 可被 D-Bus 激活（首次使用时按需启动 a11y bus）。
+    pub activatable: bool,
+}
+
+impl LauncherState {
+    /// AT-SPI 支持是否存在（已注册或可激活，二者之一即可按需提供 a11y bus）。
+    pub fn is_supported(self) -> bool {
+        self.has_owner || self.activatable
+    }
+}
+
+/// a11y bus 地址候选（被动解析，不触发激活）：`AT_SPI_BUS_ADDRESS` →
+/// `$XDG_RUNTIME_DIR/at-spi/bus_0`（现代 at-spi2 socket 名）→
+/// `$XDG_RUNTIME_DIR/at-spi/bus`（旧版兜底）。
+///
+/// 工具包同样优先读 `AT_SPI_BUS_ADDRESS`；命中存活的 socket 即可直接连接，
+/// 无需向 session bus 上的 `org.a11y.Bus` 申请地址（那会懒激活 a11y bus）。
+pub fn bus_address_candidates() -> Vec<String> {
+    candidates_from(
+        std::env::var(AT_SPI_BUS_ADDRESS_ENV).ok(),
+        std::env::var("XDG_RUNTIME_DIR").ok().as_deref(),
+    )
+}
+
+/// 候选构造（纯函数：单测不触碰进程环境，`lib.rs` 禁止 unsafe）。
+fn candidates_from(env_addr: Option<String>, runtime_dir: Option<&str>) -> Vec<String> {
+    let mut addrs = Vec::new();
+    if let Some(addr) = env_addr {
+        addrs.push(addr);
+    }
+    if let Some(runtime) = runtime_dir {
+        addrs.push(format!("unix:path={runtime}/at-spi/bus_0"));
+        addrs.push(format!("unix:path={runtime}/at-spi/bus"));
+    }
+    addrs
+}
+
+/// 未启动的 a11y bus 可否由本次调用按需拉起（`GetAddress` 懒激活）。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum LauncherActivation {
+    /// 使用路径（首次真正用无障碍）：允许——按需启动 a11y bus 是既有语义。
+    Allowed,
+    /// 装配/探测路径：禁止——激活是会话级副作用，见 [`AtspiBridge`] 类型文档。
+    Forbidden,
+}
+
+/// a11y bus 连接尝试的结果（分级）。
+///
+/// doctor 与桥接共用同一条解析链（[`dial_a11y_bus`]），只有文案各自差异化——
+/// 两条链各自演进会让「doctor 报告的总线」与「a11y 查询用的总线」漂移。
+pub enum A11yBusOutcome {
+    /// 已连接（socket 候选命中，或 launcher 给出地址后连上）。
+    Connected(zbus::Connection),
+    /// launcher 地址解析失败（预检或 `GetAddress` 出错/超时）：阶段 = 地址解析。
+    AddressUnavailable { reason: String },
+    /// 地址已解析但该地址连不上：阶段 = dial（socket 已被替换或遗留）。
+    Unreachable { address: String, reason: String },
+    /// launcher 未注册但可激活：a11y bus 未启动（调用方可按需启动）。
+    NotStarted,
+    /// launcher 未注册且不可激活：无 at-spi2-core（或其 a11y 被禁用）。
+    Unsupported,
+}
+
+impl A11yBusOutcome {
+    /// 已连接时返回连接（zbus 连接是 Arc 语义的浅拷贝）。
+    pub fn connected(&self) -> Option<zbus::Connection> {
+        match self {
+            Self::Connected(conn) => Some(conn.clone()),
+            _ => None,
+        }
+    }
+
+    /// 失败归因（分级文案；`Connected` 为 `None`）。调用方按需追加处置提示。
+    pub fn reason(&self) -> Option<String> {
+        match self {
+            Self::Connected(_) => None,
+            Self::AddressUnavailable { reason } => {
+                Some(format!("a11y bus address resolution failed ({reason})"))
+            }
+            Self::Unreachable { address, reason } => {
+                Some(format!("a11y bus unreachable at {address} ({reason})"))
+            }
+            Self::NotStarted => Some(format!(
+                "a11y bus not started ({BUS_SERVICE} starts on demand)"
+            )),
+            Self::Unsupported => Some(format!(
+                "{BUS_SERVICE} not registered and not activatable (at-spi2-core missing?)"
+            )),
+        }
+    }
+}
+
+/// [`dial_a11y_bus`] 的 Result 版本（桥接内部使用）：失败归一为
+/// [`AgentShellError::BackendUnavailable`]（带分级归因）。
+async fn dial_a11y(session: &zbus::Connection) -> Result<zbus::Connection> {
+    let outcome = AtspiBridge::dial_a11y_bus(session, LauncherActivation::Allowed).await;
+    outcome.connected().ok_or_else(|| {
+        AgentShellError::BackendUnavailable(
+            outcome
+                .reason()
+                .unwrap_or_else(|| "a11y bus unavailable".into()),
+        )
+    })
+}
+
+/// 按地址建立 a11y bus 连接（有界超时：stale socket 立即 ECONNREFUSED，
+/// 但对端挂死时不能无限等待）。
+async fn dial(address: &str) -> std::result::Result<zbus::Connection, String> {
+    let builder = zbus::connection::Builder::address(address)
+        .map_err(|e| format!("a11y bus addr {address}: {e}"))?;
+    tokio::time::timeout(BUS_CONNECT_TIMEOUT, builder.build())
+        .await
+        .map_err(|_| format!("a11y bus dial timed out: {address}"))?
+        .map_err(|e| format!("a11y bus dial {address}: {e}"))
+}
+
+/// `GetAddress` 上限：launcher 未注册时可能懒激活（[`GET_ADDRESS_TIMEOUT`]
+/// 的 30s 例外）；已注册时不可能发生激活，健康 launcher 毫秒级应答、挂死的
+/// launcher 也不该拖满 30s，用普通调用上限（纯函数，单测覆盖）。
+fn get_address_timeout(has_owner: bool) -> std::time::Duration {
+    if has_owner {
+        SESSION_CALL_TIMEOUT
+    } else {
+        GET_ADDRESS_TIMEOUT
+    }
+}
+
+/// launcher 地址解析失败的分级原因。
+enum LauncherAddressError {
+    /// 未注册但可激活：a11y bus 未启动（激活被本次调用禁止或调用方不激活）。
+    NotStarted,
+    /// 未注册且不可激活：无 at-spi2-core。
+    Unsupported,
+    /// 调用失败（预检或 `GetAddress` 出错/超时）。
+    Failed(String),
+}
+
+/// session bus `org.a11y.Bus.GetAddress()`（返回 a11y bus 地址）。
+async fn launcher_address(
+    session: &zbus::Connection,
+    activation: LauncherActivation,
+) -> std::result::Result<String, LauncherAddressError> {
+    let dbus = zbus::fdo::DBusProxy::new(session)
+        .await
+        .map_err(|e| LauncherAddressError::Failed(format!("DBusProxy: {e}")))?;
+    let bus_name = BUS_SERVICE
+        .try_into()
+        .map_err(|e| LauncherAddressError::Failed(format!("bad bus name: {e}")))?;
+    let has_owner = call_bounded(
+        dbus.name_has_owner(bus_name),
+        SESSION_CALL_TIMEOUT,
+        "NameHasOwner",
+    )
+    .await
+    .map_err(|e| LauncherAddressError::Failed(e.to_string()))?;
+
+    if !has_owner {
+        let activatable: Vec<zbus::names::OwnedBusName> = call_bounded(
+            dbus.list_activatable_names(),
+            SESSION_CALL_TIMEOUT,
+            "ListActivatableNames",
+        )
+        .await
+        .map_err(|e| LauncherAddressError::Failed(e.to_string()))?;
+        if !should_probe_address(has_owner, &activatable) {
+            return Err(LauncherAddressError::Unsupported);
+        }
+        if activation == LauncherActivation::Forbidden {
+            // `GetAddress` 会把 launcher 拉起来——探测/装配不做这种事。
+            return Err(LauncherAddressError::NotStarted);
+        }
+    }
+
+    let bus = zbus::Proxy::new(session, BUS_SERVICE, "/org/a11y/bus", "org.a11y.Bus")
+        .await
+        .map_err(|e| LauncherAddressError::Failed(format!("{BUS_SERVICE} proxy: {e}")))?;
+    // 返回签名是 s（实测 busctl），不是 v
+    call_bounded(
+        bus.call("GetAddress", &()),
+        get_address_timeout(has_owner),
+        "org.a11y.Bus.GetAddress",
+    )
+    .await
+    .map_err(|e| LauncherAddressError::Failed(e.to_string()))
+}
+
+/// zbus 调用错误 → [`AgentShellError`]：
+/// 连接层失败归一为 [`AgentShellError::BackendUnavailable`]（可区分、可重连），
+/// 其余保留 `DBus` 错误。
+///
+/// 连接层失败必须可区分——读路径据此清空连接槽位并重连重试
+/// （见 `AtspiBridge::retry_on_connection_loss`）。
+fn map_call_error(e: zbus::Error, what: &'static str) -> AgentShellError {
+    if is_connection_loss(&e) {
+        AgentShellError::BackendUnavailable(format!("atspi {what}: {e}"))
+    } else {
+        AgentShellError::DBus(format!("atspi {what}: {e}"))
+    }
+}
+
+/// 连接层失败判定：socket I/O 错误、连接建立失败、握手失败都说明当前连接
+/// 不可再用（zbus 的 `is_closed` 随后置位，但调用方不应依赖该时序）。
+fn is_connection_loss(e: &zbus::Error) -> bool {
+    matches!(
+        e,
+        zbus::Error::InputOutput(_) | zbus::Error::Connection(..) | zbus::Error::Handshake(_)
+    )
 }
 
 /// 有界 D-Bus 方法调用：超时或总线错误统一归一为 [`AgentShellError::BackendUnavailable`]。
@@ -626,6 +1021,289 @@ mod tests {
         assert_eq!(SESSION_CALL_TIMEOUT, std::time::Duration::from_secs(5));
         assert_eq!(GET_ADDRESS_TIMEOUT, std::time::Duration::from_secs(30));
         assert!(GET_ADDRESS_TIMEOUT > SESSION_CALL_TIMEOUT);
+    }
+
+    #[test]
+    fn candidates_prefer_env_then_well_known_sockets() {
+        assert_eq!(
+            candidates_from(
+                Some("unix:path=/tmp/custom-bus".to_string()),
+                Some("/run/user/1000")
+            ),
+            vec![
+                "unix:path=/tmp/custom-bus".to_string(),
+                "unix:path=/run/user/1000/at-spi/bus_0".to_string(),
+                "unix:path=/run/user/1000/at-spi/bus".to_string(),
+            ]
+        );
+        // 无环境变量 / 无 runtime dir（TTY、容器）时不产出候选
+        assert_eq!(candidates_from(None, Some("/run/user/1000")).len(), 2);
+        assert!(candidates_from(None, None).is_empty());
+    }
+
+    /// 支持判定：已注册或可激活即支持（装配期据此决定是否构造组件，
+    /// 不激活服务）。
+    #[test]
+    fn launcher_state_support_requires_owner_or_activatable() {
+        let state = |has_owner, activatable| LauncherState {
+            has_owner,
+            activatable,
+        };
+        assert!(state(true, false).is_supported());
+        assert!(state(false, true).is_supported());
+        assert!(!state(false, false).is_supported());
+    }
+
+    /// `GetAddress` 上限按「是否可能懒激活」选择：已注册的 launcher 不会触发
+    /// 激活（健康时毫秒级应答，挂死也不该拖满 30s），未注册才用 30s 例外。
+    #[test]
+    fn get_address_timeout_follows_activation_possibility() {
+        assert_eq!(get_address_timeout(true), SESSION_CALL_TIMEOUT);
+        assert_eq!(get_address_timeout(false), GET_ADDRESS_TIMEOUT);
+        assert!(get_address_timeout(true) < get_address_timeout(false));
+    }
+
+    /// 重试边界：从未连上（`None`）不重试——连接失败交由调用方上抛；已建立过
+    /// 连接后，连接已关闭或连接层错误才清槽重连；语义错误不重试。
+    #[test]
+    fn reconnect_only_after_established_connection_is_lost() {
+        assert!(!should_clear_connection(None, true));
+        assert!(!should_clear_connection(None, false));
+        assert!(should_clear_connection(Some(true), false));
+        assert!(should_clear_connection(Some(false), true));
+        assert!(!should_clear_connection(Some(false), false));
+    }
+
+    /// Registry 可达性 fail-closed：无存活连接、被动探测也无 bus（a11y bus 仅
+    /// 可激活、未启动）→ 不可达；有证据时按证据作答。
+    #[test]
+    fn registry_reachability_fails_closed_without_reachable_bus() {
+        assert!(!registry_reachability(None, None));
+        assert!(registry_reachability(Some(true), None));
+        assert!(!registry_reachability(Some(false), None));
+        assert!(registry_reachability(None, Some(true)));
+        assert!(!registry_reachability(None, Some(false)));
+    }
+
+    /// 失败归因分级：三种失败各自可辨，doctor 的状态行据此归因。
+    #[test]
+    fn bus_outcome_reasons_are_stage_specific() {
+        let unreachable = A11yBusOutcome::Unreachable {
+            address: "unix:path=/run/user/1000/at-spi/bus_0".to_string(),
+            reason: "a11y bus dial: Connection refused".to_string(),
+        };
+        assert_eq!(
+            unreachable.reason().as_deref(),
+            Some(
+                "a11y bus unreachable at unix:path=/run/user/1000/at-spi/bus_0 \
+                 (a11y bus dial: Connection refused)"
+            )
+        );
+        assert_eq!(
+            A11yBusOutcome::AddressUnavailable {
+                reason: "NameHasOwner(org.a11y.Bus) timed out".to_string(),
+            }
+            .reason()
+            .as_deref(),
+            Some(
+                "a11y bus address resolution failed \
+                 (NameHasOwner(org.a11y.Bus) timed out)"
+            )
+        );
+        assert_eq!(
+            A11yBusOutcome::NotStarted.reason().as_deref(),
+            Some("a11y bus not started (org.a11y.Bus starts on demand)")
+        );
+        assert_eq!(
+            A11yBusOutcome::Unsupported.reason().as_deref(),
+            Some("org.a11y.Bus not registered and not activatable (at-spi2-core missing?)")
+        );
+    }
+
+    /// 私有 session bus：用例内自建（`dbus-daemon --print-address`），使断言
+    /// 不依赖宿主 session bus——CI（无 session bus）下同样执行。
+    struct PrivateBus {
+        child: std::process::Child,
+        address: String,
+    }
+
+    impl PrivateBus {
+        /// 启动私有 session bus；`address` 显式给定时改用该地址（用例借此构造
+        /// 启动失败：不可绑定的路径 → daemon 立即退出、stdout 无地址行）。
+        ///
+        /// `child` 先移入 `Self`（带 `Drop`）再读取地址：地址行读不到而提前
+        /// 返回时同样走 Drop 的 kill + wait + unlink，不留存活进程、zombie 或
+        /// stale socket。启动失败（缺 `dbus-daemon`）返回 `None`，由调用方输出
+        /// 可见 SKIP 行。
+        fn start_with(address: Option<&str>) -> Option<Self> {
+            let mut command = std::process::Command::new("dbus-daemon");
+            command
+                .args(["--session", "--nofork", "--print-address=1"])
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::null());
+            if let Some(address) = address {
+                command.arg(format!("--address={address}"));
+            }
+            let mut bus = Self {
+                child: command.spawn().ok()?,
+                address: String::new(),
+            };
+            let mut stdout = bus.child.stdout.take()?;
+            bus.address = read_address_line(&mut stdout)?;
+            (!bus.address.is_empty()).then_some(bus)
+        }
+
+        fn start() -> Option<Self> {
+            Self::start_with(None)
+        }
+
+        async fn connect(&self) -> zbus::Connection {
+            zbus::connection::Builder::address(self.address.as_str())
+                .expect("private bus address must parse")
+                .build()
+                .await
+                .expect("connect to private bus")
+        }
+
+        /// 地址中的 socket 路径（`unix:path=<p>[,guid=…]`）。
+        fn socket_path(&self) -> Option<&str> {
+            let rest = self.address.strip_prefix("unix:path=")?;
+            Some(rest.split(',').next().unwrap_or(rest))
+        }
+    }
+
+    impl Drop for PrivateBus {
+        fn drop(&mut self) {
+            // `lib.rs` 禁止 unsafe（不能用 libc 发 SIGTERM），而 SIGKILL 跳过
+            // dbus-daemon 的清理路径——显式 unlink 其 socket，避免在 /tmp 累积
+            // stale /tmp/dbus-* 文件。
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+            if let Some(path) = self.socket_path() {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+    }
+
+    /// 逐字节读地址行（`--print-address=1` 恰好一行；缓存读会吞掉后续输出）。
+    fn read_address_line(stdout: &mut std::process::ChildStdout) -> Option<String> {
+        use std::io::Read as _;
+        let mut bytes = Vec::new();
+        let mut buf = [0u8; 1];
+        loop {
+            match stdout.read(&mut buf) {
+                Ok(0) => break,
+                Ok(_) if buf[0] == b'\n' => break,
+                Ok(_) => bytes.push(buf[0]),
+                Err(_) => return None,
+            }
+        }
+        String::from_utf8(bytes).ok()
+    }
+
+    /// 本进程当前处于 zombie 态的子进程 PID（`/proc` 扫描；不可读项跳过）。
+    fn zombie_children() -> Vec<u32> {
+        let me = std::process::id();
+        let mut zombies = Vec::new();
+        let Ok(entries) = std::fs::read_dir("/proc") else {
+            return zombies;
+        };
+        for entry in entries.flatten() {
+            let Some(pid) = entry.file_name().to_str().and_then(|s| s.parse().ok()) else {
+                continue;
+            };
+            let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+                continue;
+            };
+            // 字段：pid (comm) state ppid …；comm 可含空格/括号，故从其最后一个
+            // ')' 之后再切分。
+            let Some((_, rest)) = stat.rsplit_once(')') else {
+                continue;
+            };
+            let mut fields = rest.split_whitespace();
+            let state = fields.next().unwrap_or("");
+            let ppid = fields.next().and_then(|p| p.parse::<u32>().ok());
+            if state == "Z" && ppid == Some(me) {
+                zombies.push(pid);
+            }
+        }
+        zombies
+    }
+
+    /// 启动失败路径必须收尾干净：地址行读不到（daemon 启动即失败退出）时
+    /// `child` 已在带 `Drop` 的守卫里——kill + wait 之后不得留下 zombie
+    /// 子进程（`std::process::Child` 自身没有 Drop，未 wait 的子进程会变
+    /// zombie 直到本进程退出）。
+    #[test]
+    fn private_bus_start_failure_is_reaped() {
+        if std::process::Command::new("dbus-daemon")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            eprintln!("SKIP: dbus-daemon unavailable; private_bus_start_failure_is_reaped");
+            return;
+        }
+        // 先留出窗口让并行用例各自 spawn 的 bus 完成 kill + wait，再取基线。
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let baseline = zombie_children();
+
+        // 目录不存在的地址无法 bind：daemon 打印到 stderr 后立即退出，stdout 无
+        // 地址行 → start_with 返回 None（并走 Drop 收尾）。
+        let failed = PrivateBus::start_with(Some("unix:path=/nonexistent-dir-agent-shell/bus"));
+        assert!(failed.is_none(), "不可绑定的地址必须启动失败（无地址行）");
+
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert_eq!(
+            zombie_children(),
+            baseline,
+            "启动失败路径不得留下 zombie 子进程"
+        );
+    }
+
+    /// 读路径重试的观测行为：连接层失败时清空连接槽位并整体重试一次。
+    ///
+    /// 缓存槽里放一条**已关闭**的连接（`close()`），op 恒失败于连接层错误——
+    /// 断言调用两次且槽位被清空。连接取自用例内自建的私有总线，任何环境
+    /// （含无 session bus 的 CI 门禁）都执行断言；缺 `dbus-daemon` 时输出可见
+    /// SKIP 行而非静默通过。
+    #[tokio::test]
+    async fn retry_on_connection_loss_clears_slot_and_retries_once() {
+        let Some(bus) = PrivateBus::start() else {
+            eprintln!(
+                "SKIP: dbus-daemon unavailable; \
+                 retry_on_connection_loss_clears_slot_and_retries_once"
+            );
+            return;
+        };
+        let conn = bus.connect().await;
+        let bridge = AtspiBridge::deferred();
+        let probe = conn.clone();
+        conn.close().await.expect("close private bus connection");
+        assert!(probe.is_closed(), "closed connection must report closed");
+        *bridge.inner.conn.write().await = Some(probe);
+
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let out: Result<u32> = bridge
+            .retry_on_connection_loss(|| {
+                calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async {
+                    Err(AgentShellError::BackendUnavailable(
+                        "atspi ChildCount: I/O error: Broken pipe".into(),
+                    ))
+                }
+            })
+            .await;
+        assert!(out.is_err());
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "连接层失败应清槽重连后整体重试一次"
+        );
+        assert!(
+            bridge.inner.conn.read().await.is_none(),
+            "失效连接必须被清槽，后续调用才不复用 stale 连接"
+        );
     }
 
     #[test]

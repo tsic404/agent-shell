@@ -92,6 +92,9 @@ pub mod method {
     /// 截图落盘（daemon 侧执行捕获与写文件）。
     pub const SCREENSHOT_CAPTURE: &str = "screenshot.capture";
     /// AT-SPI Registry 可达性探测。
+    ///
+    /// 写副作用：Registry 已退出但可激活时按需拉起 registryd（会话内重启
+    /// 恢复），状态行注明 `Registry started on demand`；a11y bus 本身不激活。
     pub const A11Y_STATUS: &str = "a11y.status";
     /// 语义查询（role/name 过滤，§14.3）。
     pub const A11Y_QUERY: &str = "a11y.query";
