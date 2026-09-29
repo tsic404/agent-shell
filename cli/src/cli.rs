@@ -5,6 +5,7 @@
 
 use agent_shell_rpc::keys::{Key, KeyCombo, KeyName, ModifierMask};
 use clap::{Args as ClapArgs, Parser, Subcommand};
+use std::path::PathBuf;
 
 /// agent-shell——桌面自动化 CLI 入口。
 ///
@@ -24,6 +25,15 @@ pub struct Cli {
     /// 「daemon 连接提前关闭」时重建连接重试次数（§19 短退避）
     #[arg(long = "retry", global = true, default_value_t = 0)]
     pub retry: u32,
+
+    /// 直连已运行的 daemon 端点（unix socket）；默认自动拉起瞬态 daemon
+    #[arg(
+        long = "socket",
+        global = true,
+        env = "AGENT_SHELL_SOCKET",
+        value_name = "PATH"
+    )]
+    pub socket: Option<PathBuf>,
 
     #[command(subcommand)]
     pub command: Option<Command>,

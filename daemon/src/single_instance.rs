@@ -33,15 +33,43 @@ const LOCK_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
 /// 轮询实现有界等待；30s / 100ms = 300 次尝试，代价可忽略。
 const LOCK_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
+/// 锁路径环境变量：覆盖默认会话级锁路径（`--lock-path` 优先于本变量）。
+pub const ENV_LOCK_PATH: &str = "AGENT_SHELL_LOCK";
+
+/// 解析单实例锁路径：`--lock-path` 显式值 > `AGENT_SHELL_LOCK` env > 默认路径。
+///
+/// 独立路径仍是独立命名空间：并行测试/无图形会话的隔离实例互不阻塞，同一路径
+/// 上的第二个实例照旧被拦下。空值（含全空白）视为未设置，避免误落到 CWD。
+pub fn resolve_lock_path(flag: Option<&Path>) -> PathBuf {
+    resolve_lock_path_from(flag, std::env::var(ENV_LOCK_PATH).ok().as_deref())
+}
+
+/// [`resolve_lock_path`] 的纯函数形态（env 取值显式传入，单测不碰进程环境）。
+fn resolve_lock_path_from(flag: Option<&Path>, env: Option<&str>) -> PathBuf {
+    if let Some(path) = flag {
+        return path.to_path_buf();
+    }
+    if let Some(path) = env.filter(|p| !p.trim().is_empty()) {
+        return PathBuf::from(path);
+    }
+    default_lock_path()
+}
+
 impl SingleInstanceLock {
-    /// 获取单实例锁。锁被前一个 daemon 持有时排队等待（有界），超时方返回
-    /// `daemon already running`。
-    pub fn acquire() -> Result<Self, String> {
-        Self::acquire_at(&default_lock_path(), LOCK_WAIT_TIMEOUT)
+    /// 以默认等待窗口在指定路径获取锁（`--lock-path`/`AGENT_SHELL_LOCK` 隔离实例）。
+    ///
+    /// 使用方须已按 [`resolve_lock_path`] 解析路径；等待语义与默认会话锁相同。
+    pub fn acquire_at_path(path: &Path) -> Result<Self, String> {
+        Self::acquire_at(path, LOCK_WAIT_TIMEOUT)
     }
 
-    /// 在指定路径、指定等待窗口内获取锁（生产走 [`acquire`]，测试用临时路径
-    /// 与毫秒级窗口隔离并行并覆盖超时路径）。
+    /// 在指定路径、指定等待窗口内获取锁（生产走 [`Self::acquire_at_path`]，测试用
+    /// 临时路径与毫秒级窗口隔离并行并覆盖超时路径）。
+    ///
+    /// 路径可来自 `--lock-path`/`AGENT_SHELL_LOCK`，可能落在共享目录：打开前先按
+    /// 类型拒绝非普通文件（符号链接/目录/FIFO…），打开用 `O_NOFOLLOW` 关掉
+    /// check→open 窗口，PID 也只经已打开的 fd 覆写——三段一起堵死「把锁路径做成
+    /// 指向他人文件的符号链接，受害者一启动就截断改写之」。
     fn acquire_at(path: &Path, timeout: Duration) -> Result<Self, String> {
         if let Some(parent) = path.parent() {
             if let Err(e) = std::fs::create_dir_all(parent) {
@@ -49,14 +77,31 @@ impl SingleInstanceLock {
             }
         }
 
+        match std::fs::symlink_metadata(path) {
+            Ok(meta) if !meta.file_type().is_file() => {
+                return Err(format!(
+                    "refusing to use lock path {}: existing path is a {}, not a regular file \
+                     (use a path under a user-private directory such as $XDG_RUNTIME_DIR)",
+                    path.display(),
+                    crate::path_guard::describe_file_type(&meta.file_type())
+                ))
+            }
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(format!("cannot inspect lock path {}: {e}", path.display())),
+        }
+
         // `.truncate(false)`：排队等待方 open 时若 truncate 会清空持锁方写入的
         // PID（最长 30s 窗口内锁文件被清空）。PID 仅作调试提示，且 flock 不依赖
-        // 文件内容；改由取得锁后经 `write` 覆写，持锁期间 PID 保持可见。
+        // 文件内容；改由取得锁后经 fd 覆写，持锁期间 PID 保持可见。
+        // `O_NOFOLLOW`：上面刚判过类型，这里再让内核兜底拒绝符号链接。
+        use std::os::unix::fs::OpenOptionsExt;
         let file = OpenOptions::new()
             .create(true)
             .truncate(false)
             .read(true)
             .write(true)
+            .custom_flags(libc::O_NOFOLLOW)
             .open(path)
             .map_err(|e| format!("cannot create lock file {}: {e}", path.display()))?;
 
@@ -72,9 +117,12 @@ impl SingleInstanceLock {
             Err(e) => return Err(e),
         }
 
-        // 写入 PID 便于调试（锁文件常驻，stale PID 仅作提示）。
+        // 写入 PID 便于调试（锁文件常驻，stale PID 仅作提示）。经已打开的 fd 覆写，
+        // 不再按路径二次打开——那等于把刚堵上的符号链接/替换窗口再开一次。
         let pid = std::process::id();
-        let _ = std::fs::write(path, format!("{pid}\n"));
+        if let Err(e) = write_pid(&file, pid) {
+            tracing::warn!("cannot record pid in {}: {e}", path.display());
+        }
         tracing::info!(pid, "single-instance lock acquired");
         Ok(Self { _file: file })
     }
@@ -83,6 +131,18 @@ impl SingleInstanceLock {
     pub fn release(self) {
         // flock 在 _file 析构时释放；锁文件常驻，不在此删除（见结构体注释）。
     }
+}
+
+/// 经已打开的锁文件 fd 覆写 PID：先截断再写，位置固定在文件头。
+///
+/// 只用 fd 不用路径：路径可被替换，写穿符号链接会截断他人文件。
+fn write_pid(file: &std::fs::File, pid: u32) -> std::io::Result<()> {
+    use std::io::{Seek, SeekFrom, Write};
+    let mut file = file;
+    file.set_len(0)?;
+    file.seek(SeekFrom::Start(0))?;
+    file.write_all(format!("{pid}\n").as_bytes())?;
+    file.flush()
 }
 
 /// 有界排他锁：`flock(LOCK_EX | LOCK_NB)`，`WouldBlock` 时轮询等待直至
@@ -119,7 +179,7 @@ pub fn runtime_dir() -> PathBuf {
     PathBuf::from(format!("/run/user/{uid}"))
 }
 
-/// 默认锁文件路径 `$XDG_RUNTIME_DIR/agent-shell.lock`。独立于 [`SingleInstanceLock::acquire`]
+/// 默认锁文件路径 `$XDG_RUNTIME_DIR/agent-shell.lock`。独立于 [`resolve_lock_path`]
 /// 存在，使路径构造可被单测覆盖——测试只能做路径级断言，触碰全局锁即与常驻 daemon 竞争。
 fn default_lock_path() -> PathBuf {
     runtime_dir().join("agent-shell.lock")
@@ -162,6 +222,114 @@ mod tests {
     fn test_state_dir_ends_with_agent_shell() {
         let dir = state_dir();
         assert!(dir.to_string_lossy().ends_with("agent-shell"));
+    }
+
+    #[test]
+    fn resolve_lock_path_prefers_explicit_flag_over_env() {
+        let path = resolve_lock_path_from(Some(Path::new("/tmp/flag.lock")), Some("/tmp/env.lock"));
+        assert_eq!(path, PathBuf::from("/tmp/flag.lock"));
+    }
+
+    #[test]
+    fn resolve_lock_path_uses_env_when_flag_absent() {
+        assert_eq!(
+            resolve_lock_path_from(None, Some("/tmp/env.lock")),
+            PathBuf::from("/tmp/env.lock")
+        );
+    }
+
+    #[test]
+    fn resolve_lock_path_falls_back_to_default_when_unset_or_blank() {
+        // 空值/全空白视为未设置：`AGENT_SHELL_LOCK=` 不得把锁落到相对路径。
+        for env in [None, Some(""), Some("   ")] {
+            assert_eq!(resolve_lock_path_from(None, env), default_lock_path());
+        }
+    }
+
+    /// 锁路径是符号链接时必须拒绝：共享目录里他人预埋链接，受害者的「打开锁文件 +
+    /// 截断写 PID」会变成改写链接目标（如 `~/.bashrc`）。拒绝后目标内容不变。
+    #[test]
+    fn lock_path_symlink_is_refused_and_target_untouched() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let target = dir.path().join("victim.txt");
+        std::fs::write(&target, "precious content").expect("write target");
+        let lock = dir.path().join("agent-shell.lock");
+        std::os::unix::fs::symlink(&target, &lock).expect("plant symlink");
+
+        let err = match SingleInstanceLock::acquire_at(&lock, Duration::from_millis(200)) {
+            Ok(_) => panic!("symlinked lock path must be refused"),
+            Err(e) => e,
+        };
+        assert!(
+            err.contains("symlink") && err.contains(&lock.display().to_string()),
+            "error must name the symlink and the path: {err}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&target).expect("target readable"),
+            "precious content",
+            "symlink target must not be truncated or rewritten"
+        );
+    }
+
+    /// 悬空符号链接同样拒绝（`O_NOFOLLOW` 与类型检查都不允许它变成「新建目标文件」）。
+    #[test]
+    fn dangling_lock_symlink_is_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let lock = dir.path().join("agent-shell.lock");
+        std::os::unix::fs::symlink(dir.path().join("missing.txt"), &lock).expect("plant symlink");
+        let err = match SingleInstanceLock::acquire_at(&lock, Duration::from_millis(200)) {
+            Ok(_) => panic!("dangling symlink must be refused"),
+            Err(e) => e,
+        };
+        assert!(err.contains("symlink"), "error must name the type: {err}");
+        assert!(
+            !dir.path().join("missing.txt").exists(),
+            "must not create the symlink target"
+        );
+    }
+
+    /// 目录占位同样拒绝（`flock` 对目录语义不同，不能当锁文件用）。
+    #[test]
+    fn lock_path_directory_is_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let lock = dir.path().join("lock-dir");
+        std::fs::create_dir(&lock).expect("create dir");
+        let err = match SingleInstanceLock::acquire_at(&lock, Duration::from_millis(200)) {
+            Ok(_) => panic!("directory lock path must be refused"),
+            Err(e) => e,
+        };
+        assert!(err.contains("directory"), "error must name the type: {err}");
+        assert!(lock.is_dir(), "directory must survive");
+    }
+
+    /// 拒绝符号链接后，换成普通文件路径可正常取锁，且同一路径上的第二个实例
+    /// 仍被拦下——清理掉预埋链接并不能绕过单实例语义。
+    #[test]
+    fn lock_still_excludes_second_instance_after_symlink_removed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let target = dir.path().join("victim.txt");
+        std::fs::write(&target, "precious").expect("write target");
+        let lock = dir.path().join("agent-shell.lock");
+        std::os::unix::fs::symlink(&target, &lock).expect("plant symlink");
+        assert!(SingleInstanceLock::acquire_at(&lock, Duration::from_millis(100)).is_err());
+
+        std::fs::remove_file(&lock).expect("remove planted symlink");
+        let held = SingleInstanceLock::acquire_at(&lock, Duration::from_millis(200))
+            .expect("plain path acquires");
+        let err = match SingleInstanceLock::acquire_at(&lock, Duration::from_millis(150)) {
+            Ok(_) => panic!("second instance must be refused while the lock is held"),
+            Err(e) => e,
+        };
+        assert!(
+            err.contains("daemon already running"),
+            "unexpected error: {err}"
+        );
+        drop(held);
+        assert_eq!(
+            std::fs::read_to_string(&target).expect("target readable"),
+            "precious",
+            "refused symlink attempt must leave the target alone"
+        );
     }
 
     #[test]

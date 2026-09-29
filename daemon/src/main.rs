@@ -1,33 +1,59 @@
 //! agent-shell-daemon 入口（设计文档 §22.2 D1 / §23.2）。
 //!
-//! 单一形态：从 inherited stdin 逐行读 JSON-RPC、逐行写响应，stdin EOF 或
-//! 空闲超时（默认 30min，`--idle-timeout-secs` 可配置）即退出。CLI/MCP 经
-//! fork/exec 本二进制并以 stdio 管道承载协议——瞬态子进程随父进程退出
-//! （stdin EOF）自行终止，不残留孤儿。手动调试用管道保持 stdin 打开即可
-//! 维持运行（`tail -f /dev/null | agent-shell-daemon`）；`/dev/null`、
-//! 重定向或后台等非交互 stdin 会立即 EOF 退出。
+//! 两种接入形态，共用同一请求服务循环（见 [`serve`]）：
+//! - 默认 stdio：从 inherited stdin 逐行读 JSON-RPC、逐行写响应，stdin EOF 或
+//!   空闲超时（默认 30min，`--idle-timeout-secs` 可配置）即退出。CLI/MCP 经
+//!   fork/exec 本二进制并以 stdio 管道承载协议——瞬态子进程随父进程退出
+//!   （stdin EOF）自行终止，不残留孤儿。
+//! - `--socket <path>`：显式 Unix socket 端点，常驻服务多条连接，同样按空闲
+//!   超时退出。供无图形会话（QA/调试）用 `agent-shell --socket <path>` 直连。
+//!
+//! 单实例锁默认走 `$XDG_RUNTIME_DIR/agent-shell.lock`；`--lock-path` 与
+//! `AGENT_SHELL_LOCK` 提供隔离命名空间，`--no-lock` 完全跳过（并行测试实例）。
+//!
+//! 手动调试 stdio 形态时用管道保持 stdin 打开即可维持运行
+//! （`tail -f /dev/null | agent-shell-daemon`）；`/dev/null`、重定向或后台等
+//! 非交互 stdin 会立即 EOF 退出。
 
 mod a11y;
 mod capture;
 mod dispatch;
 mod ime_session;
 mod input;
+mod path_guard;
 mod portal_sessions;
 mod rootd_client;
+mod serve;
 mod single_instance;
 mod state;
 
-use agent_shell_rpc::{Notification, Request, Response};
 use state::Daemon;
-use std::sync::Arc;
+use std::path::PathBuf;
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+/// 空闲超时默认值：30min（§22.2 激活策略）。
+const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 30 * 60;
+
+const USAGE: &str = "usage: agent-shell-daemon [--idle-timeout-secs N] [--socket PATH] \
+                     [--lock-path PATH] [--no-lock]";
+
+/// daemon 命令行参数。
+#[derive(Debug, PartialEq)]
+struct Args {
+    idle_timeout: Duration,
+    /// Unix socket 端点；`None` = stdio 形态。
+    socket: Option<PathBuf>,
+    /// 单实例锁路径；`None` = `AGENT_SHELL_LOCK` env 或默认路径。
+    lock_path: Option<PathBuf>,
+    /// 跳过单实例锁（并行测试/显式隔离实例）。
+    no_lock: bool,
+}
 
 fn main() {
-    let idle_secs = match parse_idle_timeout(std::env::args().skip(1)) {
-        Ok(secs) => secs,
+    let args = match parse_args(std::env::args().skip(1)) {
+        Ok(args) => args,
         Err(msg) => {
-            eprintln!("{msg} (usage: agent-shell-daemon [--idle-timeout-secs N])");
+            eprintln!("{msg}\n{USAGE}");
             std::process::exit(2);
         }
     };
@@ -40,164 +66,138 @@ fn main() {
         .init();
 
     let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
-    runtime.block_on(run(Duration::from_secs(idle_secs)));
+    runtime.block_on(run(args));
 }
 
-/// 解析 daemon 命令行参数，返回空闲超时秒数（默认 30min）。
+/// 解析命令行参数。
 ///
 /// 未知参数、缺失值或不可解析的值统一走 `Err`，由调用方以 exit 2 报错——
-/// 与 `unknown arg` 行为一致。不可解析值不得静默回退默认 1800。
-fn parse_idle_timeout(mut args: impl Iterator<Item = String>) -> Result<u64, String> {
-    let mut idle_secs: u64 = 30 * 60;
-    while let Some(a) = args.next() {
-        match a.as_str() {
+/// 与 `unknown arg` 行为一致。不可解析值不得静默回退默认值。
+fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
+    fn value(args: &mut impl Iterator<Item = String>, flag: &str) -> Result<String, String> {
+        args.next()
+            .filter(|v| !v.is_empty())
+            .ok_or_else(|| format!("missing value for {flag}"))
+    }
+
+    let mut parsed = Args {
+        idle_timeout: Duration::from_secs(DEFAULT_IDLE_TIMEOUT_SECS),
+        socket: None,
+        lock_path: None,
+        no_lock: false,
+    };
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
             "--idle-timeout-secs" => {
-                let v = args
-                    .next()
-                    .ok_or_else(|| "missing value for --idle-timeout-secs".to_string())?;
-                idle_secs = v
-                    .parse()
-                    .map_err(|_| format!("invalid --idle-timeout-secs value: {v}"))?;
+                let raw = value(&mut args, "--idle-timeout-secs")?;
+                parsed.idle_timeout = Duration::from_secs(
+                    raw.parse()
+                        .map_err(|_| format!("invalid --idle-timeout-secs value: {raw}"))?,
+                );
             }
+            "--socket" => parsed.socket = Some(PathBuf::from(value(&mut args, "--socket")?)),
+            "--lock-path" => {
+                parsed.lock_path = Some(PathBuf::from(value(&mut args, "--lock-path")?))
+            }
+            "--no-lock" => parsed.no_lock = true,
             other => return Err(format!("unknown arg: {other}")),
         }
     }
-    Ok(idle_secs)
+    Ok(parsed)
 }
 
-async fn run(idle_timeout: Duration) {
-    // 单实例锁（§22.2 D1）——失败说明已有 daemon 运行。
-    let lock = match single_instance::SingleInstanceLock::acquire() {
-        Ok(l) => l,
-        Err(msg) => {
-            eprintln!("error: {msg}");
-            std::process::exit(1);
+async fn run(args: Args) {
+    // 单实例锁（§22.2 D1）：默认会话级锁；`--lock-path`/`AGENT_SHELL_LOCK`
+    // 换到独立命名空间（同路径仍互斥），`--no-lock` 完全跳过供测试。
+    let lock = if args.no_lock {
+        tracing::warn!("single-instance lock disabled (--no-lock)");
+        None
+    } else {
+        let path = single_instance::resolve_lock_path(args.lock_path.as_deref());
+        match single_instance::SingleInstanceLock::acquire_at_path(&path) {
+            Ok(lock) => Some(lock),
+            Err(msg) => {
+                eprintln!("error: {msg}");
+                std::process::exit(1);
+            }
         }
     };
+
+    // 端点先绑定再装配：路径冲突（活跃端点、不可写目录）在建立桌面连接之前失败。
+    let listener = match args.socket.as_deref() {
+        Some(path) => match serve::bind_socket(path) {
+            Ok(listener) => Some(listener),
+            Err(msg) => {
+                eprintln!("error: {msg}");
+                std::process::exit(1);
+            }
+        },
+        None => None,
+    };
+
     // 版本自报：`<crate-version> (<git-commit>)`（§20.7 QA 二进制版本约定）。
     tracing::info!(
         "agent-shell-daemon {} ({}) starting",
         env!("CARGO_PKG_VERSION"),
         env!("AGENT_SHELL_GIT_COMMIT")
     );
-    // 连接来源说明（§22.2 激活策略）：
-    // - 当前唯一形态：CLI/MCP fork/exec 本二进制为瞬态子进程，经 stdio 管道
-    //   承载 JSON-RPC；父进程退出 → stdin EOF → 本进程随之退出。
-    // - 手动管道/测试：stdin/stdout 即协议通道。
-    // LISTEN_FDs (systemd socket activation) — Phase 3 待接线：当前仅记录检测
-    // 到 LISTEN_FDs 的存在，但不使用 fd 接受连接，统一从 inherited stdio 读取。
-    // 这是有意限制：socket-activated 监听需先完成 daemon D-Bus 服务注册
-    // （见 §22.2 激活策略），否则单连接 stdio 服务无法与多连接 socket 模型共存。
+    if let Some(path) = args.socket.as_deref() {
+        tracing::info!(socket = %path.display(), "serving on explicit unix socket endpoint");
+    }
+    // 连接来源说明（§22.2 激活策略）：CLI/MCP fork/exec 本二进制经 stdio 管道
+    // 承载 JSON-RPC；LISTEN_FDs (systemd socket activation) — Phase 3 待接线：
+    // 当前仅记录检测到 LISTEN_FDs 的存在，但不使用 fd 接受连接。这是有意限制：
+    // socket-activated 监听需先完成 daemon D-Bus 服务注册（见 §22.2 激活策略），
+    // 否则单连接 stdio 服务无法与多连接 socket 模型共存。
     if std::env::var("LISTEN_FDS")
         .map(|v| v != "0")
         .unwrap_or(false)
     {
-        tracing::info!("LISTEN_FDs present but unused (socket activation wiring pending); serving on inherited stdio");
+        tracing::info!("LISTEN_FDs present but unused (socket activation wiring pending)");
     }
 
-    let daemon = Daemon::connect(idle_timeout).await;
-    let idle = daemon.idle_timeout;
-    serve_connection(daemon, idle).await;
+    let daemon = Daemon::connect(args.idle_timeout).await;
+    // 空闲超时以 daemon 装配值为准（§22.2：无请求达超时即退，systemd
+    // `Restart=on-failure` 语义下正常退出不重启）。
+    let idle_timeout = daemon.idle_timeout;
+    match listener {
+        Some(listener) => serve::serve_socket(listener, daemon, idle_timeout).await,
+        None => serve::serve_stdio(daemon, idle_timeout).await,
+    }
 
     // 释放单实例锁
-    lock.release();
-}
-
-/// 单连接服务循环：逐行读请求 → dispatch → 写响应。EOF 或空闲超时退出。
-async fn serve_connection(mut daemon: Daemon, idle_timeout: Duration) {
-    let stdin = tokio::io::stdin();
-    let mut lines = BufReader::new(stdin);
-    // 响应与通知共用同一 stdout 行流；订阅转发任务独立 spawn，必须共享
-    // 一个互斥 writer，否则并发写入会交织半行。tokio Mutex 跨 await 持有。
-    let out = Arc::new(tokio::sync::Mutex::new(tokio::io::stdout()));
-    loop {
-        // 空闲超时退出（§22.2 激活策略）：连接上无请求达 idle_timeout 即退，
-        // systemd `Restart=on-failure` 语义下正常退出不重启。
-        let mut line = String::new();
-        let n = match tokio::time::timeout(idle_timeout, lines.read_line(&mut line)).await {
-            Ok(Ok(n)) => n,
-            Ok(Err(e)) => {
-                tracing::warn!("read error: {e}; exiting");
-                break;
-            }
-            Err(_elapsed) => {
-                tracing::info!("idle timeout reached; exiting");
-                break;
-            }
-        };
-        if n == 0 {
-            tracing::info!("stdin closed; exiting");
-            break;
-        }
-
-        let req = match Request::from_line(&line) {
-            Ok(r) => r,
-            Err(e) => {
-                // 解析失败：id 不可知，回 id=0 的 ParseError（规范允许）。
-                let resp = Response::err(0, agent_shell_rpc::RpcErrorCode::ParseError, e);
-                write_line(&out, resp.to_line()).await;
-                continue;
-            }
-        };
-        let resp = dispatch::dispatch(&mut daemon, &req).await;
-        write_line(&out, resp.to_line()).await;
-
-        // events.subscribe 的返回订阅句柄被 dispatch 暂存在 daemon；此处取走
-        // 并 spawn 转发任务。订阅句柄 channel 关闭（unsubscribe）时任务退出。
-        let subs = std::mem::take(&mut daemon.subscriptions);
-        for mut sub in subs {
-            let out = Arc::clone(&out);
-            tokio::spawn(async move {
-                while let Some(evt) = sub.recv().await {
-                    let params = match serde_json::to_value(evt) {
-                        Ok(p) => p,
-                        Err(e) => {
-                            tracing::warn!("event serialize failed: {e}");
-                            continue;
-                        }
-                    };
-                    write_line(&out, Notification::event(params).to_line()).await;
-                }
-            });
-        }
+    if let Some(lock) = lock {
+        lock.release();
     }
-
-    // 退出前关闭 portal ScreenCast 会话（D-Bus Close，审查项 #6）。
-    if let Some(capture) = daemon.capture.as_ref() {
-        capture.shutdown().await;
-    }
-    // 长驻事件脚本不随本进程退出卸载：CLI 每条命令一个瞬态 daemon，退出即卸载
-    // 会让 doctor 的事件脚本行在任何后续进程里恒为「未加载」——订阅过也报成
-    // 从未装配。脚本实例留在 KWin 侧，装配状态跨进程可观察；实例堆积由下次
-    // 装载前的固定名卸载（`unload_event_monitor`）收敛，同一时刻至多一个。
-}
-
-async fn write_line(out: &Arc<tokio::sync::Mutex<tokio::io::Stdout>>, line: String) {
-    let mut stdout = out.lock().await;
-    let _ = stdout.write_all(line.as_bytes()).await;
-    let _ = stdout.flush().await;
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn parse(args: &[&str]) -> Result<u64, String> {
-        parse_idle_timeout(args.iter().map(|s| s.to_string()))
+    fn parse(args: &[&str]) -> Result<Args, String> {
+        parse_args(args.iter().map(|s| s.to_string()))
     }
 
     #[test]
-    fn default_when_no_args() {
-        assert_eq!(parse(&[]).unwrap(), 1800);
+    fn defaults_without_args() {
+        let args = parse(&[]).unwrap();
+        assert_eq!(args.idle_timeout, Duration::from_secs(1800));
+        assert_eq!(args.socket, None);
+        assert_eq!(args.lock_path, None);
+        assert!(!args.no_lock);
     }
 
     #[test]
-    fn explicit_value_wins() {
-        assert_eq!(parse(&["--idle-timeout-secs", "60"]).unwrap(), 60);
+    fn explicit_idle_value_wins() {
+        assert_eq!(
+            parse(&["--idle-timeout-secs", "60"]).unwrap().idle_timeout,
+            Duration::from_secs(60)
+        );
     }
 
     #[test]
-    fn unparseable_value_errors() {
+    fn unparseable_idle_value_errors() {
         let err = parse(&["--idle-timeout-secs", "abc"]).unwrap_err();
         assert!(
             err.contains("abc"),
@@ -206,18 +206,66 @@ mod tests {
     }
 
     #[test]
-    fn missing_value_errors() {
+    fn missing_idle_value_errors() {
         assert!(parse(&["--idle-timeout-secs"]).is_err());
+    }
+
+    #[test]
+    fn negative_idle_value_rejected_as_unparseable() {
+        assert!(parse(&["--idle-timeout-secs", "-1"]).is_err());
+    }
+
+    #[test]
+    fn socket_flag_carries_explicit_path() {
+        let args = parse(&["--socket", "/run/user/1000/agent-shell-qa.sock"]).unwrap();
+        assert_eq!(
+            args.socket,
+            Some(PathBuf::from("/run/user/1000/agent-shell-qa.sock"))
+        );
+    }
+
+    #[test]
+    fn lock_path_and_no_lock_flags() {
+        let args = parse(&["--lock-path", "/tmp/qa.lock", "--no-lock"]).unwrap();
+        assert_eq!(args.lock_path, Some(PathBuf::from("/tmp/qa.lock")));
+        assert!(args.no_lock);
+    }
+
+    #[test]
+    fn flags_accept_any_order() {
+        let args = parse(&[
+            "--no-lock",
+            "--socket",
+            "s.sock",
+            "--idle-timeout-secs",
+            "5",
+        ])
+        .unwrap();
+        assert_eq!(args.socket, Some(PathBuf::from("s.sock")));
+        assert!(args.no_lock);
+        assert_eq!(args.idle_timeout, Duration::from_secs(5));
+    }
+
+    #[test]
+    fn missing_value_errors_name_the_flag() {
+        for flag in ["--socket", "--lock-path"] {
+            let err = parse(&[flag]).unwrap_err();
+            assert!(err.contains(flag), "error should name the flag: {err}");
+        }
+    }
+
+    #[test]
+    fn empty_value_errors_name_the_flag() {
+        let err = parse(&["--socket", ""]).unwrap_err();
+        assert!(
+            err.contains("--socket"),
+            "empty value must not bind a path: {err}"
+        );
     }
 
     #[test]
     fn unknown_arg_errors() {
         let err = parse(&["--bogus"]).unwrap_err();
         assert!(err.contains("unknown arg"));
-    }
-
-    #[test]
-    fn negative_value_rejected_as_unparseable() {
-        assert!(parse(&["--idle-timeout-secs", "-1"]).is_err());
     }
 }

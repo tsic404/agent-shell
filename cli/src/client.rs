@@ -2,9 +2,9 @@
 //!
 //! CLI 是瞬态无状态进程，不直连任何系统服务（D-Bus/Wayland/X11/portal/
 //! AT-SPI）。本模块负责：
-//! 1. daemon 连接获取——优先 systemd socket activation（LISTEN_FDS），
-//!    否则 fork/exec `agent-shell-daemon` 子进程并经 stdio
-//!    通信（自动激活语义，§22.2 激活策略）；
+//! 1. daemon 连接获取——显式端点（`--socket`/`AGENT_SHELL_SOCKET`，直连已运行
+//!    daemon 的 unix socket）优先，否则 fork/exec `agent-shell-daemon` 子进程并
+//!    经 stdio 通信（自动激活语义，§22.2 激活策略）；
 //! 2. 请求/响应往返（行分隔 JSON-RPC 2.0）；
 //! 3. 错误码 → CLI 退出码映射。
 
@@ -12,10 +12,11 @@ use agent_shell_rpc::{method, Request, Response};
 use parking_lot::Mutex;
 use serde_json::{json, Value};
 use std::collections::VecDeque;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::Notify;
 
 /// 结构化调用错误：RPC 错误携带 code，便于调用方按退出码分派
@@ -95,15 +96,18 @@ fn spawn_stderr_drain(mut stderr: tokio::process::ChildStderr) -> Arc<StderrTail
 
 /// 一个 daemon 连接上的客户端会话。
 pub struct DaemonClient {
+    /// spawn 形态的子进程句柄；显式端点形态为 None（daemon 不由本进程拉起）。
     child: Option<tokio::process::Child>,
-    stdin: tokio::process::ChildStdin,
-    reader: BufReader<tokio::process::ChildStdout>,
+    stdin: Box<dyn AsyncWrite + Unpin + Send>,
+    reader: BufReader<Box<dyn AsyncRead + Unpin + Send>>,
     /// daemon stderr 尾部缓冲（后台任务持续排空，见 [`spawn_stderr_drain`]）；
-    /// 连接提前关闭时取尾部透传诊断。
+    /// 连接提前关闭时取尾部透传诊断。显式端点形态无 stderr 管道 → None。
     stderr_tail: Option<Arc<StderrTail>>,
     next_id: u64,
     /// 「连接提前关闭」时的重建重试次数（`--retry N` 注入）。
     retries: u32,
+    /// 显式端点（`--socket`/`AGENT_SHELL_SOCKET`）；None = spawn 瞬态 daemon。
+    socket: Option<PathBuf>,
 }
 
 impl Drop for DaemonClient {
@@ -117,16 +121,54 @@ impl Drop for DaemonClient {
 }
 
 impl DaemonClient {
-    /// 建立到 daemon 的连接（不重试「连接提前关闭」）。
-    pub async fn connect() -> Result<Self, String> {
-        Self::connect_with_retries(0).await
+    /// 建立到 daemon 的连接并配置「连接提前关闭」时的重建重试次数。
+    ///
+    /// `socket` 为显式端点（`--socket`/`AGENT_SHELL_SOCKET`）：直连已运行的
+    /// daemon，不 spawn、不碰单实例锁；None 走 spawn 瞬态 daemon 的默认路径。
+    pub async fn connect_with_retries(retries: u32, socket: Option<&Path>) -> Result<Self, String> {
+        match socket {
+            Some(path) => Self::connect_socket(path, retries).await,
+            None => Self::connect_spawned(retries).await,
+        }
     }
 
-    /// 建立到 daemon 的连接并配置「连接提前关闭」时的重建重试次数。
-    pub async fn connect_with_retries(retries: u32) -> Result<Self, String> {
-        // 自动激活：spawn 瞬态 daemon 子进程（stdio 管道承载 JSON-RPC）。
-        // D-Bus/systemd activation 形态由 unit 层提供同名二进制；CLI 统一
-        // 走 spawn 路径保证行为一致（首次查询 ~100ms 启动延迟可接受）。
+    /// 直连显式端点（unix socket）。连接失败不回退 spawn：用户点了具体端点，
+    /// 回退会把「端点没起来」伪装成「命令成功」。
+    ///
+    /// 连上后校验对端 uid：路径落在共享目录（`/tmp` 等）时可被同机他人抢占，
+    /// 不校验就把整条命令的负载（含 `secret set` 的值）发给对方进程。
+    async fn connect_socket(path: &Path, retries: u32) -> Result<Self, String> {
+        let stream = tokio::net::UnixStream::connect(path).await.map_err(|e| {
+            format!(
+                "cannot connect to daemon socket {}: {e} (start the daemon with \
+                 `agent-shell-daemon --socket {} --lock-path $XDG_RUNTIME_DIR/agent-shell-qa.lock` \
+                 — or `--no-lock` — since the default session lock may be held by a resident \
+                 daemon; keep both paths under a user-private directory (not /tmp); drop \
+                 --socket/AGENT_SHELL_SOCKET to auto-spawn a transient daemon)",
+                path.display(),
+                path.display()
+            )
+        })?;
+        let peer = stream
+            .peer_cred()
+            .map_err(|e| format!("cannot read peer credentials of {}: {e}", path.display()))?;
+        verify_peer_uid(path, peer.uid(), current_uid())?;
+        let (read, write) = stream.into_split();
+        Ok(Self {
+            child: None,
+            stdin: Box::new(write),
+            reader: BufReader::new(Box::new(read)),
+            stderr_tail: None,
+            next_id: 1,
+            retries,
+            socket: Some(path.to_path_buf()),
+        })
+    }
+
+    /// 自动激活：spawn 瞬态 daemon 子进程（stdio 管道承载 JSON-RPC）。
+    /// D-Bus/systemd activation 形态由 unit 层提供同名二进制；CLI 统一
+    /// 走 spawn 路径保证行为一致（首次查询 ~100ms 启动延迟可接受）。
+    async fn connect_spawned(retries: u32) -> Result<Self, String> {
         let exe = find_daemon_binary()?;
         let mut child = tokio::process::Command::new(&exe)
             .stdin(Stdio::piped())
@@ -139,11 +181,12 @@ impl DaemonClient {
         let stderr_tail = child.stderr.take().map(spawn_stderr_drain);
         Ok(Self {
             child: Some(child),
-            stdin,
-            reader: BufReader::new(stdout),
+            stdin: Box::new(stdin),
+            reader: BufReader::new(Box::new(stdout)),
             stderr_tail,
             next_id: 1,
             retries,
+            socket: None,
         })
     }
 
@@ -160,11 +203,7 @@ impl DaemonClient {
             // `daemon already running`、portal 会话失败等早期退出根因原样可见，
             // 而非只报通用「connection closed before responding」。
             let diag = self.drain_stderr().await;
-            let mut msg = format!(
-                "{CLOSED_EARLY} (hint: daemon exited early — possible portal/DBus \
-                 session-permission failure or concurrent daemon startup; use --retry N \
-                 or ensure an active graphical login session)"
-            );
+            let mut msg = format!("{CLOSED_EARLY} ({})", self.closed_early_hint());
             if !diag.is_empty() {
                 msg.push_str(&format!(" [daemon: {diag}]"));
             }
@@ -177,6 +216,21 @@ impl DaemonClient {
             return Err("daemon read: truncated response (EOF before newline)".into());
         }
         Ok(line)
+    }
+
+    /// 连接提前关闭的排障提示：spawn 形态指向锁竞争/会话权限，端点形态指向
+    /// 端点自身已退出（daemon 由用户启动，CLI 侧无 stderr 管道可诊断）。
+    fn closed_early_hint(&self) -> String {
+        match self.socket.as_deref() {
+            Some(path) => format!(
+                "hint: daemon on {} exited — check it is still running (idle timeout?)",
+                path.display()
+            ),
+            None => "hint: daemon exited early — possible portal/DBus session-permission \
+                     failure or concurrent daemon startup; use --retry N or ensure an active \
+                     graphical login session"
+                .to_string(),
+        }
     }
 
     /// 取 daemon 退出前的 stderr 尾部诊断（去首尾空白）。等待后台排空任务
@@ -212,7 +266,8 @@ impl DaemonClient {
                 {
                     attempt += 1;
                     tokio::time::sleep(Duration::from_millis(RETRY_BACKOFF_MS)).await;
-                    *self = Self::connect_with_retries(self.retries).await?;
+                    *self =
+                        Self::connect_with_retries(self.retries, self.socket.as_deref()).await?;
                 }
                 Err(e) => return Err(e),
             }
@@ -372,6 +427,30 @@ fn is_transport_error(msg: &str) -> bool {
         || msg.starts_with("daemon read:")
         || is_closed_early(msg)
 }
+
+/// 本进程 uid（`SO_PEERCRED` 比对基准）。
+fn current_uid() -> u32 {
+    // SAFETY: getuid 无参数、无副作用、不会失败（始终返回调用进程的真实 uid）。
+    unsafe { libc::getuid() }
+}
+
+/// 端点对端 uid 校验：只接受同 uid 的 daemon。
+///
+/// daemon 侧已用 socket 权限 0600 挡住「别人连我」；这里是反向的一半——显式端点
+/// 路径可落在共享目录，别人先绑定同名 socket 就能收到本 CLI 发出的命令负载。
+/// 路径本身不可信，对端进程凭据才是。
+fn verify_peer_uid(path: &Path, peer_uid: u32, our_uid: u32) -> Result<(), String> {
+    if peer_uid == our_uid {
+        return Ok(());
+    }
+    Err(format!(
+        "refusing to use daemon socket {}: peer runs as uid {peer_uid}, not ours ({our_uid}) — \
+         the path may be a socket planted by another user; keep endpoints under a \
+         user-private directory such as $XDG_RUNTIME_DIR",
+        path.display()
+    ))
+}
+
 /// 定位 daemon 二进制（委托 agent-shell-rpc::daemon_bin）。
 ///
 /// workspace target 目录用 `CARGO_MANIFEST_DIR` 拼绝对路径，不依赖 CWD。
@@ -575,6 +654,71 @@ fn a11y_query_params(role: Option<&str>, name: Option<&str>, all: bool) -> Value
 mod tests {
     use super::*;
 
+    /// 直连端点校验对端 uid：不同 uid 一律拒绝，并在报错里点名两个 uid 与路径。
+    #[test]
+    fn verify_peer_uid_rejects_foreign_process() {
+        let path = std::path::Path::new("/tmp/agent-shell.sock");
+        assert!(verify_peer_uid(path, 1000, 1000).is_ok());
+        let err = verify_peer_uid(path, 0, 1000).expect_err("foreign uid must be refused");
+        assert!(
+            err.contains("uid 0") && err.contains("1000") && err.contains("/tmp/agent-shell.sock"),
+            "error must name both uids and the path: {err}"
+        );
+        assert!(
+            err.contains("$XDG_RUNTIME_DIR"),
+            "error must point at a user-private location: {err}"
+        );
+    }
+
+    /// 端点不可达时给的补救命令必须可执行：带 `--lock-path`（默认会话锁可能被
+    /// 常驻 daemon 持有，照旧提示 `--socket` 会立刻撞 `daemon already running`）。
+    #[tokio::test]
+    async fn connect_socket_hint_mentions_lock_override() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let missing = dir.path().join("missing.sock");
+        let err = match DaemonClient::connect_with_retries(0, Some(&missing)).await {
+            Ok(_) => panic!("missing endpoint must fail"),
+            Err(e) => e,
+        };
+        assert!(
+            err.contains("--lock-path") && err.contains("--no-lock"),
+            "hint must carry a runnable daemon command: {err}"
+        );
+        assert!(
+            err.contains("XDG_RUNTIME_DIR") && err.contains("user-private"),
+            "hint must steer to a user-private directory (shared /tmp can be hijacked): {err}"
+        );
+    }
+
+    /// 测试用客户端：把子进程的 stdio 管道包成 spawn 形态会话。
+    fn client_from_child(mut child: tokio::process::Child) -> DaemonClient {
+        let stdin = child.stdin.take().expect("child stdin");
+        let stdout = child.stdout.take().expect("child stdout");
+        let stderr = child.stderr.take();
+        DaemonClient {
+            child: Some(child),
+            stdin: Box::new(stdin),
+            reader: BufReader::new(Box::new(stdout)),
+            stderr_tail: stderr.map(spawn_stderr_drain),
+            next_id: 1,
+            retries: 0,
+            socket: None,
+        }
+    }
+
+    /// 测试用 daemon 替身：`sh -c <script>`，stdio 走管道。
+    fn spawn_script(script: &str) -> DaemonClient {
+        let child = tokio::process::Command::new("sh")
+            .arg("-c")
+            .arg(script)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn sh");
+        client_from_child(child)
+    }
+
     /// CLI 注入的 target 目录用 CARGO_MANIFEST_DIR 拼绝对路径——CWD 无关。
     /// 验证候选目录列表中包含基于 CARGO_MANIFEST_DIR 的 target/debug 与
     /// target/release 绝对路径。
@@ -667,25 +811,7 @@ mod tests {
     /// 而非只剩通用 `connection closed before responding`。
     #[tokio::test]
     async fn read_line_surfaces_daemon_stderr_on_early_exit() {
-        let mut child = tokio::process::Command::new("sh")
-            .arg("-c")
-            .arg("echo 'error: daemon already running' >&2")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("spawn sh");
-        let stdin = child.stdin.take().unwrap();
-        let stdout = child.stdout.take().unwrap();
-        let stderr = child.stderr.take();
-        let mut client = DaemonClient {
-            child: Some(child),
-            stdin,
-            reader: BufReader::new(stdout),
-            stderr_tail: stderr.map(spawn_stderr_drain),
-            next_id: 1,
-            retries: 0,
-        };
+        let mut client = spawn_script("echo 'error: daemon already running' >&2");
         let err = client.read_line().await.unwrap_err();
         assert!(err.contains(CLOSED_EARLY), "must be closed-early: {err}");
         assert!(
@@ -699,25 +825,7 @@ mod tests {
     /// 伪装成「event stream ended」成功。
     #[tokio::test]
     async fn subscribe_surfaces_daemon_stderr_when_exits_before_response() {
-        let mut child = tokio::process::Command::new("sh")
-            .arg("-c")
-            .arg("read _line; echo 'error: daemon already running' >&2")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("spawn sh");
-        let stdin = child.stdin.take().unwrap();
-        let stdout = child.stdout.take().unwrap();
-        let stderr = child.stderr.take();
-        let mut client = DaemonClient {
-            child: Some(child),
-            stdin,
-            reader: BufReader::new(stdout),
-            stderr_tail: stderr.map(spawn_stderr_drain),
-            next_id: 1,
-            retries: 0,
-        };
+        let mut client = spawn_script("read _line; echo 'error: daemon already running' >&2");
         let err = client.subscribe(None).await.unwrap_err();
         assert!(
             err.contains("error: daemon already running"),
@@ -729,25 +837,9 @@ mod tests {
     /// 仍返回 Ok（exit 0），不因 stderr 透传改动而误判为失败。
     #[tokio::test]
     async fn subscribe_treats_post_response_eof_as_clean_end() {
-        let mut child = tokio::process::Command::new("sh")
-            .arg("-c")
-            .arg("read _line; printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"subscriber_id\":\"s1\"}}'")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("spawn sh");
-        let stdin = child.stdin.take().unwrap();
-        let stdout = child.stdout.take().unwrap();
-        let stderr = child.stderr.take();
-        let mut client = DaemonClient {
-            child: Some(child),
-            stdin,
-            reader: BufReader::new(stdout),
-            stderr_tail: stderr.map(spawn_stderr_drain),
-            next_id: 1,
-            retries: 0,
-        };
+        let mut client = spawn_script(
+            "read _line; printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"subscriber_id\":\"s1\"}}'",
+        );
         client
             .subscribe(None)
             .await

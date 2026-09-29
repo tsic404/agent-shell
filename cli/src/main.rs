@@ -14,6 +14,7 @@ use clap::Parser;
 use cli::{Cli, Command, ExtensionCommand, OutputFormat};
 use client::{CallError, DaemonClient};
 use serde_json::{json, Value};
+use std::path::PathBuf;
 
 fn main() {
     let argv: Vec<std::ffi::OsString> = std::env::args_os().collect();
@@ -46,11 +47,19 @@ async fn run(args: Cli) -> i32 {
 type CmdResult = Result<i32, String>;
 
 async fn dispatch(args: Cli) -> CmdResult {
-    // CLI 无状态：每条命令建一次连接（自动拉起 daemon，§22.2 激活策略）。
+    // CLI 无状态：每条命令建一次连接（显式端点直连 / 自动拉起 daemon，§22.2 激活策略）。
+    let socket = socket_endpoint(args.socket);
     match args.command {
-        Some(command) => dispatch_command(command, args.output_format, args.retry).await,
-        None => repl::run_repl(args.output_format, args.retry).await,
+        Some(command) => dispatch_command(command, args.output_format, args.retry, socket).await,
+        None => repl::run_repl(args.output_format, args.retry, socket).await,
     }
+}
+
+/// 显式端点归一化：空白值视为未设置（与 daemon 侧 `AGENT_SHELL_LOCK` 同一判据：
+/// `trim()` 后为空即忽略），否则 `AGENT_SHELL_SOCKET=` 或纯空格会变成空的相对路径
+/// 端点。非空值保持原样（不 trim，避免悄悄改写用户给的路径）。
+fn socket_endpoint(socket: Option<PathBuf>) -> Option<PathBuf> {
+    socket.filter(|path| !path.to_string_lossy().trim().is_empty())
 }
 
 /// 本地可判定的参数校验（无 I/O、无 daemon 依赖），在 daemon 连接之前执行。
@@ -69,9 +78,14 @@ fn prevalidate_command(command: &Command) -> CmdResult {
 }
 
 /// 分派具体子命令（REPL 与单次执行共用）。
-async fn dispatch_command(command: Command, out: OutputFormat, retry: u32) -> CmdResult {
+async fn dispatch_command(
+    command: Command,
+    out: OutputFormat,
+    retry: u32,
+    socket: Option<PathBuf>,
+) -> CmdResult {
     prevalidate_command(&command)?;
-    let mut c = DaemonClient::connect_with_retries(retry).await?;
+    let mut c = DaemonClient::connect_with_retries(retry, socket.as_deref()).await?;
     match command {
         Command::Doctor => doctor(out, &mut c).await,
         Command::Info => info(out, &mut c).await,
@@ -1290,8 +1304,9 @@ mod tests {
         a11y_query_exit_code, brightness_rpc_error, dispatch, is_auth_required, job_status_outcome,
         log_query_timeout_error, parse_log_filter, pkg_failed_job_line, process_rootd_error,
         render_capability, render_doctor, render_extension_status, render_info,
-        security_audit_params, security_request, sysctl_rpc_error, sysctl_set_accepted_line,
-        validate_area, wait_for_job_impl, JobStatusSource, LOG_QUERY_TIMEOUT,
+        security_audit_params, security_request, socket_endpoint, sysctl_rpc_error,
+        sysctl_set_accepted_line, validate_area, wait_for_job_impl, JobStatusSource,
+        LOG_QUERY_TIMEOUT,
     };
     use crate::client::CallError;
     use crate::{CapabilityStatus, OutputFormat, RpcErrorCode};
@@ -1299,7 +1314,26 @@ mod tests {
     use clap::Parser;
     use serde_json::{json, Value};
     use std::collections::VecDeque;
+    use std::path::PathBuf;
     use std::time::Duration;
+
+    /// 空白 `--socket`/`AGENT_SHELL_SOCKET` 视为未设置（与 `AGENT_SHELL_LOCK` 同一
+    /// `trim()` 判据）；真实路径原样保留（含两侧空格的路径不 trim）。
+    #[test]
+    fn socket_endpoint_treats_blank_as_unset() {
+        assert_eq!(socket_endpoint(None), None);
+        assert_eq!(socket_endpoint(Some(PathBuf::from(""))), None);
+        assert_eq!(socket_endpoint(Some(PathBuf::from("   "))), None);
+        assert_eq!(socket_endpoint(Some(PathBuf::from("\t"))), None);
+        assert_eq!(
+            socket_endpoint(Some(PathBuf::from("/run/user/1000/agent-shell.sock"))),
+            Some(PathBuf::from("/run/user/1000/agent-shell.sock"))
+        );
+        assert_eq!(
+            socket_endpoint(Some(PathBuf::from(" /tmp/a.sock "))),
+            Some(PathBuf::from(" /tmp/a.sock "))
+        );
+    }
 
     #[test]
     fn render_capability_maps_status_to_terminal_marker() {

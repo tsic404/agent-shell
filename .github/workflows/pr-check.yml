@@ -50,7 +50,13 @@ jobs:
         if: matrix.profile == 'default'
         # --all-targets：把 examples 的 #[test]（如 area_smoke 的 smoke_verdict
         # 纯函数单测）纳入门禁——裸 cargo test 只编译 examples、不运行其测试。
-        run: cargo test --all-targets
+        #
+        # 先构建 daemon 二进制：cli 的 socket_endpoint_e2e 启动真实
+        # agent-shell-daemon（跨包 bin，`cargo test` 不会为别的 crate 的 bin 产出
+        # target/debug/<name>，用例内部虽会自行补建，这里显式构建避免测试期编译）。
+        run: |
+          cargo build -p agent-shell-daemon --bin agent-shell-daemon
+          cargo test --all-targets
 
       - name: Build (Rust)
         if: matrix.profile == 'default'
