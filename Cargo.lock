@@ -211,6 +211,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "agent-shell-bluetooth"
+version = "0.1.0"
+dependencies = [
+ "agent-shell-core",
+ "async-trait",
+ "libc",
+ "tokio",
+ "tracing",
+ "zbus",
+ "zvariant",
+]
+
+[[package]]
 name = "agent-shell-capture"
 version = "0.1.0"
 dependencies = [
@@ -405,14 +418,20 @@ version = "0.1.0"
 dependencies = [
  "agent-shell-a11y",
  "agent-shell-backend-dde",
+ "agent-shell-bluetooth",
  "agent-shell-capture",
  "agent-shell-compositor-kwin",
  "agent-shell-compositor-mutter",
  "agent-shell-core",
  "agent-shell-event",
  "agent-shell-input",
+ "agent-shell-mime",
+ "agent-shell-peripherals",
  "agent-shell-power",
  "agent-shell-rpc",
+ "agent-shell-shortcut",
+ "agent-shell-software",
+ "agent-shell-systemd",
  "async-trait",
  "dirs",
  "futures",
@@ -506,6 +525,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "agent-shell-mime"
+version = "0.1.0"
+dependencies = [
+ "agent-shell-core",
+ "async-trait",
+ "tempfile",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "agent-shell-network"
 version = "0.1.0"
 dependencies = [
@@ -527,6 +557,19 @@ version = "0.1.0"
 dependencies = [
  "agent-shell-core",
  "async-trait",
+ "tokio",
+ "tracing",
+ "zbus",
+]
+
+[[package]]
+name = "agent-shell-peripherals"
+version = "0.1.0"
+dependencies = [
+ "agent-shell-core",
+ "async-trait",
+ "libc",
+ "tempfile",
  "tokio",
  "tracing",
  "zbus",
@@ -603,12 +646,37 @@ dependencies = [
 ]
 
 [[package]]
+name = "agent-shell-shortcut"
+version = "0.1.0"
+dependencies = [
+ "agent-shell-core",
+ "async-trait",
+ "libc",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "zbus",
+]
+
+[[package]]
+name = "agent-shell-software"
+version = "0.1.0"
+dependencies = [
+ "agent-shell-core",
+ "async-trait",
+ "tempfile",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "agent-shell-systemd"
 version = "0.1.0"
 dependencies = [
  "agent-shell-core",
  "agent-shell-logind",
  "async-trait",
+ "libc",
  "tokio",
  "tracing",
  "zbus",

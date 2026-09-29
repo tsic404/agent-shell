@@ -4,6 +4,7 @@
 //! 异步收集（合成器 doctor_lines + a11y 探测），CLI 只做渲染。
 
 use crate::state::Daemon;
+use agent_shell_core::component::SystemComponent;
 use agent_shell_core::error::AgentShellError;
 use agent_shell_core::security::{Operation, PermissionDecision, PermissionLevel};
 use agent_shell_core::types::{
@@ -99,6 +100,15 @@ pub async fn dispatch(daemon: &mut Daemon, req: &Request) -> Response {
         method::BRIGHTNESS_SET => brightness_set(daemon, req).await,
         // 未实现服务（§21.35，待 Phase 3 接线）不在此逐条登记：兜底分支按
         // [`placeholder_service`] 回执 not_implemented，安全门禁读同一张表。
+        method::MIME_GET => mime_get(daemon, req).await,
+        method::MIME_DEFAULT_BROWSER => mime_default_browser(daemon).await,
+        method::BLUETOOTH_LIST => bluetooth_list(daemon).await,
+        method::FLATPAK_LIST => flatpak_list(daemon).await,
+        method::TOUCHPAD_STATUS => touchpad_status(daemon).await,
+        method::KBD_LAYOUT_LIST => kbd_layout_list(daemon).await,
+        method::SHORTCUT_BIND => shortcut_bind(daemon, req).await,
+        method::TIMER_LIST => timer_list(daemon).await,
+        method::TIMER_NEXT => timer_next(daemon, req).await,
         // ── GNOME Shell 扩展（§8.1 安装/启用）──
         method::EXTENSION_STATUS => extension_status().await,
         method::EXTENSION_INSTALL => extension_install().await,
@@ -929,28 +939,20 @@ const PLACEHOLDER_SERVICES: &[(&str, &str)] = &[
     (method::FILE_PICK, "file.pick"),
     (method::FILE_TRASH, "file.trash"),
     (method::FILE_OPEN_DIR, "file.open_directory"),
-    (method::MIME_GET, "mime.get"),
     (method::MIME_SET, "mime.set"),
-    (method::MIME_DEFAULT_BROWSER, "mime.default_browser"),
     // 蓝牙 / 软件（§21.30）
     (method::BLUETOOTH_SCAN, "bluetooth.scan"),
     (method::BLUETOOTH_CONNECT, "bluetooth.connect"),
     (method::BLUETOOTH_DISCONNECT, "bluetooth.disconnect"),
-    (method::BLUETOOTH_LIST, "bluetooth.list"),
-    (method::FLATPAK_LIST, "flatpak.list"),
     (method::FLATPAK_INSTALL, "flatpak.install"),
     (method::SOFTWARE_UPDATES, "software.updates"),
     // 触控板 / 键盘布局 / 密钥环（§21.31–21.32）
-    (method::TOUCHPAD_STATUS, "touchpad.status"),
     (method::TOUCHPAD_SET, "touchpad.set"),
-    (method::KBD_LAYOUT_LIST, "kbd.layout.list"),
     (method::KBD_LAYOUT_SET, "kbd.layout.set"),
     (method::SECRET_SET, "secret.set"),
     (method::SECRET_GET, "secret.get"),
     // 快捷键 / timer（§21.33–21.34）
-    (method::SHORTCUT_BIND, "shortcut.bind"),
     (method::SHORTCUT_TRIGGER, "shortcut.trigger"),
-    (method::TIMER_LIST, "timer.list"),
 ];
 
 /// 未实现服务方法 → 占位回执服务名（§21.35）。
@@ -964,6 +966,176 @@ fn placeholder_service(method_name: &str) -> Option<&'static str> {
 /// 占位回执载荷：`status=not_implemented` + 服务名（§21.35）。
 fn not_implemented_payload(service: &str) -> Value {
     json!({"status": "not_implemented", "service": service})
+}
+
+/// 系统服务组件错误 → RPC 错误码：无后端（BackendUnavailable）与后端失败
+/// （BackendError）区分，CLI 据此判读退出码（同 brightness_error 口径）。
+fn service_error(e: AgentShellError) -> (RpcErrorCode, String) {
+    match e {
+        AgentShellError::BackendUnavailable(m) => (RpcErrorCode::BackendUnavailable, m),
+        other => (RpcErrorCode::BackendError, other.to_string()),
+    }
+}
+
+/// 取必填字符串参数（去空白；缺失或空串 → InvalidParams）。
+fn required_str<'a>(params: &'a Value, key: &str) -> Result<&'a str, (RpcErrorCode, String)> {
+    params
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .ok_or_else(|| {
+            (
+                RpcErrorCode::InvalidParams,
+                format!("missing or empty '{key}'"),
+            )
+        })
+}
+
+// ───────────────────────── 默认应用（§21.27） ─────────────────────────
+
+/// 查询 MIME 类型默认应用：`{ "mime": "text/html" }`。
+async fn mime_get(d: &Daemon, req: &Request) -> RpcResult {
+    let params = params_of(req)?;
+    let mime = required_str(params, "mime")?;
+    let backend = d.mime.as_ref().ok_or((
+        RpcErrorCode::BackendUnavailable,
+        "no MIME backend assembled".into(),
+    ))?;
+    let resolved = backend.default_app(mime).await.map_err(service_error)?;
+    Ok(json!({
+        "mime": resolved.target,
+        "default_app": resolved.desktop_id,
+        "source": resolved.source,
+    }))
+}
+
+/// 查询默认浏览器。
+async fn mime_default_browser(d: &Daemon) -> RpcResult {
+    let backend = d.mime.as_ref().ok_or((
+        RpcErrorCode::BackendUnavailable,
+        "no MIME backend assembled".into(),
+    ))?;
+    let resolved = backend.default_browser().await.map_err(service_error)?;
+    Ok(json!({
+        "default_browser": resolved.desktop_id,
+        "source": resolved.source,
+    }))
+}
+
+// ───────────────────────── 蓝牙（§21.29） ─────────────────────────
+
+/// 列出已知蓝牙设备。
+async fn bluetooth_list(d: &Daemon) -> RpcResult {
+    let backend = d.bluetooth.as_ref().ok_or((
+        RpcErrorCode::BackendUnavailable,
+        "no bluetooth backend assembled".into(),
+    ))?;
+    let devices = backend.list_devices().await.map_err(service_error)?;
+    Ok(serde_json::to_value(devices).expect("BtDevice serializable"))
+}
+
+// ───────────────────────── 软件（§21.30） ─────────────────────────
+
+/// 列出已安装 Flatpak 应用。
+async fn flatpak_list(d: &Daemon) -> RpcResult {
+    let backend = d.software.as_ref().ok_or((
+        RpcErrorCode::BackendUnavailable,
+        "no software backend assembled".into(),
+    ))?;
+    let apps = backend.list_flatpaks().await.map_err(service_error)?;
+    Ok(serde_json::to_value(apps).expect("FlatpakApp serializable"))
+}
+
+// ───────────────────────── 外设（§21.31） ─────────────────────────
+
+/// 查询触控板状态。
+async fn touchpad_status(d: &Daemon) -> RpcResult {
+    let backend = d.peripherals.as_ref().ok_or((
+        RpcErrorCode::BackendUnavailable,
+        "no peripherals backend assembled".into(),
+    ))?;
+    let status = backend.touchpad_status().await.map_err(service_error)?;
+    Ok(serde_json::to_value(status).expect("TouchpadStatus serializable"))
+}
+
+/// 列出键盘布局。
+async fn kbd_layout_list(d: &Daemon) -> RpcResult {
+    let backend = d.peripherals.as_ref().ok_or((
+        RpcErrorCode::BackendUnavailable,
+        "no peripherals backend assembled".into(),
+    ))?;
+    let layouts = backend.keyboard_layouts().await.map_err(service_error)?;
+    Ok(serde_json::to_value(layouts).expect("KeyboardLayouts serializable"))
+}
+
+// ───────────────────────── 全局快捷键（§21.33） ─────────────────────────
+
+/// 绑定全局快捷键：`{ "combo": "meta+t", "action": "<命令行>" }`。
+///
+/// 参数校验先于后端判定（同 brightness.set）：组合键语法错误、多键序列、
+/// 空动作恒返回 InvalidParams，不被后端可用性掩盖。
+async fn shortcut_bind(d: &Daemon, req: &Request) -> RpcResult {
+    let params = params_of(req)?;
+    let spec = required_str(params, "combo")?;
+    let action = required_str(params, "action")?;
+    // 控制字符（换行等）会在这行落进被 DE 解析的配置文件（Hyprland 片段 /
+    // desktop `Exec=`），能开启新的配置指令；边界拒绝，错误码为 InvalidParams。
+    if action.chars().any(char::is_control) {
+        return Err((
+            RpcErrorCode::InvalidParams,
+            "action must not contain control characters".into(),
+        ));
+    }
+    let combo = crate::input::parse_combo(spec)?;
+    if combo.keys.len() != 1 {
+        return Err((
+            RpcErrorCode::InvalidParams,
+            format!("global shortcut requires exactly one key: {spec}"),
+        ));
+    }
+    let backend = d.shortcut.as_ref().ok_or((
+        RpcErrorCode::BackendUnavailable,
+        "no shortcut backend assembled".into(),
+    ))?;
+    let binding = backend.bind(&combo, action).await.map_err(service_error)?;
+    Ok(serde_json::to_value(binding).expect("ShortcutBinding serializable"))
+}
+
+// ───────────────────────── systemd timer（§21.34） ─────────────────────────
+
+/// 列出 systemd timer（下次/上次触发时间）。
+async fn timer_list(d: &Daemon) -> RpcResult {
+    let timers = require_systemd(d)?
+        .list_timers()
+        .await
+        .map_err(service_error)?;
+    Ok(serde_json::to_value(timers).expect("SystemdTimer serializable"))
+}
+
+/// 查询单个 timer 的下次触发：`{ "name": "backup.timer" }`。
+async fn timer_next(d: &Daemon, req: &Request) -> RpcResult {
+    let params = params_of(req)?;
+    let name = required_str(params, "name")?;
+    let timers = require_systemd(d)?
+        .list_timers()
+        .await
+        .map_err(service_error)?;
+    let timer = timers
+        .into_iter()
+        .find(|t| t.name == name)
+        .ok_or_else(|| (RpcErrorCode::NotFound, format!("timer not found: {name}")))?;
+    Ok(serde_json::to_value(timer).expect("SystemdTimer serializable"))
+}
+
+/// systemd 组件（timer 查询数据源）。
+fn require_systemd(
+    d: &Daemon,
+) -> Result<&std::sync::Arc<dyn SystemComponent>, (RpcErrorCode, String)> {
+    d.systemd.as_ref().ok_or((
+        RpcErrorCode::BackendUnavailable,
+        "systemd unavailable (org.freedesktop.systemd1 not reachable)".into(),
+    ))
 }
 
 /// 事件订阅（§22.5 D4）：解析过滤器、创建订阅句柄，返回 subscriber_id。
@@ -1949,7 +2121,7 @@ mod tests {
         //
         // 用例集合取自表本身，故条目删除会静默缩小覆盖——条目数在此钉住：表是
         // 占位方法的唯一登记处，后端接线（删条目）须同步本行。
-        assert_eq!(PLACEHOLDER_SERVICES.len(), 22);
+        assert_eq!(PLACEHOLDER_SERVICES.len(), 14);
         let mut d = test_daemon().await;
         for &(method_name, service) in PLACEHOLDER_SERVICES {
             let resp = dispatch(
@@ -3416,6 +3588,427 @@ mod tests {
         assert_eq!(
             resp.error.expect("error").code,
             RpcErrorCode::BackendUnavailable as i32
+        );
+    }
+
+    // ── 扩展系统服务（§21.27–§21.34）：fake 后端证明 stub 已接线到真实组件 ──
+
+    use agent_shell_core::services::{
+        DefaultAppResolution, FlatpakApp, KeyboardLayout, KeyboardLayouts, ShortcutBinding,
+        SystemdTimer, TouchpadDevice, TouchpadStatus,
+    };
+    use agent_shell_core::types::KeyCombo;
+
+    struct FakeMime {
+        desktop_id: Option<String>,
+        source: &'static str,
+        last_mime: Mutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl agent_shell_mime::MimeOps for FakeMime {
+        async fn default_app(
+            &self,
+            mime: &str,
+        ) -> agent_shell_core::error::Result<DefaultAppResolution> {
+            self.last_mime.lock().push(mime.to_string());
+            Ok(DefaultAppResolution {
+                target: mime.to_string(),
+                desktop_id: self.desktop_id.clone(),
+                source: self.source.to_string(),
+            })
+        }
+
+        async fn default_browser(&self) -> agent_shell_core::error::Result<DefaultAppResolution> {
+            Ok(DefaultAppResolution {
+                target: "web-browser".into(),
+                desktop_id: self.desktop_id.clone(),
+                source: self.source.to_string(),
+            })
+        }
+    }
+
+    struct FakeBluetooth {
+        devices: Vec<AgentBtDevice>,
+    }
+
+    use agent_shell_core::services::BtDevice as AgentBtDevice;
+
+    #[async_trait]
+    impl agent_shell_bluetooth::BluetoothOps for FakeBluetooth {
+        async fn list_devices(&self) -> agent_shell_core::error::Result<Vec<AgentBtDevice>> {
+            Ok(self.devices.clone())
+        }
+    }
+
+    struct FakeSoftware {
+        apps: Vec<FlatpakApp>,
+    }
+
+    #[async_trait]
+    impl agent_shell_software::SoftwareOps for FakeSoftware {
+        async fn list_flatpaks(&self) -> agent_shell_core::error::Result<Vec<FlatpakApp>> {
+            Ok(self.apps.clone())
+        }
+    }
+
+    struct FakePeripherals {
+        touchpad: TouchpadStatus,
+        layouts: KeyboardLayouts,
+    }
+
+    #[async_trait]
+    impl agent_shell_peripherals::PeripheralsOps for FakePeripherals {
+        async fn touchpad_status(&self) -> agent_shell_core::error::Result<TouchpadStatus> {
+            Ok(self.touchpad.clone())
+        }
+
+        async fn keyboard_layouts(&self) -> agent_shell_core::error::Result<KeyboardLayouts> {
+            Ok(self.layouts.clone())
+        }
+    }
+
+    struct FakeShortcut {
+        calls: Mutex<Vec<(KeyCombo, String)>>,
+        binding: ShortcutBinding,
+    }
+
+    #[async_trait]
+    impl agent_shell_shortcut::ShortcutOps for FakeShortcut {
+        async fn bind(
+            &self,
+            combo: &KeyCombo,
+            action: &str,
+        ) -> agent_shell_core::error::Result<ShortcutBinding> {
+            self.calls.lock().push((combo.clone(), action.to_string()));
+            Ok(self.binding.clone())
+        }
+    }
+
+    struct FakeSystemd {
+        timers: Vec<SystemdTimer>,
+    }
+
+    #[async_trait]
+    impl agent_shell_core::component::DesktopComponent for FakeSystemd {
+        fn name(&self) -> &'static str {
+            "fake-systemd"
+        }
+
+        fn component_type(&self) -> agent_shell_core::component::ComponentType {
+            agent_shell_core::component::ComponentType::InitSystem
+        }
+
+        fn is_available(&self) -> bool {
+            true
+        }
+
+        async fn health(&self) -> agent_shell_core::component::ComponentHealth {
+            agent_shell_core::component::ComponentHealth::Healthy
+        }
+    }
+
+    #[async_trait]
+    impl SystemComponent for FakeSystemd {
+        async fn daemon_reload(&self) -> agent_shell_core::error::Result<()> {
+            Ok(())
+        }
+        async fn list_units(
+            &self,
+        ) -> agent_shell_core::error::Result<Vec<agent_shell_core::services::SystemdUnit>> {
+            Ok(Vec::new())
+        }
+        async fn list_timers(&self) -> agent_shell_core::error::Result<Vec<SystemdTimer>> {
+            Ok(self.timers.clone())
+        }
+        async fn start_unit(&self, _name: &str) -> agent_shell_core::error::Result<()> {
+            Ok(())
+        }
+        async fn stop_unit(&self, _name: &str) -> agent_shell_core::error::Result<()> {
+            Ok(())
+        }
+        async fn enable_unit(&self, _name: &str) -> agent_shell_core::error::Result<()> {
+            Ok(())
+        }
+        async fn disable_unit(&self, _name: &str) -> agent_shell_core::error::Result<()> {
+            Ok(())
+        }
+        async fn unit_status(
+            &self,
+            _name: &str,
+        ) -> agent_shell_core::error::Result<agent_shell_core::types::UnitStatus> {
+            Ok(agent_shell_core::types::UnitStatus::Unknown)
+        }
+    }
+
+    fn fake_mime(desktop_id: Option<&str>) -> std::sync::Arc<dyn agent_shell_mime::MimeOps> {
+        std::sync::Arc::new(FakeMime {
+            desktop_id: desktop_id.map(str::to_string),
+            source: "fake",
+            last_mime: Mutex::new(Vec::new()),
+        })
+    }
+
+    fn sample_timer(name: &str) -> SystemdTimer {
+        SystemdTimer {
+            name: name.into(),
+            next_elapse_real: Some("2026-09-28T00:00:00Z".into()),
+            last_trigger_real: Some("2026-09-26T03:32:30Z".into()),
+            unit_path: Some(format!("/usr/lib/systemd/system/{name}")),
+            next_elapse_monotonic: Some(7_000),
+            last_trigger_monotonic: Some(9_000),
+            running: true,
+        }
+    }
+
+    #[tokio::test]
+    async fn mime_get_queries_backend_with_trimmed_type() {
+        let mut d = test_daemon().await;
+        let inner = std::sync::Arc::new(FakeMime {
+            desktop_id: Some("firefox.desktop".into()),
+            source: "fake",
+            last_mime: Mutex::new(Vec::new()),
+        });
+        d.mime =
+            Some(std::sync::Arc::clone(&inner) as std::sync::Arc<dyn agent_shell_mime::MimeOps>);
+        let resp = dispatch(
+            &mut d,
+            &req(method::MIME_GET, Some(json!({"mime": "  text/html "}))),
+        )
+        .await;
+        let value = resp.result.expect("ok");
+        assert_eq!(value["default_app"], "firefox.desktop");
+        assert_eq!(value["mime"], "text/html");
+        assert_eq!(value["source"], "fake");
+        // 空白已裁剪后再查后端，避免 `xdg-mime query default "  text/html "` 空手而归。
+        assert_eq!(*inner.last_mime.lock(), vec!["text/html".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn mime_get_rejects_missing_type_before_backend_lookup() {
+        let mut d = test_daemon().await;
+        d.mime = Some(fake_mime(Some("firefox.desktop")));
+        for params in [Some(json!({})), Some(json!({"mime": "   "})), None] {
+            let resp = dispatch(&mut d, &req(method::MIME_GET, params)).await;
+            assert_eq!(
+                resp.error.expect("error").code,
+                RpcErrorCode::InvalidParams as i32
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn mime_default_browser_reports_unconfigured_as_null() {
+        // 未配置默认浏览器不是错误：明示 null + 来源，CLI 退出码保持 0。
+        let mut d = test_daemon().await;
+        d.mime = Some(fake_mime(None));
+        let resp = dispatch(&mut d, &req(method::MIME_DEFAULT_BROWSER, None)).await;
+        let value = resp.result.expect("ok");
+        assert!(value["default_browser"].is_null());
+        assert_eq!(value["source"], "fake");
+    }
+
+    #[tokio::test]
+    async fn mime_backend_absent_reports_backend_unavailable() {
+        let mut d = test_daemon().await;
+        d.mime = None;
+        let resp = dispatch(
+            &mut d,
+            &req(method::MIME_GET, Some(json!({"mime": "text/html"}))),
+        )
+        .await;
+        assert_eq!(
+            resp.error.expect("error").code,
+            RpcErrorCode::BackendUnavailable as i32
+        );
+    }
+
+    #[tokio::test]
+    async fn bluetooth_list_projects_devices() {
+        let mut d = test_daemon().await;
+        d.bluetooth = Some(std::sync::Arc::new(FakeBluetooth {
+            devices: vec![AgentBtDevice {
+                address: "AA:BB:CC:DD:EE:FF".into(),
+                name: "Headset".into(),
+                paired: true,
+                connected: false,
+                trusted: true,
+                rssi: Some(-42),
+                uuids: vec!["0000110b-0000-1000-8000-00805f9b34fb".into()],
+            }],
+        }));
+        let resp = dispatch(&mut d, &req(method::BLUETOOTH_LIST, None)).await;
+        let arr = resp.result.expect("ok");
+        assert_eq!(arr[0]["address"], "AA:BB:CC:DD:EE:FF");
+        assert_eq!(arr[0]["rssi"], -42);
+        assert_eq!(arr[0]["connected"], false);
+    }
+
+    #[tokio::test]
+    async fn flatpak_list_projects_apps() {
+        let mut d = test_daemon().await;
+        d.software = Some(std::sync::Arc::new(FakeSoftware {
+            apps: vec![FlatpakApp {
+                app_id: "org.mozilla.firefox".into(),
+                name: "Firefox".into(),
+                origin: "flathub".into(),
+                version: "129.0".into(),
+                branch: "stable".into(),
+                installation: "system".into(),
+            }],
+        }));
+        let resp = dispatch(&mut d, &req(method::FLATPAK_LIST, None)).await;
+        let arr = resp.result.expect("ok");
+        assert_eq!(arr[0]["app_id"], "org.mozilla.firefox");
+        assert_eq!(arr[0]["origin"], "flathub");
+    }
+
+    #[tokio::test]
+    async fn touchpad_status_projects_devices_and_effective_values() {
+        let mut d = test_daemon().await;
+        d.peripherals = Some(std::sync::Arc::new(FakePeripherals {
+            touchpad: TouchpadStatus {
+                source: "fake".into(),
+                enabled: Some(true),
+                natural_scroll: Some(false),
+                tap_to_click: Some(true),
+                devices: vec![TouchpadDevice {
+                    sysname: Some("event7".into()),
+                    name: "ELAN touchpad".into(),
+                    enabled: true,
+                    natural_scroll: Some(false),
+                    tap_to_click: Some(true),
+                }],
+            },
+            layouts: KeyboardLayouts {
+                source: "fake".into(),
+                active_index: Some(0),
+                layouts: vec![KeyboardLayout {
+                    index: 0,
+                    layout: "us".into(),
+                    variant: None,
+                    display_name: None,
+                }],
+            },
+        }));
+        let resp = dispatch(&mut d, &req(method::TOUCHPAD_STATUS, None)).await;
+        let value = resp.result.expect("ok");
+        assert_eq!(value["source"], "fake");
+        assert_eq!(value["enabled"], true);
+        assert_eq!(value["devices"][0]["sysname"], "event7");
+
+        let resp = dispatch(&mut d, &req(method::KBD_LAYOUT_LIST, None)).await;
+        let value = resp.result.expect("ok");
+        assert_eq!(value["active_index"], 0);
+        assert_eq!(value["layouts"][0]["layout"], "us");
+    }
+
+    #[tokio::test]
+    async fn shortcut_bind_parses_combo_and_forwards_action() {
+        let mut d = test_daemon().await;
+        let inner = std::sync::Arc::new(FakeShortcut {
+            calls: Mutex::new(Vec::new()),
+            binding: ShortcutBinding {
+                backend: "fake".into(),
+                component: Some("agent-shell-test.desktop".into()),
+                combo: "meta+t".into(),
+                action: "notify-send hi".into(),
+            },
+        });
+        d.shortcut =
+            Some(std::sync::Arc::clone(&inner)
+                as std::sync::Arc<dyn agent_shell_shortcut::ShortcutOps>);
+        let resp = dispatch(
+            &mut d,
+            &req(
+                method::SHORTCUT_BIND,
+                Some(json!({"combo": "meta+t", "action": "notify-send hi"})),
+            ),
+        )
+        .await;
+        let value = resp.result.expect("ok");
+        assert_eq!(value["backend"], "fake");
+        assert_eq!(value["combo"], "meta+t");
+        let calls = inner.calls.lock().clone();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].1, "notify-send hi");
+        // 组合键按 CLI 同语法解析成 core KeyCombo（单键 + meta）。
+        assert_eq!(calls[0].0.keys.len(), 1);
+        assert!(calls[0].0.modifiers.meta && !calls[0].0.modifiers.ctrl);
+    }
+
+    #[tokio::test]
+    async fn shortcut_bind_rejects_bad_params_before_backend() {
+        let mut d = test_daemon().await;
+        d.shortcut = Some(std::sync::Arc::new(FakeShortcut {
+            calls: Mutex::new(Vec::new()),
+            binding: ShortcutBinding {
+                backend: "fake".into(),
+                component: None,
+                combo: String::new(),
+                action: String::new(),
+            },
+        }));
+        for params in [
+            json!({"combo": "meta+t"}),
+            json!({"combo": "meta+t", "action": "  "}),
+            json!({"combo": "notakey", "action": "x"}),
+            json!({"combo": "ctrl+k ctrl+c", "action": "x"}),
+            json!({"combo": "meta+t", "action": "touch a\nexec-once = evil"}),
+        ] {
+            let resp = dispatch(&mut d, &req(method::SHORTCUT_BIND, Some(params))).await;
+            assert_eq!(
+                resp.error.expect("error").code,
+                RpcErrorCode::InvalidParams as i32
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn timer_list_and_next_read_from_systemd_component() {
+        let mut d = test_daemon().await;
+        d.systemd = Some(std::sync::Arc::new(FakeSystemd {
+            timers: vec![sample_timer("backup.timer"), sample_timer("fstrim.timer")],
+        }));
+        let resp = dispatch(&mut d, &req(method::TIMER_LIST, None)).await;
+        let arr = resp.result.expect("ok");
+        assert_eq!(arr.as_array().expect("array").len(), 2);
+        assert_eq!(arr[0]["name"], "backup.timer");
+        assert_eq!(arr[0]["next_elapse_real"], "2026-09-28T00:00:00Z");
+        assert_eq!(arr[0]["running"], true);
+
+        let resp = dispatch(
+            &mut d,
+            &req(method::TIMER_NEXT, Some(json!({"name": "fstrim.timer"}))),
+        )
+        .await;
+        assert_eq!(
+            resp.result.expect("ok")["unit_path"],
+            "/usr/lib/systemd/system/fstrim.timer"
+        );
+
+        let resp = dispatch(
+            &mut d,
+            &req(method::TIMER_NEXT, Some(json!({"name": "missing.timer"}))),
+        )
+        .await;
+        assert_eq!(
+            resp.error.expect("error").code,
+            RpcErrorCode::NotFound as i32
+        );
+    }
+
+    #[tokio::test]
+    async fn timer_list_without_systemd_reports_backend_unavailable() {
+        let mut d = test_daemon().await;
+        d.systemd = None;
+        let resp = dispatch(&mut d, &req(method::TIMER_LIST, None)).await;
+        let err = resp.error.expect("error");
+        assert_eq!(err.code, RpcErrorCode::BackendUnavailable as i32);
+        assert!(
+            err.message.contains("systemd"),
+            "error must name the missing component: {}",
+            err.message
         );
     }
 }

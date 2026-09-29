@@ -5601,8 +5601,14 @@ impl FilesystemService {
 | 文件管理器 | `xdg-settings get default-folder-viewer` | 查询默认文件管理器 |
 | 浏览器 | `xdg-settings get default-web-browser` | 查询默认浏览器 |
 
+**已落地**（`components/mime`，`agent-shell mime get <mime>` / `mime default-browser`）：
+`xdg-mime query default <mime>` / `xdg-settings get default-web-browser`，二进制缺失时回退
+解析 `$XDG_CONFIG_HOME/mimeapps.list` 的 `[Default Applications]` 段（浏览器按
+`x-scheme-handler/https` → `x-scheme-handler/http` → `text/html` 逐级取）。
+`mime.set` 仍未接线（写默认应用属 L1 变更，路线图项）。
+
 ```rust
-// 未实现（pending）：daemon 仅回执 not_implemented 占位（mime.get/set/default_browser）
+// 历史草稿（勿照抄）：MimeService 的最终实现见 components/mime/src/lib.rs
 
 pub struct MimeService;
 
@@ -5700,8 +5706,14 @@ if let Some(token) = &activation_token {
 | `org.bluez.Device1` | `/org/bluez/hci0/dev_XX_XX_XX_XX_XX_XX` | 设备: `Connect`, `Disconnect`, `Pair`, `CancelPairing`; 属性 `Name`, `Address`, `Connected`, `Paired`, `Trusted`, `UUIDs`, `RSSI` |
 | `org.bluez.Agent1` | 自定义 | 配对代理: `RequestPinCode`, `RequestConfirmation`, `AuthorizeService` |
 
+**已落地（只读部分）**：`components/bluetooth` 经 system bus 的 `org.bluez`
+ObjectManager `GetManagedObjects()` 读 `org.bluez.Device1` 对象属性
+（Address/Alias|Name/Paired/Connected/Trusted/RSSI/UUIDs）；BlueZ 未运行 →
+`BackendUnavailable`（含根因文案）。`bluetooth.scan/connect/disconnect` 仍未接线
+（连接/配对需用户交互与 Agent1 配对代理，路线图项）。
+
 ```rust
-// 未实现（pending）：daemon 仅回执 not_implemented 占位（bluetooth.*）
+// 历史草稿（勿照抄）：BluetoothManager 的最终实现见 components/bluetooth/src/lib.rs
 
 pub struct BluetoothManager {
     adapter: BluezAdapter1Proxy,
@@ -5760,8 +5772,13 @@ pub struct BtDevice {
 | **PackageKit** | `org.freedesktop.PackageKit` (system bus) | 发行版软件包管理: `GetUpdates`, `GetPackages`, `InstallPackages`, `UpdatePackages`, `RefreshCache`（需 polkit） |
 | **发行版 CLI** | `apt` / `dnf` / `pacman` | 直接调用，注意权限 |
 
+**已落地（只读部分）**：`components/software` 走 `flatpak list --app
+--columns=application,name,origin,version,branch,installation`（tab 分隔，缺列补空串）；
+`flatpak` 未安装 → `BackendUnavailable`。`flatpak.install` 与 `software.updates`
+（PackageKit 事务）仍未接线——安装属特权写路径，路线图项。
+
 ```rust
-// 未实现（pending）：daemon 仅回执 not_implemented 占位（flatpak.list/install、software.updates）
+// 历史草稿（勿照抄）：SoftwareManager 的最终实现见 components/software/src/lib.rs
 
 pub struct SoftwareManager {
     pkgkit: PackageKitProxy,     // org.freedesktop.PackageKit
@@ -5796,6 +5813,16 @@ impl SoftwareManager {
 | **键盘布局** | `org.deepin.dde.InputDevices1` 方法 `SetLayoutList` | gsettings `org.gnome.desktop.input-sources sources` | `org.freedesktop.locale1` 属性 `X11Layout` |
 
 ---
+
+**已落地**（`components/peripherals`，按检测到的 DE 选路，各后端自校验后逐段降级）：
+
+| 能力 | KDE | GNOME | X11 | 其它 |
+|------|-----|-------|-----|------|
+| `touchpad.status` | KWin `org.kde.KWin.InputDeviceManager.ListTouch` + 逐设备 `org.kde.KWin.InputDevice`（enabled/naturalScroll/tapToClick/name），顶层取首个设备 | gsettings `org.gnome.desktop.peripherals.touchpad`（send-events/natural-scroll/tap-to-click，全局设置） | ❌ 路线图（`xinput list-props`） | ❌ 路线图（DDE `org.deepin.dde.InputDevices1`） |
+| `kbd.layout.list` | `$XDG_CONFIG_HOME/kxkbrc` `[Layout]`（LayoutList/VariantList/DisplayNames 按下标对齐） | gsettings `org.gnome.desktop.input-sources`（sources + mru-sources 定 active_index） | `setxkbmap -query`（**仅 X11 会话**：Wayland 下它读的是 XWayland 键映射，与会话布局可能不同，故不进链） | ❌ 路线图（DDE `SetLayoutList`） |
+
+链路全失败 → `BackendUnavailable`，错误文案逐段列出失败原因。`touchpad.set` /
+`kbd.layout.set` 仍是路线图项（写路径需按 DE 分别落 KWin/kcminputrc 或 gsettings）。
 
 ### 21.32 Secret Service 密钥环
 
@@ -5865,6 +5892,23 @@ L3 确认门禁与真实后端同时生效。
 
 ---
 
+**已落地**（`components/shortcut`，按检测到的 DE 选唯一后端——跨 DE 回退会写出目标桌面
+根本不监听的绑定，故不静默降级）：
+
+| DE | 落地方式 | 生效语义 |
+|----|---------|---------|
+| KDE | 写 `$XDG_DATA_HOME/kglobalaccel/<id>.desktop`（`X-KDE-GlobalAccel-CommandShortcut=true` + `Exec=/bin/sh -c '…'`）→ `doRegister` 触发 kglobalacceld 解析并注册组件 → `setForeignShortcut(["<id>","_launch",…], [qt_keycode])` 绑定；随后回读 `shortcutKeys` 校验，按键被占用则报错而非谎报成功 | 即时生效（kglobalacceld 自带持久化到 `kglobalshortcutsrc` 的 `[services][<id>] _launch=`），跨会话保留 |
+| GNOME | gsettings `org.gnome.settings-daemon.plugins.media-keys` `custom-keybindings` 分配/复用条目 + `custom-keybinding:<path>` 的 name/command/binding（先写子键再并列表，避免悬空条目） | gsd-media-keys 即时生效 |
+| Hyprland | `hyprctl keyword bind …`（运行期）+ `$XDG_CONFIG_HOME/hypr/agent-shell.conf` 片段（按组合键覆盖行）+ 主配置补一次 `source`；两处写入均「先写临时文件再 rename」，主配置读取失败（非 NotFound）直接上抛而非当作空文件覆盖 | 片段文件持久，重启由 Hyprland 读取 |
+
+**注意**：KGlobalAccel 的 D-Bus 方法名是 Qt 侧原样的 camelCase（`allComponents` /
+`doRegister` / `setForeignShortcut` / `shortcutKeys`），zbus 默认的 PascalCase 转换会发出
+不存在的名字——代理方法必须显式 `#[zbus(name = …)]`。
+
+路线图：`org.freedesktop.portal.GlobalShortcuts`（标准跨 DE 接口）属**会话级**绑定——CLI
+一次调用一个瞬态 daemon（§22.2 D1），进程退出即失去事件接收方，故不接线；待常驻 daemon
+（socket activation，§22.2 激活策略）落地后再引入。`shortcut.trigger` 仍是路线图项。
+
 ### 21.34 systemd timer 管理
 
 设计 18.13 只覆盖了 service，补 timer：
@@ -5876,8 +5920,17 @@ L3 确认门禁与真实后端同时生效。
 | 创建 timer | 写 unit 文件 + `daemon-reload` + `StartUnit` | 间接 |
 | 启用 timer | `EnableUnitFiles` + `StartUnit` | 标准流程 |
 
+**已落地**：`SystemComponent::list_timers()`（`components/systemd`）——
+`Manager.ListTimers` 对非特权调用方被 polkit 拒绝（systemd dbus 策略未放行，2026-09 实测），
+故改走策略放行的 `Manager.ListUnitsByPatterns([], ["*.timer"])`，再逐单元读
+`org.freedesktop.systemd1.Timer` 属性（`NextElapseUSecRealtime` / `LastTriggerUSec` /
+`NextElapseUSecMonotonic`）与 `org.freedesktop.systemd1.Unit.FragmentPath`；epoch 0
+是「未安排」哨兵，渲染为空串（`core::time::format_epoch_usec`）。`timer.list` /
+`timer.next` 均已接线（后者未命中返回 NotFound）。
+
 ```rust
-// 未实现（pending）：SystemdComponent 未实现 list_timers；SystemdTimer 类型在 core/src/services.rs
+// 历史草稿（勿照抄）：SystemdManager 的最终实现见 components/systemd/src/lib.rs
+
 impl SystemdManager {
     /// 列出所有 timer
     pub async fn list_timers(&self) -> Result<Vec<SystemdTimer>> {
@@ -5972,6 +6025,25 @@ agent-shell shortcut trigger "meta+shift+s"
 agent-shell timer list
 agent-shell timer next backup.timer
 ```
+
+**P2 只读能力载荷契约**（daemon 侧 JSON；`not_implemented` 占位已由真实实现替换）：
+
+| 方法 | 请求 | 响应 |
+|------|------|------|
+| `mime.get` | `{"mime": "text/html"}` | `{"mime", "default_app": string\|null, "source"}` |
+| `mime.default_browser` | — | `{"default_browser": string\|null, "source"}` |
+| `bluetooth.list` | — | `BtDevice[]`（address/name/paired/connected/trusted/rssi/uuids） |
+| `flatpak.list` | — | `FlatpakApp[]`（app_id/name/origin/version/branch/installation） |
+| `touchpad.status` | — | `{"source", "enabled", "natural_scroll", "tap_to_click", "devices": [{sysname,name,enabled,natural_scroll,tap_to_click}]}` |
+| `kbd.layout.list` | — | `{"source", "active_index": u32\|null, "layouts": [{index,layout,variant,display_name}]}` |
+| `shortcut.bind` | `{"combo": "meta+t", "action": "<命令行>"}`（`action` 含控制字符 → InvalidParams） | `{"backend", "component": string\|null, "combo", "action"}` |
+| `timer.list` | — | `SystemdTimer[]`（next/last 触发时间为 ISO-8601 UTC：未安排为空串 `""`，属性读取失败为 `null`——两者不可混同） |
+| `timer.next` | `{"name": "backup.timer"}` | 单个 `SystemdTimer`；未命中 → NotFound |
+
+统一错误语义：组合键语法错误 / 缺参 / 多键序列 / `action` 含控制字符 → `InvalidParams`
+（控制字符会经配置行注入 DE 指令：Hyprland 片段文件、desktop `Exec=`）；后端缺失或被拒 →
+`BackendUnavailable`（文案含逐段根因）；后端在位但执行失败 → `BackendError`。
+`shortcut.bind` 在 KGlobalAccel 回读不到目标键码时同样报错，不谎报成功。
 
 **MCP 新增工具**：
 ```rust
@@ -6616,7 +6688,8 @@ agent-shell doctor
 **Phase 3：系统服务（2-3 周）— 🟡 部分实现/部分接线**
 - services 组件 crate 已合入：`components/audio|network|power|notification|appearance|clipboard|launcher`（PR #6/#8/#9）
 - 基础设施 crate 已合入：`components/systemd|logind`（PR #6）
-- daemon 侧大量方法仍为占位回执 `not_implemented`（`daemon/src/dispatch.rs` 的 `placeholder_service` 表：file/mime/bluetooth/flatpak/software/touchpad/kbd/secret/shortcut/timer）
+- daemon 侧剩余占位回执 `not_implemented`（`daemon/src/dispatch.rs` 的 `placeholder_service` 表：file/secret + 各能力写路径如 mime.set、touchpad.set、kbd.layout.set、bluetooth.scan/connect/disconnect、flatpak.install、software.updates、shortcut.trigger）
+- P2 只读能力（mime/bluetooth/flatpak/touchpad/kbd/shortcut/timer + timer.next）已接线到真实后端（见 §21.27–§21.34 各节与 §21.35 载荷契约）
 - 验收「全部 CLI 命令在 DDE 实测通过」未达成
 
 **Phase 4：跨 DE + MCP 打磨（2 周）— 🟡 部分实现/部分接线**

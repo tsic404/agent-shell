@@ -86,7 +86,7 @@ fn parse_at(at: Option<&Value>) -> Option<(i32, i32)> {
 
 /// "ctrl+c" / "meta+t" 组合键解析（与 CLI 层同语法；daemon 侧独立实现以
 /// 保持 CLI 零组件依赖——解析规则由 rpc crate 测试锚定）。
-fn parse_combo(spec: &str) -> Result<KeyCombo, (RpcErrorCode, String)> {
+pub(crate) fn parse_combo(spec: &str) -> Result<KeyCombo, (RpcErrorCode, String)> {
     let mut modifiers = ModifierMask::default();
     let mut keys = Vec::new();
     for part in spec.split('+').filter(|p| !p.is_empty()) {
