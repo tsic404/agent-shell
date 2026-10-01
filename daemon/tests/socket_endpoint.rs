@@ -1,8 +1,8 @@
 //! `--socket` 显式端点生命周期 e2e：真实 daemon 二进制、无图形会话。
 //!
 //! 绑定细节（权限、残留回收、活跃端点拒绝、非 socket 路径拒绝）由 `serve.rs` 单测
-//! 覆盖；这里钉住只有完整进程才能观察的契约：空闲退出与连接存续的关系，以及
-//! 活跃端点上的二次绑定在进程层面的表现（退出码 + stderr）。
+//! 覆盖；这里钉住只有完整进程才能观察的契约：空闲退出回收绑定路径，空闲退出与连接
+//! 存续的关系，以及活跃端点上的二次绑定在进程层面的表现（退出码 + stderr）。
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
@@ -172,8 +172,8 @@ fn idle_exit_waits_for_open_connections_to_finish() {
     };
     assert!(status.success(), "idle exit must be clean, got {status}");
     assert!(
-        UnixStream::connect(&socket).is_err(),
-        "socket must be gone after idle exit"
+        !socket.exists(),
+        "clean idle exit must unlink the bound socket path"
     );
     kill(&mut child);
 }

@@ -6,7 +6,8 @@
 //!   fork/exec 本二进制并以 stdio 管道承载协议——瞬态子进程随父进程退出
 //!   （stdin EOF）自行终止，不残留孤儿。
 //! - `--socket <path>`：显式 Unix socket 端点，常驻服务多条连接，同样按空闲
-//!   超时退出。供无图形会话（QA/调试）用 `agent-shell --socket <path>` 直连。
+//!   超时退出，正常退出时回收绑定路径（见 [`serve::BoundSocket`]）。供无图形
+//!   会话（QA/调试）用 `agent-shell --socket <path>` 直连。
 //!
 //! 单实例锁默认走 `$XDG_RUNTIME_DIR/agent-shell.lock`；`--lock-path` 与
 //! `AGENT_SHELL_LOCK` 提供隔离命名空间，`--no-lock` 完全跳过（并行测试实例）。
@@ -124,9 +125,9 @@ async fn run(args: Args) {
     };
 
     // 端点先绑定再装配：路径冲突（活跃端点、不可写目录）在建立桌面连接之前失败。
-    let listener = match args.socket.as_deref() {
+    let endpoint = match args.socket.as_deref() {
         Some(path) => match serve::bind_socket(path) {
-            Ok(listener) => Some(listener),
+            Ok(endpoint) => Some(endpoint),
             Err(msg) => {
                 eprintln!("error: {msg}");
                 std::process::exit(1);
@@ -160,8 +161,8 @@ async fn run(args: Args) {
     // 空闲超时以 daemon 装配值为准（§22.2：无请求达超时即退，systemd
     // `Restart=on-failure` 语义下正常退出不重启）。
     let idle_timeout = daemon.idle_timeout;
-    match listener {
-        Some(listener) => serve::serve_socket(listener, daemon, idle_timeout).await,
+    match endpoint {
+        Some(endpoint) => serve::serve_socket(endpoint, daemon, idle_timeout).await,
         None => serve::serve_stdio(daemon, idle_timeout).await,
     }
 
