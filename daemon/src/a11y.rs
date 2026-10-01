@@ -8,14 +8,19 @@
 //! 存活性漂移无从定位。
 
 use agent_shell_a11y::atspi_bridge::{
-    A11yBusOutcome, AtspiBridge, LauncherActivation, BUS_SERVICE, REGISTRY_SERVICE, ROOT_PATH,
-    SESSION_CALL_TIMEOUT, STATUS_IFACE, STATUS_PATH,
+    A11yBusOutcome, AtspiBridge, LauncherActivation, AT_SPI_BUS_ADDRESS_ENV, BUS_SERVICE,
+    REGISTRY_SERVICE, ROOT_PATH, SESSION_CALL_TIMEOUT, STATUS_IFACE, STATUS_PATH,
 };
 use std::future::Future;
 use std::time::Duration;
 use zbus::names::WellKnownName;
 
-/// Registry 激活等待上限：registryd 启动是秒级，远低于 D-Bus 激活超时 ~120s。
+/// Registry 激活等待上限（兜底；设计文档 §19 的 10s）：registryd 启动是秒级，
+/// 远低于 D-Bus 激活超时 ~120s。实测该激活的失败现场不是超时——broker 环境缺
+/// `AT_SPI_BUS_ADDRESS` 时 registryd 取不到总线地址、未注册名字即退出：dbus-broker
+/// 立即回 `ServiceUnknown`（归因见 [`activation_failure_reason`]），dbus-daemon 则
+/// 把激活挂到自身 `service_start_timeout`（25s）才回错。本上限先于总线返回，兜住
+/// 这种挂起（挂死的 broker 不该拖住探测）。
 const REGISTRY_ACTIVATION_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// AT-SPI Registry 可达性报告行（✓/⚠ 前缀；doctor 与 a11y.status 共用）。
@@ -107,18 +112,60 @@ async fn ensure_registry(bus: &zbus::Connection) -> Result<Option<String>, Strin
         ));
     }
     // registryd 退出后由 D-Bus 激活拉起——「Registry 存活性漂移」的恢复路径。
-    let started: u32 = bounded(
-        dbus.start_service_by_name(well_known(REGISTRY_SERVICE)?, 0),
-        REGISTRY_ACTIVATION_TIMEOUT,
-        "StartServiceByName(Registry)",
-    )
-    .await?;
+    let started = start_registry(&dbus).await?;
     if !name_owned(&dbus, REGISTRY_SERVICE).await? {
         return Err(format!(
-            "{REGISTRY_SERVICE} activation returned {started} but name is still unowned"
+            "{REGISTRY_SERVICE} activation returned {started} but name is still unowned — {}",
+            unregistered_registry_hint()
         ));
     }
     Ok(Some("Registry started on demand".to_string()))
+}
+
+/// 拉起 Registry：激活失败按错误名归因（[`activation_failure_reason`]），
+/// 超时归一为带上下限的调用文案（兜底，见 [`REGISTRY_ACTIVATION_TIMEOUT`]）。
+async fn start_registry(dbus: &zbus::fdo::DBusProxy<'_>) -> Result<u32, String> {
+    let activation = dbus.start_service_by_name(well_known(REGISTRY_SERVICE)?, 0);
+    match tokio::time::timeout(REGISTRY_ACTIVATION_TIMEOUT, activation).await {
+        Ok(Ok(started)) => Ok(started),
+        Ok(Err(err)) => Err(activation_failure_reason(&err)),
+        Err(_) => Err(format!(
+            "StartServiceByName(Registry) timed out after {}s",
+            REGISTRY_ACTIVATION_TIMEOUT.as_secs()
+        )),
+    }
+}
+
+/// 「Registry 拉起后仍未注册」的归因提示（激活失败与激活后名字仍无主共用）。
+///
+/// broker 环境缺 `AT_SPI_BUS_ADDRESS` 时 registryd 取不到自身总线地址、连不上
+/// 即退出，总线只回一个错误名（`ServiceUnknown` / `Spawn.ChildExited`）——现场
+/// 无从归因，故在此补出可疑根因与处置。
+fn unregistered_registry_hint() -> String {
+    format!(
+        "a11y broker environment likely lacks {AT_SPI_BUS_ADDRESS_ENV} — registryd cannot reach the a11y bus without it and exits instead of registering; restart at-spi-dbus-bus.service"
+    )
+}
+
+/// 激活失败归因（供 [`start_registry`] 归一）：未注册名字即退出类
+/// （[`activation_left_unregistered`]）追加 broker 环境提示，其余保留 D-Bus
+/// 原始错误名与描述。
+fn activation_failure_reason(err: &zbus::fdo::Error) -> String {
+    if activation_left_unregistered(err) {
+        format!("{err}; {}", unregistered_registry_hint())
+    } else {
+        err.to_string()
+    }
+}
+
+/// 激活失败是否为「进程未注册名字即退出」类（两种总线实现下的同一现场）：
+/// dbus-broker（经 systemd 瞬态单元激活）报 `ServiceUnknown`，dbus-daemon 报
+/// `Spawn.ChildExited`。
+fn activation_left_unregistered(err: &zbus::fdo::Error) -> bool {
+    matches!(
+        err,
+        zbus::fdo::Error::ServiceUnknown(_) | zbus::fdo::Error::SpawnChildExited(_)
+    )
 }
 
 /// 名称是否已在总线上注册。
@@ -302,6 +349,45 @@ mod tests {
         let line = connect_failure_line(&A11yBusOutcome::NotStarted);
         assert!(!line.contains("restart at-spi-dbus-bus.service"), "{line}");
         assert!(line.contains("starts on demand"), "{line}");
+    }
+
+    /// 激活失败归因：两种总线实现的「拉起后未注册」错误名都要带 broker 环境
+    /// 提示（否则现场只剩一个 D-Bus 错误名）；调用级失败不得被误归因。
+    #[test]
+    fn activation_failure_names_broker_env_hint() {
+        for name in [
+            "org.freedesktop.DBus.Error.ServiceUnknown",
+            "org.freedesktop.DBus.Error.Spawn.ChildExited",
+        ] {
+            let reason = activation_failure_reason(&method_error(name));
+            assert!(reason.contains(name), "{reason}");
+            assert!(reason.contains(AT_SPI_BUS_ADDRESS_ENV), "{reason}");
+            assert!(
+                reason.contains("restart at-spi-dbus-bus.service"),
+                "{reason}"
+            );
+        }
+
+        let denied =
+            activation_failure_reason(&method_error("org.freedesktop.DBus.Error.AccessDenied"));
+        assert!(
+            !denied.contains(AT_SPI_BUS_ADDRESS_ENV),
+            "调用级失败不得归因到 broker 环境: {denied}"
+        );
+        assert!(denied.contains("AccessDenied"), "{denied}");
+    }
+
+    /// 现场等价的错误（fdo proxy 把错误回复映射为 [`zbus::fdo::Error`]；`Message`
+    /// 仅作载体），错误名 → 变体的映射与生产中同源。
+    fn method_error(name: &str) -> zbus::fdo::Error {
+        let reply = zbus::Message::method_call(ROOT_PATH, "StartServiceByName")
+            .and_then(|builder| builder.build(&()))
+            .expect("valid method call message");
+        zbus::fdo::Error::from(zbus::Error::MethodError(
+            name.try_into().expect("valid D-Bus error name"),
+            Some("detail".to_string()),
+            reply,
+        ))
     }
 
     /// 无 a11y bus 的环境（CI/容器）下探测返回 ⚠ 行而非 panic；可达时保留
