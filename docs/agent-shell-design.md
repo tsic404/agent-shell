@@ -2687,7 +2687,13 @@ bus 被换掉——该会话其它客户端的新连接随即被拒（`Connectio
 - `doctor` / `a11y.status` 与桥接共用同一条地址解析链，分级报告失败阶段
   （session bus → a11y bus → Registry）；Registry 未运行但可激活时按需启动
   （会话内重启恢复，状态行注明 `Registry started on demand`）；总线 socket
-  已被替换时报告 `stale a11y bus socket — restart at-spi-dbus-bus.service`。
+  已被替换时报告 `stale a11y bus socket — restart at-spi-dbus-bus.service`；
+- Registry 激活失败按错误名归因：被激活的 registryd 未注册名字即退出
+  （`ServiceUnknown` / `Spawn.ChildExited`，同一现场在 dbus-broker / dbus-daemon
+  下的两种错误名）时补出可疑根因——broker 环境缺 `AT_SPI_BUS_ADDRESS` 时
+  registryd 取不到自身总线地址、连不上即退出——与处置
+  `restart at-spi-dbus-bus.service`；激活上限 10s（§19）保留为兜底，只防挂死
+  的 broker 把探测拖住。
 
 ### 14.3 语义定位引擎
 
