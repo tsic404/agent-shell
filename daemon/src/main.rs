@@ -14,7 +14,10 @@
 //!
 //! 手动调试 stdio 形态时用管道保持 stdin 打开即可维持运行
 //! （`tail -f /dev/null | agent-shell-daemon`）；`/dev/null`、重定向或后台等
-//! 非交互 stdin 会立即 EOF 退出。
+//! 非交互 stdin 的 EOF 由内核直接给出（读返回 0 / `POLLHUP`），但 stdin 服务
+//! 循环排在单实例锁之后，EOF 要等锁判定完才被看见：已有实例持锁时本进程先等满
+//! `LOCK_WAIT_TIMEOUT`（30s）再以 exit 1 报「daemon already running」，锁空闲
+//! 时才随即因 EOF 退出（exit 0）。
 
 mod a11y;
 mod capture;
