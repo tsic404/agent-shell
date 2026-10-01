@@ -6252,7 +6252,7 @@ function winDesktops(w) {
 - D-Bus session activation：首个需要 daemon 的操作自动拉起（`agent-shell.service` systemd user unit, `Restart=on-failure`）
 - 空闲超时退出（默认 30min，可配置）：避免常驻浪费
 - 手动调试：直接运行 `agent-shell-daemon`，从 stdin 读 JSON-RPC、stdin EOF 即退出
-- 显式端点：`agent-shell-daemon --socket <path>` 监听 Unix socket 常驻服务（多连接、空闲超时退出），CLI 用 `--socket <path>` 或 `AGENT_SHELL_SOCKET` 直连（§17.1 Unix Socket 形态）。无图形会话（QA/CI）与常驻实例场景的入口——CLI 不再 spawn 瞬态 daemon，也不参与会话单实例锁
+- 显式端点：`agent-shell-daemon --socket <path>` 监听 Unix socket 常驻服务（多连接、空闲超时退出），CLI 用 `--socket <path>` 或 `AGENT_SHELL_SOCKET` 直连（§17.1 Unix Socket 形态）。无图形会话（QA/CI）与常驻实例场景的入口——CLI 不再 spawn 瞬态 daemon，也不参与会话单实例锁。**端点生命周期**：正常退出（空闲超时/panic 展开，含装配期 panic）按 dev/ino 复核后 unlink 绑定路径；仅被信号终止（SIGKILL/SIGTERM，不执行析构）残留陈旧文件，由下次绑定的不可达探测接管回收
 - 锁覆盖：`--lock-path <path>` / `AGENT_SHELL_LOCK` 把单实例锁换到独立命名空间（同路径仍互斥），`--no-lock` 完全跳过（并行测试实例）。无该覆盖时，CLI spawn 的瞬态 daemon 继承会话锁，常驻实例持锁会让每条命令等满 30s 后失败
 
 **CLI-Daemon 协议**：JSON-RPC 2.0 行分隔（传输可为 daemon 与 CLI 进程间的 stdio 管道，或 `--socket` 的 Unix socket），与 MCP 传输同构，复用序列化代码：

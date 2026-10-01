@@ -9,8 +9,8 @@ use crate::dispatch;
 use crate::path_guard::describe_file_type;
 use crate::state::Daemon;
 use agent_shell_rpc::{Notification, Request, Response};
-use std::os::unix::fs::FileTypeExt;
-use std::path::Path;
+use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
@@ -50,13 +50,42 @@ impl ActivityClock {
     }
 }
 
+/// 绑定成功后的显式端点：listener + 绑定路径身份（dev/ino）。
+///
+/// Drop 时按身份复核后回收 socket 文件：空闲超时退出与 panic 展开（含装配期 panic）
+/// 都不留残留端点。被信号终止（SIGKILL/SIGTERM）不执行析构，仍会留下文件——由下次
+/// `bind_socket` 的连通性探测接管，与崩溃现场同一路径。
+#[derive(Debug)]
+pub(crate) struct BoundSocket {
+    listener: UnixListener,
+    path: PathBuf,
+    dev: u64,
+    ino: u64,
+}
+
+impl Drop for BoundSocket {
+    fn drop(&mut self) {
+        // 先复核 inode 再删：旧端点退出与新端点启动重叠时，路径可能已被新 daemon
+        // 回收重建；按路径盲删会摘掉后来者的端点，让它变成无人可达的孤儿。
+        let Ok(meta) = std::fs::symlink_metadata(&self.path) else {
+            return;
+        };
+        if (meta.dev(), meta.ino()) != (self.dev, self.ino) {
+            return;
+        }
+        if let Err(e) = std::fs::remove_file(&self.path) {
+            tracing::warn!(socket = %self.path.display(), "cannot unlink socket endpoint: {e}");
+        }
+    }
+}
+
 /// 绑定监听 socket（显式端点）。
 ///
 /// 路径已存在时按文件类型分流：**非 socket 对象（普通文件/目录/符号链接）一律拒绝**
 /// ——`--socket` 指向用户数据时不得为了绑定而删除它；socket 文件则连一下判定：能连上
 /// 说明有 daemon 正在服务该端点（拒绝启动，不抢活跃端点），连不上说明是上次崩溃留下的
 /// 文件，回收后重新绑定。权限收紧到 0600——该 socket 即桌面控制面，不能放同机其他用户接入。
-pub(crate) fn bind_socket(path: &Path) -> Result<UnixListener, String> {
+pub(crate) fn bind_socket(path: &Path) -> Result<BoundSocket, String> {
     match std::fs::symlink_metadata(path) {
         Ok(meta) if meta.file_type().is_socket() => {
             match std::os::unix::net::UnixStream::connect(path) {
@@ -97,10 +126,22 @@ pub(crate) fn bind_socket(path: &Path) -> Result<UnixListener, String> {
     }
     let listener = UnixListener::bind(path)
         .map_err(|e| format!("cannot bind socket {}: {e}", path.display()))?;
-    use std::os::unix::fs::PermissionsExt;
+    // 先取身份再收紧权限：此后任何失败路径都由守卫 Drop 回收文件，不留半成品端点。
+    let meta = std::fs::symlink_metadata(path).map_err(|e| {
+        format!(
+            "cannot read identity of bound socket {}: {e}",
+            path.display()
+        )
+    })?;
+    let bound = BoundSocket {
+        listener,
+        path: path.to_path_buf(),
+        dev: meta.dev(),
+        ino: meta.ino(),
+    };
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
         .map_err(|e| format!("cannot restrict socket {}: {e}", path.display()))?;
-    Ok(listener)
+    Ok(bound)
 }
 
 /// stdio 形态：单连接，stdin EOF 或空闲超时退出。
@@ -113,7 +154,7 @@ pub(crate) async fn serve_stdio(daemon: Daemon, idle_timeout: Duration) {
 }
 
 /// 监听形态：每条连接一个任务，共享同一 daemon 状态；无请求且无连接达空闲超时退出。
-pub(crate) async fn serve_socket(listener: UnixListener, daemon: Daemon, idle_timeout: Duration) {
+pub(crate) async fn serve_socket(bound: BoundSocket, daemon: Daemon, idle_timeout: Duration) {
     let daemon = Arc::new(Mutex::new(daemon));
     let activity = Arc::new(ActivityClock::new());
     let connections = Arc::new(AtomicUsize::new(0));
@@ -126,7 +167,7 @@ pub(crate) async fn serve_socket(listener: UnixListener, daemon: Daemon, idle_ti
                     break;
                 }
             }
-            accepted = listener.accept() => match accepted {
+            accepted = bound.listener.accept() => match accepted {
                 Ok((stream, _addr)) => {
                     activity.touch();
                     spawn_connection(&daemon, stream, Arc::clone(&activity), Arc::clone(&connections));
@@ -138,6 +179,9 @@ pub(crate) async fn serve_socket(listener: UnixListener, daemon: Daemon, idle_ti
             },
         }
     }
+    // 先摘端点（关 fd + 回收路径）再做收尾：portal Close 可能要等 D-Bus 往返，
+    // 期间留着「文件在、却无人接受」的假端点，客户端会连上后无限等待。
+    drop(bound);
     shutdown(&daemon).await;
 }
 
@@ -363,7 +407,7 @@ mod tests {
     async fn bind_creates_owner_only_socket() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("agent-shell.sock");
-        let _listener = bind_socket(&path).expect("bind on free path");
+        let _bound = bind_socket(&path).expect("bind on free path");
         let mode = std::fs::metadata(&path)
             .expect("socket metadata")
             .permissions()
@@ -387,17 +431,54 @@ mod tests {
     async fn bind_reclaims_stale_socket_file() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("agent-shell.sock");
-        // 绑定后立即 Drop：socket 文件残留、无人监听，等价于上次崩溃的现场。
+        // 裸 listener（不经过守卫）：等价于被信号终止的 daemon——不跑析构，文件残留。
         drop(std::os::unix::net::UnixListener::bind(&path).expect("stale listener"));
         assert!(path.exists(), "stale socket file must remain after drop");
-        let _listener = bind_socket(&path).expect("stale socket file must be reclaimed");
+        let _bound = bind_socket(&path).expect("stale socket file must be reclaimed");
+    }
+
+    /// 正常退出（守卫 Drop）回收绑定路径：同路径立刻可重新绑定，不依赖陈旧接管。
+    #[tokio::test]
+    async fn drop_unlinks_bound_socket_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("agent-shell.sock");
+        let bound = bind_socket(&path).expect("bind on free path");
+        assert!(path.exists(), "endpoint must exist while bound");
+        drop(bound);
+        assert!(!path.exists(), "clean exit must unlink the bound path");
+    }
+
+    /// 路径已被新 daemon 重建时，旧守卫不得按路径盲删——身份（dev/ino）不符即放手。
+    #[tokio::test]
+    async fn drop_spares_socket_bound_by_another_daemon() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("agent-shell.sock");
+        let old = bind_socket(&path).expect("bind old endpoint");
+        std::fs::remove_file(&path).expect("remove old path");
+        let _replacement = std::os::unix::net::UnixListener::bind(&path).expect("bind replacement");
+        drop(old);
+        assert!(
+            path.exists(),
+            "guard must not unlink a replacement endpoint"
+        );
+        std::os::unix::net::UnixStream::connect(&path).expect("replacement must stay reachable");
+    }
+
+    /// 路径已先被外部摘除时静默通过：析构期 panic 会把收尾变成 abort。
+    #[tokio::test]
+    async fn drop_tolerates_path_already_unlinked() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("agent-shell.sock");
+        let bound = bind_socket(&path).expect("bind on free path");
+        std::fs::remove_file(&path).expect("unlink path externally");
+        drop(bound);
     }
 
     #[tokio::test]
     async fn bind_creates_missing_parent_dir() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("nested/agent-shell.sock");
-        let _listener = bind_socket(&path).expect("bind with missing parent");
+        let _bound = bind_socket(&path).expect("bind with missing parent");
         assert!(path.exists());
     }
 
