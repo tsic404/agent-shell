@@ -421,12 +421,12 @@ impl KWinCompositor {
             Err(KWinError::ScriptingUnavailable(_)) => PROBE_FAIL_PERMANENT,
             Err(_) => PROBE_FAIL_TRANSIENT,
         };
-        // fetch_update 的 CAS 防 lost update：并发探测已把状态推进到 PROBE_OK
+        // try_update 的 CAS 防 lost update：并发探测已把状态推进到 PROBE_OK
         // 后，本探测的旧结果（可能失败）不得覆写确认态——仅当当前态仍非
         // PROBE_OK 时才写回。
         let _ = self
             .scripting_probe
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
                 if cur == PROBE_OK {
                     None
                 } else {
