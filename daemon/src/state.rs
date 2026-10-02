@@ -55,6 +55,19 @@ impl CompositorBackend {
         }
     }
 
+    /// KDE 原生输入注入候选（`org_kde_kwin_fake_input`），非 KWin 会话或无绑定
+    /// 时 `None`——输入链据此后退到 libei/ydotool/uinput。
+    fn kwin_native_input(&self) -> Option<Box<dyn agent_shell_input::InputService>> {
+        let Self::Kwin(c) = self else {
+            return None;
+        };
+        let fake_input = c.fake_input_handle()?;
+        let protocols = c.protocols_handle()?;
+        Some(Box::new(agent_shell_backend_kde::KWinNativeInput::new(
+            fake_input, protocols,
+        )))
+    }
+
     /// 事件源标注：KWin 会话按 Wayland/X11 细分；DDE 会话按合成器形态
     /// 细分（deepin-kwin→KWinWayland / Treeland→Treeland / X11→X11Generic）；
     /// Mutter 会话按窗口语义路径细分（Eval→MutterEval / Extension→MutterExtension）。
@@ -254,18 +267,25 @@ impl Daemon {
             }
         }
         .map(std::sync::Arc::new);
-        // 输入降级链（libei → ydotool → uinput → XTest）：与 compositor 独立装配。
-        // detect_with_reason 返回 (装配结果, 首选后端探测根因)：有具体根因
-        // （如 portal 缺 ConnectToEIS）时保存供 doctor/input_send 透出；纯
+        // 输入降级链（DE 原生通道 → libei → ydotool → uinput → XTest/xdotool）：
+        // 与 compositor 独立装配。原生候选取自 KWin 的 org_kde_kwin_fake_input
+        // 句柄——协议直达 KWin 输入栈，是 KDE Wayland 唯一保证生效的注入路径
+        // （无 portal 弹窗、无需 /dev/uinput 权限、不受 XWayland XTEST 被忽略影响）。
+        // detect_with_reason_and_native 返回 (装配结果, 首选后端探测根因)：有具体
+        // 根因（如 portal 缺 ConnectToEIS）时保存供 doctor/input_send 透出；纯
         // TTY/空链（无根因）存 None，doctor 回退友好文案而非裸英文内部消息。
         let de_type = agent_shell_core::de_detection::detect_desktop_environment();
-        let (input, input_error) = match agent_shell_input::detect_with_reason(de_type).await {
-            (Ok(handle), _) => (Some(handle), None),
-            (Err(e), reason) => {
-                tracing::warn!("input assemble failed: {e}");
-                (None, reason)
-            }
-        };
+        let native_input = compositor
+            .as_deref()
+            .and_then(CompositorBackend::kwin_native_input);
+        let (input, input_error) =
+            match agent_shell_input::detect_with_reason_and_native(de_type, native_input).await {
+                (Ok(handle), _) => (Some(handle), None),
+                (Err(e), reason) => {
+                    tracing::warn!("input assemble failed: {e}");
+                    (None, reason)
+                }
+            };
 
         // PortalSessionManager 先建——注入 CaptureDispatcher 作 TokenStore，
         // 使 ScreenCast 能 restore_token 静默恢复（§22.7 D5）。

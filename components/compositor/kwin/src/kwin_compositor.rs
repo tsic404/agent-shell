@@ -137,6 +137,25 @@ impl KWinCompositor {
         self.wayland_core.as_ref()
     }
 
+    /// fake_input 协议句柄（未绑定返回 `None`；可克隆，认证状态共享）。
+    ///
+    /// 输入组件据此构造链首原生注入候选：句柄在首次注入前
+    /// [`FakeInput::authenticate`]（`input.send` 路径此前从不认证，导致协议绑定
+    /// 却注入恒失败）。
+    pub fn fake_input_handle(&self) -> Option<FakeInput> {
+        self.protocols.as_ref()?.fake_input.clone()
+    }
+
+    /// org_kde_* 私有协议通道句柄（注入路径提交请求用）。
+    ///
+    /// 注入走 [`KWinProtocols::flush_queue`]（阻塞 roundtrip）而非裸 `flush`：
+    /// 往返保证请求已被 compositor 处理，并让协议错误（如未授权、版本不符）
+    /// 立刻以错误返回——"发完即忘 + 只 flush"会让被丢弃的注入看起来像成功，
+    /// 正是 `input` 静默 no-op 的成因。
+    pub fn protocols_handle(&self) -> Option<std::sync::Arc<KWinProtocols>> {
+        self.protocols.clone()
+    }
+
     /// Wayland 会话装配（`KdeBackend::assemble` 约定签名）。
     ///
     /// 连接 `$WAYLAND_DISPLAY`、绑定 org_kde_* globals、探测版本；
@@ -323,15 +342,19 @@ impl KWinCompositor {
             }
         });
         if let Some(p) = &self.protocols {
+            // 注入路径在首次注入前 authenticate（`input.send` 不再依赖 doctor 先行
+            // 认证），故「bound 未认证」是正常态而非告警；未绑定时 KDE Wayland 的
+            // X11 注入候选已被排除（KWin 忽略 XWayland XTEST），链退到 libei 起的
+            // 通用降级链。
             match &p.fake_input {
                 Some(fi) if fi.is_authenticated() => {
                     lines.push("✓ 输入注入   : fake_input authenticated ✓".into())
                 }
-                Some(_) => lines.push("⚠ 输入注入   : fake_input bound, not authenticated".into()),
-                None => lines.push(
-                    "⚠ 输入注入   : 无 fake_input（降级 libei/ydotool/uinput/XTest/xdotool）"
-                        .into(),
-                ),
+                Some(_) => lines
+                    .push("✓ 输入注入   : fake_input bound（原生注入候选，首次注入时认证）".into()),
+                None => {
+                    lines.push("⚠ 输入注入   : 无 fake_input（降级 libei/ydotool/uinput）".into())
+                }
             }
         }
         // 事件脚本是懒启动（subscribe 时才 load），未启动前如实报告；
@@ -452,12 +475,6 @@ impl KWinCompositor {
     /// window_management 短绑引用。
     fn window_mgmt(&self) -> Option<&WindowManagement> {
         self.protocols.as_ref()?.window_mgmt.as_ref()
-    }
-
-    /// fake_input 引用（未 authenticate 视为不可用）。
-    fn fake_input(&self) -> Option<&FakeInput> {
-        let fi = &self.protocols.as_ref()?.fake_input;
-        fi.as_ref().filter(|f| f.is_authenticated())
     }
 
     /// Scripting 查询封装：渲染模板 → run → 解析 JSON。
@@ -1539,7 +1556,12 @@ impl CompositorComponent for KWinCompositor {
             // 一个语义未定的流。
             window_events: false,
             workspace_events: false, // T3b
-            native_input: self.fake_input().is_some(),
+            // 原生注入通道可用 = 协议已绑定即可（注入路径在首次注入前
+            // authenticate），不再要求 doctor 先行认证。
+            native_input: self
+                .protocols
+                .as_ref()
+                .is_some_and(|p| p.fake_input.is_some()),
             native_capture: false, // kde-screencast 归 capture 组件（T2b）
             virtual_desktops: true,
             effects_control: false,

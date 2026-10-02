@@ -62,6 +62,11 @@ const ABS_CNT: usize = 64;
 /// 设备名。
 const DEVICE_NAME: &[u8] = b"agent-shell virtual input";
 
+/// 虚拟设备创建后等待合成器（libinput）打开新 evdev 节点的余量。
+///
+/// 实测：UI_DEV_CREATE 后立即注入的事件全部丢失，+100ms 起稳定送达。
+const DEVICE_SETTLE_DELAY: std::time::Duration = std::time::Duration::from_millis(200);
+
 /// linux/input.h `struct input_event`（x86_64 ABI：time 16 字节 + 8 字节 type/code/value）。
 #[repr(C)]
 struct InputEvent {
@@ -95,15 +100,14 @@ struct UinputUserDev {
 /// 设备广告的键码范围：keymap 可能产出的全部键码 + 鼠标按键 BTN_*。
 ///
 /// 与 `keymap` 产出保持一致——漏掉任一键码，对应键的注入会被内核静默丢弃
-/// （错误极难在真机之外复现）。
+/// （错误极难在真机之外复现）。字母键码按物理键位分布（`q`=16…`p`=25、`a`=30…
+/// `l`=38、`z`=44…`m`=50），不连续覆盖会漏键：`1..=88` 一次覆盖 Evdev 主键区
+/// （Esc…F12），多声明无副作用。
 const KEY_CODE_RANGES: &[std::ops::RangeInclusive<u32>] = &[
-    1..=15,        // Esc、1..0、BackSpace、Tab、-、=
-    26..=57,       // [ ] \ Enter Ctrl、a..z、Alt、Space、; ' ` Shift
-    59..=68,       // F1..F10
-    87..=88,       // F11..F12
-    102..=111,     // Home..Delete
-    125..=125,     // Super
-    139..=139,     // Menu
+    1..=88, // Esc、数字/符号排、q..p、[ ] \、a..l、; ' `、Shift、z..m、, . /、Alt、Space、F1..F12
+    102..=111, // Home..Delete
+    125..=125, // Super
+    139..=139, // Menu
     0x110..=0x116, // BTN_LEFT..BTN_BACK（含 BTN_SIDE/EXTRA）
 ];
 
@@ -151,6 +155,12 @@ impl UinputInput {
         register_device(&self.file).map_err(|e| {
             AgentShellError::BackendUnavailable(format!("uinput device setup failed: {e}"))
         })?;
+        // UI_DEV_CREATE 返回只代表内核已注册设备：合成器的 libinput 尚未打开新的
+        // evdev 节点，此刻写入的事件没有任何读者，会被**静默丢弃**（CLI 每次调用
+        // 都是新 daemon + 新设备，故表现为「uinput 后端恒无效果且 rc=0」）。
+        // 实测（KDE Plasma 6.7.5 + KWin/libinput）：创建后立即注入 0 送达，
+        // +100ms 起全部送达——取 200ms 留余量，一次性成本。
+        tokio::time::sleep(DEVICE_SETTLE_DELAY).await;
         *created = true;
         Ok(())
     }
@@ -302,6 +312,16 @@ impl InputService for UinputInput {
     async fn ensure_ready(&self, _op: Op<'_>) -> Result<()> {
         // 设备注册失败发生在任何注入之前——dispatcher 据此安全降级重放。
         self.ensure_created().await
+    }
+
+    fn supports(&self, op: Op<'_>) -> bool {
+        // 绝对指针定位不可用：设备把 `[0, ABS_RANGE_MAX]` 映射到整屏，而操作契约的
+        // 坐标是桌面像素——没有桌面尺寸就无法换算（装配层只传 DE，输入组件拿不到
+        // 监视器几何）。此前把像素当设备单位写，点击落在屏幕左上角附近：桌面无
+        // 可见效果、退出码仍是 0（QA 复现的静默 no-op）。声明能力缺口让 dispatcher
+        // 改试其他候选（原生协议 / libei），整链无候选时返回显式错误——不做
+        // 「看起来成功、实际点错位置」的注入。
+        !matches!(op, Op::Move(..))
     }
 
     async fn send_key(&self, combo: &KeyCombo) -> Result<()> {

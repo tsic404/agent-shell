@@ -423,10 +423,14 @@ impl WindowManagement {
 }
 
 /// fake_input 句柄：构造后必须先 [`FakeInput::authenticate`] 再注入。
-#[derive(Debug)]
+///
+/// 句柄可克隆（`OrgKdeKwinFakeInput` 是 wl_proxy 的轻量引用，认证状态共享
+/// `Arc`）——输入组件把它作为链首注入候选持有，与 doctor/窗口管理共用同一协议
+/// 对象；请求提交由持有者经 [`KWinProtocols::flush_queue`] 完成。
+#[derive(Debug, Clone)]
 pub struct FakeInput {
     input: OrgKdeKwinFakeInput,
-    authenticated: std::sync::atomic::AtomicBool,
+    authenticated: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl FakeInput {
@@ -442,7 +446,7 @@ impl FakeInput {
         ) {
             Ok(input) => Some(Self {
                 input,
-                authenticated: std::sync::atomic::AtomicBool::new(false),
+                authenticated: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             }),
             Err(e) => {
                 // ≤6.7.x 黑名单同样过滤 fake_input——NotPresent ≠ 协议缺失。
@@ -457,10 +461,24 @@ impl FakeInput {
         }
     }
 
-    /// 向 compositor 声明注入用途（协议要求 authenticate 先于任何注入请求）。
+    /// 向 compositor **发送**注入用途声明（协议要求 authenticate 先于任何注入请求）。
+    ///
+    /// 幂等：已认证则直接返回，不重复发送。本方法不置位认证状态——请求是否被
+    /// compositor 接受，由调用方在请求确认送达（协议队列 roundtrip 成功）后经
+    /// [`FakeInput::confirm_authenticated`] 置位。否则「发送成功」会被当成
+    /// 「认证成功」，注入请求被丢弃时调用方仍看到成功（假成功路径）。
     pub fn authenticate(&self, reason: &str) {
+        use std::sync::atomic::Ordering;
+        if self.authenticated.load(Ordering::Relaxed) {
+            return;
+        }
         self.input
             .authenticate("agent-shell".to_string(), reason.to_string());
+    }
+
+    /// 认证请求已确认送达 compositor（roundtrip 成功）——此后注入请求才可能
+    /// 被接受，注入前的 `ensure_authenticated` 才放行。
+    pub fn confirm_authenticated(&self) {
         self.authenticated
             .store(true, std::sync::atomic::Ordering::Relaxed);
     }
@@ -469,6 +487,12 @@ impl FakeInput {
     pub fn is_authenticated(&self) -> bool {
         self.authenticated
             .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// 协商到的协议版本（`keyboard_key` 需 ≥4、`pointer_motion_absolute` 需 ≥3）。
+    pub fn version(&self) -> u32 {
+        use wayland_client::Proxy as _;
+        self.input.version()
     }
 
     fn ensure_authenticated(&self) -> Result<()> {
@@ -480,6 +504,13 @@ impl FakeInput {
         } else {
             Err(KWinError::FakeInputNotAuthenticated.into())
         }
+    }
+
+    /// 滚轮/触摸板轴事件（`axis` 0=垂直、1=水平；`value` 为滚动量，正负表示方向）。
+    pub fn axis(&self, axis: u32, value: f64) -> Result<()> {
+        self.ensure_authenticated()?;
+        self.input.axis(axis, value);
+        Ok(())
     }
 
     /// 相对指针移动。

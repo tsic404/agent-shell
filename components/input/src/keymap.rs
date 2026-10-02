@@ -41,6 +41,16 @@ pub fn named_to_evdev(name: KeyName) -> Option<u32> {
     })
 }
 
+/// 字母 → evdev 键码（下标 = `c - 'a'`）。
+///
+/// evdev 键码是**物理键位**编号（`KEY_A`=30、`KEY_S`=31、`KEY_D`=32…），与字母表
+/// 顺序无对应关系；`KEY_B`=48 在底排。写成 `30 + (c - 'a')` 会把 "b" 打成 "s"、
+/// "c" 打成 "d" —— 真机上表现为「键入文本与预期不符」，且退出码仍为 0。
+pub const LETTER_EVDEV: [u32; 26] = [
+    30, 48, 46, 32, 18, 33, 34, 35, 23, 36, 37, 38, 50, 49, 24, 25, 16, 19, 31, 20, 22, 47, 17, 45,
+    21, 44,
+];
+
 /// 单字符 → (evdev 键码, 是否需要 shift)，US QWERTY。
 pub fn char_to_evdev(original: char) -> Option<(u32, bool)> {
     // Shift 符号先折回其底键（US QWERTY），再查键码。
@@ -70,7 +80,9 @@ pub fn char_to_evdev(original: char) -> Option<(u32, bool)> {
     };
     let lower = c.to_ascii_lowercase();
     let code: u32 = match lower {
-        'a'..='z' => 30 + (lower as u32 - b'a' as u32), // a=30..z=55
+        // 字母键码按物理键位编号，字母表顺序与键码顺序无关（a=30 与 s=31 相邻，
+        // b=48 却在底排）——连续递增写法会把 "b" 打成 "s"（见 LETTER_EVDEV）。
+        'a'..='z' => LETTER_EVDEV[(lower as u32 - b'a' as u32) as usize],
         '1'..='9' => 2 + (lower as u32 - u32::from(b'1')), // 1=2..9=10
         '0' => 11,
         ' ' => 57,
@@ -192,6 +204,53 @@ mod tests {
         assert_eq!(char_to_evdev(' '), Some((57, false)));
         assert_eq!(char_to_evdev('\n'), Some((28, false)));
         assert_eq!(char_to_evdev('中'), None);
+    }
+
+    /// 回归锚定：字母必须映射到 evdev 物理键位码，而非「a 起连续递增」。
+    /// 历史缺陷把 `30 + (c - 'a')` 当字母表——真机上 "b" 打成 "s"、"z" 打成 `*`，
+    /// 且命令仍返回 rc=0（静默注入错误内容）。
+    #[test]
+    fn letter_mapping_matches_evdev_physical_keycodes() {
+        let cases = [
+            ('a', 30),
+            ('b', 48),
+            ('c', 46),
+            ('d', 32),
+            ('e', 18),
+            ('f', 33),
+            ('g', 34),
+            ('h', 35),
+            ('i', 23),
+            ('j', 36),
+            ('k', 37),
+            ('l', 38),
+            ('m', 50),
+            ('n', 49),
+            ('o', 24),
+            ('p', 25),
+            ('q', 16),
+            ('r', 19),
+            ('s', 31),
+            ('t', 20),
+            ('u', 22),
+            ('v', 47),
+            ('w', 17),
+            ('x', 45),
+            ('y', 21),
+            ('z', 44),
+        ];
+        for (c, code) in cases {
+            assert_eq!(char_to_evdev(c), Some((code, false)), "lowercase {c}");
+            assert_eq!(
+                char_to_evdev(c.to_ascii_uppercase()),
+                Some((code, true)),
+                "uppercase {c}"
+            );
+        }
+        // 下标语义（c - 'a'）不得被「连续递增」改回：三处非相邻键位锚定。
+        assert_eq!(LETTER_EVDEV[1], 48, "KEY_B");
+        assert_eq!(LETTER_EVDEV[2], 46, "KEY_C");
+        assert_eq!(LETTER_EVDEV[18], 31, "KEY_S");
     }
 
     #[test]

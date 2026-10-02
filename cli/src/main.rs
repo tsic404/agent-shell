@@ -91,7 +91,7 @@ async fn dispatch_command(
         Command::Info => info(out, &mut c).await,
         Command::Windows(cmd) => windows(out, &mut c, cmd).await,
         Command::Workspaces(cmd) => workspaces(out, &mut c, cmd).await,
-        Command::Input(cmd) => input(&mut c, cmd).await,
+        Command::Input(cmd) => input(out, &mut c, cmd).await,
         Command::Screenshot(cmd) => screenshot(&mut c, cmd).await,
         Command::A11y(cmd) => a11y(&mut c, cmd).await,
         Command::Events(cmd) => events(&mut c, cmd).await,
@@ -337,9 +337,14 @@ async fn workspaces(
 
 // ───────────────────────── input ─────────────────────────
 
-async fn input(c: &mut DaemonClient, cmd: cli::InputCommand) -> CmdResult {
+/// 输入注入：成功时打印实际生效的后端名（原生协议 / libei / ydotool / …）。
+///
+/// 只报告"哪个通道完成注入"：注入失败走 RPC 错误路径（非 0 退出码 + 错误行），
+/// 因而 stdout 有输出即代表注入已被某后端接受——`rc=0 且无任何输出` 不再可能
+/// 与"静默 no-op"混淆。
+async fn input(out: OutputFormat, c: &mut DaemonClient, cmd: cli::InputCommand) -> CmdResult {
     use agent_shell_rpc::InputKind::*;
-    match cmd {
+    let backend = match cmd {
         cli::InputCommand::Key { combo } => {
             cli::parse_key_combo(&combo)?; // 语法校验在 CLI（快速失败）
             c.input(Key, json!({ "combo": combo })).await?
@@ -353,6 +358,10 @@ async fn input(c: &mut DaemonClient, cmd: cli::InputCommand) -> CmdResult {
         cli::InputCommand::Scroll { dx, dy } => {
             c.input(Scroll, json!({ "dx": dx, "dy": dy })).await?
         }
+    };
+    match out {
+        OutputFormat::Json => println!("{}", json!({ "ok": true, "backend": backend })),
+        OutputFormat::Table => println!("injected via {backend}"),
     }
     Ok(0)
 }
