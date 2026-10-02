@@ -6,12 +6,16 @@
 //! - `window_with_uuid`（窗口映射）→ [`RawEvent::KWinWindowAdded`]；
 //! - `org_kde_plasma_window.unmapped`（窗口卸载）→ [`RawEvent::KWinWindowRemoved`]。
 //!
-//! 事件队列由独立线程阻塞 dispatch（`blocking_dispatch`），与请求队列分离——
-//! window_mgmt 在同一 Wayland 连接上做第二次绑定（「only one client」按
-//! wl_client 计，同一客户端多绑定合法，KWin `bind_resource` 仅回发初始状态、
-//! 不拒绝第二次绑定），事件流与 on-demand roundtrip 互不干扰。
+//! 事件队列由独立线程短超时 poll 驱动（`prepare_read` + `poll(timeout)`），
+//! 与请求队列分离——window_mgmt 在同一 Wayland 连接上做第二次绑定（「only
+//! one client」按 wl_client 计，同一客户端多绑定合法，KWin `bind_resource`
+//! 仅回发初始状态、不拒绝第二次绑定）。读保护（read guard）只在 poll 短超时
+//! 窗口内持有，避免饿死主线程 on-demand roundtrip（否则 `events subscribe`
+//! 存活期间独立 CLI 命令全部阻塞）。
 
 use std::collections::HashMap;
+use std::os::fd::AsRawFd;
+use std::time::Duration;
 
 use agent_shell_core::error::{AgentShellError, Result};
 use agent_shell_core::types::WindowId;
@@ -30,6 +34,11 @@ use wayland_protocols_plasma::plasma_window_management::client::org_kde_plasma_w
 /// window_management 绑定版本区间（get_window_by_uuid 需 v12）。
 const WM_MIN: u32 = 12;
 const WM_MAX: u32 = 18;
+
+/// 事件线程 poll 超时（毫秒）：读保护只在此窗口内持有，主线程的 roundtrip
+/// 在窗口间隙取回读保护——过长会饿死主线程（QA 实测独立 CLI 阻塞），过短
+/// 增加空闲 CPU 占用。20ms 对窗口事件的投递延迟与 CPU 双端都可接受。
+const EVENT_POLL_TIMEOUT: Duration = Duration::from_millis(20);
 
 /// 原生事件派发状态：持事件发送端与窗口对象（保活以接收 unmapped）。
 ///
@@ -90,8 +99,8 @@ impl Dispatch<OrgKdePlasmaWindow, ()> for WaylandEventState {
 
 /// 已启动的 Wayland 原生事件监视器：持接收端（一次性取走）与事件线程句柄。
 ///
-/// 事件线程常驻组件生命周期，不设停止旗标——`blocking_dispatch` 阻塞读
-/// socket，进程退出时随线程终止。`_thread` 仅用于保持句柄（drop 即 detach）。
+/// 事件线程常驻组件生命周期，不设停止旗标——短超时 poll 阻塞读 socket，
+/// 进程退出时随线程终止。`_thread` 仅用于保持句柄（drop 即 detach）。
 pub struct WaylandEventMonitor {
     rx: Option<mpsc::UnboundedReceiver<RawEvent>>,
     _thread: std::thread::JoinHandle<()>,
@@ -131,9 +140,43 @@ pub(crate) fn spawn_wayland_monitor(
     let thread = std::thread::spawn(move || {
         let mut state = state;
         loop {
-            if queue.blocking_dispatch(&mut state).is_err() {
+            // 派发已排队事件（inner queue + 事件队列）；dispatch 处理器可能
+            // 发出 get_window_by_uuid 请求。
+            if queue.dispatch_pending(&mut state).is_err() {
                 break;
             }
+            // 冲刷 bind / get_window_by_uuid 等请求。
+            let _ = queue.flush();
+
+            // 预备读取；None = inner queue 有待派发事件，回卷重试。
+            let Some(guard) = queue.prepare_read() else {
+                continue;
+            };
+
+            // 短超时 poll：不在读保护上无限阻塞——同一 wl_display 上主线程的
+            // roundtrip（stacking_order_uuids/flush_queue）需要读保护，事件线程
+            // 长期持锁会饿死主线程（QA 实测：订阅存活时独立 CLI 全部阻塞）。
+            let mut pfd = libc::pollfd {
+                fd: guard.connection_fd().as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let ready =
+                unsafe { libc::poll(&mut pfd, 1, EVENT_POLL_TIMEOUT.as_millis() as libc::c_int) };
+            if ready > 0 {
+                // 读 socket + 派发（read 消费 guard）。
+                let _ = guard.read();
+            } else {
+                // 超时/错误：drop 取消预备读取，释放读保护。
+                drop(guard);
+            }
+
+            // 派发刚读入的事件。
+            if queue.dispatch_pending(&mut state).is_err() {
+                break;
+            }
+            // 让出，给主线程取回读保护的机会。
+            std::thread::yield_now();
         }
     });
     Ok(WaylandEventMonitor {
