@@ -148,8 +148,17 @@ pub(crate) fn bind_socket(path: &Path) -> Result<BoundSocket, String> {
 pub(crate) async fn serve_stdio(daemon: Daemon, idle_timeout: Duration) {
     let daemon = Arc::new(Mutex::new(daemon));
     let out = Arc::new(Mutex::new(tokio::io::stdout()));
-    serve_stream(&daemon, tokio::io::stdin(), out, Some(idle_timeout), None).await;
-    tracing::info!("stdio session ended; exiting");
+    serve_stream(
+        &daemon,
+        tokio::io::stdin(),
+        out,
+        Some(idle_timeout),
+        None,
+        true,
+    )
+    .await;
+    // 瞬态形态：本连接结束即进程退出，退出日志走非阻塞写（见 [`exit_info`]）。
+    crate::log_exit("stdio session ended; exiting");
     shutdown(&daemon).await;
 }
 
@@ -222,8 +231,29 @@ fn spawn_connection(
     let out = Arc::new(Mutex::new(writer));
     tokio::spawn(async move {
         let _alive = ConnectionGuard::acquire(&connections);
-        serve_stream(&daemon, reader, out, None, Some(activity)).await;
+        serve_stream(&daemon, reader, out, None, Some(activity), false).await;
     });
+}
+
+/// 退出临近的连接日志：瞬态 stdio 连接结束后进程即退出，日志走非阻塞
+/// [`crate::log_exit`]——调用方 stderr 管道写满或无读者时，阻塞写会把
+/// `std::process::exit` 拖住，进程带着单实例锁残留；socket 连接为 `false`，
+/// daemon 继续服务其它连接，保持 tracing 结构化输出与级别过滤。
+fn exit_info(transient: bool, msg: &str) {
+    if transient {
+        crate::log_exit(msg);
+    } else {
+        tracing::info!("{msg}");
+    }
+}
+
+/// [`exit_info`] 的 warn 级别版本（瞬态形态只有纯文本行，无级别概念）。
+fn exit_warn(transient: bool, msg: &str) {
+    if transient {
+        crate::log_exit(msg);
+    } else {
+        tracing::warn!("{msg}");
+    }
 }
 
 /// 请求服务循环：逐行读 → dispatch → 逐行写。连接 EOF 退出；`idle_timeout`
@@ -231,12 +261,16 @@ fn spawn_connection(
 ///
 /// 响应与通知共用同一 writer 行流；订阅转发任务独立 spawn，必须共享一个互斥
 /// writer，否则并发写入会交织半行。本连接创建的订阅在退出时逐个从 hub 注销。
+///
+/// `transient`：本连接结束即进程退出（CLI/MCP fork/exec 的 stdio 形态）——退出
+/// 临近的日志必须非阻塞，见 [`exit_info`]。
 async fn serve_stream<R, W>(
     daemon: &Arc<Mutex<Daemon>>,
     reader: R,
     out: Arc<Mutex<W>>,
     idle_timeout: Option<Duration>,
     activity: Option<Arc<ActivityClock>>,
+    transient: bool,
 ) where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin + Send + 'static,
@@ -253,7 +287,7 @@ async fn serve_stream<R, W>(
                 match tokio::time::timeout(timeout, lines.read_line(&mut line)).await {
                     Ok(result) => result,
                     Err(_elapsed) => {
-                        tracing::info!("idle timeout reached");
+                        exit_info(transient, "idle timeout reached");
                         break;
                     }
                 }
@@ -263,12 +297,12 @@ async fn serve_stream<R, W>(
         let n = match read {
             Ok(n) => n,
             Err(e) => {
-                tracing::warn!("read error: {e}");
+                exit_warn(transient, &format!("read error: {e}"));
                 break;
             }
         };
         if n == 0 {
-            tracing::info!("connection closed");
+            exit_info(transient, "connection closed");
             break;
         }
         if let Some(clock) = activity.as_ref() {
@@ -394,7 +428,8 @@ mod tests {
 
         let (reader, writer) = tokio::io::split(server);
         let out = Arc::new(Mutex::new(writer));
-        serve_stream(&daemon, reader, out, None, None).await;
+        // `transient = false`：本用例关心订阅注销，不涉及退出日志形态。
+        serve_stream(&daemon, reader, out, None, None, false).await;
 
         assert_eq!(
             daemon.lock().await.hub.subscriber_count(),

@@ -19,6 +19,20 @@ fn daemon_bin() -> PathBuf {
 
 /// 起一个显式端点 daemon（私有锁，不碰会话级锁；抹掉图形会话痕迹）。
 fn spawn_daemon(dir: &Path, socket: &Path, lock: &Path, idle_secs: u64) -> Child {
+    spawn_daemon_with_stdin(dir, socket, lock, idle_secs, Stdio::null())
+}
+
+/// [`spawn_daemon`] 的 stdin 可配置版本。
+///
+/// socket 形态的 stdin 不是协议通道，`Stdio::null()` 上 `poll(events=0)` 永远收不到
+/// POLLHUP——用例需要以管道启动并主动挂断，才能覆盖「挂断不得终止 socket 形态」。
+fn spawn_daemon_with_stdin(
+    dir: &Path,
+    socket: &Path,
+    lock: &Path,
+    idle_secs: u64,
+    stdin: Stdio,
+) -> Child {
     Command::new(daemon_bin())
         .arg("--socket")
         .arg(socket)
@@ -32,7 +46,7 @@ fn spawn_daemon(dir: &Path, socket: &Path, lock: &Path, idle_secs: u64) -> Child
         .env_remove("XDG_CURRENT_DESKTOP")
         .env("XDG_SESSION_TYPE", "tty")
         .current_dir(dir)
-        .stdin(Stdio::null())
+        .stdin(stdin)
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
@@ -262,4 +276,49 @@ fn second_daemon_on_live_endpoint_fails_without_disturbing_the_first() {
         "first daemon must keep serving after the refused second bind"
     );
     kill(&mut first);
+}
+
+/// socket 形态的 stdin 不是协议通道：写端关闭（内核置 POLLHUP）不得终止 daemon——
+/// 端点必须继续服务请求，并按空闲超时自行退出。
+///
+/// 看门狗只在 stdio 形态安装（`main.rs` 的 `args.socket.is_none()` gating）。既有
+/// socket 用例全部以 `Stdio::null()` 启动，误装看门狗也拦不住；本用例以 piped stdin
+/// 启动并主动挂断，正是该 gating 的回归保护。
+#[test]
+fn stdin_hangup_does_not_stop_socket_mode_daemon() {
+    const IDLE_SECS: u64 = 2;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let socket = dir.path().join("agent-shell.sock");
+    let lock = dir.path().join("agent-shell.lock");
+    let mut child = spawn_daemon_with_stdin(dir.path(), &socket, &lock, IDLE_SECS, Stdio::piped());
+    wait_until_serving(&socket);
+
+    // 客户端挂断：关闭 stdin 写端。
+    drop(child.stdin.take());
+    // 端点必须继续服务——把挂断当作瞬态客户端消亡就会 exit(0)，后续请求失败。
+    assert!(
+        request(&socket, "info.show").is_ok(),
+        "socket daemon must keep serving after stdin hangup"
+    );
+    assert!(
+        request(&socket, "info.show").is_ok(),
+        "socket daemon must keep serving on further requests after stdin hangup"
+    );
+
+    // 收尾：挂断不改变空闲退出语义——超时后进程自行正常退出，不留残留。
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                assert!(status.success(), "clean idle exit expected, got {status:?}");
+                break;
+            }
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(100)),
+            Ok(None) => {
+                kill(&mut child);
+                panic!("daemon must idle-exit after stdin hangup, not stay resident");
+            }
+            Err(e) => panic!("try_wait failed: {e}"),
+        }
+    }
 }
