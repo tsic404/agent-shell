@@ -31,6 +31,11 @@ const BACKLIGHT_READONLY_HINT: &str = "the sysfs mount is read-only — remount 
 const BACKLIGHT_SYSFS_UNMOUNTED_HINT: &str = "a path component is not a directory — sysfs is \
      probably not mounted at /sys, or the backlight device vanished (check `mount | grep sysfs`)";
 
+/// sysfs 写入目标本身是目录（EISDIR：`brightness` 被同名目录占用）的指引。
+const BACKLIGHT_PATH_IS_DIR_HINT: &str = "the brightness path is a directory, not a writable \
+     file — sysfs is probably not mounted as a device tree at /sys, or the device node was \
+     replaced (check `mount | grep sysfs`)";
+
 /// 亮度能力契约（daemon 持 `dyn BrightnessOps`，测试注入 fake）。
 #[async_trait]
 pub trait BrightnessOps: Send + Sync {
@@ -407,7 +412,10 @@ fn sysfs_write_hint(kind: std::io::ErrorKind) -> Option<&'static str> {
     match kind {
         std::io::ErrorKind::PermissionDenied => Some(BACKLIGHT_PERMISSION_HINT),
         std::io::ErrorKind::ReadOnlyFilesystem => Some(BACKLIGHT_READONLY_HINT),
+        // 枚举（`sysfs_devices`）按 `<dev>/max_brightness` 可读且 > 0 过滤，非目录项
+        // 进不了写入路径：该分支仅「枚举与写入之间设备被同名文件替换」的竞态可达。
         std::io::ErrorKind::NotADirectory => Some(BACKLIGHT_SYSFS_UNMOUNTED_HINT),
+        std::io::ErrorKind::IsADirectory => Some(BACKLIGHT_PATH_IS_DIR_HINT),
         _ => None,
     }
 }
@@ -774,6 +782,18 @@ mod tests {
         let e = std::io::Error::from_raw_os_error(libc::ENOTDIR);
         let msg = sysfs_write_error(path, &e).to_string();
         assert!(msg.contains("Not a directory"), "{msg}");
+        assert!(msg.contains(path.to_str().expect("ascii path")), "{msg}");
+        assert!(msg.contains("not mounted"), "{msg}");
+    }
+
+    #[test]
+    fn sysfs_is_a_directory_error_carries_path_hint() {
+        // 夹具可达形态：`<dev>/brightness` 被同名目录占用（枚举只看 `max_brightness`
+        // 可读 > 0，故能走到写入）→ EISDIR，正文须带路径与恢复动作而非裸错。
+        let path = Path::new("/sys/class/backlight/bg0/brightness");
+        let e = std::io::Error::from_raw_os_error(libc::EISDIR);
+        let msg = sysfs_write_error(path, &e).to_string();
+        assert!(msg.contains("Is a directory"), "{msg}");
         assert!(msg.contains(path.to_str().expect("ascii path")), "{msg}");
         assert!(msg.contains("not mounted"), "{msg}");
     }
