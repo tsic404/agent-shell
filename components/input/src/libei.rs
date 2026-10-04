@@ -472,6 +472,10 @@ fn parse_response_body(
 
 /// 消费预订阅的流，读取一条 `Response` 信号并解析 `(ua{sv})`，返回 results；
 /// 响应码非 0 归一为 `Permission`。弹窗等待放宽到 30s（用户确认不可预期）。
+///
+/// 30s 内无应答同样归一为 `Permission`（授权未授予）：这是**需要人工确认**的
+/// 失败，不是瞬态传输故障——dispatcher 据此不重试（重试只会再弹一次窗、再等
+/// 30s，把单次 `input.send` 拖到分钟级），直接降级到下一候选。
 async fn drain_response(
     stream: &mut zbus::MessageStream,
     step: &str,
@@ -479,7 +483,9 @@ async fn drain_response(
     let msg = tokio::time::timeout(INPUT_TIMEOUT * 30, stream.next())
         .await
         .map_err(|_| {
-            AgentShellError::Timeout(format!("portal {step} Response timed out after 30s"))
+            AgentShellError::Permission(format!(
+                "portal RemoteDesktop {step} 授权未确认（30s 内无应答，请在弹出的门户对话框中允许）"
+            ))
         })?
         .ok_or_else(|| AgentShellError::DBus("portal signal stream ended".to_string()))?
         .map_err(|e| AgentShellError::DBus(format!("signal read: {e}")))?;
