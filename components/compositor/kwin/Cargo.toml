@@ -2,6 +2,7 @@
 name = "agent-shell-compositor-kwin"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "agent-shell KWin compositor component (org_kde_* Wayland protocols + KWin Scripting D-Bus bridge)"

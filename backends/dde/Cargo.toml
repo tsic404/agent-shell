@@ -2,6 +2,7 @@
 name = "agent-shell-backend-dde"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "agent-shell DDE backend: DdeCompositor (deepin-kwin/Treeland/X11) + dde-api service wrappers"

@@ -28,10 +28,16 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
+      - name: Setup Rust (pinned via rust-toolchain.toml)
+        # 版本唯一来自仓库根 rust-toolchain.toml（§9 C-100）；本步骤不声明任何版本（F6）。
+        run: |
+          channel=$(sed -n 's/^channel[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' rust-toolchain.toml)
+          test -n "$channel" || { echo "rust-toolchain.toml has no channel"; exit 1; }
+          rustup toolchain install "$channel" --profile minimal --no-self-update \
+            --component rustfmt,clippy
+          rustup show active-toolchain
+          rustup show active-toolchain | grep -qF "$channel-" || \
+            { echo "ERROR: active toolchain does not match pinned channel $channel"; exit 1; }
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
@@ -80,10 +86,16 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: aarch64-unknown-linux-gnu
+      - name: Setup Rust (pinned via rust-toolchain.toml)
+        # 版本唯一来自仓库根 rust-toolchain.toml（§9 C-100）；本步骤不声明任何版本（F6）。
+        run: |
+          channel=$(sed -n 's/^channel[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' rust-toolchain.toml)
+          test -n "$channel" || { echo "rust-toolchain.toml has no channel"; exit 1; }
+          rustup toolchain install "$channel" --profile minimal --no-self-update \
+            --target aarch64-unknown-linux-gnu --component rustfmt,clippy
+          rustup show active-toolchain
+          rustup show active-toolchain | grep -qF "$channel-" || \
+            { echo "ERROR: active toolchain does not match pinned channel $channel"; exit 1; }
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2

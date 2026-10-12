@@ -2,6 +2,7 @@
 name = "agent-shell-compositor-sway"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "agent-shell SwayCompositor (WlrWaylandCompositor base + Sway IPC supplementary channel)"

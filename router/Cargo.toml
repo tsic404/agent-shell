@@ -2,6 +2,7 @@
 name = "agent-shell-router"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "agent-shell semantic routing layer: Command model, Executor, resolve_target"

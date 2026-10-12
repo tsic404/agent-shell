@@ -1,0 +1,5 @@
+# 工具链版本唯一真源（§9 C-100）：本地构建与 CI 均由 rustup 依据本文件选型。
+[toolchain]
+channel = "1.99.0"                  # 精确 stable 版本，双引号；禁止 stable / beta / nightly / 缺 patch
+profile = "minimal"
+components = ["rustfmt", "clippy"]
