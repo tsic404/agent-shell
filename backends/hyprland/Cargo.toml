@@ -2,6 +2,7 @@
 name = "agent-shell-backend-hyprland"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "agent-shell Hyprland backend assembler: HyprlandCompositor + UPower + portal three-piece set"

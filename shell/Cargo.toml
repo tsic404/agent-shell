@@ -2,6 +2,7 @@
 name = "agent-shell-shell"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "agent-shell top-level: AgentShell struct + detect_and_assemble entry"

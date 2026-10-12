@@ -2,6 +2,7 @@
 name = "agent-shell-power"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "agent-shell power component: UPower/login1 common wrappers + DePriorityRouter"

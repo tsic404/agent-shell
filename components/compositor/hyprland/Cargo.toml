@@ -2,6 +2,7 @@
 name = "agent-shell-compositor-hyprland"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "agent-shell Hyprland compositor component (wlr base + hyprland_* private protocols + hyprctl socket IPC)"

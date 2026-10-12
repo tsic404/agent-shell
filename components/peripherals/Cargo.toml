@@ -2,6 +2,7 @@
 name = "agent-shell-peripherals"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "agent-shell input peripherals component (touchpad status, keyboard layouts)"

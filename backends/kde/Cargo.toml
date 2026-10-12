@@ -2,6 +2,7 @@
 name = "agent-shell-backend-kde"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "agent-shell KDE backend: KdeBackend assembler + powerdevil/kscreenlocker/appearance/launcher wrappers"

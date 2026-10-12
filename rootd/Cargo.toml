@@ -2,6 +2,7 @@
 name = "agent-shell-rootd"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "agent-shell privileged proxy (systemd system unit, polkit whitelist, §23.2/§23.4)"
