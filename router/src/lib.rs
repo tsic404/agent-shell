@@ -12,5 +12,8 @@ pub mod command;
 pub mod dispatcher;
 pub mod executor;
 
+#[cfg(test)]
+pub(crate) mod test_support;
+
 pub use command::{Command, CommandResult};
 pub use executor::Executor;
