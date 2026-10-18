@@ -15,6 +15,7 @@ agent-shell-displayserver-wayland.workspace = true
 agent-shell-displayserver-x11.workspace = true
 x11rb = "0.14"
 wayland-client = { version = "0.31", features = ["log"] }
+wayland-protocols = { version = "0.32", features = ["client", "unstable"] }
 wayland-protocols-plasma = { version = "0.3", features = ["client"] }
 zbus = { version = "5", default-features = false, features = ["tokio"] }
 async-trait.workspace = true

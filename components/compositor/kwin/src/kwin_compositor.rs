@@ -17,6 +17,8 @@ use serde_json::{json, Value};
 use tokio::sync::Mutex as AsyncMutex;
 
 use crate::dbus_bridge::{EventDeduper, EventDeduperHandle, KWinBridge, RegistrationOutcome};
+use crate::desktop_geometry;
+use crate::entitlement;
 use crate::error::{KWinError, Result};
 use crate::event_script::EventScriptHandle;
 use crate::native::KWinNative;
@@ -58,6 +60,12 @@ pub struct KWinCompositor {
     /// `Arc` 供 `list_windows` 的 stacking order roundtrip 经 `spawn_blocking`
     /// 移入阻塞线程（§19：同步段不得占 tokio worker）。
     protocols: Option<Arc<KWinProtocols>>,
+    /// 桌面几何探测态（懒建立，跨调用复用 registry/队列/manager）。
+    ///
+    /// 不复用会累积对象：`wl_registry` 是 core 单例、只有 `bind` 请求而无析构
+    /// 请求，每次重取都新建 registry 会让合成器侧 registry 资源数与重取次数
+    /// 同阶（见 [`desktop_geometry::Probe`]）。
+    geometry: std::sync::Mutex<Option<desktop_geometry::Probe>>,
     /// D-Bus / Scripting 补充通道（会话无关，共享）。
     bridge: KWinBridge,
     /// 事件推送去重器（组件级持有）：`EventDeduper` 判重状态从每连接的
@@ -137,6 +145,25 @@ impl KWinCompositor {
         self.wayland_core.as_ref()
     }
 
+    /// 桌面逻辑几何（输出包围盒，原点 `(0,0)`；不确定时 `None`）。
+    ///
+    /// 输入组件把 `input click --at` 的像素坐标换算成 uinput 直写设备的绝对轴值时
+    /// 需要它；走核心协议（[`desktop_geometry`]：`wl_output` + `zxdg_output_v1`），
+    /// **不受 KWin 私有接口授权门控**——原生注入通道不可用时这是绝对坐标的落点。
+    /// 每次调用都重新探测：显示布局可能在 daemon 生命周期内变化（输入链在移动
+    /// 注入前重取，不复用装配期结果）。探测态（registry/队列/manager）懒建立后
+    /// 常驻——见 [`desktop_geometry::Probe`]，重取期临时绑定的输出对象在读数后析构。
+    pub fn desktop_geometry(&self) -> Option<Rect> {
+        let connection = self.wayland_display_server()?.connection();
+        let mut probe = self.geometry.lock().unwrap_or_else(|p| p.into_inner());
+        if probe.is_none() {
+            // 建立失败不下沉为永久缺口：留 `None` 供下次调用重试（如合成器启动
+            // 早期未通告 xdg-output）。
+            *probe = desktop_geometry::Probe::new(connection);
+        }
+        probe.as_mut()?.refresh()
+    }
+
     /// fake_input 协议句柄（未绑定返回 `None`；可克隆，认证状态共享）。
     ///
     /// 输入组件据此构造链首原生注入候选：句柄在首次注入前
@@ -176,6 +203,7 @@ impl KWinCompositor {
         Ok(Self {
             wayland_core: Some(wl),
             protocols: Some(Arc::new(protocols)),
+            geometry: std::sync::Mutex::new(None),
             bridge,
             event_dedup,
             native,
@@ -204,6 +232,7 @@ impl KWinCompositor {
         Ok(Self {
             wayland_core: None,
             protocols: None,
+            geometry: std::sync::Mutex::new(None),
             bridge,
             event_dedup,
             native,
@@ -244,6 +273,7 @@ impl KWinCompositor {
         Self {
             wayland_core: None,
             protocols: None,
+            geometry: std::sync::Mutex::new(None),
             bridge,
             event_dedup,
             native,
@@ -279,12 +309,27 @@ impl KWinCompositor {
     /// 同步入口：KWin 侧脚本状态未知（按「未加载」渲染）。daemon doctor 走
     /// [`Self::doctor_lines_async`] 补齐该证据。
     pub fn doctor_lines(&self) -> Vec<String> {
-        self.doctor_lines_with(false)
+        self.doctor_lines_with(false, None)
+    }
+
+    /// 输入注入行是否需要授权条目摘要（未绑定 `fake_input` 的会话才要归因）。
+    ///
+    /// 与渲染分支的判据同源：`protocols` 有值但 `fake_input` 未绑定。
+    fn needs_entitlement_hint(&self) -> bool {
+        self.protocols
+            .as_ref()
+            .is_some_and(|p| p.fake_input.is_none())
     }
 
     /// doctor 输出主体；`loaded_in_kwin` 为 KWin 侧事件脚本装载态（异步探测后
-    /// 传入，见 [`Self::doctor_lines_async`]）。
-    fn doctor_lines_with(&self, loaded_in_kwin: bool) -> Vec<String> {
+    /// 传入，见 [`Self::doctor_lines_async`]）；`entitlement_hint` 为 async 入口
+    /// 在阻塞线程池上预先算好的授权条目摘要（`None` = 同步入口，渲染时就地生成，
+    /// 见 [`Self::doctor_lines`]）。
+    fn doctor_lines_with(
+        &self,
+        loaded_in_kwin: bool,
+        entitlement_hint: Option<&str>,
+    ) -> Vec<String> {
         let mut lines = Vec::new();
         if let Some(p) = &self.protocols {
             let bound = p.bound_count();
@@ -352,8 +397,24 @@ impl KWinCompositor {
                 }
                 Some(_) => lines
                     .push("✓ 输入注入   : fake_input bound（原生注入候选，首次注入时认证）".into()),
+                // 未绑定必须可归因（装配不变量：空槽给具体原因）：给出 KWin 的绑定
+                // 失败原因与授权条目状态——「无 fake_input」本身不区分缺条目、
+                // Exec 不匹配与 KWin 未放行，三者修复动作不同。
                 None => {
-                    lines.push("⚠ 输入注入   : 无 fake_input（降级 libei/ydotool/uinput）".into())
+                    let mut detail = vec!["无 fake_input（降级 libei/ydotool/uinput）".to_string()];
+                    detail.extend(
+                        p.bind_failures()
+                            .iter()
+                            .filter(|(name, _)| *name == "org_kde_kwin_fake_input")
+                            .map(|(_, reason)| reason.clone()),
+                    );
+                    // 授权条目摘要：async 入口已预计算（见 `doctor_lines_async`）；
+                    // 同步入口未预计算，就地生成。
+                    detail.push(match entitlement_hint {
+                        Some(hint) => hint.to_string(),
+                        None => entitlement::hint(),
+                    });
+                    lines.push(format!("⚠ 输入注入   : {}", detail.join("；")));
                 }
             }
         }
@@ -421,7 +482,20 @@ impl KWinCompositor {
         } else {
             false
         };
-        self.doctor_lines_with(loaded_in_kwin)
+        // 未绑定 fake_input 时输入注入行要附授权条目摘要，而摘要是同步扫描 XDG
+        // `applications/`（文件 I/O）——doctor 处在 async 路径上，放阻塞线程池执行
+        // （与输入注入路径同一口径：同步段不占 tokio worker）。阻塞任务异常退出
+        // （理论上不发生）时就地生成兜底，doctor 输出不因探测失败缺口。
+        let entitlement_hint = if self.needs_entitlement_hint() {
+            Some(
+                tokio::task::spawn_blocking(entitlement::hint)
+                    .await
+                    .unwrap_or_else(|_| entitlement::hint()),
+            )
+        } else {
+            None
+        };
+        self.doctor_lines_with(loaded_in_kwin, entitlement_hint.as_deref())
     }
 
     /// 探测并缓存 `/Scripting` 可用性。
