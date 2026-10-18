@@ -20,7 +20,7 @@
 use agent_shell_core::component::ComponentHealth;
 use agent_shell_core::error::{AgentShellError, Result};
 use agent_shell_core::types::{KeyCombo, MouseButton};
-use agent_shell_input::{keymap, InputService, Op};
+use agent_shell_input::{keymap, InputService, Op, SetupFailure};
 use async_trait::async_trait;
 
 use agent_shell_compositor_kwin::{FakeInput, KWinProtocols};
@@ -123,13 +123,17 @@ impl InputService for KWinNativeInput {
         }
     }
 
-    async fn ensure_ready(&self, _op: Op<'_>) -> Result<()> {
+    async fn ensure_ready(&self, _op: Op<'_>) -> Result<(), SetupFailure> {
         // 协议要求 authenticate 先于任何注入请求；幂等，重复调用无副作用。
         // 认证状态只在 roundtrip 确认送达**之后**置位：compositor 未处理（超时/
         // 协议错误）时保持未认证，后续注入会显式报错，而不是"打印 injected 但
         // 桌面无效果"的假成功（审查建议 3）。
         self.fake_input.authenticate(AUTH_REASON);
-        self.commit().await?;
+        if let Err(e) = self.commit().await {
+            // 认证握手类瞬态失败（compositor 无应答）归通道建立失败：dispatcher
+            // 按 §19 重试后降级，不会在注入期重放。
+            return Err(SetupFailure::Unavailable(e));
+        }
         self.fake_input.confirm_authenticated();
         Ok(())
     }

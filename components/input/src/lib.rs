@@ -13,9 +13,9 @@ mod xdotool;
 mod xtest;
 mod ydotool;
 
-pub use dispatcher::{InputDispatcher, InputService, Op};
+pub use dispatcher::{InputDispatcher, InputService, Op, SetupFailure};
 pub use libei::LibeiInput;
-pub use uinput::UinputInput;
+pub use uinput::{DesktopGeometrySource, UinputInput};
 pub use xdotool::XdotoolInput;
 pub use xtest::XTestInput;
 pub use ydotool::YdotoolInput;
@@ -53,8 +53,33 @@ impl InputComponentHandle {
         de_type: DesktopEnvironment,
         native: Option<Box<dyn InputService>>,
     ) -> Result<Self> {
-        let dispatcher = InputDispatcher::new_with_native(de_type, native).await?;
+        Self::detect_with_native_and_desktop(de_type, native, None).await
+    }
+
+    /// 同 [`Self::detect_with_native`]，额外接受桌面几何来源（合成器给出）。
+    ///
+    /// `desktop` 供 uinput 直写把 `--at` 像素坐标换算成设备绝对轴：原生通道
+    /// 未绑定且 portal 未授权时，这是 Wayland 会话里仍可用的绝对坐标通路；
+    /// 显示布局在 daemon 生命周期内可能变化，故每次移动注入前重取该来源。
+    pub async fn detect_with_native_and_desktop(
+        de_type: DesktopEnvironment,
+        native: Option<Box<dyn InputService>>,
+        desktop: Option<DesktopGeometrySource>,
+    ) -> Result<Self> {
+        let dispatcher = InputDispatcher::new_with_native(de_type, native, desktop).await?;
         Self::assemble(dispatcher, de_type)
+    }
+
+    /// 装配夹具入口（`tests/acceptance/<TC-id>` 用）：由给定候选链构造。
+    ///
+    /// 生产装配走 [`Self::detect_with_native`]（环境探测是 I/O，结果随主机
+    /// 变化）；验收用例要复现「某会话已装配好一条链」的确定性输入面，故这里
+    /// 直接接收候选链：active 仍按「链上首个可用候选」判定（与生产同规则）。
+    pub async fn from_candidates(
+        de_type: DesktopEnvironment,
+        candidates: Vec<Box<dyn InputService>>,
+    ) -> Result<Self> {
+        Self::assemble(InputDispatcher::from_candidates(candidates).await, de_type)
     }
 
     /// 由已构造 dispatcher 组装 handle（detect 的空链判定与错误构造）。
@@ -156,15 +181,19 @@ pub async fn detect_with_native(
 pub async fn detect_with_reason(
     de_type: DesktopEnvironment,
 ) -> (Result<InputComponentHandle>, Option<String>) {
-    detect_with_reason_and_native(de_type, None).await
+    detect_with_reason_and_native(de_type, None, None).await
 }
 
-/// 同 [`detect_with_reason`]，额外接受 DE 原生注入候选（链首）。
+/// 同 [`detect_with_reason`]，额外接受 DE 原生注入候选（链首）与桌面几何来源。
+///
+/// `desktop` 供 uinput 直写换算绝对坐标（见
+/// [`InputComponentHandle::detect_with_native_and_desktop`]），移动注入前重取。
 pub async fn detect_with_reason_and_native(
     de_type: DesktopEnvironment,
     native: Option<Box<dyn InputService>>,
+    desktop: Option<DesktopGeometrySource>,
 ) -> (Result<InputComponentHandle>, Option<String>) {
-    let dispatcher = match InputDispatcher::new_with_native(de_type, native).await {
+    let dispatcher = match InputDispatcher::new_with_native(de_type, native, desktop).await {
         Ok(d) => d,
         Err(e) => return (Err(e), None),
     };

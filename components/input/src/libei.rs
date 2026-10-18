@@ -17,7 +17,7 @@ use futures_util::StreamExt;
 use reis::event::{DeviceCapability, EiEvent};
 use tokio::sync::Mutex;
 
-use super::dispatcher::{InputService, Op, INPUT_TIMEOUT};
+use super::dispatcher::{InputService, Op, SetupFailure, INPUT_TIMEOUT};
 use crate::keymap::{char_to_evdev, combo_to_press_sequence, evdev_mouse_button};
 
 /// portal 服务 bus 名。
@@ -557,12 +557,15 @@ impl InputService for LibeiInput {
         }
     }
 
-    async fn ensure_ready(&self, op: Op<'_>) -> Result<()> {
-        // 建立 portal→EI 会话（可能触发授权弹窗）但不注入。会话建立失败
-        // （如 `AccessDenied: Invalid session`）或所需能力缺失（门户可能只
-        // 授权部分设备，如仅 pointer 而缺 keyboard）都发生在任何注入之前，
-        // dispatcher 据此安全降级重放，而不会在注入期重试同一后端。
-        let s = self.ensure_connected().await?;
+    async fn ensure_ready(&self, op: Op<'_>) -> Result<(), SetupFailure> {
+        // 建立 portal→EI 会话（可能触发授权弹窗）但不注入：会话建立失败是通道级
+        // 失败（重试后降级）；建会话后才发现的能力缺口是另一类事实——门户可能
+        // 只授权部分设备（如仅 pointer 而缺 keyboard），此时该后端对本次操作
+        // 不可用但仍是其它操作的候选，不得因此被摘除。
+        let s = self
+            .ensure_connected()
+            .await
+            .map_err(SetupFailure::Unavailable)?;
         let missing = match op {
             Op::Key(_) | Op::Text(..) => s.keyboard.is_none().then_some("keyboard"),
             Op::Move(..) => s.pointer_absolute.is_none().then_some("absolute-pointer"),
@@ -570,7 +573,7 @@ impl InputService for LibeiInput {
             Op::Scroll(..) => s.scroll.is_none().then_some("scroll"),
         };
         match missing {
-            Some(cap) => Err(AgentShellError::BackendUnavailable(format!(
+            Some(cap) => Err(SetupFailure::CapabilityGap(format!(
                 "libei: no {cap} capability"
             ))),
             None => Ok(()),
@@ -620,8 +623,10 @@ impl InputService for LibeiInput {
             s.device.device().frame(0, Self::now_us());
             s.inner.flush().map_err(flush_err)
         } else {
-            Err(AgentShellError::NotImplemented(
-                "libei backend: absolute motion unsupported by this device".into(),
+            // 能力缺失（本会话无绝对指针设备）——非「参数语义不满足」，
+            // 归 BackendUnavailable 而非 NotImplemented。
+            Err(AgentShellError::BackendUnavailable(
+                "libei: no absolute-pointer capability".into(),
             ))
         }
     }

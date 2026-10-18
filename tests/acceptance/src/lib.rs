@@ -74,6 +74,28 @@ impl Fixture {
             .set_token("screencast", token.to_string(), 2)
     }
 
+    /// 注入输入候选链（夹具用）。
+    ///
+    /// 生产输入装配依赖本机环境探测（portal / ydotool / `/dev/uinput` / 原生
+    /// 协议握手），在 CI 与验收机上不可复现；`input.click --at` 的判定面是
+    /// **已装配好的链上的候选选择与降级语义**，故由夹具给出确定性候选链，
+    /// 请求仍走真实 `dispatch` 与真实 dispatcher（TC-input-03）。
+    pub async fn set_input_chain(
+        &mut self,
+        de_type: DesktopEnvironment,
+        candidates: Vec<Box<dyn agent_shell_input::InputService>>,
+    ) {
+        let handle = agent_shell_input::InputComponentHandle::from_candidates(de_type, candidates)
+            .await
+            .expect("fixture chain must have at least one available candidate");
+        self.daemon.input = Some(handle);
+    }
+
+    /// 当前输入链的 active 后端名（判定「能力缺口不得摘除候选」用）。
+    pub fn input_backend_name(&self) -> Option<&'static str> {
+        self.daemon.input.as_ref().and_then(|i| i.backend_name())
+    }
+
     /// 发一条 JSON-RPC 请求（真实 `dispatch` 入口）。
     pub async fn call(&mut self, method_name: &str, params: Option<Value>) -> Response {
         let request = match params {

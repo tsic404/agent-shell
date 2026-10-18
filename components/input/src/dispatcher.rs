@@ -53,13 +53,13 @@ pub trait InputService: Send + Sync {
     /// absolute-pointer/button/scroll 能力（门户可能只授权部分设备，如仅
     /// pointer 而缺 keyboard）。命令型后端（ydotool/xdotool/XTest）无持久
     /// 会话，默认 `Ok(())` 忽略 `op`。dispatcher 在执行注入操作前先调用本
-    /// 方法：失败（含能力缺失）发生在任何注入之前，可安全降级重放；注入期
-    /// 错误则直接返回调用方，不重放（避免重复键击/点击/文本）。
+    /// 方法：失败发生在任何注入之前，可安全降级重放；注入期错误则直接返回
+    /// 调用方，不重放（避免重复键击/点击/文本）。
     ///
     /// 瞬态失败（连接/会话未就绪）由 dispatcher 按 §19 重试后再降级；授权
     /// 类失败（[`AgentShellError::Permission`]，含弹窗未确认）不重试——重试
     /// 只会重复弹窗。
-    async fn ensure_ready(&self, _op: Op<'_>) -> Result<()> {
+    async fn ensure_ready(&self, _op: Op<'_>) -> Result<(), SetupFailure> {
         Ok(())
     }
 
@@ -101,6 +101,51 @@ pub enum Op<'a> {
     Move(i32, i32),
     Click(MouseButton),
     Scroll(i32, i32),
+}
+
+impl Op<'_> {
+    /// 本操作需要的能力名（诊断文案用）。
+    ///
+    /// 能力缺口错误必须点名缺什么能力，而非笼统的「不支持该操作」——「绝对
+    /// 坐标」与「点击」在用户看来是同一命令 `input click --at`，只有点名能力
+    /// 才能解释「不带 --at 可用、带 --at 不可用」。
+    pub fn capability(self) -> &'static str {
+        match self {
+            Op::Key(..) | Op::Text(..) => "键盘注入 (keyboard-injection)",
+            Op::Move(..) => "绝对坐标定位 (absolute-pointer)",
+            Op::Click(..) => "指针按键注入 (pointer-button)",
+            Op::Scroll(..) => "滚轮注入 (pointer-scroll)",
+        }
+    }
+}
+
+/// [`InputService::ensure_ready`] 的失败分类。
+///
+/// 能力缺口与通道建立失败是两类不同事实：前者只影响本次操作（后端可能仅缺
+/// 这一类操作的能力——门户只授权了 keyboard 而缺 absolute-pointer），必须
+/// **保留候选**；后者是通道本身不可用，按 §19 重试后降级摘除。混同二者会让
+/// 一次 `--at` 把 libei 从整条链上摘掉，后续 `type`/`key` 一起丢失该后端。
+#[derive(Debug)]
+pub enum SetupFailure {
+    /// 本会话该后端不具备本次操作需要的能力（能力缺口）。
+    CapabilityGap(String),
+    /// 通道建立失败（权限/瞬态/结构性不可用）。
+    Unavailable(AgentShellError),
+}
+
+impl From<AgentShellError> for SetupFailure {
+    fn from(e: AgentShellError) -> Self {
+        SetupFailure::Unavailable(e)
+    }
+}
+
+impl std::fmt::Display for SetupFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SetupFailure::CapabilityGap(m) => write!(f, "{m}"),
+            SetupFailure::Unavailable(e) => write!(f, "{e}"),
+        }
+    }
 }
 
 /// 带降级链的输入分发器（§12.2）。
@@ -267,7 +312,7 @@ fn is_transient_setup_failure(e: &AgentShellError) -> bool {
 impl InputDispatcher {
     /// 按 DE 探测候选集合并选出第一个可用的 active 后端。
     pub async fn new(de_type: DesktopEnvironment) -> Result<Self> {
-        Self::new_with_native(de_type, None).await
+        Self::new_with_native(de_type, None, None).await
     }
 
     /// 带 DE 原生注入通道的装配入口。
@@ -276,9 +321,15 @@ impl InputDispatcher {
     /// 原生协议不经 portal 授权弹窗、不依赖 `/dev/uinput` 权限，是 Wayland 会话
     /// 唯一能保证「注入即生效」的通道（KWin 忽略 XWayland 的 XTEST 注入）。
     /// `None` 时链从 libei 开始（非 KDE / 原生协议未绑定）。
+    ///
+    /// `desktop`：合成器给出的桌面几何来源，供 uinput 直写把像素坐标换算成设备
+    /// 绝对轴（原生通道不可用时 `--at` 的绝对坐标通路）；`None` 时该候选按
+    /// 能力缺口跳过并计入可归因错误。来源在每次移动注入前重取——显示布局可能在
+    /// daemon 生命周期内变化。
     pub async fn new_with_native(
         de_type: DesktopEnvironment,
         native: Option<Box<dyn InputService>>,
+        desktop: Option<super::uinput::DesktopGeometrySource>,
     ) -> Result<Self> {
         let mut backends: Vec<Box<dyn InputService>> = Vec::new();
         // 首选后端探测失败的可诊断根因（仅「portal 在场但缺 ConnectToEIS」这类
@@ -318,10 +369,17 @@ impl InputDispatcher {
         //    /dev/uinput，不依赖 ydotool 二进制/ydotoold。仅 Wayland 会话压入
         //    （与 libei 同条件）——X11Generic 由 XTest/xdotool 以像素坐标原生
         //    处理，uinput 的 [0,0x7fff] 设备坐标会改退 move 语义（审查 #3）。
+        //    绝对坐标定位另需桌面几何来源（`desktop`）：合成器把设备轴映射到整块
+        //    桌面，没有尺寸就无法换算，故几何缺失时该候选对 move 声明能力缺口
+        //    （有来源则在每次注入前重取，布局变化不会用到过期包围盒）。
         //    探测 /dev/uinput 可写性，不可写/权限不足跳过候选；失败原因保存
         //    供整链空链时透出可诊断错误。
         if de_type != DesktopEnvironment::X11Generic && !de_type.is_tty() {
-            match super::uinput::UinputInput::new() {
+            let uinput = match desktop {
+                Some(source) => super::uinput::UinputInput::with_geometry_source(source),
+                None => super::uinput::UinputInput::with_desktop(None),
+            };
+            match uinput {
                 Ok(uinput) => backends.push(Box::new(uinput)),
                 Err(e) => {
                     tracing::debug!("input: uinput direct-write candidate unavailable: {e}");
@@ -386,6 +444,27 @@ impl InputDispatcher {
             probe_failure,
             fallback_failure,
         })
+    }
+
+    /// 夹具装配：用给定候选链构造（不触碰环境探测、不读写状态文件）。
+    ///
+    /// active 取链上首个 `is_available()` 候选——与生产装配同规则；验收用例据此
+    /// 复现某个真实会话的候选链（原生未绑定 / 无 ABS 的 ydotool 等）。
+    pub async fn from_candidates(backends: Vec<Box<dyn InputService>>) -> Self {
+        let mut active = None;
+        for (i, b) in backends.iter().enumerate() {
+            if b.is_available().await {
+                active = Some(i);
+                break;
+            }
+        }
+        Self {
+            backends,
+            active: std::sync::Mutex::new(active),
+            state_path: None,
+            probe_failure: None,
+            fallback_failure: None,
+        }
     }
 
     /// 当前激活的后端名（doctor：Healthy/Degraded 标明实际选中后端）。
@@ -471,6 +550,9 @@ impl InputDispatcher {
         let mut idx = self.current_active();
         let mut last_err = None;
         let mut unsupported = 0usize;
+        // 通道建立期才确认的能力缺口（后端名, 原因）：不摘除候选，仅供最终
+        // 能力缺口错误归因——「哪个候选为什么做不了这个操作」。
+        let mut gaps: Vec<(&'static str, String)> = Vec::new();
         while let Some(i) = idx {
             let backend = self.backends[i].as_ref();
             if !backend.supports(op) {
@@ -484,20 +566,35 @@ impl InputDispatcher {
                 continue;
             }
             // 通道建立/能力校验失败发生在任何注入之前——可安全降级重放。
-            if let Err(e) = self.ensure_ready_retrying(i, op).await {
-                tracing::warn!(
-                    backend = self.backends[i].name(),
-                    error = %e,
-                    "input: backend setup failed; demoting to next candidate"
-                );
-                last_err = Some(e);
-                // 摘除只在 `i` 仍是 active 时真正推进 active 指针（持久化随之更新）；
-                // 游标一律单调前进、**不回读** `current_active()`——失败候选位于
-                // active 之后时 demote 不推进，回读会退回到已跳过的候选：与能力
-                // 缺口跳过叠加即成死循环，永不返回要求的显式错误。
-                self.demote(i);
-                idx = self.next_index(i);
-                continue;
+            match self.ensure_ready_retrying(i, op).await {
+                Ok(()) => {}
+                // 建立期确认的能力缺口：与 `supports` 声明的缺口同类处理——
+                // 只跳过本次操作，候选留在链上供其它操作使用。
+                Err(SetupFailure::CapabilityGap(reason)) => {
+                    tracing::debug!(
+                        backend = self.backends[i].name(),
+                        reason = %reason,
+                        "input: backend confirmed capability gap at setup; trying next candidate"
+                    );
+                    gaps.push((self.backends[i].name(), reason));
+                    idx = self.next_index(i);
+                    continue;
+                }
+                Err(SetupFailure::Unavailable(e)) => {
+                    tracing::warn!(
+                        backend = self.backends[i].name(),
+                        error = %e,
+                        "input: backend setup failed; demoting to next candidate"
+                    );
+                    last_err = Some(e);
+                    // 摘除只在 `i` 仍是 active 时真正推进 active 指针（持久化随之更新）；
+                    // 游标一律单调前进、**不回读** `current_active()`——失败候选位于
+                    // active 之后时 demote 不推进，回读会退回到已跳过的候选：与能力
+                    // 缺口跳过叠加即成死循环，永不返回要求的显式错误。
+                    self.demote(i);
+                    idx = self.next_index(i);
+                    continue;
+                }
             }
             // 通道就绪：注入一次。注入期错误不再降级重放。
             return match op {
@@ -508,24 +605,33 @@ impl InputDispatcher {
                 Op::Scroll(dx, dy) => backend.mouse_scroll(dx, dy).await,
             };
         }
-        Err(last_err.unwrap_or_else(|| self.no_candidate_error(unsupported)))
+        // 建立失败（通道级）优先透出原错误类型（Permission 等语义不丢）；
+        // 只有「无候选可服务该操作」才是能力缺口错误。
+        match last_err {
+            Some(e) => Err(e),
+            None => Err(self.no_candidate_error(op, unsupported, &gaps)),
+        }
     }
 
     /// `ensure_ready` 的通道建立重试（§19：首次 + 重试共 `INPUT_RETRIES` 次）。
     ///
     /// 只重试瞬态失败（连接/会话尚未就绪、DBus/EIS 竞态）：立即降级会让「portal
     /// 会话延迟建立」这类可恢复故障被永久摘除。授权类失败（`Permission`，含
-    /// portal 弹窗未确认）不重试——重试只会重复弹窗。
-    async fn ensure_ready_retrying(&self, i: usize, op: Op<'_>) -> Result<()> {
+    /// portal 弹窗未确认）与能力缺口都不重试——前者重试只会重复弹窗，后者重试
+    /// 结论不变。
+    async fn ensure_ready_retrying(&self, i: usize, op: Op<'_>) -> Result<(), SetupFailure> {
         let backend = self.backends[i].as_ref();
         let mut attempt = 0u32;
         loop {
             match backend.ensure_ready(op).await {
                 Ok(()) => return Ok(()),
-                Err(e) => {
+                Err(SetupFailure::CapabilityGap(reason)) => {
+                    return Err(SetupFailure::CapabilityGap(reason))
+                }
+                Err(SetupFailure::Unavailable(e)) => {
                     attempt += 1;
                     if attempt >= INPUT_RETRIES || !is_transient_setup_failure(&e) {
-                        return Err(e);
+                        return Err(SetupFailure::Unavailable(e));
                     }
                     tracing::debug!(
                         backend = self.backends[i].name(),
@@ -539,21 +645,45 @@ impl InputDispatcher {
         }
     }
 
-    /// 链上无候选支持该操作（全部候选能力缺口）时的错误。
+    /// 链上无候选能服务该操作时的错误（C-043 能力缺失）。
     ///
-    /// 与「候选建立失败」区分：前者是能力问题（如 uinput 直写无法定位绝对坐标），
-    /// 文案须指向缺什么，而非笼统 "no available backend"。
-    fn no_candidate_error(&self, unsupported: usize) -> AgentShellError {
-        if unsupported > 0 {
-            AgentShellError::BackendUnavailable(format!(
-                "input: no backend supports this operation in this session \
-                 ({unsupported} candidate(s) lack the capability)"
-            ))
-        } else {
-            AgentShellError::BackendUnavailable(
+    /// 与「候选建立失败」区分：本错误表示**能力**问题（如整条链都没有绝对坐标
+    /// 定位能力），文案须点名缺什么能力、哪个候选为什么缺，并带上整链的探测
+    /// 根因——用户看到「不带 `--at` 的点击可用」时才能理解坐标版为何失效。
+    fn no_candidate_error(
+        &self,
+        op: Op<'_>,
+        unsupported: usize,
+        gaps: &[(&'static str, String)],
+    ) -> AgentShellError {
+        if unsupported == 0 && gaps.is_empty() {
+            return AgentShellError::BackendUnavailable(
                 "input: no available backend in this session".into(),
-            )
+            );
         }
+        let mut details: Vec<String> = Vec::new();
+        for (name, reason) in gaps {
+            details.push(format!("{name}: {reason}"));
+        }
+        if unsupported > 0 {
+            details.push(format!(
+                "{unsupported} candidate(s) declared no capability for this operation"
+            ));
+        }
+        for reason in [
+            self.probe_failure.as_deref(),
+            self.fallback_failure.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            details.push(format!("probe: {reason}"));
+        }
+        AgentShellError::BackendUnavailable(format!(
+            "input: no backend in this session can perform {}: {}",
+            op.capability(),
+            details.join("; ")
+        ))
     }
 
     /// 链上 `i` 之后的下一候选下标（能力缺口跳过用，不改动 active）。
@@ -668,8 +798,8 @@ mod tests {
         async fn is_available(&self) -> bool {
             true
         }
-        async fn ensure_ready(&self, _op: Op<'_>) -> Result<()> {
-            Err(AgentShellError::BackendUnavailable("setup refused".into()))
+        async fn ensure_ready(&self, _op: Op<'_>) -> Result<(), SetupFailure> {
+            Err(AgentShellError::BackendUnavailable("setup refused".into()).into())
         }
         async fn send_key(&self, _combo: &KeyCombo) -> Result<()> {
             unimplemented!("never reached: ensure_ready fails first")
@@ -874,6 +1004,46 @@ mod tests {
         }
     }
 
+    /// 建立期才确认能力缺口的后端（复刻 libei：门户只授权部分设备，
+    /// 绝对指针能力在会话建立后才可知）。
+    struct LateGapBackend {
+        keys: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl InputService for LateGapBackend {
+        fn name(&self) -> &'static str {
+            "late-gap"
+        }
+        async fn is_available(&self) -> bool {
+            true
+        }
+        async fn ensure_ready(&self, op: Op<'_>) -> Result<(), SetupFailure> {
+            match op {
+                Op::Move(..) => Err(SetupFailure::CapabilityGap(
+                    "libei: no absolute-pointer capability".into(),
+                )),
+                _ => Ok(()),
+            }
+        }
+        async fn send_key(&self, _combo: &KeyCombo) -> Result<()> {
+            self.keys.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+        async fn type_text(&self, _text: &str, _delay_ms: u32) -> Result<()> {
+            Ok(())
+        }
+        async fn mouse_move(&self, _x: i32, _y: i32) -> Result<()> {
+            unreachable!("dispatcher must skip the candidate, not call the gap op")
+        }
+        async fn mouse_click(&self, _button: MouseButton) -> Result<()> {
+            Ok(())
+        }
+        async fn mouse_scroll(&self, _dx: i32, _dy: i32) -> Result<()> {
+            Ok(())
+        }
+    }
+
     /// 瞬态建立失败的假后端：前 `fail_times` 次 `ensure_ready` 报 DBus 故障。
     struct FlakySetupBackend {
         fail_times: usize,
@@ -888,10 +1058,10 @@ mod tests {
         async fn is_available(&self) -> bool {
             true
         }
-        async fn ensure_ready(&self, _op: Op<'_>) -> Result<()> {
+        async fn ensure_ready(&self, _op: Op<'_>) -> Result<(), SetupFailure> {
             let n = self.attempts.fetch_add(1, Ordering::SeqCst);
             if n < self.fail_times {
-                Err(AgentShellError::DBus("session not started yet".into()))
+                Err(AgentShellError::DBus("session not started yet".into()).into())
             } else {
                 Ok(())
             }
@@ -926,11 +1096,12 @@ mod tests {
         async fn is_available(&self) -> bool {
             true
         }
-        async fn ensure_ready(&self, _op: Op<'_>) -> Result<()> {
+        async fn ensure_ready(&self, _op: Op<'_>) -> Result<(), SetupFailure> {
             self.attempts.fetch_add(1, Ordering::SeqCst);
             Err(AgentShellError::Permission(
                 "portal RemoteDesktop Start 授权未在 30s 内确认".into(),
-            ))
+            )
+            .into())
         }
         async fn send_key(&self, _combo: &KeyCombo) -> Result<()> {
             Ok(())
@@ -996,6 +1167,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn setup_stage_capability_gap_skips_without_demoting() {
+        // 能力缺口可能在通道建立后才确认（门户按设备授权）：必须只跳过本次操作、
+        // 保留候选——否则一次 `--at` 会把该后端从整链摘除，后续 type/key 一起
+        // 失去它（C-034⑤ 回退链每一跳保持同一语义）。
+        let keys = Arc::new(AtomicUsize::new(0));
+        let gap = LateGapBackend {
+            keys: Arc::clone(&keys),
+        };
+        let ok = FakeBackend::new("ok", 0);
+        let d = dispatch_with(vec![Box::new(gap), Box::new(ok)], Some(0));
+
+        d.mouse_move(10, 20)
+            .await
+            .expect("falls through to a candidate that supports the op");
+        assert_eq!(
+            d.active_backend_name(),
+            Some("late-gap"),
+            "setup-stage capability gap must not demote the candidate"
+        );
+        d.send_key(&combo(true))
+            .await
+            .expect("key op still served by the gapped candidate");
+        assert_eq!(keys.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn setup_stage_capability_gap_error_names_capability_and_reason() {
+        // 整链无候选支持该操作时，错误必须点名缺的能力并带上候选给出的原因
+        // （C-043：能力缺失不得与「参数语义不满足」混同，也不得笼统报「不支持」）。
+        let d = dispatch_with(
+            vec![Box::new(LateGapBackend {
+                keys: Arc::new(AtomicUsize::new(0)),
+            })],
+            Some(0),
+        );
+        let err = d.mouse_move(1, 2).await.unwrap_err();
+        assert!(
+            matches!(&err, AgentShellError::BackendUnavailable(m)
+                if m.contains("absolute-pointer")
+                    && m.contains("late-gap: libei: no absolute-pointer capability")),
+            "got: {err:?}"
+        );
+        assert_eq!(d.active_backend_name(), Some("late-gap"));
+    }
+
+    #[tokio::test]
     async fn no_capable_candidate_reports_capability_gap() {
         // 全链能力缺口：错误必须指向能力缺口（而非「无可用后端」），
         // 且不得静默返回 Ok。
@@ -1005,7 +1222,8 @@ mod tests {
         let d = dispatch_with(vec![Box::new(gap)], Some(0));
         let err = d.mouse_move(1, 1).await.unwrap_err();
         assert!(
-            matches!(&err, AgentShellError::BackendUnavailable(m) if m.contains("capability")),
+            matches!(&err, AgentShellError::BackendUnavailable(m)
+                if m.contains("absolute-pointer") && m.contains("no capability")),
             "got: {err:?}"
         );
     }

@@ -21,7 +21,9 @@ agent-shell-core.workspace = true
 # dev 头的机器（no-pipewire profile、arm64）被 portal-screencast 卡住编译。
 agent-shell-daemon = { path = "../../daemon", default-features = false }
 agent-shell-event.workspace = true
+agent-shell-input.workspace = true
 agent-shell-rpc.workspace = true
+async-trait.workspace = true
 serde_json.workspace = true
 tempfile = "3"
 tokio.workspace = true
@@ -33,3 +35,7 @@ path = "TC-events-01.rs"
 [[test]]
 name = "TC-journey-03"
 path = "TC-journey-03.rs"
+
+[[test]]
+name = "TC-input-03"
+path = "TC-input-03.rs"

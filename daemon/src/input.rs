@@ -37,7 +37,7 @@ pub(crate) fn prepare(
                     .and_then(Value::as_str)
                     .unwrap_or("left"),
             )?,
-            parse_at(payload.get("at")),
+            parse_at(payload.get("at"))?,
         ),
         InputKind::Scroll => PreparedOp::Scroll(
             payload.get("dx").and_then(Value::as_i64).unwrap_or(0) as i32,
@@ -72,16 +72,46 @@ fn str_field<'a>(v: &'a Value, key: &str) -> Result<&'a str, (RpcErrorCode, Stri
     ))
 }
 
-/// 可选点击坐标 `[x, y]`；非二元组视为未指定（与 CLI `--at` 契约一致）。
-fn parse_at(at: Option<&Value>) -> Option<(i32, i32)> {
-    let arr = at?.as_array()?;
+/// 可选点击坐标 `[x, y]`：`at` 缺键或为 `null` → `None`（未指定坐标）；其余
+/// 非整数二元组、超出 32 位像素域的坐标 → `InvalidParams`。
+///
+/// 「参数语义不满足」与「未指定坐标」是两种不同事实：把坏载荷当作未指定会静默
+/// 点击**当前位置**（rc=0、用户以为点到了目标坐标），而 CLI 层对同一载荷是硬
+/// 拒绝——两侧口径必须一致，坏参数不得降级成另一种成功语义。CLI 的点击载荷恒带
+/// `at` 键（无 `--at` 时序列化为 `null`），故 `null` 与缺键同义。
+fn parse_at(at: Option<&Value>) -> Result<Option<(i32, i32)>, (RpcErrorCode, String)> {
+    let Some(at) = at.filter(|v| !v.is_null()) else {
+        return Ok(None);
+    };
+    let arr = at.as_array().ok_or_else(|| bad_at(at))?;
     if arr.len() != 2 {
-        return None;
+        return Err(bad_at(at));
     }
-    Some((
-        arr[0].as_i64().unwrap_or(0) as i32,
-        arr[1].as_i64().unwrap_or(0) as i32,
-    ))
+    let (Some(x), Some(y)) = (arr[0].as_i64(), arr[1].as_i64()) else {
+        return Err(bad_at(at));
+    };
+    // i64 → i32 必须受检：截断把超范围坐标回绕到用户未指定的位置（rc=0，本仓
+    // 禁止的静默错误），与 i32 内越界的夹取口径也不一致。
+    match (i32::try_from(x), i32::try_from(y)) {
+        (Ok(x), Ok(y)) => Ok(Some((x, y))),
+        _ => Err(at_out_of_range(x, y)),
+    }
+}
+
+/// 坏 `at` 载荷的统一拒绝（含 CLI 同款写法提示）。
+fn bad_at(at: &Value) -> (RpcErrorCode, String) {
+    (
+        RpcErrorCode::InvalidParams,
+        format!("payload.at must be [x, y] integers (e.g. [100, 200]); got {at}"),
+    )
+}
+
+/// 坐标超出 32 位像素域的拒绝：CLI 按 i64 解析，这里是最后一道范围校验。
+fn at_out_of_range(x: i64, y: i64) -> (RpcErrorCode, String) {
+    (
+        RpcErrorCode::InvalidParams,
+        format!("payload.at out of range: [{x}, {y}] must fit in 32-bit pixels"),
+    )
 }
 
 /// "ctrl+c" / "meta+t" 组合键解析（与 CLI 层同语法；daemon 侧独立实现以
@@ -214,10 +244,41 @@ mod tests {
     #[test]
     fn click_at_parses_two_element_array_only() {
         let at = serde_json::json!([10, 20]);
-        assert_eq!(parse_at(Some(&at)), Some((10, 20)));
-        // 非二元组 → 视为未指定，不移动。
-        assert_eq!(parse_at(Some(&serde_json::json!([1]))), None);
-        assert_eq!(parse_at(None), None);
+        assert_eq!(parse_at(Some(&at)), Ok(Some((10, 20))));
+        assert_eq!(parse_at(None), Ok(None), "无 at 即「在当前位置点击」");
+        // CLI 无 `--at` 时实发 `"at": null`（`cli/src/main.rs` 的载荷构造）：
+        // 只认缺键会让默认位置点击在真实入口上变成参数错误。
+        assert_eq!(
+            parse_at(Some(&serde_json::Value::Null)),
+            Ok(None),
+            "at: null 与缺键同义（CLI 实发形态）"
+        );
+        // 坏载荷是参数错误，不得退化为「未指定坐标」（那会静默点当前位置）。
+        for bad in [
+            serde_json::json!([1]),
+            serde_json::json!([1, 2, 3]),
+            serde_json::json!("100,200"),
+            serde_json::json!(["100", 200]),
+            serde_json::json!([100, null]),
+            // i64 域内但超 i32 像素域：截断会回绕到用户未指定的坐标。
+            serde_json::json!([4294967396_i64, 100]),
+            serde_json::json!([3000000000_i64, 0]),
+            serde_json::json!([0, -3000000000_i64]),
+            serde_json::json!([i64::from(i32::MAX) + 1, 0]),
+        ] {
+            let err = parse_at(Some(&bad)).expect_err(&format!("{bad} must be rejected"));
+            assert_eq!(err.0, agent_shell_rpc::RpcErrorCode::InvalidParams);
+            assert!(err.1.contains("payload.at"), "{err:?}");
+        }
+        // 可表示的边界值仍须接受（越出桌面的夹取由后端负责，不在参数层拒绝）。
+        assert_eq!(
+            parse_at(Some(&serde_json::json!([i32::MIN, i32::MAX]))),
+            Ok(Some((i32::MIN, i32::MAX)))
+        );
+        assert_eq!(
+            parse_at(Some(&serde_json::json!([-1, 0]))),
+            Ok(Some((-1, 0)))
+        );
     }
 
     #[test]

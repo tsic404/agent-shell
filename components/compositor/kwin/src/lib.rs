@@ -7,6 +7,8 @@
 //! 双通道（§7.1）：Wayland 私有协议（[`wayland`]，零开销原生接口）为首选，D-Bus/KWin
 //! Scripting（[`dbus_bridge`]，callDBus 回传）为回退——能力够走协议、不够走 Scripting（§7.2）。
 pub mod dbus_bridge;
+pub mod desktop_geometry;
+pub mod entitlement;
 pub mod error;
 pub mod event_ewmh;
 pub mod event_native;

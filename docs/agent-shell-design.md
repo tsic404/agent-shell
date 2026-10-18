@@ -1481,6 +1481,13 @@ Nix 装 `$out/share/applications/` 并经 `substituteInPlace` 把 `Exec` 替换�
 `Exec` 路径须与实际运行的 `agent-shell-daemon` 二进制一致（dev 用 `target/release/...` 时需相应
 同名 desktop 或 `KWIN_WAYLAND_NO_PERMISSION_CHECKS=1` 绕过）。KWin 6.8+ 该过滤改为按沙箱 cgroup。
 
+`fake_input` 未绑定时 doctor 的「输入注入」行给出归因：协议绑定失败原因（KWin 侧是否通告）
+外加授权条目探测结果——扫描 `$XDG_DATA_HOME`/`$XDG_DATA_DIRS` 的 `applications/*.desktop`，
+按 `Exec` 首词的规范路径与 `/proc/self/exe` 比对（与 KWin `fetchProcessServiceField` 同口径），
+报出「无条目」「条目未声明接口」「已声明但 KWin 尚未通告」三者之一及条目路径。该探测只读、
+不写任何文件（健康体检不修复）；源构建（二进制路径与打包条目不一致）是该会话下
+`fake_input` 缺失的最常见原因，探针据此给出可执行的修复落点。
+
 ### 7.7 实现设计
 
 **模块结构**（`components/compositor/kwin/src/`）：
@@ -2469,6 +2476,24 @@ impl InputService for YdotoolInput {
 ydotool（不回归既有路径），仅在 ydotool 缺失时落到直写。权限模型与 ydotool 一致
 （§20.3 udev 规则 `uinput` 组）；`/dev/uinput` 不可写/权限不足时构造期探测失败，
 dispatcher 记录失败原因，整链空链时并入 `BackendUnavailable` 可诊断错误。
+
+**绝对坐标（`mouse_move`）**：设备把 `[0, ABS_RANGE_MAX]` 线性映射到整块桌面
+（KWin 按 `libinput_event_pointer_get_absolute_x_transformed(event, workspace.width)`
+折算），故像素坐标须按**桌面逻辑几何**换算成设备轴值——几何由合成器给出
+（KWin 经 `wl_output` + `zxdg_output_v1` 探测输出包围盒，核心协议不受私有接口授权
+门控）。没有几何就没有可信换算：该候选对 `mouse_move` 声明**能力缺口**
+（`supports` 为 false），dispatcher 只跳过本次操作、保留候选，绝不做
+「看起来成功、实际点错位置」的注入；几何原点非零的布局同样视为不可换算。
+能力缺口与通道建立失败是两类事实：前者不摘除候选（其余操作仍可用该后端），
+后者按 §19 重试后降级；整链无候选支持某操作时返回的错误点名缺的能力与各候选原因。
+几何在**每次移动注入前重取**（装配期探测只作初值）：显示布局可能在 daemon 生命周期
+内变化（热插拔、改分辨率），按过期包围盒换算会把 `--at` 注入到用户未指定的位置且
+rc=0；重取仍给不出可信几何时按同一能力缺口处理，而不是回落到旧几何。重取是同步阻塞
+的协议往返，故经 `spawn_blocking` 移出 async worker 并套 §19 输入预算（1s）：合成器无
+应答时报通道级 `Timeout`（按 §19 重试后降级摘除），与「几何此刻不可信」的能力缺口不
+混同。探测态（registry/队列/xdg-output manager）在会话内常驻、重取只临时绑定输出对象
+并在读数后发析构请求——`wl_registry` 没有析构请求，每次重取重建 registry 会按 `--at`
+次数在合成器侧累积对象。
 
 ---
 

@@ -68,6 +68,33 @@ impl CompositorBackend {
         )))
     }
 
+    /// 桌面逻辑几何（输出包围盒）——输入链把 `--at` 像素坐标换算成 uinput 直写
+    /// 设备绝对轴时使用；探测走核心协议，不依赖 KWin 私有接口授权。
+    ///
+    /// 只有 KWin 会话有几何来源：其余会话的绝对坐标由各自原生通道 / libei 承担，
+    /// uinput 候选保持能力缺口（dispatcher 据此给出可归因的能力错误）。
+    fn desktop_geometry(&self) -> Option<agent_shell_core::types::Rect> {
+        let Self::Kwin(c) = self else {
+            return None;
+        };
+        c.desktop_geometry()
+    }
+
+    /// 桌面几何来源（调用即重探当前显示布局），交给输入链在移动注入前重取。
+    ///
+    /// 装配期快照有保鲜期问题：常驻 `--socket` 形态下热插拔显示器或改分辨率后，
+    /// 按旧包围盒换算会把 `--at` 点到用户未指定的位置且 rc=0。非 KWin 会话没有
+    /// 几何来源（返回 `None`），uinput 候选据此声明能力缺口。
+    fn desktop_geometry_source(
+        self: &std::sync::Arc<Self>,
+    ) -> Option<agent_shell_input::DesktopGeometrySource> {
+        let Self::Kwin(_) = self.as_ref() else {
+            return None;
+        };
+        let backend = std::sync::Arc::clone(self);
+        Some(std::sync::Arc::new(move || backend.desktop_geometry()))
+    }
+
     /// 事件源标注：KWin 会话按 Wayland/X11 细分；DDE 会话按合成器形态
     /// 细分（deepin-kwin→KWinWayland / Treeland→Treeland / X11→X11Generic）；
     /// Mutter 会话按窗口语义路径细分（Eval→MutterEval / Extension→MutterExtension）。
@@ -288,14 +315,24 @@ impl Daemon {
         let native_input = compositor
             .as_deref()
             .and_then(CompositorBackend::kwin_native_input);
-        let (input, input_error) =
-            match agent_shell_input::detect_with_reason_and_native(de_type, native_input).await {
-                (Ok(handle), _) => (Some(handle), None),
-                (Err(e), reason) => {
-                    tracing::warn!("input assemble failed: {e}");
-                    (None, reason)
-                }
-            };
+        // 传「几何来源」而非一次性快照：输入链在每次移动注入前重取，避免显示布局
+        // 变化后按过期包围盒换算 `--at`（rc=0 且位置错）。
+        let desktop_geometry = compositor
+            .as_ref()
+            .and_then(CompositorBackend::desktop_geometry_source);
+        let (input, input_error) = match agent_shell_input::detect_with_reason_and_native(
+            de_type,
+            native_input,
+            desktop_geometry,
+        )
+        .await
+        {
+            (Ok(handle), _) => (Some(handle), None),
+            (Err(e), reason) => {
+                tracing::warn!("input assemble failed: {e}");
+                (None, reason)
+            }
+        };
 
         // PortalSessionManager 先建——注入 CaptureDispatcher 作 TokenStore，
         // 使 ScreenCast 能 restore_token 静默恢复（§22.7 D5）。

@@ -15,11 +15,11 @@ use std::os::unix::fs::OpenOptionsExt;
 
 use agent_shell_core::component::ComponentHealth;
 use agent_shell_core::error::{AgentShellError, Result};
-use agent_shell_core::types::{KeyCombo, MouseButton};
+use agent_shell_core::types::{KeyCombo, MouseButton, Rect};
 use async_trait::async_trait;
 use tokio::sync::Mutex;
 
-use super::dispatcher::{InputService, Op};
+use super::dispatcher::{InputService, Op, SetupFailure, INPUT_TIMEOUT};
 use crate::keymap::{char_to_evdev, combo_to_press_sequence, evdev_mouse_button};
 
 // ─── linux/uinput.h ioctl 请求码（_IOW/_IO 展开值，x86_64 ABI） ───
@@ -111,10 +111,123 @@ const KEY_CODE_RANGES: &[std::ops::RangeInclusive<u32>] = &[
     0x110..=0x116, // BTN_LEFT..BTN_BACK（含 BTN_SIDE/EXTRA）
 ];
 
+/// 桌面几何来源：调用即重探当前显示布局（`None` = 此刻给不出可信几何）。
+///
+/// 合成器侧是一次阻塞往返（只读 registry + roundtrip），与原生注入通道的协议
+/// 往返同类；装配期快照会随显示布局变化过期（热插拔、改分辨率），注入前必须
+/// 重取——按过期包围盒换算会把 `--at` 点到用户未指定的位置且 rc=0。
+/// 来源本身是同步阻塞调用：只准在阻塞线程池上执行（见
+/// [`DesktopGeometry::refresh_blocking`]）。
+pub type DesktopGeometrySource = std::sync::Arc<dyn Fn() -> Option<Rect> + Send + Sync>;
+
+/// 绝对坐标换算所需的桌面几何：最近一次可信快照 + 可选重取来源。
+///
+/// 与设备句柄解耦（无 `/dev/uinput` 也能覆盖时效语义）。
+#[derive(Default)]
+struct DesktopGeometry {
+    /// 最近一次可信几何（合成器输出包围盒，原点 `(0,0)`）。
+    snapshot: std::sync::RwLock<Option<Rect>>,
+    /// 重取来源；`None` 时快照即终值（定值形态，见 [`UinputInput::with_desktop`]）。
+    source: Option<DesktopGeometrySource>,
+}
+
+impl DesktopGeometry {
+    /// 定值几何（不重取）。
+    fn fixed(desktop: Option<Rect>) -> Self {
+        Self {
+            snapshot: std::sync::RwLock::new(valid(desktop)),
+            source: None,
+        }
+    }
+
+    /// 可重取几何：装配期先探一次作为初值。
+    fn refreshed(source: DesktopGeometrySource) -> Self {
+        Self {
+            snapshot: std::sync::RwLock::new(valid(source())),
+            source: Some(source),
+        }
+    }
+
+    fn get(&self) -> Option<Rect> {
+        *self.snapshot.read().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// 是否可能重取到几何（把「此刻没有」与「永远没有」分开：前者在建立期
+    /// 确认才构成能力缺口，且缺口带具体原因）。
+    fn refreshable(&self) -> bool {
+        self.source.is_some()
+    }
+
+    /// 注入前重取：来源给不出可信几何即能力缺口，不按过期快照注入。
+    fn refresh(&self) -> std::result::Result<(), SetupFailure> {
+        let Some(source) = self.source.as_ref() else {
+            return Ok(());
+        };
+        match valid(source()) {
+            Some(fresh) => {
+                *self.snapshot.write().unwrap_or_else(|p| p.into_inner()) = Some(fresh);
+                Ok(())
+            }
+            None => Err(SetupFailure::CapabilityGap(
+                "uinput: no trustworthy desktop geometry (display layout changed or not published)"
+                    .into(),
+            )),
+        }
+    }
+
+    /// 注入前重取（异步形态）：同步往返放阻塞线程池，并套 §19 输入预算。
+    ///
+    /// `refresh` 里的合成器往返是同步阻塞调用：直接放在 async 请求路径上会占住
+    /// tokio worker，且 KWin 无应答时永不返回（`input.send` 既无退出码也无错误
+    /// 信息——正是本单要消除的失败形态）。超时按**通道级失败**归因，不冒充能力
+    /// 缺口：「探测没答」与「几何此刻不可信」是两类事实，混同会让 dispatcher
+    /// 只跳过本次操作、而不是摘除已确认无应答的通道。
+    async fn refresh_blocking(
+        self: &std::sync::Arc<Self>,
+        budget: std::time::Duration,
+    ) -> std::result::Result<(), SetupFailure> {
+        let geometry = std::sync::Arc::clone(self);
+        let work = tokio::task::spawn_blocking(move || geometry.refresh());
+        match tokio::time::timeout(budget, work).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(join_error)) => Err(SetupFailure::Unavailable(AgentShellError::Input(format!(
+                "uinput: desktop geometry refresh task failed: {join_error}"
+            )))),
+            Err(_elapsed) => Err(SetupFailure::Unavailable(AgentShellError::Timeout(format!(
+                "uinput: desktop geometry refresh did not complete within {}ms (compositor unresponsive)",
+                budget.as_millis()
+            )))),
+        }
+    }
+}
+
+/// 建链期几何前置校验：移动注入前重取几何。
+///
+/// 单独成函数是为了让这段接线能被**设备无关**地覆盖：`UinputInput` 的构造要求
+/// `/dev/uinput` 可写（CI 常态不可用，用例只能自跳），而「几何重取失败在建链期
+/// 报能力缺口」是与设备无关的语义。
+async fn refresh_geometry_for(
+    geometry: &std::sync::Arc<DesktopGeometry>,
+    op: Op<'_>,
+) -> std::result::Result<(), SetupFailure> {
+    if matches!(op, Op::Move(..)) {
+        geometry.refresh_blocking(INPUT_TIMEOUT).await?;
+    }
+    Ok(())
+}
+
+/// 丢弃尺寸非正的几何（零面积桌面无法把像素换算成设备轴值）。
+fn valid(desktop: Option<Rect>) -> Option<Rect> {
+    desktop.filter(|d| d.width > 0 && d.height > 0)
+}
+
 /// uinput 直写注入后端。
 pub struct UinputInput {
     /// 已打开的 `/dev/uinput` 写句柄（构造时探测可写性）。
     file: std::fs::File,
+    /// 桌面逻辑几何；`None` 时绝对坐标无法换算成设备轴值。
+    /// `Arc` 供重取经 `spawn_blocking` 移入阻塞线程（[`DesktopGeometry::refresh_blocking`]）。
+    geometry: std::sync::Arc<DesktopGeometry>,
     /// 虚拟设备是否已创建（UI_DEV_CREATE 已调用）。
     created: Mutex<bool>,
     /// 串行化注入：单一 uinput fd 上多事件序列必须原子提交，否则并发调用会
@@ -127,6 +240,28 @@ impl UinputInput {
     /// 构造候选实例。探测 `/dev/uinput` 可写（open O_WRONLY|O_NONBLOCK）；
     /// 不可写/权限不足返回 `Err`，由 dispatcher 跳过并记录失败原因。
     pub fn new() -> Result<Self> {
+        Self::with_desktop(None)
+    }
+
+    /// 带定值桌面几何构造（绝对坐标定位用，快照不再重取）。
+    ///
+    /// 设备轴区间 `[0, ABS_RANGE_MAX]` 由合成器线性映射到整块桌面，故像素坐标
+    /// 必须按桌面尺寸换算（见 [`pixel_to_abs`]）；装配层给不出几何时保持 `None`，
+    /// 该候选对 `mouse_move` 声明能力缺口而不是注入到错误位置。
+    pub fn with_desktop(desktop: Option<Rect>) -> Result<Self> {
+        Self::open(DesktopGeometry::fixed(desktop))
+    }
+
+    /// 带几何来源构造：装配期探一次作初值，每次移动注入前重取。
+    ///
+    /// 显示布局在 daemon 生命周期内可能变化（常驻 `--socket` 形态尤其），按装配期
+    /// 包围盒换算会让 `--at` 落到用户未指定的位置且 rc=0。重取仍给不出可信几何时
+    /// 该候选声明能力缺口，交给 dispatcher 换候选或报可归因错误。
+    pub fn with_geometry_source(source: DesktopGeometrySource) -> Result<Self> {
+        Self::open(DesktopGeometry::refreshed(source))
+    }
+
+    fn open(geometry: DesktopGeometry) -> Result<Self> {
         let file = open_uinput().map_err(|e| {
             // 按 errno 区分诊断：节点缺失（ENOENT/ENODEV）与权限不足（EACCES/EPERM）
             // 是两种不同的环境故障，混用「not writable」会误导排障。
@@ -141,6 +276,7 @@ impl UinputInput {
         })?;
         Ok(Self {
             file,
+            geometry: std::sync::Arc::new(geometry),
             created: Mutex::new(false),
             inject_lock: Mutex::new(()),
         })
@@ -291,6 +427,22 @@ fn sync(file: &std::fs::File) -> std::io::Result<()> {
     write_event(file, EV_SYN, SYN_REPORT, 0)
 }
 
+/// 桌面像素坐标 → 设备绝对轴值（`[0, ABS_RANGE_MAX]`）。
+///
+/// 合成器把设备轴区间线性映射到整块桌面逻辑几何（KWin 按
+/// `libinput_event_pointer_get_absolute_x_transformed(event, workspace.width)` 折算），
+/// 故换算必须按桌面尺寸而非设备单位：`origin` 为桌面几何左上角（输出包围盒
+/// 原点），`span` 为对应轴的逻辑像素数。区间取整误差 ≤1px，由「点击目标为
+/// 元素中心」的吸收能力覆盖；越界坐标夹取到桌面边缘。
+fn pixel_to_abs(pixel: i32, origin: i32, span: i32) -> i32 {
+    if span <= 0 {
+        return 0;
+    }
+    let rel = i64::from(pixel - origin).clamp(0, i64::from(span - 1));
+    let max = i64::from(ABS_RANGE_MAX);
+    ((rel * max + i64::from(span) / 2) / i64::from(span)) as i32
+}
+
 #[async_trait]
 impl InputService for UinputInput {
     fn name(&self) -> &'static str {
@@ -309,19 +461,25 @@ impl InputService for UinputInput {
         }
     }
 
-    async fn ensure_ready(&self, _op: Op<'_>) -> Result<()> {
+    async fn ensure_ready(&self, op: Op<'_>) -> Result<(), super::dispatcher::SetupFailure> {
+        // 移动注入前先重取几何：显示布局可能已变（常驻 --socket 形态尤其），
+        // 按过期包围盒换算等于静默点错位置。重取在阻塞线程池上执行并带 §19
+        // 输入预算（见 `refresh_geometry_for`）：失败在建链期确认，dispatcher
+        // 据此改试其他候选；几何不可信报能力缺口、往返超时报通道级失败，
+        // 两者不混同。
+        refresh_geometry_for(&self.geometry, op).await?;
         // 设备注册失败发生在任何注入之前——dispatcher 据此安全降级重放。
-        self.ensure_created().await
+        Ok(self.ensure_created().await?)
     }
 
     fn supports(&self, op: Op<'_>) -> bool {
-        // 绝对指针定位不可用：设备把 `[0, ABS_RANGE_MAX]` 映射到整屏，而操作契约的
-        // 坐标是桌面像素——没有桌面尺寸就无法换算（装配层只传 DE，输入组件拿不到
-        // 监视器几何）。此前把像素当设备单位写，点击落在屏幕左上角附近：桌面无
-        // 可见效果、退出码仍是 0（QA 复现的静默 no-op）。声明能力缺口让 dispatcher
-        // 改试其他候选（原生协议 / libei），整链无候选时返回显式错误——不做
-        // 「看起来成功、实际点错位置」的注入。
-        !matches!(op, Op::Move(..))
+        // 绝对坐标定位要求桌面几何：设备把 `[0, ABS_RANGE_MAX]` 映射到整块桌面，
+        // 没有桌面尺寸就无法把像素换算成设备轴值。此前把像素当设备单位写，点击
+        // 落在屏幕左上角附近：桌面无可见效果、退出码仍是 0（QA 复现的静默
+        // no-op）。几何缺失时声明能力缺口让 dispatcher 改试其他候选，整链无
+        // 候选时返回显式错误——不做「看起来成功、实际点错位置」的注入。
+        // 有重取来源时把判定推到建立期：此刻没有不等于稍后没有，缺口原因也更具体。
+        !matches!(op, Op::Move(..)) || self.geometry.get().is_some() || self.geometry.refreshable()
     }
 
     async fn send_key(&self, combo: &KeyCombo) -> Result<()> {
@@ -368,10 +526,18 @@ impl InputService for UinputInput {
     }
 
     async fn mouse_move(&self, x: i32, y: i32) -> Result<()> {
+        // 几何由 `ensure_ready` 的 Move 分支刷新；缺几何即能力缺口（不该走到这里）。
+        let desktop = self.geometry.get().ok_or_else(|| {
+            AgentShellError::BackendUnavailable(
+                "uinput: no desktop geometry; absolute pointer unavailable".into(),
+            )
+        })?;
         let _guard = self.inject_lock.lock().await;
         self.ensure_created().await?;
-        write_event(&self.file, EV_ABS, ABS_X, x.clamp(0, ABS_RANGE_MAX)).map_err(input_err)?;
-        write_event(&self.file, EV_ABS, ABS_Y, y.clamp(0, ABS_RANGE_MAX)).map_err(input_err)?;
+        let dev_x = pixel_to_abs(x, desktop.x, desktop.width);
+        let dev_y = pixel_to_abs(y, desktop.y, desktop.height);
+        write_event(&self.file, EV_ABS, ABS_X, dev_x).map_err(input_err)?;
+        write_event(&self.file, EV_ABS, ABS_Y, dev_y).map_err(input_err)?;
         sync(&self.file).map_err(input_err)?;
         Ok(())
     }
@@ -424,6 +590,196 @@ mod tests {
     use super::*;
     use crate::keymap::{char_to_evdev, named_to_evdev};
     use agent_shell_core::types::KeyName;
+
+    fn rect(width: i32, height: i32) -> Rect {
+        Rect {
+            x: 0,
+            y: 0,
+            width,
+            height,
+        }
+    }
+
+    #[test]
+    fn geometry_refresh_follows_display_layout_changes() {
+        use std::sync::atomic::{AtomicI32, Ordering};
+        // 定值快照（夹具/`with_desktop` 形态）：无重取来源，refresh 是空操作。
+        let fixed = DesktopGeometry::fixed(Some(rect(1920, 1080)));
+        fixed.refresh().expect("定值形态没有可失败的重取");
+        assert_eq!(fixed.get().map(|d| d.width), Some(1920));
+
+        // 可重取来源：装配期探一次，之后每次 refresh 取当前显示布局——常驻 daemon
+        // 下热插拔/改分辨率后不得再按旧包围盒换算（那会把 --at 点到别处且 rc=0）。
+        let width = std::sync::Arc::new(AtomicI32::new(1920));
+        let live = std::sync::Arc::clone(&width);
+        let geo = DesktopGeometry::refreshed(std::sync::Arc::new(move || {
+            Some(rect(live.load(Ordering::SeqCst), 1080))
+        }));
+        assert_eq!(geo.get().map(|d| d.width), Some(1920), "装配期先探一次");
+        width.store(3840, Ordering::SeqCst);
+        geo.refresh().expect("重取成功");
+        assert_eq!(geo.get().map(|d| d.width), Some(3840), "重取后按新布局换算");
+    }
+
+    #[test]
+    fn geometry_refresh_gaps_instead_of_reusing_stale_layout() {
+        // 来源给不出可信几何 → 能力缺口；快照保持「无」，不回落到过期包围盒。
+        let gone = DesktopGeometry::refreshed(std::sync::Arc::new(|| None));
+        assert_eq!(gone.get(), None, "首次探测不可信即无快照");
+        assert!(matches!(
+            gone.refresh(),
+            Err(SetupFailure::CapabilityGap(_))
+        ));
+        assert_eq!(gone.get(), None);
+
+        // 尺寸非正（合成器未公布逻辑尺寸）同样不可信。
+        let zero = DesktopGeometry::refreshed(std::sync::Arc::new(|| Some(rect(0, 0))));
+        assert_eq!(zero.get(), None);
+        assert!(matches!(
+            zero.refresh(),
+            Err(SetupFailure::CapabilityGap(_))
+        ));
+
+        // 布局从「未公布」翻转为「已公布」：下一次重取必须拿到几何——缺口只对本次
+        // 重取成立，不把「此刻没有」固化成永久缺口。
+        let published = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let live = std::sync::Arc::clone(&published);
+        let geo = DesktopGeometry::refreshed(std::sync::Arc::new(move || {
+            live.load(std::sync::atomic::Ordering::SeqCst)
+                .then(|| rect(1920, 1080))
+        }));
+        assert_eq!(geo.get(), None);
+        published.store(true, std::sync::atomic::Ordering::SeqCst);
+        geo.refresh().expect("来源恢复后重取成功");
+        assert_eq!(geo.get().map(|d| d.width), Some(1920));
+
+        // 有来源时能力判定推到建立期（此刻没有 ≠ 稍后没有）；定值形态无该弹性。
+        assert!(geo.refreshable());
+        assert!(!DesktopGeometry::fixed(None).refreshable());
+    }
+
+    #[tokio::test]
+    async fn move_setup_reports_geometry_gap_device_independently() {
+        // 设备无关覆盖「几何重取失败在建链期报 CapabilityGap」（C-055）：不构造
+        // UinputInput（其构造要求 /dev/uinput 可写，CI 常态不可用），直接驱动
+        // ensure_ready 使用的那段建链期校验。
+        let gone = std::sync::Arc::new(DesktopGeometry::refreshed(std::sync::Arc::new(|| None)));
+        assert!(
+            matches!(
+                refresh_geometry_for(&gone, Op::Move(10, 10)).await,
+                Err(SetupFailure::CapabilityGap(_))
+            ),
+            "几何来源失效必须在建链期报能力缺口"
+        );
+
+        let live = std::sync::Arc::new(DesktopGeometry::refreshed(std::sync::Arc::new(|| {
+            Some(rect(1920, 1080))
+        })));
+        refresh_geometry_for(&live, Op::Move(10, 10))
+            .await
+            .expect("重取成功即建链就绪");
+        assert_eq!(live.get().map(|d| d.width), Some(1920));
+
+        // 非移动操作不触发重取：几何来源失效不影响键盘/点击建链。
+        assert!(refresh_geometry_for(&gone, Op::Click(MouseButton::Left))
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn geometry_refresh_runs_off_the_async_worker() {
+        // 合成器往返是同步阻塞调用：必须在阻塞线程池上执行，否则 KWin 无应答时
+        // 占住的 tokio worker 永不返回（`input.send` 既无退出码也无错误信息）。
+        let caller = std::thread::current().id();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let record = std::sync::Arc::clone(&seen);
+        let geometry =
+            std::sync::Arc::new(DesktopGeometry::refreshed(std::sync::Arc::new(move || {
+                record
+                    .lock()
+                    .expect("record lock")
+                    .push(std::thread::current().id());
+                Some(rect(1920, 1080))
+            })));
+        geometry
+            .refresh_blocking(INPUT_TIMEOUT)
+            .await
+            .expect("重取成功");
+        let seen = seen.lock().expect("record lock").clone();
+        assert_eq!(seen.len(), 2, "装配期首探一次 + 本次重取一次");
+        assert_eq!(seen[0], caller, "装配期首探在调用线程");
+        assert_ne!(seen[1], caller, "重取必须在阻塞线程池上执行");
+    }
+
+    #[tokio::test]
+    async fn geometry_refresh_timeout_is_channel_failure_not_capability_gap() {
+        // 超时按通道级失败归因：「探测没答」与「几何此刻不可信」是两类事实，
+        // 混同会让 dispatcher 只跳过本次操作，而不是摘除已确认无应答的通道。
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let rx = std::sync::Mutex::new(rx);
+        let geometry =
+            std::sync::Arc::new(DesktopGeometry::refreshed(std::sync::Arc::new(move || {
+                // 装配期首探立即返回；之后的重取卡在无应答的往返上。
+                if calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                    return Some(rect(1920, 1080));
+                }
+                let _ = rx.lock().expect("rx lock").recv();
+                Some(rect(1920, 1080))
+            })));
+        let err = geometry
+            .refresh_blocking(std::time::Duration::from_millis(50))
+            .await
+            .expect_err("无应答的往返必须在预算内超时");
+        assert!(
+            matches!(err, SetupFailure::Unavailable(_)),
+            "超时是通道级失败，不是能力缺口: {err:?}"
+        );
+        drop(tx); // 放行卡住的阻塞线程，不在用例结束后留悬挂任务
+    }
+
+    #[tokio::test]
+    async fn geometry_source_refreshes_before_move_injection() {
+        // /dev/uinput 不可用（CI/无 uinput 内核）时跳过，不误报失败。
+        let input =
+            match UinputInput::with_geometry_source(std::sync::Arc::new(|| Some(rect(1920, 1080))))
+            {
+                Ok(i) => i,
+                Err(e) => {
+                    eprintln!("skip: {e}");
+                    return;
+                }
+            };
+        input
+            .ensure_ready(Op::Move(100, 100))
+            .await
+            .expect("重取成功即建链就绪");
+        assert_eq!(input.geometry.get().map(|d| d.width), Some(1920));
+
+        // 重取失败在建链期确认：能力缺口（不摘除候选、不按过期几何注入）。
+        let gone = match UinputInput::with_geometry_source(std::sync::Arc::new(|| None)) {
+            Ok(i) => i,
+            Err(e) => {
+                eprintln!("skip: {e}");
+                return;
+            }
+        };
+        assert!(
+            matches!(
+                gone.ensure_ready(Op::Move(100, 100)).await,
+                Err(SetupFailure::CapabilityGap(_))
+            ),
+            "几何来源失效必须在建立期报能力缺口"
+        );
+        assert!(
+            gone.supports(Op::Move(100, 100)),
+            "有重取来源时不得提前宣告缺口"
+        );
+        assert!(
+            !gone.supports(Op::Click(MouseButton::Left)),
+            "其它操作与几何无关"
+        );
+    }
 
     #[test]
     fn input_event_layout_matches_kernel_abi() {
@@ -506,6 +862,45 @@ mod tests {
         // dy<0=向上。evdev REL_WHEEL 正值=向上（=X11 button 4），故取反。
         assert_eq!(rel_wheel_value(2), -2, "向下（dy>0）须映射为负 REL_WHEEL");
         assert_eq!(rel_wheel_value(-3), 3, "向上（dy<0）须映射为正 REL_WHEEL");
+    }
+
+    #[test]
+    fn pixel_to_abs_maps_desktop_span_onto_device_range() {
+        // 1920×1080 桌面：像素坐标须按桌面尺寸换算（此前直接当设备轴写，
+        // 点击落在屏幕左上角附近——桌面无效果、rc=0 的静默 no-op）。
+        const SPAN: i32 = 1920;
+        assert_eq!(pixel_to_abs(0, 0, SPAN), 0);
+        assert_eq!(
+            pixel_to_abs(960, 0, SPAN),
+            16_384,
+            "桌面中点 → 设备区间中点"
+        );
+        assert_eq!(
+            pixel_to_abs(SPAN - 1, 0, SPAN),
+            32_750,
+            "右下角像素贴近区间上界（不越界）"
+        );
+        // 单调不减：位移与像素同向（换算错误会在这里先失败）。
+        let mut previous = -1;
+        for pixel in [0, 1, 100, 500, 1000, 1919] {
+            let mapped = pixel_to_abs(pixel, 0, SPAN);
+            assert!(mapped > previous, "pixel {pixel} → {mapped}");
+            previous = mapped;
+        }
+    }
+
+    #[test]
+    fn pixel_to_abs_clamps_to_desktop_and_honours_origin() {
+        // 越界坐标夹取到桌面边缘（与原生通道交给合成器夹取同口径）。
+        assert_eq!(pixel_to_abs(-500, 0, 1920), 0);
+        assert_eq!(pixel_to_abs(5000, 0, 1920), pixel_to_abs(1919, 0, 1920));
+        // 输出包围盒原点非零时按相对坐标换算。
+        assert_eq!(pixel_to_abs(100, 100, 800), 0);
+        assert_eq!(
+            pixel_to_abs(0, 0, 0),
+            0,
+            "degenerate span must not divide by zero"
+        );
     }
 
     #[test]
