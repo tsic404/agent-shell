@@ -218,6 +218,204 @@ fn priority_low_for_system_events_and_noop() {
 
 // ───────────────────────── EventFilter 过滤 ─────────────────────────
 
+/// 每种事件一个样本，供过滤器表驱动测试使用。
+fn sample_event_cases() -> Vec<(&'static str, DesktopEvent)> {
+    let now = Instant::now();
+    let id = win_id(1);
+    let workspace = agent_shell_core::types::WorkspaceInfo {
+        id: agent_shell_core::types::WorkspaceId {
+            native_id: "1".into(),
+            de_type: DesktopEnvironment::KDE,
+        },
+        name: "1".into(),
+        number: 1,
+        is_active: true,
+        monitor_ids: vec![],
+        window_ids: vec![],
+    };
+    vec![
+        (
+            "WindowOpened",
+            DesktopEvent::WindowOpened {
+                info: window_info(id.clone()),
+                source: EventSource::KWinWayland,
+                occurred_at: now,
+            },
+        ),
+        (
+            "WindowClosed",
+            DesktopEvent::WindowClosed {
+                id: id.clone(),
+                source: EventSource::KWinWayland,
+                occurred_at: now,
+            },
+        ),
+        (
+            "WindowFocused",
+            DesktopEvent::WindowFocused {
+                info: window_info(id.clone()),
+                source: EventSource::KWinWayland,
+                occurred_at: now,
+            },
+        ),
+        (
+            "WindowMoved",
+            DesktopEvent::WindowMoved {
+                id: id.clone(),
+                geometry: Rect::default(),
+                source: EventSource::KWinWayland,
+                occurred_at: now,
+            },
+        ),
+        (
+            "WindowStateChanged",
+            DesktopEvent::WindowStateChanged {
+                id: id.clone(),
+                states: vec![agent_shell_core::types::WindowState::Maximized],
+                source: EventSource::KWinWayland,
+                occurred_at: now,
+            },
+        ),
+        (
+            "WindowMetadataChanged",
+            DesktopEvent::WindowMetadataChanged {
+                id: id.clone(),
+                title: Some("t".into()),
+                app_id: Some("a".into()),
+                source: EventSource::KWinWayland,
+                occurred_at: now,
+            },
+        ),
+        (
+            "WindowStackingChanged",
+            DesktopEvent::WindowStackingChanged {
+                ids: vec![id.clone()],
+                source: EventSource::KWinWayland,
+                occurred_at: now,
+            },
+        ),
+        (
+            "FullscreenChanged",
+            DesktopEvent::FullscreenChanged {
+                enabled: true,
+                window_id: Some(id.clone()),
+                source: EventSource::KWinWayland,
+                occurred_at: now,
+            },
+        ),
+        (
+            "WorkspaceChanged",
+            DesktopEvent::WorkspaceChanged {
+                info: workspace.clone(),
+                source: EventSource::KWinWayland,
+                occurred_at: now,
+            },
+        ),
+        (
+            "WorkspaceListChanged",
+            DesktopEvent::WorkspaceListChanged {
+                workspaces: vec![workspace],
+                source: EventSource::KWinWayland,
+                occurred_at: now,
+            },
+        ),
+        (
+            "WorkspaceWindowMoved",
+            DesktopEvent::WorkspaceWindowMoved {
+                window_id: id.clone(),
+                from: None,
+                to: None,
+                source: EventSource::KWinWayland,
+                occurred_at: now,
+            },
+        ),
+        (
+            "MonitorHotplug",
+            DesktopEvent::MonitorHotplug {
+                monitor: sample_monitor(),
+                added: true,
+                source: EventSource::KWinWayland,
+                occurred_at: now,
+            },
+        ),
+        (
+            "MonitorChanged",
+            DesktopEvent::MonitorChanged {
+                info: sample_monitor(),
+                source: EventSource::KWinX11,
+                occurred_at: now,
+            },
+        ),
+        (
+            "PointerButton",
+            DesktopEvent::PointerButton {
+                window_id: Some(id.clone()),
+                button: agent_shell_core::types::MouseButton::Left,
+                pressed: true,
+                position: (0, 0),
+                source: EventSource::Input,
+                occurred_at: now,
+            },
+        ),
+        (
+            "KeyComboPressed",
+            DesktopEvent::KeyComboPressed {
+                combo: agent_shell_core::types::KeyCombo {
+                    keys: vec![agent_shell_core::types::Key::Named(
+                        agent_shell_core::types::KeyName::Tab,
+                    )],
+                    modifiers: agent_shell_core::types::ModifierMask::default(),
+                },
+                source: EventSource::Input,
+                occurred_at: now,
+            },
+        ),
+        (
+            "AppLaunched",
+            DesktopEvent::AppLaunched {
+                app_id: "x".into(),
+                pid: 1,
+                desktop_file: None,
+                source: EventSource::AtSpi,
+                occurred_at: now,
+            },
+        ),
+        (
+            "AppExited",
+            DesktopEvent::AppExited {
+                pid: 1,
+                source: EventSource::AtSpi,
+                occurred_at: now,
+            },
+        ),
+        (
+            "PowerStateChanged",
+            DesktopEvent::PowerStateChanged {
+                state: PowerState::Suspend,
+                source: EventSource::Power,
+                occurred_at: now,
+            },
+        ),
+        (
+            "AccessibilityTreeChanged",
+            DesktopEvent::AccessibilityTreeChanged {
+                app_pid: 1,
+                change_type: AccessibilityChange::PropertyChanged,
+                source: EventSource::AtSpi,
+                occurred_at: now,
+            },
+        ),
+    ]
+}
+
+fn event_named(name: &str) -> DesktopEvent {
+    sample_event_cases()
+        .into_iter()
+        .find(|(case, _)| *case == name)
+        .map(|(_, event)| event)
+        .unwrap_or_else(|| panic!("no sample event named {name}"))
+}
+
 #[test]
 fn filter_matches_by_category() {
     let now = Instant::now();
@@ -249,48 +447,19 @@ fn filter_never_matches_noop() {
 
 #[test]
 fn filter_apply_token_accepts_categories_and_event_names() {
-    // 类别名
+    // 类别名：整类命中
     let mut f = EventFilter::default();
     assert!(f.apply_token("window"));
-    assert!(f.window_events && !f.workspace_events && !f.power_events);
+    assert!(f.matches(&event_named("WindowOpened")));
+    assert!(f.matches(&event_named("WindowFocused")));
+    assert!(!f.matches(&event_named("WorkspaceChanged")));
 
-    // 事件枚举名 → 所属类别（WindowOpened 归 window，WorkspaceChanged 归 workspace）
+    // 事件枚举名：单点命中，不退化为所属类别
     let mut f = EventFilter::default();
     assert!(f.apply_token("WindowOpened"));
-    assert!(f.window_events && !f.workspace_events);
-    assert!(f.apply_token("WorkspaceChanged"));
-    assert!(f.workspace_events);
-
-    // 全部 19 个事件枚举名均须识别（apply_token 与 matches 同源，防漂移）
-    let mut f = EventFilter::default();
-    for name in [
-        "WindowOpened",
-        "WindowClosed",
-        "WindowFocused",
-        "WindowMoved",
-        "WindowStateChanged",
-        "WindowMetadataChanged",
-        "WindowStackingChanged",
-        "FullscreenChanged",
-        "WorkspaceChanged",
-        "WorkspaceListChanged",
-        "WorkspaceWindowMoved",
-        "MonitorHotplug",
-        "MonitorChanged",
-        "PointerButton",
-        "KeyComboPressed",
-        "AppLaunched",
-        "AppExited",
-        "PowerStateChanged",
-        "AccessibilityTreeChanged",
-    ] {
-        assert!(f.apply_token(name), "event name {name} must be accepted");
-    }
-
-    // all 覆盖为全量
-    let mut f = EventFilter::default();
-    assert!(f.apply_token("all"));
-    assert!(f.window_events && f.workspace_events && f.power_events);
+    assert!(f.matches(&event_named("WindowOpened")));
+    assert!(!f.matches(&event_named("WindowFocused")));
+    assert!(!f.matches(&event_named("WorkspaceChanged")));
 
     // 未知 token（含已废弃的旧名 WindowAdded）拒绝
     let mut f = EventFilter::default();
@@ -298,13 +467,93 @@ fn filter_apply_token_accepts_categories_and_event_names() {
     assert!(!f.apply_token("bogus"));
 }
 
+#[test]
+fn event_name_filter_matches_only_that_event() {
+    let cases = sample_event_cases();
+    for (name, _) in &cases {
+        let mut f = EventFilter::default();
+        assert!(f.apply_token(name), "event name {name} must be accepted");
+        for (other_name, other_event) in &cases {
+            assert_eq!(
+                f.matches(other_event),
+                name == other_name,
+                "filter {name} must match only {name}, got {other_name}"
+            );
+        }
+    }
+}
+
+#[test]
+fn category_filter_matches_whole_category() {
+    let cases = sample_event_cases();
+    let mut f = EventFilter::default();
+    assert!(f.apply_token("window"));
+    for (name, event) in &cases {
+        let expected = matches!(
+            *name,
+            "WindowOpened"
+                | "WindowClosed"
+                | "WindowFocused"
+                | "WindowMoved"
+                | "WindowStateChanged"
+                | "WindowMetadataChanged"
+                | "WindowStackingChanged"
+                | "FullscreenChanged"
+        );
+        assert_eq!(f.matches(event), expected, "window filter vs {name}");
+    }
+}
+
+#[test]
+fn filter_tokens_are_additive_and_all_resets() {
+    let mut f = EventFilter::default();
+    assert!(f.apply_token("WindowClosed"));
+    assert!(f.apply_token("PowerStateChanged"));
+    assert!(f.matches(&event_named("WindowClosed")));
+    assert!(f.matches(&event_named("PowerStateChanged")));
+    assert!(!f.matches(&event_named("WindowOpened")));
+
+    // all 覆盖式重置：单点选择之后再 all，全部命中
+    assert!(f.apply_token("all"));
+    for (name, event) in sample_event_cases() {
+        assert!(f.matches(&event), "all filter must match {name}");
+    }
+}
+
+#[tokio::test]
+async fn hub_delivers_only_filtered_event_name() {
+    // 订阅路径回归：`--filter WindowOpened` 只投递该事件，同类别其他事件
+    // 在 hub 预过滤阶段被丢弃（TC-events-01 场景 1 的可观察行为）。
+    let hub = EventHub::with_capacity(8);
+    let mut filter = EventFilter::default();
+    assert!(filter.apply_token("WindowOpened"));
+    let mut sub = hub.subscribe(filter);
+
+    for event in [
+        event_named("WindowFocused"),
+        event_named("WindowOpened"),
+        event_named("WindowClosed"),
+    ] {
+        hub.publish(event).await;
+    }
+
+    let received = sub.recv().await.expect("one matching event");
+    assert!(
+        matches!(received, DesktopEvent::WindowOpened { .. }),
+        "got {received:?}"
+    );
+    assert!(
+        sub.try_recv().is_none(),
+        "only WindowOpened may be delivered"
+    );
+}
+
 #[tokio::test]
 async fn hub_does_not_deliver_unsubscribed_categories() {
     let hub = EventHub::with_capacity(8);
-    let mut sub = hub.subscribe(EventFilter {
-        power_events: true,
-        ..EventFilter::default()
-    });
+    let mut filter = EventFilter::default();
+    assert!(filter.apply_token("power"));
+    let mut sub = hub.subscribe(filter);
     hub.publish(DesktopEvent::WindowClosed {
         id: win_id(1),
         source: EventSource::Hyprland,
