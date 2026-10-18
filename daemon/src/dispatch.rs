@@ -1824,6 +1824,7 @@ async fn package_refresh(d: &mut Daemon) -> RpcResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::TestDaemon;
     use agent_shell_a11y::{A11yOps, AtspiRole, AtspiState, ElementNode};
     use agent_shell_core::security::{AgentShellConfig, SecurityManager};
     use agent_shell_rpc::method;
@@ -1845,14 +1846,37 @@ mod tests {
         || Box::pin(std::future::ready(None))
     }
 
-    /// 测试基座：隔离 ambient env/config——`caller_id` 回落 `"*"`、security 用
-    /// 默认配置（不读磁盘/env 的持久化 grant/deny）。需要具名 caller 或自定义
-    /// 审计路径的测试在基座返回值上显式覆盖。
-    async fn test_daemon() -> Daemon {
-        let mut d = Daemon::connect(Duration::from_secs(1)).await;
-        d.caller_id = "*".into();
-        d.security = SecurityManager::with_config(AgentShellConfig::default());
-        d
+    /// 测试基座：走生产装配，状态目录落一次性沙箱（见 [`crate::test_support`]）
+    /// ——单测不得向宿主状态目录写审计记录。需要具名 caller 或自定义审计路径的
+    /// 测试在基座返回值上显式覆盖。
+    async fn test_daemon() -> TestDaemon {
+        TestDaemon::start(Duration::from_secs(1)).await
+    }
+
+    /// 门禁审计必须落在单测沙箱内：宿主状态目录出现本用例的 caller 标记即隔离失效。
+    ///
+    /// 标记（唯一 caller id）只用在本用例内，宿主文件里出现它必然是本次判定写进去的
+    /// ——跑单测污染被测主机的正是这条路径。
+    #[tokio::test]
+    async fn audit_stays_out_of_host_state_dir() {
+        const PROBE_CALLER: &str = "audit-isolation-probe";
+        let host_audit = agent_shell_core::audit::state_dir().join("audit.jsonl");
+        let mut d = test_daemon().await;
+        d.caller_id = PROBE_CALLER.into();
+
+        let _ = dispatch(&mut d, &req(method::EVENTS_UNSUBSCRIBE, None)).await;
+
+        let sandbox = std::fs::read_to_string(d.sandbox().audit_path()).unwrap_or_default();
+        assert!(
+            sandbox.contains(PROBE_CALLER),
+            "沙箱内应有本次判定的审计记录：{sandbox:?}"
+        );
+        let host = std::fs::read_to_string(&host_audit).unwrap_or_default();
+        assert!(
+            !host.contains(PROBE_CALLER),
+            "单测不得向宿主状态目录写审计记录：{}",
+            host_audit.display()
+        );
     }
 
     fn win(native_id: &str, title: &str, app_id: &str) -> WindowInfo {
@@ -2817,7 +2841,8 @@ mod tests {
     }
     #[tokio::test]
     async fn events_subscribe_returns_subscriber_id() {
-        let mut d = test_daemon().await.with_compositor_none();
+        let (daemon, _sandbox) = test_daemon().await.into_parts();
+        let mut d = daemon.with_compositor_none();
         let resp = dispatch(&mut d, &req(method::EVENTS_SUBSCRIBE, None)).await;
         let v = resp.result.expect("subscribe ok");
         let id = v.get("subscriber_id").and_then(|v| v.as_str()).expect("id");
@@ -3571,7 +3596,7 @@ mod tests {
     }
     #[tokio::test]
     async fn sysctl_get_missing_key_returns_invalid_params() {
-        let mut d = Daemon::connect(Duration::from_secs(1)).await;
+        let mut d = test_daemon().await;
         let resp = dispatch(&mut d, &req(method::SYSCTL_GET, Some(json!({})))).await;
         assert_eq!(
             resp.error.expect("error").code,
@@ -3583,7 +3608,7 @@ mod tests {
         // 合法 key 到达 rootd 连接：注入离线 rootd 连接器 →
         // BackendUnavailable 降级，证明无 rootd 时的降级路径在所有主机
         // 确定性可测（rootd 常驻主机不再误入非降级路径）。
-        let mut d = Daemon::connect(Duration::from_secs(1)).await;
+        let mut d = test_daemon().await;
         d.rootd_connect = offline_rootd_connector();
         let resp = dispatch(
             &mut d,
@@ -3615,7 +3640,7 @@ mod tests {
     #[tokio::test]
     async fn sysctl_set_missing_value_returns_invalid_params() {
         // 授权 L4 绕过 gate → 到达 handler，缺 value 由 handler 报 InvalidParams。
-        let mut d = Daemon::connect(Duration::from_secs(1)).await;
+        let mut d = test_daemon().await;
         d.caller_id = "trusted".into();
         d.security
             .config
@@ -3640,7 +3665,7 @@ mod tests {
         // L4 放行后进入 handler：合法 key/value 到达 rootd 连接。注入离线
         // rootd 连接器 → BackendUnavailable 降级，证明无 rootd 时的降级
         // 路径在所有主机确定性可测（rootd 常驻主机不再误入非降级路径）。
-        let mut d = Daemon::connect(Duration::from_secs(1)).await;
+        let mut d = test_daemon().await;
         d.rootd_connect = offline_rootd_connector();
         d.caller_id = "trusted".into();
         d.security

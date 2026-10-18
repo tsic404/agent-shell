@@ -407,6 +407,7 @@ async fn write_line<W: AsyncWrite + Unpin>(out: &Mutex<W>, line: &str) -> std::i
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::TestDaemon;
     use std::os::unix::fs::PermissionsExt;
 
     /// 客户端在订阅响应写出之前消失时，订阅仍必须被回收。
@@ -417,7 +418,9 @@ mod tests {
     /// 写响应必然 BrokenPipe。
     #[tokio::test]
     async fn subscription_is_reclaimed_when_response_write_fails() {
-        let daemon = Arc::new(Mutex::new(Daemon::connect(Duration::from_secs(1)).await));
+        // 沙箱随本测试存活：`serve_stream` 期间的门禁审计落沙箱内。
+        let (daemon, _sandbox) = TestDaemon::start(Duration::from_secs(1)).await.into_parts();
+        let daemon = Arc::new(Mutex::new(daemon));
         let (server, mut client) = tokio::io::duplex(4096);
         client
             .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"events.subscribe\"}\n")
