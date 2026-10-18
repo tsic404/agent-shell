@@ -17,6 +17,9 @@ pub mod serve;
 pub mod single_instance;
 pub mod state;
 
+#[cfg(test)]
+pub(crate) mod test_support;
+
 /// 退出路径的日志：非阻塞尽力写 stderr（`serve` 的瞬态连接与看门狗共用）。
 ///
 /// 退出路径不能走 tracing（阻塞写）：stderr 读端仍在但不排空时写满管道会让调用

@@ -235,6 +235,16 @@ impl Daemon {
     /// 装配：连接当前会话合成器。失败不 panic——doctor 场景需要 daemon
     /// 存活以报告诊断细节，各方法在 `compositor=None` 时返回明确错误。
     pub async fn connect(idle_timeout: Duration) -> Self {
+        Self::connect_with_state_dir(idle_timeout, crate::single_instance::state_dir()).await
+    }
+
+    /// 装配到指定状态目录：生产入口 [`Self::connect`] 传 XDG 解析结果，单测基座
+    /// 传一次性沙箱——portal 会话（含注入 capture 的 restore_token 后端）在装配期
+    /// 就绑定该根，不会先绑定宿主再靠事后替换（漏换即污染宿主）。
+    pub(crate) async fn connect_with_state_dir(
+        idle_timeout: Duration,
+        state_dir: std::path::PathBuf,
+    ) -> Self {
         let compositor = match session_kind().as_str() {
             "kde" => if is_wayland_session() {
                 KWinCompositor::new_wayland().await
@@ -289,9 +299,8 @@ impl Daemon {
 
         // PortalSessionManager 先建——注入 CaptureDispatcher 作 TokenStore，
         // 使 ScreenCast 能 restore_token 静默恢复（§22.7 D5）。
-        let portal_sessions = std::sync::Arc::new(
-            crate::portal_sessions::PortalSessionManager::new(crate::single_instance::state_dir()),
-        );
+        let portal_sessions =
+            std::sync::Arc::new(crate::portal_sessions::PortalSessionManager::new(state_dir));
         let token_store: std::sync::Arc<dyn agent_shell_capture::TokenStore> =
             std::sync::Arc::clone(&portal_sessions) as _;
         let caller_id = std::env::var("AGENT_SHELL_AGENT_ID").unwrap_or_else(|_| "*".to_string());
@@ -744,18 +753,19 @@ fn is_wayland_session() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{Sandbox, TestDaemon};
 
     #[tokio::test]
     async fn connect_survives_without_compositor() {
         // daemon 契约：装配失败不 panic（doctor 场景需要 daemon 存活报告诊断）。
-        let d = Daemon::connect(Duration::from_secs(1)).await;
+        let d = TestDaemon::start(Duration::from_secs(1)).await;
         // 在无合成器会话/CI 环境下 has_compositor 可能为 false，但结构必须完整。
         assert_eq!(d.has_compositor(), d.compositor.is_some());
     }
 
     #[tokio::test]
     async fn require_compositor_errors_gracefully() {
-        let d = Daemon::connect(Duration::from_secs(1)).await;
+        let d = TestDaemon::start(Duration::from_secs(1)).await;
         if !d.has_compositor() {
             let (code, msg) = match d.require_compositor() {
                 Err(e) => e,
@@ -764,6 +774,67 @@ mod tests {
             assert_eq!(code, agent_shell_rpc::RpcErrorCode::BackendUnavailable);
             assert!(msg.contains("unavailable"));
         }
+    }
+
+    /// portal 会话状态必须落沙箱：宿主 `sessions.json` 出现本次探针即隔离失效。
+    #[tokio::test]
+    async fn portal_sessions_live_in_sandbox() {
+        use agent_shell_capture::TokenStore;
+
+        const PROBE_TOKEN: &str = "portal-session-isolation-probe";
+        let d = TestDaemon::start(Duration::from_secs(1)).await;
+        d.portal_sessions
+            .save_restore_token(Some(PROBE_TOKEN.into()));
+
+        let sandbox_sessions =
+            std::fs::read_to_string(d.sandbox().state_dir().join("sessions.json"))
+                .unwrap_or_default();
+        assert!(
+            sandbox_sessions.contains(PROBE_TOKEN),
+            "沙箱内应有本次写入的会话：{sandbox_sessions:?}"
+        );
+        let host_sessions = crate::single_instance::state_dir().join("sessions.json");
+        let host = std::fs::read_to_string(&host_sessions).unwrap_or_default();
+        assert!(
+            !host.contains(PROBE_TOKEN),
+            "单测不得写宿主 sessions.json：{}",
+            host_sessions.display()
+        );
+    }
+
+    /// `capture` 的 restore_token 后端必须是沙箱会话管理器（装配期注入，非事后替换）。
+    ///
+    /// 无 session bus / 无后端时 `capture=None`，该通道不存在（无宿主读写面），
+    /// 用例走空装配分支；桌面开发机上 capture 装配成功即真实覆盖该通道。
+    #[tokio::test]
+    async fn capture_token_store_lives_in_sandbox() {
+        let probe = format!("capture-token-isolation-probe-{}", std::process::id());
+        let d = TestDaemon::start(Duration::from_secs(1)).await;
+        let Some(store) = d.capture.as_ref().and_then(|c| c.token_store()) else {
+            return;
+        };
+        let daemon_store: std::sync::Arc<dyn agent_shell_capture::TokenStore> =
+            std::sync::Arc::clone(&d.portal_sessions) as _;
+        assert!(
+            std::sync::Arc::ptr_eq(&daemon_store, &store),
+            "capture 的 token 后端必须是 daemon 持有的沙箱会话管理器"
+        );
+
+        store.save_restore_token(Some(probe.clone()));
+        let sandbox_sessions =
+            std::fs::read_to_string(d.sandbox().state_dir().join("sessions.json"))
+                .unwrap_or_default();
+        assert!(
+            sandbox_sessions.contains(&probe),
+            "capture 的 restore_token 必须落沙箱：{sandbox_sessions:?}"
+        );
+        let host_sessions = crate::single_instance::state_dir().join("sessions.json");
+        let host = std::fs::read_to_string(&host_sessions).unwrap_or_default();
+        assert!(
+            !host.contains(&probe),
+            "单测不得写宿主 sessions.json：{}",
+            host_sessions.display()
+        );
     }
 
     #[test]
@@ -849,8 +920,9 @@ mod tests {
 
     /// 离线 bare Daemon 夹具：所有外部组件为 None，字段可逐项覆盖。
     /// Compositor 变体在 A1 下均需 I/O 装配（KWinCompositor/Treeland），
-    /// 单测无法离线构造，故此处只固化 None 路径。
-    fn bare_daemon() -> Daemon {
+    /// 单测无法离线构造，故此处只固化 None 路径。状态目录（审计、portal 会话）
+    /// 指向夹具沙箱，与 [`TestDaemon`] 同口径。
+    fn bare_daemon(sandbox: &Sandbox) -> Daemon {
         Daemon {
             compositor: None,
             cache: Vec::new(),
@@ -859,19 +931,9 @@ mod tests {
             capture: None,
             input: None,
             input_error: None,
-            portal_sessions: std::sync::Arc::new(
-                crate::portal_sessions::PortalSessionManager::new(
-                    crate::single_instance::state_dir(),
-                ),
-            ),
+            portal_sessions: sandbox.portal_sessions(),
             ime_session: crate::ime_session::ImeSession::new(),
-            security: agent_shell_core::security::SecurityManager::load_default().unwrap_or_else(
-                |_| {
-                    agent_shell_core::security::SecurityManager::with_config(
-                        agent_shell_core::security::AgentShellConfig::default(),
-                    )
-                },
-            ),
+            security: sandbox.security(),
             caller_id: "*".into(),
             rootd_connect: crate::rootd_client::connector(),
             a11y: None,
@@ -893,14 +955,16 @@ mod tests {
     fn compositor_name_reports_unavailable_without_backend() {
         // 名称委托的 Dde 路径由 dde crate 的 name() 契约覆盖。此处固化 None
         // 路径（doctor 兜底展示名）。
-        let d = bare_daemon();
+        let sandbox = Sandbox::new();
+        let d = bare_daemon(&sandbox);
         assert_eq!(d.compositor_name(), "unavailable");
     }
 
     #[test]
     fn windows_cached_reports_count_when_warm_and_none_when_cold() {
         use agent_shell_core::types::{DesktopEnvironment, Rect, WindowId, WindowType};
-        let mut d = bare_daemon();
+        let sandbox = Sandbox::new();
+        let mut d = bare_daemon(&sandbox);
         // 冷缓存（从未填充）→ None（daemon.status 省略该字段）。
         assert_eq!(d.windows_cached(), None);
         // 新鲜缓存 → 报告条目数。
@@ -943,7 +1007,7 @@ mod tests {
     #[tokio::test]
     async fn event_ring_replay_after_push() {
         // events --replay 数据源：push 一个真实 DesktopEvent 后 snapshot 非空。
-        let d = Daemon::connect(Duration::from_secs(1)).await;
+        let d = TestDaemon::start(Duration::from_secs(1)).await;
         assert!(d.ring.snapshot().is_empty());
         d.ring.push(event::DesktopEvent::Noop);
         let events = d.ring.snapshot();
@@ -982,7 +1046,7 @@ mod tests {
     /// 真实归一化事件」的装配链路覆盖）。
     #[tokio::test]
     async fn install_pipeline_feeds_normalized_events_into_ring() {
-        let d = Daemon::connect(Duration::from_secs(1)).await;
+        let d = TestDaemon::start(Duration::from_secs(1)).await;
         Daemon::install_pipeline(&d.hub, &d.ring, noop_resolver(), Box::new(FakeRawSource));
         // 等归一化 task flush。
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -997,7 +1061,7 @@ mod tests {
     /// 首启失败不置位启动标志（可重试）；成功后才置位（审查 #2 回归）。
     #[tokio::test]
     async fn failed_assembly_keeps_pipeline_retryable() {
-        let mut d = Daemon::connect(Duration::from_secs(1)).await;
+        let mut d = TestDaemon::start(Duration::from_secs(1)).await;
         let resolver = noop_resolver();
         let err = d.apply_assembly_outcome(
             resolver.clone(),

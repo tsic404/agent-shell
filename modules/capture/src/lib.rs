@@ -179,6 +179,21 @@ impl CaptureDispatcher {
         })
     }
 
+    /// 当前注入的 restore_token 持久化后端（装配后只读）。
+    ///
+    /// 供测试基座断言会话状态落点；`portal-screencast` 关闭时恒 `None`
+    /// （ScreenCast 路径编译期排除，无 token 读写面）。
+    pub fn token_store(&self) -> Option<std::sync::Arc<dyn TokenStore>> {
+        #[cfg(feature = "portal-screencast")]
+        {
+            self.token_store.clone()
+        }
+        #[cfg(not(feature = "portal-screencast"))]
+        {
+            None
+        }
+    }
+
     /// 窗口直捕（X11-only；portal 无法定位 native window id）。
     /// 连接经 `OnceCell` 惰性建立并复用。
     ///
