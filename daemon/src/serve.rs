@@ -56,7 +56,7 @@ impl ActivityClock {
 /// 都不留残留端点。被信号终止（SIGKILL/SIGTERM）不执行析构，仍会留下文件——由下次
 /// `bind_socket` 的连通性探测接管，与崩溃现场同一路径。
 #[derive(Debug)]
-pub(crate) struct BoundSocket {
+pub struct BoundSocket {
     listener: UnixListener,
     path: PathBuf,
     dev: u64,
@@ -85,7 +85,7 @@ impl Drop for BoundSocket {
 /// ——`--socket` 指向用户数据时不得为了绑定而删除它；socket 文件则连一下判定：能连上
 /// 说明有 daemon 正在服务该端点（拒绝启动，不抢活跃端点），连不上说明是上次崩溃留下的
 /// 文件，回收后重新绑定。权限收紧到 0600——该 socket 即桌面控制面，不能放同机其他用户接入。
-pub(crate) fn bind_socket(path: &Path) -> Result<BoundSocket, String> {
+pub fn bind_socket(path: &Path) -> Result<BoundSocket, String> {
     match std::fs::symlink_metadata(path) {
         Ok(meta) if meta.file_type().is_socket() => {
             match std::os::unix::net::UnixStream::connect(path) {
@@ -145,7 +145,7 @@ pub(crate) fn bind_socket(path: &Path) -> Result<BoundSocket, String> {
 }
 
 /// stdio 形态：单连接，stdin EOF 或空闲超时退出。
-pub(crate) async fn serve_stdio(daemon: Daemon, idle_timeout: Duration) {
+pub async fn serve_stdio(daemon: Daemon, idle_timeout: Duration) {
     let daemon = Arc::new(Mutex::new(daemon));
     let out = Arc::new(Mutex::new(tokio::io::stdout()));
     serve_stream(
@@ -163,7 +163,7 @@ pub(crate) async fn serve_stdio(daemon: Daemon, idle_timeout: Duration) {
 }
 
 /// 监听形态：每条连接一个任务，共享同一 daemon 状态；无请求且无连接达空闲超时退出。
-pub(crate) async fn serve_socket(bound: BoundSocket, daemon: Daemon, idle_timeout: Duration) {
+pub async fn serve_socket(bound: BoundSocket, daemon: Daemon, idle_timeout: Duration) {
     let daemon = Arc::new(Mutex::new(daemon));
     let activity = Arc::new(ActivityClock::new());
     let connections = Arc::new(AtomicUsize::new(0));

@@ -43,6 +43,7 @@ members = [
     "modules/capture",
     "mcp",
     "event",
+    "tests/acceptance",
 ]
 
 [workspace.package]

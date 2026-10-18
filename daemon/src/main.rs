@@ -20,19 +20,7 @@
 //! `LOCK_WAIT_TIMEOUT`（30s）再以 exit 1 报「daemon already running」，锁空闲
 //! 时才随即因 EOF 退出（exit 0）。
 
-mod a11y;
-mod capture;
-mod dispatch;
-mod ime_session;
-mod input;
-mod path_guard;
-mod portal_sessions;
-mod rootd_client;
-mod serve;
-mod single_instance;
-mod state;
-
-use state::Daemon;
+use agent_shell_daemon::{log_exit, serve, single_instance, state::Daemon};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -236,32 +224,6 @@ fn spawn_client_watchdog() {
         });
     if let Err(e) = spawned {
         tracing::warn!("client watchdog thread failed to start: {e}");
-    }
-}
-
-/// 退出路径的日志：非阻塞尽力写 stderr（`serve` 的瞬态连接与看门狗共用）。
-///
-/// 退出路径不能走 tracing（阻塞写）：stderr 读端仍在但不排空时写满管道会让调用
-/// 线程无限阻塞，`std::process::exit` 执行不到，进程带着单实例锁残留——正是本
-/// 模块要防的故障形态。这里 dup fd 2、置 `O_NONBLOCK` 后写一次：管道满（EAGAIN）
-/// 或无读者（EPIPE；Rust 运行时已忽略 SIGPIPE）都立即返回，写不出去即丢弃。
-/// 消息保持纯文本、单行——只求不阻塞、不 panic。写入时自动补行尾 `\n`：多轮瞬态
-/// daemon 的退出消息各自成行，不会在 stderr 上粘成一行、与 shell 提示符相接。
-pub(crate) fn log_exit(msg: &str) {
-    // SAFETY: 只操作本进程的 stderr；dup 出的 fd 在本次调用内关闭，不与其它线程
-    // 共享；写入缓冲区是本函数的有效切片，长度与指针同源。
-    unsafe {
-        let fd = libc::fcntl(libc::STDERR_FILENO, libc::F_DUPFD_CLOEXEC, 3);
-        if fd < 0 {
-            return;
-        }
-        let flags = libc::fcntl(fd, libc::F_GETFL);
-        if flags >= 0 {
-            libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
-        }
-        libc::write(fd, msg.as_ptr().cast(), msg.len());
-        libc::write(fd, b"\n".as_ptr().cast(), 1);
-        libc::close(fd);
     }
 }
 
