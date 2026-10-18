@@ -1,0 +1,31 @@
+[package]
+name = "agent-shell-acceptance"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "agent-shell 验收用例的可执行形式：设计仓 03-acceptance.md 的用例标识与本目录文件一一对应"
+
+# 用例 = 测试目标：一个 TC 一个 `[[test]]`，路径即设计仓写明的
+# `tests/acceptance/<TC-id>`；目标内保持单个 `#[tokio::test]`（见 src/lib.rs 夹具文档）。
+autotests = false
+
+[lib]
+name = "acceptance"
+path = "src/lib.rs"
+
+[dependencies]
+agent-shell-core.workspace = true
+# 直连路径依赖 + 关默认特性：与 daemon / cli 的跨成员依赖同形，避免无 PipeWire
+# dev 头的机器（no-pipewire profile、arm64）被 portal-screencast 卡住编译。
+agent-shell-daemon = { path = "../../daemon", default-features = false }
+agent-shell-event.workspace = true
+agent-shell-rpc.workspace = true
+serde_json.workspace = true
+tempfile = "3"
+tokio.workspace = true
+
+[[test]]
+name = "TC-events-01"
+path = "TC-events-01.rs"

@@ -557,7 +557,11 @@ impl Daemon {
     }
 
     /// 组件健康摘要（doctor 数据源之一）。
-    pub fn compositor_health(&self) -> Result<agent_shell_core::component::ComponentHealth, ()> {
+    ///
+    /// 单元错误表示「无合成器」；仅供 crate 内 doctor 数据源使用，不作为库出口。
+    pub(crate) fn compositor_health(
+        &self,
+    ) -> Result<agent_shell_core::component::ComponentHealth, ()> {
         // health() 是 async；此处仅暴露可用性。完整 doctor 行在 dispatch 层异步收集。
         match &self.compositor {
             Some(_) => Ok(agent_shell_core::component::ComponentHealth::Healthy),
