@@ -328,8 +328,8 @@ pub enum A11yCommand {
 
 /// `events subscribe --filter` / `events replay --filter` 的可用值（逗号分隔）。
 ///
-/// 类别名与事件枚举名均可：类别名按域过滤，事件枚举名等价于其所属类别
-/// （如 `WindowOpened` 等价于 `window`）。两份值表须与
+/// 类别名按域过滤整类；事件枚举名只过滤该事件（如 `WindowOpened` 仅匹配
+/// 该事件，不等价于 `window`）。两份值表须与
 /// `event::EventFilter::valid_values()` 保持同步——新增
 /// `DesktopEvent` 变体而漏改此处，会被 `mod tests` 的表驱动测试捕获。
 const EVENT_FILTER_CATEGORIES: &str = "all/window/workspace/monitor/input/app/a11y/power";
@@ -339,7 +339,7 @@ const EVENT_FILTER_EVENT_NAMES: &str = "WindowOpened/WindowClosed/WindowFocused/
 /// 无第三份手写列表，杜绝文案与值表漂移。
 static EVENT_FILTER_HELP: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
     format!(
-        "过滤器，逗号分隔。类别：{EVENT_FILTER_CATEGORIES}；事件枚举名：{EVENT_FILTER_EVENT_NAMES}"
+        "过滤器，逗号分隔。类别（整类）：{EVENT_FILTER_CATEGORIES}；事件枚举名（单个事件）：{EVENT_FILTER_EVENT_NAMES}"
     )
 });
 

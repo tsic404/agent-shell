@@ -1194,8 +1194,8 @@ async fn events_replay(d: &mut Daemon, req: &Request) -> RpcResult {
 
 /// 解析 events.subscribe / events.replay 的可选 `filter` 字符串（逗号分隔）。
 ///
-/// 每项可为类别名（`window`/`workspace`/…）或事件枚举名
-/// （`WindowOpened`/`WindowClosed`/…），识别与类别归属逻辑集中在
+/// 每项可为类别名（`window`/`workspace`/…，整类）或事件枚举名
+/// （`WindowOpened`/`WindowClosed`/…，单个事件），识别与掩码归属逻辑集中在
 /// [`EventFilter::apply_token`]，此处只负责切分与错误上抛；错误文案列出
 /// 全部可用值，避免用户盲猜枚举名。
 fn parse_event_filter(req: &Request) -> Result<EventFilter, (RpcErrorCode, String)> {
@@ -2842,15 +2842,46 @@ mod tests {
 
     #[test]
     fn parse_event_filter_accepts_event_enum_names() {
-        // 事件枚举名与类别名均可（`WindowOpened` 归 window，`WorkspaceChanged`
-        // 归 workspace），此前仅类别名可用 → `--filter WindowOpened` 报 unknown。
+        // 事件枚举名与类别名均可；枚举名只命中该事件（单点掩码），
+        // 不退化为所属类别的整类过滤。
         let f = parse_event_filter(&req(
             method::EVENTS_SUBSCRIBE,
             Some(json!({"filter": "WindowOpened,WorkspaceChanged"})),
         ))
         .expect("event enum names accepted");
-        assert!(f.window_events && f.workspace_events);
-        assert!(!f.monitor_events && !f.input_events);
+
+        let now = std::time::Instant::now();
+        let opened = event::DesktopEvent::WindowOpened {
+            info: win("1", "t", "a"),
+            source: event::EventSource::KWinWayland,
+            occurred_at: now,
+        };
+        let focused = event::DesktopEvent::WindowFocused {
+            info: win("1", "t", "a"),
+            source: event::EventSource::KWinWayland,
+            occurred_at: now,
+        };
+        let workspace_changed = event::DesktopEvent::WorkspaceChanged {
+            info: agent_shell_core::types::WorkspaceInfo {
+                id: agent_shell_core::types::WorkspaceId {
+                    native_id: "1".into(),
+                    de_type: agent_shell_core::types::DesktopEnvironment::KDE,
+                },
+                name: "1".into(),
+                number: 1,
+                is_active: true,
+                monitor_ids: vec![],
+                window_ids: vec![],
+            },
+            source: event::EventSource::KWinWayland,
+            occurred_at: now,
+        };
+        assert!(f.matches(&opened));
+        assert!(
+            !f.matches(&focused),
+            "WindowOpened filter must not match WindowFocused"
+        );
+        assert!(f.matches(&workspace_changed));
 
         // 已废弃旧名（WindowAdded）与乱码均拒绝，错误文案列出可用值
         let (code, msg) = parse_event_filter(&req(
@@ -2943,6 +2974,45 @@ mod tests {
         .await;
         let v = resp.result.expect("replay ok");
         assert_eq!(v.get("count").and_then(|v| v.as_u64()), Some(0));
+    }
+
+    #[tokio::test]
+    async fn events_replay_filters_by_event_enum_name() {
+        // 枚举名必须落到单点：同一批窗口事件里，只回放 WindowOpened，
+        // 不退化为整个 window 类别（WindowClosed/WindowFocused 不得出现）。
+        let mut d = test_daemon().await;
+        let now = std::time::Instant::now();
+        d.ring.push(event::DesktopEvent::WindowOpened {
+            info: win("1", "t", "a"),
+            source: event::EventSource::KWinWayland,
+            occurred_at: now,
+        });
+        d.ring.push(event::DesktopEvent::WindowClosed {
+            id: test_window_id(),
+            source: event::EventSource::KWinWayland,
+            occurred_at: now,
+        });
+        d.ring.push(event::DesktopEvent::WindowFocused {
+            info: win("1", "t", "a"),
+            source: event::EventSource::KWinWayland,
+            occurred_at: now,
+        });
+
+        let resp = dispatch(
+            &mut d,
+            &req(
+                method::EVENTS_REPLAY,
+                Some(json!({"filter": "WindowOpened"})),
+            ),
+        )
+        .await;
+        let v = resp.result.expect("replay ok");
+        assert_eq!(v.get("count").and_then(|v| v.as_u64()), Some(1));
+        let events = v.get("events").and_then(|v| v.as_array()).expect("events");
+        assert!(
+            events[0].get("WindowOpened").is_some(),
+            "only WindowOpened may be replayed, got {events:?}"
+        );
     }
 
     fn test_window_id() -> agent_shell_core::types::WindowId {

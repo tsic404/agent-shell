@@ -281,14 +281,20 @@ mod tests {
     }
 
     /// 私有 session bus（并行测试隔离；dbus-daemon 为测试前置）。
+    ///
+    /// 持 [`fork_guard`](crate::testsupport::fork_guard)：spawn 是 fork，可能
+    /// 继承其它测试写桩时打开的写 fd；非 D-Bus 测试同期也可能 exec 桩脚本。
+    /// 守卫随 bus 生命周期存在，任何使用本结构的用例自动进入同一互斥域。
     struct TestBus {
         addr: String,
         _child: std::process::Child,
+        _fork: tokio::sync::MutexGuard<'static, ()>,
     }
 
     impl TestBus {
         async fn start() -> Self {
             use std::process::Stdio;
+            let fork = crate::testsupport::fork_guard().await;
             let mut child = std::process::Command::new("dbus-daemon")
                 .args(["--session", "--nofork", "--print-address=1"])
                 .stdout(Stdio::piped())
@@ -304,6 +310,7 @@ mod tests {
             Self {
                 addr,
                 _child: child,
+                _fork: fork,
             }
         }
 

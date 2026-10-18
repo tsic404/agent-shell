@@ -262,6 +262,9 @@ mod tests {
 
     #[tokio::test]
     async fn bind_reports_each_backend_reason_when_none_is_available() {
+        // 该用例会 spawn 不存在的 gsettings/hyprctl（fork 仍发生），
+        // 必须与写桩/其它 spawn 用例共用 fork 互斥，避免 ETXTBSY 竞态。
+        let _guard = crate::testsupport::fork_guard().await;
         let err = binder(DesktopEnvironment::Unknown)
             .bind(&meta_t(), "notify-send hi")
             .await

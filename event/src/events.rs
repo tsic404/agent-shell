@@ -375,56 +375,260 @@ impl DesktopEvent {
             | Self::AccessibilityTreeChanged { occurred_at, .. } => Some(*occurred_at),
         }
     }
+
+    /// 事件种类；`Noop` 无种类，返回 `None`。
+    pub fn kind(&self) -> Option<EventKind> {
+        match self {
+            Self::WindowOpened { .. } => Some(EventKind::WindowOpened),
+            Self::WindowClosed { .. } => Some(EventKind::WindowClosed),
+            Self::WindowFocused { .. } => Some(EventKind::WindowFocused),
+            Self::WindowMoved { .. } => Some(EventKind::WindowMoved),
+            Self::WindowStateChanged { .. } => Some(EventKind::WindowStateChanged),
+            Self::WindowMetadataChanged { .. } => Some(EventKind::WindowMetadataChanged),
+            Self::WindowStackingChanged { .. } => Some(EventKind::WindowStackingChanged),
+            Self::WorkspaceChanged { .. } => Some(EventKind::WorkspaceChanged),
+            Self::WorkspaceListChanged { .. } => Some(EventKind::WorkspaceListChanged),
+            Self::WorkspaceWindowMoved { .. } => Some(EventKind::WorkspaceWindowMoved),
+            Self::MonitorHotplug { .. } => Some(EventKind::MonitorHotplug),
+            Self::MonitorChanged { .. } => Some(EventKind::MonitorChanged),
+            Self::PointerButton { .. } => Some(EventKind::PointerButton),
+            Self::KeyComboPressed { .. } => Some(EventKind::KeyComboPressed),
+            Self::AppLaunched { .. } => Some(EventKind::AppLaunched),
+            Self::AppExited { .. } => Some(EventKind::AppExited),
+            Self::FullscreenChanged { .. } => Some(EventKind::FullscreenChanged),
+            Self::PowerStateChanged { .. } => Some(EventKind::PowerStateChanged),
+            Self::AccessibilityTreeChanged { .. } => Some(EventKind::AccessibilityTreeChanged),
+            Self::Noop => None,
+        }
+    }
 }
 
 // ───────────────────────── 事件过滤 ─────────────────────────
 
-/// 事件过滤器（订阅者按类别筛选）。对应设计文档 §18.1。
+/// 事件种类：每个实体 [`DesktopEvent`] 变体占位图一位。
+///
+/// 变体声明顺序即位序，仅 `Noop` 无位；新增事件变体时同步本枚举、
+/// [`DesktopEvent::kind`] 与 [`EventKind::ALL`]。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum EventKind {
+    /// 窗口打开
+    WindowOpened,
+    /// 窗口关闭
+    WindowClosed,
+    /// 窗口聚焦变化
+    WindowFocused,
+    /// 窗口移动/缩放
+    WindowMoved,
+    /// 窗口状态变化
+    WindowStateChanged,
+    /// 窗口标题/应用名变化
+    WindowMetadataChanged,
+    /// 窗口层叠顺序变化
+    WindowStackingChanged,
+    /// 全屏状态变化
+    FullscreenChanged,
+    /// 工作区切换
+    WorkspaceChanged,
+    /// 工作区增删
+    WorkspaceListChanged,
+    /// 窗口跨工作区移动
+    WorkspaceWindowMoved,
+    /// 监视器热插拔
+    MonitorHotplug,
+    /// 监视器变化
+    MonitorChanged,
+    /// 指针按键
+    PointerButton,
+    /// 组合键按下
+    KeyComboPressed,
+    /// 应用启动
+    AppLaunched,
+    /// 应用退出
+    AppExited,
+    /// 电源状态变化
+    PowerStateChanged,
+    /// 无障碍树变化
+    AccessibilityTreeChanged,
+}
+
+impl EventKind {
+    /// 全部实体事件种类，顺序即 `--help` 与错误文案中的枚举顺序。
+    pub const ALL: [Self; 19] = [
+        Self::WindowOpened,
+        Self::WindowClosed,
+        Self::WindowFocused,
+        Self::WindowMoved,
+        Self::WindowStateChanged,
+        Self::WindowMetadataChanged,
+        Self::WindowStackingChanged,
+        Self::FullscreenChanged,
+        Self::WorkspaceChanged,
+        Self::WorkspaceListChanged,
+        Self::WorkspaceWindowMoved,
+        Self::MonitorHotplug,
+        Self::MonitorChanged,
+        Self::PointerButton,
+        Self::KeyComboPressed,
+        Self::AppLaunched,
+        Self::AppExited,
+        Self::PowerStateChanged,
+        Self::AccessibilityTreeChanged,
+    ];
+
+    /// 全部实体事件位的并集。
+    pub const ALL_MASK: u32 = {
+        let mut mask = 0;
+        let mut i = 0;
+        while i < Self::ALL.len() {
+            mask |= Self::ALL[i].bit();
+            i += 1;
+        }
+        mask
+    };
+
+    /// 单点位。
+    pub const fn bit(self) -> u32 {
+        1 << self as u32
+    }
+
+    /// 与 `DesktopEvent` 变体名一致的枚举名。
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::WindowOpened => "WindowOpened",
+            Self::WindowClosed => "WindowClosed",
+            Self::WindowFocused => "WindowFocused",
+            Self::WindowMoved => "WindowMoved",
+            Self::WindowStateChanged => "WindowStateChanged",
+            Self::WindowMetadataChanged => "WindowMetadataChanged",
+            Self::WindowStackingChanged => "WindowStackingChanged",
+            Self::FullscreenChanged => "FullscreenChanged",
+            Self::WorkspaceChanged => "WorkspaceChanged",
+            Self::WorkspaceListChanged => "WorkspaceListChanged",
+            Self::WorkspaceWindowMoved => "WorkspaceWindowMoved",
+            Self::MonitorHotplug => "MonitorHotplug",
+            Self::MonitorChanged => "MonitorChanged",
+            Self::PointerButton => "PointerButton",
+            Self::KeyComboPressed => "KeyComboPressed",
+            Self::AppLaunched => "AppLaunched",
+            Self::AppExited => "AppExited",
+            Self::PowerStateChanged => "PowerStateChanged",
+            Self::AccessibilityTreeChanged => "AccessibilityTreeChanged",
+        }
+    }
+
+    /// 按枚举名查找；大小写敏感。
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|kind| kind.name() == name)
+    }
+
+    /// 所属类别（`FullscreenChanged` 归 `window`）。
+    pub const fn category(self) -> EventCategory {
+        match self {
+            Self::WindowOpened
+            | Self::WindowClosed
+            | Self::WindowFocused
+            | Self::WindowMoved
+            | Self::WindowStateChanged
+            | Self::WindowMetadataChanged
+            | Self::WindowStackingChanged
+            | Self::FullscreenChanged => EventCategory::Window,
+            Self::WorkspaceChanged | Self::WorkspaceListChanged | Self::WorkspaceWindowMoved => {
+                EventCategory::Workspace
+            }
+            Self::MonitorHotplug | Self::MonitorChanged => EventCategory::Monitor,
+            Self::PointerButton | Self::KeyComboPressed => EventCategory::Input,
+            Self::AppLaunched | Self::AppExited => EventCategory::App,
+            Self::PowerStateChanged => EventCategory::Power,
+            Self::AccessibilityTreeChanged => EventCategory::A11y,
+        }
+    }
+}
+
+/// 事件类别：过滤器的类别名 token。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum EventCategory {
+    /// 窗口事件
+    Window,
+    /// 工作区事件
+    Workspace,
+    /// 监视器事件
+    Monitor,
+    /// 输入事件
+    Input,
+    /// 应用生命周期事件
+    App,
+    /// 无障碍事件
+    A11y,
+    /// 电源事件
+    Power,
+}
+
+impl EventCategory {
+    /// 全部类别，顺序即 `--help` 中的类别顺序。
+    pub const ALL: [Self; 7] = [
+        Self::Window,
+        Self::Workspace,
+        Self::Monitor,
+        Self::Input,
+        Self::App,
+        Self::A11y,
+        Self::Power,
+    ];
+
+    /// 类别名 token。
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Window => "window",
+            Self::Workspace => "workspace",
+            Self::Monitor => "monitor",
+            Self::Input => "input",
+            Self::App => "app",
+            Self::A11y => "a11y",
+            Self::Power => "power",
+        }
+    }
+
+    /// 按类别名查找。
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|category| category.name() == name)
+    }
+
+    /// 整类掩码：该类全部事件位的并集。
+    pub fn mask(self) -> u32 {
+        EventKind::ALL
+            .into_iter()
+            .filter(|kind| kind.category() == self)
+            .fold(0, |mask, kind| mask | kind.bit())
+    }
+}
+
+/// 事件过滤器（订阅者按事件种类位图筛选）。对应设计文档 §18.1。
+///
+/// 类别 token 置整类掩码；事件枚举名 token 只置单点位——`--filter WindowOpened`
+/// 只匹配该事件，不退化为整个 `window` 类别。
 #[derive(Clone, Debug, Default)]
 pub struct EventFilter {
-    /// 窗口事件
-    pub window_events: bool,
-    /// 工作区事件
-    pub workspace_events: bool,
-    /// 监视器事件
-    pub monitor_events: bool,
-    /// 输入事件
-    pub input_events: bool,
-    /// 应用生命周期事件
-    pub app_events: bool,
-    /// 无障碍事件
-    pub a11y_events: bool,
-    /// 电源事件
-    pub power_events: bool,
+    /// 选中的事件种类位图
+    mask: u32,
     /// 优先级过滤（None = 全部）
     pub priority: Option<EventPriority>,
 }
 
 impl EventFilter {
     /// 匹配所有事件。
-    pub const fn all() -> Self {
+    pub fn all() -> Self {
         Self {
-            window_events: true,
-            workspace_events: true,
-            monitor_events: true,
-            input_events: true,
-            app_events: true,
-            a11y_events: true,
-            power_events: true,
+            mask: EventKind::ALL_MASK,
             priority: None,
         }
     }
 
-    /// 仅窗口事件。
-    pub const fn windows_only() -> Self {
+    /// 仅窗口类别。
+    pub fn windows_only() -> Self {
         Self {
-            window_events: true,
-            workspace_events: false,
-            monitor_events: false,
-            input_events: false,
-            app_events: false,
-            a11y_events: false,
-            power_events: false,
+            mask: EventCategory::Window.mask(),
             priority: None,
         }
     }
@@ -432,108 +636,53 @@ impl EventFilter {
     /// 将单个过滤器 token 应用到自身，返回是否识别。
     ///
     /// `events.subscribe` / `events.replay` 的 `--filter` 解析复用本方法，
-    /// 使 token → 类别归属与 [`EventFilter::matches`] 保持单一事实来源，
-    /// 避免两处枚举漂移。类别名（`window`/`workspace`/…）与 [`DesktopEvent`]
-    /// 变体名（`WindowOpened`/`WindowClosed`/…）均可；`all` 覆盖为全量，
-    /// 未识别返回 `false`（调用方据此上抛 InvalidParams）。
+    /// 使 token → 掩码与 [`EventFilter::matches`] 保持单一事实来源，避免两处
+    /// 枚举漂移。`all` 覆盖式重置为全量，其余 token 追加；类别名置整类，
+    /// 事件枚举名只置单点。未识别返回 `false`（调用方据此上抛 InvalidParams）。
     pub fn apply_token(&mut self, token: &str) -> bool {
-        match token {
-            "all" => *self = Self::all(),
-            // 类别名
-            "window" => self.window_events = true,
-            "workspace" => self.workspace_events = true,
-            "monitor" => self.monitor_events = true,
-            "input" => self.input_events = true,
-            "app" => self.app_events = true,
-            "a11y" => self.a11y_events = true,
-            "power" => self.power_events = true,
-            // 事件枚举名（窗口，FullscreenChanged 亦归窗口）
-            "WindowOpened"
-            | "WindowClosed"
-            | "WindowFocused"
-            | "WindowMoved"
-            | "WindowStateChanged"
-            | "WindowMetadataChanged"
-            | "WindowStackingChanged"
-            | "FullscreenChanged" => self.window_events = true,
-            "WorkspaceChanged" | "WorkspaceListChanged" | "WorkspaceWindowMoved" => {
-                self.workspace_events = true
-            }
-            "MonitorHotplug" | "MonitorChanged" => self.monitor_events = true,
-            "PointerButton" | "KeyComboPressed" => self.input_events = true,
-            "AppLaunched" | "AppExited" => self.app_events = true,
-            "PowerStateChanged" => self.power_events = true,
-            "AccessibilityTreeChanged" => self.a11y_events = true,
-            _ => return false,
+        if token == "all" {
+            self.mask = EventKind::ALL_MASK;
+            return true;
         }
-        true
+        if let Some(category) = EventCategory::from_name(token) {
+            self.mask |= category.mask();
+            return true;
+        }
+        match EventKind::from_name(token) {
+            Some(kind) => {
+                self.mask |= kind.bit();
+                true
+            }
+            None => false,
+        }
     }
 
     /// 全部可用过滤器值（`--help` / 错误提示列出）。
     ///
-    /// 顺序固定：类别名在前，事件枚举名随后按类别分组列出（窗口、工作区、
-    /// 监视器、输入、应用、电源、无障碍）。
-    pub const fn valid_values() -> &'static [&'static str] {
-        &[
-            "all",
-            "window",
-            "workspace",
-            "monitor",
-            "input",
-            "app",
-            "a11y",
-            "power",
-            "WindowOpened",
-            "WindowClosed",
-            "WindowFocused",
-            "WindowMoved",
-            "WindowStateChanged",
-            "WindowMetadataChanged",
-            "WindowStackingChanged",
-            "FullscreenChanged",
-            "WorkspaceChanged",
-            "WorkspaceListChanged",
-            "WorkspaceWindowMoved",
-            "MonitorHotplug",
-            "MonitorChanged",
-            "PointerButton",
-            "KeyComboPressed",
-            "AppLaunched",
-            "AppExited",
-            "PowerStateChanged",
-            "AccessibilityTreeChanged",
-        ]
+    /// 由类别表与事件种类表派生，顺序固定：`all`、类别名、事件枚举名
+    /// （按类别分组）。新增变体只改两张表，帮助文案与报错同步更新。
+    pub fn valid_values() -> &'static [&'static str] {
+        static VALUES: std::sync::LazyLock<Vec<&'static str>> = std::sync::LazyLock::new(|| {
+            let mut values =
+                Vec::with_capacity(1 + EventCategory::ALL.len() + EventKind::ALL.len());
+            values.push("all");
+            values.extend(EventCategory::ALL.iter().map(|category| category.name()));
+            values.extend(EventKind::ALL.iter().map(|kind| kind.name()));
+            values
+        });
+        VALUES.as_slice()
     }
 
     /// 判断事件是否匹配过滤器。`Noop` 永不匹配（归一化已丢弃）。
     pub fn matches(&self, event: &DesktopEvent) -> bool {
+        let Some(kind) = event.kind() else {
+            return false;
+        };
         if let Some(p) = self.priority {
             if event.priority() != p {
                 return false;
             }
         }
-        match event {
-            DesktopEvent::WindowOpened { .. }
-            | DesktopEvent::WindowClosed { .. }
-            | DesktopEvent::WindowFocused { .. }
-            | DesktopEvent::WindowMoved { .. }
-            | DesktopEvent::WindowStateChanged { .. }
-            | DesktopEvent::WindowMetadataChanged { .. }
-            | DesktopEvent::WindowStackingChanged { .. } => self.window_events,
-            DesktopEvent::WorkspaceChanged { .. }
-            | DesktopEvent::WorkspaceListChanged { .. }
-            | DesktopEvent::WorkspaceWindowMoved { .. } => self.workspace_events,
-            DesktopEvent::MonitorHotplug { .. } | DesktopEvent::MonitorChanged { .. } => {
-                self.monitor_events
-            }
-            DesktopEvent::PointerButton { .. } | DesktopEvent::KeyComboPressed { .. } => {
-                self.input_events
-            }
-            DesktopEvent::AppLaunched { .. } | DesktopEvent::AppExited { .. } => self.app_events,
-            DesktopEvent::FullscreenChanged { .. } => self.window_events,
-            DesktopEvent::PowerStateChanged { .. } => self.power_events,
-            DesktopEvent::AccessibilityTreeChanged { .. } => self.a11y_events,
-            DesktopEvent::Noop => false,
-        }
+        self.mask & kind.bit() != 0
     }
 }
