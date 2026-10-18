@@ -11,6 +11,7 @@
 //! 会话隔离与并发约束见 [`headless_session`]：一个测试目标内保持单个
 //! `#[tokio::test]`。
 
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 use agent_shell_core::security::{AgentShellConfig, SecurityManager};
@@ -52,6 +53,25 @@ impl Fixture {
             daemon,
             _sandbox: sandbox,
         }
+    }
+
+    /// 隔离根目录：本轮旅程的状态、配置与会话路径都必须落在它之内。
+    pub fn sandbox_root(&self) -> &Path {
+        self._sandbox.path()
+    }
+
+    /// 设定调用方身份：审计按调用方留痕（C-107），验收据此把本轮与其它运行区分开。
+    pub fn set_caller_id(&mut self, caller_id: &str) {
+        self.daemon.caller_id = caller_id.into();
+    }
+
+    /// 写入 ScreenCast 恢复令牌：capture 的 `restore_token` 后端就是 daemon 持有的
+    /// 会话管理器（装配期注入），故这是该通道在验收环境下的真实写入面。
+    pub fn save_screencast_token(&self, token: &str) -> Result<(), String> {
+        // kind 与 persist_mode 同 `TokenStore` 实现：screencast / persist_until_revoked。
+        self.daemon
+            .portal_sessions
+            .set_token("screencast", token.to_string(), 2)
     }
 
     /// 发一条 JSON-RPC 请求（真实 `dispatch` 入口）。

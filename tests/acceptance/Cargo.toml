@@ -29,3 +29,7 @@ tokio.workspace = true
 [[test]]
 name = "TC-events-01"
 path = "TC-events-01.rs"
+
+[[test]]
+name = "TC-journey-03"
+path = "TC-journey-03.rs"
