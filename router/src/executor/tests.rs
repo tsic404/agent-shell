@@ -9,13 +9,13 @@
 use parking_lot::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use agent_shell_core::component::{
     BackendCapabilities, ComponentHealth, ComponentType, CompositorComponent, DesktopComponent,
 };
 use agent_shell_core::error::{AgentShellError, Result};
-use agent_shell_core::security::{AgentShellConfig, ConfirmMode, SecurityManager};
+use agent_shell_core::security::ConfirmMode;
 use agent_shell_core::types::{
     CaptureTarget, DesktopEnvironment, Key, KeyCombo, MonitorInfo, MouseButton, Rect,
     SemanticTarget, TitleMatchMode, WindowId, WindowInfo, WorkspaceId, WorkspaceInfo,
@@ -26,6 +26,7 @@ use crate::command::{Command, CommandResult};
 use crate::dispatcher::{A11yElement, CaptureDispatcher, ElementActions, InputDispatcher};
 use crate::executor::Executor;
 use crate::executor::POLL_STEP as _POLL_STEP_WITNESS;
+use crate::test_support::{Sandbox, TestSecurity};
 
 // ───────────────────────── mock 合成器 ─────────────────────────
 
@@ -301,24 +302,28 @@ impl ElementActions for FailingSetTextA11y {
 
 // ───────────────────────── 构造辅助 ─────────────────────────
 
-fn default_security() -> Arc<SecurityManager> {
-    Arc::new(SecurityManager::with_config(AgentShellConfig::default()))
-}
-
+/// 测试基座：安全入口与审计路径落一次性沙箱（见 [`crate::test_support`]）。
+/// 返回值中的夹具必须活到测试结束——它是沙箱的所有者。
 fn make_executor(
     compositor: MockCompositor,
-) -> (Executor, Arc<Mutex<Vec<String>>>, Arc<MockInput>) {
+) -> (
+    Executor,
+    Arc<Mutex<Vec<String>>>,
+    Arc<MockInput>,
+    TestSecurity,
+) {
     let input = Arc::new(MockInput::default());
     let focused = compositor.focused.clone();
+    let test_security = TestSecurity::new();
     let ex = Executor::new(
         Box::new(compositor),
         input.clone(),
         Arc::new(MockCapture),
         Arc::new(FailingSetTextA11y),
-        default_security(),
+        test_security.security(),
         "*".into(),
     );
-    (ex, focused, input)
+    (ex, focused, input, test_security)
 }
 
 // ───────────────────────── FocusWindow(ByAppId) ─────────────────────────
@@ -329,7 +334,7 @@ async fn focus_window_by_app_id_hits_and_focuses() {
         win("w1", "Editor", "org.kde.kate"),
         win("w2", "终端", "konsole"),
     ]);
-    let (ex, focused, _) = make_executor(comp);
+    let (ex, focused, _, _security) = make_executor(comp);
 
     let res = ex
         .execute(Command::FocusWindow {
@@ -351,7 +356,7 @@ async fn focus_window_by_app_id_hits_and_focuses() {
 #[tokio::test]
 async fn focus_window_by_app_id_miss_returns_window_not_found() {
     let comp = MockCompositor::new(vec![win("w1", "Editor", "kate")]);
-    let (ex, _, _) = make_executor(comp);
+    let (ex, _, _, _security) = make_executor(comp);
 
     let err = ex
         .execute(Command::FocusWindow {
@@ -409,7 +414,7 @@ async fn by_title_four_match_modes_positive_and_negative() {
     ];
 
     for c in cases {
-        let (ex, _, _) = make_executor(MockCompositor::new(windows.clone()));
+        let (ex, _, _, _security) = make_executor(MockCompositor::new(windows.clone()));
         let got = ex
             .resolve_target(&SemanticTarget::ByTitle(c.pattern.into(), c.mode))
             .await
@@ -431,7 +436,7 @@ async fn by_title_four_match_modes_positive_and_negative() {
 async fn regex_invalid_expression_no_panic_treated_as_mismatch() {
     // 非法正则 `([` 不 panic，按「不匹配」处理 → WindowNotFound。
     let comp = MockCompositor::new(vec![win("a", "anything", "app")]);
-    let (ex, _, _) = make_executor(comp);
+    let (ex, _, _, _security) = make_executor(comp);
 
     let result = ex
         .resolve_target(&SemanticTarget::ByTitle(
@@ -453,7 +458,7 @@ async fn wait_for_window_times_out_when_absent() {
     // 步进 100ms，250ms 预算内至少轮询两次，保证覆盖「出现前」路径。
     assert!(Duration::from_millis(250) > _POLL_STEP_WITNESS);
     let comp = MockCompositor::new(vec![win("a", "other", "other-app")]);
-    let (ex, _, _) = make_executor(comp);
+    let (ex, _, _, _security) = make_executor(comp);
 
     let err = ex
         .execute(Command::WaitForWindow {
@@ -472,7 +477,7 @@ async fn wait_for_window_times_out_when_absent() {
 #[tokio::test]
 async fn wait_for_window_succeeds_immediately_when_present() {
     let comp = MockCompositor::new(vec![win("a", "term", "konsole")]);
-    let (ex, _, _) = make_executor(comp);
+    let (ex, _, _, _security) = make_executor(comp);
 
     let res = ex
         .execute(Command::WaitForWindow {
@@ -576,12 +581,13 @@ async fn wait_for_window_succeeds_once_window_appears() {
         appear_after: 3,
     };
     let input = Arc::new(MockInput::default());
+    let test_security = TestSecurity::new();
     let ex = Executor::new(
         Box::new(comp),
         input.clone(),
         Arc::new(MockCapture),
         Arc::new(FailingSetTextA11y),
-        default_security(),
+        test_security.security(),
         "*".into(),
     );
 
@@ -602,12 +608,13 @@ async fn wait_for_window_succeeds_once_window_appears() {
 async fn type_text_falls_back_to_input_when_a11y_set_text_fails() {
     let comp = MockCompositor::new(vec![win("a", "t", "app")]);
     let input = Arc::new(MockInput::default());
+    let test_security = TestSecurity::new();
     let ex = Executor::new(
         Box::new(comp),
         input.clone(),
         Arc::new(MockCapture),
         Arc::new(FailingSetTextA11y),
-        default_security(),
+        test_security.security(),
         "*".into(),
     );
 
@@ -626,9 +633,10 @@ async fn type_text_falls_back_to_input_when_a11y_set_text_fails() {
 #[tokio::test]
 async fn denied_command_short_circuits_before_execution() {
     // 黑名单命中 → execute 入口返回 Permission，不触达 backend。
-    let mut config = AgentShellConfig::default();
-    config.permissions.deny.insert("input.send".into(), true);
-    let security = Arc::new(SecurityManager::with_config(config));
+    let sandbox = Sandbox::new();
+    let security = Arc::new(sandbox.security_with(|config| {
+        config.permissions.deny.insert("input.send".into(), true);
+    }));
 
     let comp = MockCompositor::new(vec![win("w", "t", "app")]);
     let input = Arc::new(MockInput::default());
@@ -657,12 +665,13 @@ async fn denied_command_short_circuits_before_execution() {
 #[tokio::test]
 async fn confirm_override_returns_confirmation_required() {
     // 操作确认覆盖命中 → 纯后端阶段返回 ConfirmationRequired 占位。
-    let mut config = AgentShellConfig::default();
-    config
-        .operations
-        .confirm
-        .insert("input.send".into(), ConfirmMode::Always);
-    let security = Arc::new(SecurityManager::with_config(config));
+    let sandbox = Sandbox::new();
+    let security = Arc::new(sandbox.security_with(|config| {
+        config
+            .operations
+            .confirm
+            .insert("input.send".into(), ConfirmMode::Always);
+    }));
 
     let comp = MockCompositor::new(vec![win("w", "t", "app")]);
     let ex = Executor::new(
@@ -690,14 +699,8 @@ async fn confirm_override_returns_confirmation_required() {
 async fn allow_command_records_execution_outcome() {
     // router 门禁放行后须在命令返回后落执行结果审计——
     // 门禁判定记录 result=false + 执行结果记录 result=true，二者独立有序。
-    let audit_path = std::env::temp_dir().join(format!(
-        "agent-shell-router-audit-{}.jsonl",
-        std::process::id()
-    ));
-    let _ = std::fs::remove_file(&audit_path);
-    let mut cfg = AgentShellConfig::default();
-    cfg.security.audit_log_path = Some(audit_path.to_string_lossy().into_owned());
-    let security = Arc::new(SecurityManager::with_config(cfg));
+    let test_security = TestSecurity::new();
+    let security = test_security.security();
 
     let ex = Executor::new(
         Box::new(MockCompositor::new(vec![])),
@@ -731,21 +734,14 @@ async fn allow_command_records_execution_outcome() {
         op_entries.iter().any(|e| e.result),
         "execution record must be result=true: {op_entries:?}"
     );
-    let _ = std::fs::remove_file(&audit_path);
 }
 
 #[tokio::test]
 async fn allow_command_failure_still_records_execution_outcome() {
     // `?` 提前返回不得绕过执行结果审计——失败路径同样落
     // 门禁 allow+false + 执行结果 false 两条记录，与 daemon 侧契约一致。
-    let audit_path = std::env::temp_dir().join(format!(
-        "agent-shell-router-audit-fail-{}.jsonl",
-        std::process::id()
-    ));
-    let _ = std::fs::remove_file(&audit_path);
-    let mut cfg = AgentShellConfig::default();
-    cfg.security.audit_log_path = Some(audit_path.to_string_lossy().into_owned());
-    let security = Arc::new(SecurityManager::with_config(cfg));
+    let test_security = TestSecurity::new();
+    let security = test_security.security();
 
     let ex = Executor::new(
         Box::new(FailingListCompositor),
@@ -777,7 +773,6 @@ async fn allow_command_failure_still_records_execution_outcome() {
         op_entries.iter().all(|e| !e.result),
         "both records must be result=false on failure: {op_entries:?}"
     );
-    let _ = std::fs::remove_file(&audit_path);
 }
 
 #[tokio::test]
@@ -785,14 +780,8 @@ async fn injected_caller_id_propagates_to_security_gate_and_audit() {
     // caller_id 经 `Executor::new` 注入后，门禁判定与执行
     // 审计均携带该身份而非硬编码 `"*"`——router 未来持真实会话身份时，
     // 白名单按 agent 匹配而非 `"*"` 通配兜底。
-    let audit_path = std::env::temp_dir().join(format!(
-        "agent-shell-router-audit-caller-{}.jsonl",
-        std::process::id()
-    ));
-    let _ = std::fs::remove_file(&audit_path);
-    let mut cfg = AgentShellConfig::default();
-    cfg.security.audit_log_path = Some(audit_path.to_string_lossy().into_owned());
-    let security = Arc::new(SecurityManager::with_config(cfg));
+    let test_security = TestSecurity::new();
+    let security = test_security.security();
 
     let ex = Executor::new(
         Box::new(MockCompositor::new(vec![])),
@@ -822,13 +811,53 @@ async fn injected_caller_id_propagates_to_security_gate_and_audit() {
         op_entries.iter().all(|e| e.agent_id == "agent-x"),
         "both audit records must carry injected caller_id: {op_entries:?}"
     );
-    let _ = std::fs::remove_file(&audit_path);
+}
+
+#[tokio::test]
+async fn audit_stays_out_of_host_state_dir() {
+    // 标记只用在本用例内：宿主审计文件出现它，必然是本次判定写进去的。
+    // 带 pid + 纳秒避免历史遗留记录造成假红。
+    let marker = format!(
+        "router-audit-isolation-probe-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock before epoch")
+            .as_nanos()
+    );
+    let host_audit = agent_shell_core::audit::state_dir().join("audit.jsonl");
+    let test_security = TestSecurity::new();
+    let security = test_security.security();
+
+    let ex = Executor::new(
+        Box::new(MockCompositor::new(vec![])),
+        Arc::new(MockInput::default()),
+        Arc::new(MockCapture),
+        Arc::new(FailingSetTextA11y),
+        security,
+        marker.clone(),
+    );
+    ex.execute(Command::GetDesktopInfo)
+        .await
+        .expect("system.desktop_info must succeed");
+
+    let sandbox = std::fs::read_to_string(test_security.sandbox().audit_path()).unwrap_or_default();
+    assert!(
+        sandbox.contains(&marker),
+        "沙箱内应有本次判定的审计记录：{sandbox:?}"
+    );
+    let host = std::fs::read_to_string(&host_audit).unwrap_or_default();
+    assert!(
+        !host.contains(&marker),
+        "单测不得向宿主状态目录写审计记录：{}",
+        host_audit.display()
+    );
 }
 
 #[tokio::test]
 async fn resolve_target_by_id_direct_query() {
     let comp = MockCompositor::new(vec![win("direct", "d", "app")]);
-    let (ex, _, _) = make_executor(comp);
+    let (ex, _, _, _security) = make_executor(comp);
 
     let got = ex
         .resolve_target(&SemanticTarget::ById(WindowId {
