@@ -123,16 +123,66 @@ fn parse_flatpak_list(out: &str) -> Vec<FlatpakApp> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::ErrorKind;
     use std::os::unix::fs::PermissionsExt;
+    use std::path::Path;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
 
-    /// 写入可执行的 stub 脚本，返回其路径（临时目录由调用方持有生命周期）。
-    fn write_stub(dir: &std::path::Path, body: &str) -> PathBuf {
-        let path = dir.join("flatpak");
-        std::fs::write(&path, body).expect("write stub");
-        let mut perms = std::fs::metadata(&path).expect("stat stub").permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&path, perms).expect("chmod stub");
-        path
+    /// 并发回归用例的 worker 数（与 `#[tokio::test]` 的 worker 线程数一致）。
+    const STRESS_WORKERS: usize = 8;
+
+    /// 每个 worker 的「写 → chmod → spawn」轮次。该规模下闸门缺失必然命中 ETXTBSY。
+    const STRESS_ROUNDS_PER_WORKER: usize = 300;
+
+    /// 全局 fork 闸门。fork 出的子进程会复制其它线程打开着的写 fd（CLOEXEC 要到
+    /// execve 之后才收尾，而 ETXTBSY 检查在前），并行测试里写 stub 的线程就可能
+    /// exec 到自己那份「还有写者」的文件而偶发 `Text file busy`。任何会 fork 的
+    /// 用例（含 spawn 不存在的二进制）都必须经 [`Sandbox`] 取锁。
+    static FORK_GUARD: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// 测试沙箱：持 fork 闸门 + 临时目录。会 fork 的用例一律经它搭建，
+    /// 「会 fork 必持闸门」由构造保证而非人工约定。
+    struct Sandbox {
+        _fork_guard: tokio::sync::MutexGuard<'static, ()>,
+        dir: Arc<tempfile::TempDir>,
+    }
+
+    impl Sandbox {
+        /// 独占临时目录的沙箱。
+        async fn new() -> Self {
+            Self::with_dir(Arc::new(tempfile::tempdir().expect("tempdir"))).await
+        }
+
+        /// 复用已有目录的沙箱：并发回归用例的 worker 共享同一 stub 路径。
+        async fn with_dir(dir: Arc<tempfile::TempDir>) -> Self {
+            Self {
+                _fork_guard: FORK_GUARD.lock().await,
+                dir,
+            }
+        }
+
+        fn path(&self) -> &Path {
+            self.dir.path()
+        }
+
+        /// 写可执行 stub 脚本，代替真实 flatpak 二进制。
+        ///
+        /// 返回错误而非 panic：闸门失效时写入自身会命中 ETXTBSY，
+        /// 回归用例需要计数而不是中断。
+        fn stub(&self, name: &str, body: &str) -> std::io::Result<PathBuf> {
+            let path = self.dir.path().join(name);
+            std::fs::write(&path, format!("#!/bin/sh\n{body}\n"))?;
+            let mut perms = std::fs::metadata(&path)?.permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&path, perms)?;
+            Ok(path)
+        }
+    }
+
+    /// ETXTBSY：写入正被执行的二进制，或 exec 一个仍有写者的文件。
+    fn is_text_file_busy(err: &std::io::Error) -> bool {
+        err.kind() == ErrorKind::ExecutableFileBusy
     }
 
     #[test]
@@ -183,11 +233,13 @@ mod tests {
 
     #[tokio::test]
     async fn stub_binary_output_is_parsed() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let bin = write_stub(
-            dir.path(),
-            "#!/bin/sh\nprintf 'org.mozilla.firefox\\tFirefox\\tflathub\\t128.0.3\\tstable\\tsystem\\n'\nprintf 'org.videolan.VLC\\tVLC\\tflathub\\t3.0.21\\tstable\\tsystem\\n'\n",
-        );
+        let sandbox = Sandbox::new().await;
+        let bin = sandbox
+            .stub(
+                "flatpak",
+                "printf 'org.mozilla.firefox\\tFirefox\\tflathub\\t128.0.3\\tstable\\tsystem\\n'\nprintf 'org.videolan.VLC\\tVLC\\tflathub\\t3.0.21\\tstable\\tsystem\\n'",
+            )
+            .expect("write stub");
         let apps = FlatpakClient::with_bin(bin)
             .list_flatpaks()
             .await
@@ -199,8 +251,8 @@ mod tests {
 
     #[tokio::test]
     async fn stub_binary_empty_stdout_is_empty_list() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let bin = write_stub(dir.path(), "#!/bin/sh\nexit 0\n");
+        let sandbox = Sandbox::new().await;
+        let bin = sandbox.stub("flatpak", "exit 0").expect("write stub");
         let apps = FlatpakClient::with_bin(bin)
             .list_flatpaks()
             .await
@@ -210,11 +262,13 @@ mod tests {
 
     #[tokio::test]
     async fn stub_binary_nonzero_exit_surfaces_stderr() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let bin = write_stub(
-            dir.path(),
-            "#!/bin/sh\necho 'error: failed to load /var/lib/flatpak' >&2\nexit 1\n",
-        );
+        let sandbox = Sandbox::new().await;
+        let bin = sandbox
+            .stub(
+                "flatpak",
+                "echo 'error: failed to load /var/lib/flatpak' >&2\nexit 1",
+            )
+            .expect("write stub");
         let err = FlatpakClient::with_bin(bin)
             .list_flatpaks()
             .await
@@ -230,13 +284,57 @@ mod tests {
 
     #[tokio::test]
     async fn missing_binary_is_backend_unavailable() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let bin = dir.path().join("flatpak");
+        let sandbox = Sandbox::new().await;
+        let bin = sandbox.path().join("flatpak");
         let err = FlatpakClient::with_bin(bin)
             .list_flatpaks()
             .await
             .expect_err("missing binary must fail");
         assert!(matches!(err, AgentShellError::BackendUnavailable(_)));
         assert!(err.to_string().contains("flatpak not installed"));
+    }
+
+    /// 回归用例：闸门一旦从 [`Sandbox`] 的构造入口消失，同一 stub 路径上的并发
+    /// 「写 → chmod → spawn」就会命中 ETXTBSY。只断言持闸门轮次的命中计数为 0，
+    /// 不以无闸门基线为断言。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn concurrent_stub_writes_never_hit_text_file_busy() {
+        let shared = Arc::new(tempfile::tempdir().expect("tempdir"));
+        let hits = Arc::new(AtomicUsize::new(0));
+        let mut workers = Vec::with_capacity(STRESS_WORKERS);
+        for _ in 0..STRESS_WORKERS {
+            let shared = Arc::clone(&shared);
+            let hits = Arc::clone(&hits);
+            workers.push(tokio::spawn(async move {
+                for _ in 0..STRESS_ROUNDS_PER_WORKER {
+                    // 每轮经构造入口取闸门：闸门缺失时不同 worker 的写与执行重叠。
+                    let sandbox = Sandbox::with_dir(Arc::clone(&shared)).await;
+                    let bin = match sandbox.stub("flatpak", "exit 0") {
+                        Ok(bin) => bin,
+                        Err(e) if is_text_file_busy(&e) => {
+                            hits.fetch_add(1, Ordering::Relaxed);
+                            continue;
+                        }
+                        Err(e) => panic!("write stub: {e}"),
+                    };
+                    if let Err(e) = tokio::process::Command::new(&bin)
+                        .arg("list")
+                        .output()
+                        .await
+                    {
+                        assert!(is_text_file_busy(&e), "spawn stub: {e}");
+                        hits.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }));
+        }
+        for worker in workers {
+            worker.await.expect("stress worker panicked");
+        }
+        assert_eq!(
+            hits.load(Ordering::Relaxed),
+            0,
+            "持闸门时同一 stub 路径的并发写与执行仍命中 ETXTBSY"
+        );
     }
 }
