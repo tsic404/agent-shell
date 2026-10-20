@@ -30,9 +30,11 @@ dependencies = [
  "agent-shell-input",
  "agent-shell-rpc",
  "async-trait",
+ "libc",
  "serde_json",
  "tempfile",
  "tokio",
+ "zbus",
 ]
 
 [[package]]

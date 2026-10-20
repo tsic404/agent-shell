@@ -4,6 +4,10 @@
 （`TC-<id>.rs` + `Cargo.toml` 的 `[[test]]`），执行
 `cargo test -p agent-shell-acceptance --test <TC-id>`。夹具与隔离约束见 `src/lib.rs`。
 
+本清单不关闭自动测试发现（`autotests = true`，TC-tech-03 判据）；测试目标的启用
+状态由构建元数据确认（`cargo metadata` 的 `targets[].test == true`），TC-tech-01、
+TC-tech-03、TC-tech-04 据此取证。
+
 ## 无执行形式的用例（豁免声明）
 
 判据落在验收流程本身（门禁裁决、报告格式、缺陷提交）的用例，被测产品无从提供可
