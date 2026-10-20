@@ -7,9 +7,12 @@ license.workspace = true
 repository.workspace = true
 description = "agent-shell 验收用例的可执行形式：设计仓 03-acceptance.md 的用例标识与本目录文件一一对应"
 
-# 用例 = 测试目标：一个 TC 一个 `[[test]]`，路径即设计仓写明的
-# `tests/acceptance/<TC-id>`；目标内保持单个 `#[tokio::test]`（见 src/lib.rs 夹具文档）。
-autotests = false
+# 用例 = 测试目标：一个 TC 一个 `TC-<id>.rs`（包根，路径即设计仓写明的
+# `tests/acceptance/<TC-id>`）+ `[[test]]` 显式声明。测试腿启用状态由构建元数据
+# 确认（`harness` 缺省 true，`test: true`）；本清单**不关闭自动测试发现**
+# （`autotests` 显式 true，TC-tech-03 判据：包清单不得以 `autotests = false`
+# 关闭发现、目标不得被声明为不参与测试腿）。
+autotests = true
 
 [lib]
 name = "acceptance"
@@ -28,6 +31,10 @@ serde_json.workspace = true
 tempfile = "3"
 tokio.workspace = true
 
+[dev-dependencies]
+libc.workspace = true
+zbus.workspace = true
+
 [[test]]
 name = "TC-events-01"
 path = "TC-events-01.rs"
@@ -39,3 +46,27 @@ path = "TC-journey-03.rs"
 [[test]]
 name = "TC-input-03"
 path = "TC-input-03.rs"
+
+[[test]]
+name = "TC-tech-01"
+path = "TC-tech-01.rs"
+
+[[test]]
+name = "TC-tech-02"
+path = "TC-tech-02.rs"
+
+[[test]]
+name = "TC-tech-03"
+path = "TC-tech-03.rs"
+
+[[test]]
+name = "TC-tech-04"
+path = "TC-tech-04.rs"
+
+[[test]]
+name = "TC-tech-05"
+path = "TC-tech-05.rs"
+
+[[test]]
+name = "TC-tech-06"
+path = "TC-tech-06.rs"

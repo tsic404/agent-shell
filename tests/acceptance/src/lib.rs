@@ -11,7 +11,7 @@
 //! 会话隔离与并发约束见 [`headless_session`]：一个测试目标内保持单个
 //! `#[tokio::test]`。
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use agent_shell_core::security::{AgentShellConfig, SecurityManager};
@@ -31,6 +31,28 @@ const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 /// 请求标识：单连接内唯一即可，夹具固定一个值。
 const REQUEST_ID: u64 = 1;
 
+/// 实现仓根目录（含 `[workspace]` 的根 `Cargo.toml` 所在目录）。
+///
+/// 构建期约束组（TC-tech-01/03/04/05）以 `cargo metadata` 与根清单的构建事实
+/// 取证，需要从测试进程定位工作区根；`CARGO_MANIFEST_DIR` 在本包内是
+/// `tests/acceptance/`（工作区根下两级），故向上逐级找含 `[workspace]` 的清单。
+pub fn workspace_root() -> PathBuf {
+    let mut dir = Path::new(env!("CARGO_MANIFEST_DIR")).to_path_buf();
+    loop {
+        let manifest = dir.join("Cargo.toml");
+        if manifest.is_file()
+            && std::fs::read_to_string(&manifest).is_ok_and(|text| text.contains("[workspace]"))
+        {
+            return dir;
+        }
+        assert!(
+            dir.pop(),
+            "未在 {} 向上找到含 [workspace] 的根清单",
+            env!("CARGO_MANIFEST_DIR")
+        );
+    }
+}
+
 /// 验收夹具：装配完成的真实 daemon，事件面可注入。
 pub struct Fixture {
     daemon: Daemon,
@@ -45,7 +67,19 @@ impl Fixture {
     /// daemon 单测基座同口径——环境身份不参与判定，审计路径仍按生产解析落到
     /// 夹具目录内。
     pub async fn start() -> Self {
+        Self::start_with_env(&[]).await
+    }
+
+    /// [`Self::start`] 的扩展：装配前先施加额外环境覆盖（最后一次出现者胜）。
+    ///
+    /// 只供确有需要改变生产环境解析的用例（如 TC-tech-06 把 sysfs 根指向空目录、
+    /// PATH 置空隐藏 `brightnessctl`）使用；覆盖必须在 [`headless_session`] 之后
+    /// 应用，避免被夹具的隔离值冲掉。
+    pub async fn start_with_env(extra: &[(&str, String)]) -> Self {
         let sandbox = headless_session();
+        for (key, value) in extra {
+            std::env::set_var(key, value);
+        }
         let mut daemon = Daemon::connect(IDLE_TIMEOUT).await;
         daemon.caller_id = "*".into();
         daemon.security = SecurityManager::with_config(AgentShellConfig::default());
