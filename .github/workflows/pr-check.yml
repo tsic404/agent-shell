@@ -35,7 +35,8 @@ jobs:
           test -n "$channel" || { echo "rust-toolchain.toml has no channel"; exit 1; }
           rustup toolchain install "$channel" --profile minimal --no-self-update \
             --component rustfmt,clippy
-          rustup show active-toolchain
+          active=$(rustup show active-toolchain)
+          printf 'active toolchain: %s（由本仓声明文件覆盖：rust-toolchain.toml）\n' "$active"
           rustup show active-toolchain | grep -qF "$channel-" || \
             { echo "ERROR: active toolchain does not match pinned channel $channel"; exit 1; }
 
@@ -93,7 +94,8 @@ jobs:
           test -n "$channel" || { echo "rust-toolchain.toml has no channel"; exit 1; }
           rustup toolchain install "$channel" --profile minimal --no-self-update \
             --target aarch64-unknown-linux-gnu --component rustfmt,clippy
-          rustup show active-toolchain
+          active=$(rustup show active-toolchain)
+          printf 'active toolchain: %s（由本仓声明文件覆盖：rust-toolchain.toml）\n' "$active"
           rustup show active-toolchain | grep -qF "$channel-" || \
             { echo "ERROR: active toolchain does not match pinned channel $channel"; exit 1; }
 
