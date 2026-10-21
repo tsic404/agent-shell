@@ -616,12 +616,17 @@ async fn file_cmd(c: &mut DaemonClient, cmd: cli::FileCommand) -> CmdResult {
             let r = c.call0(method::FILE_PICK).await?;
             println!("{}", serde_json::to_string_pretty(&r).unwrap_or_default());
         }
+        // 写侧同样回显 daemon 载荷：未接线时回执 status=not_implemented，
+        // 静默 rc=0 会被消费方读成「已生效」（§21.35 占位回执以状态字段判定）。
         cli::FileCommand::Trash { path } => {
-            c.call(method::FILE_TRASH, json!({ "path": path })).await?;
+            let r = c.call(method::FILE_TRASH, json!({ "path": path })).await?;
+            println!("{}", serde_json::to_string_pretty(&r).unwrap_or_default());
         }
         cli::FileCommand::OpenDirectory { path } => {
-            c.call(method::FILE_OPEN_DIR, json!({ "path": path }))
+            let r = c
+                .call(method::FILE_OPEN_DIR, json!({ "path": path }))
                 .await?;
+            println!("{}", serde_json::to_string_pretty(&r).unwrap_or_default());
         }
     }
     Ok(0)
@@ -635,9 +640,12 @@ async fn mime_cmd(c: &mut DaemonClient, cmd: cli::MimeCommand) -> CmdResult {
             let r = c.call(method::MIME_GET, json!({ "mime": mime })).await?;
             println!("{}", serde_json::to_string_pretty(&r).unwrap_or_default());
         }
+        // 写侧回显回执：未接线时 status=not_implemented，退出码零不得作为成功判据。
         cli::MimeCommand::Set { mime, app } => {
-            c.call(method::MIME_SET, json!({ "mime": mime, "app": app }))
+            let r = c
+                .call(method::MIME_SET, json!({ "mime": mime, "app": app }))
                 .await?;
+            println!("{}", serde_json::to_string_pretty(&r).unwrap_or_default());
         }
         cli::MimeCommand::DefaultBrowser => {
             let r = c.call0(method::MIME_DEFAULT_BROWSER).await?;
@@ -655,13 +663,18 @@ async fn bluetooth(c: &mut DaemonClient, cmd: cli::BluetoothCommand) -> CmdResul
             let r = c.call0(method::BLUETOOTH_SCAN).await?;
             println!("{}", serde_json::to_string_pretty(&r).unwrap_or_default());
         }
+        // 写侧回显回执：未接线时 status=not_implemented，退出码零不得作为成功判据。
         cli::BluetoothCommand::Connect { address } => {
-            c.call(method::BLUETOOTH_CONNECT, json!({ "address": address }))
+            let r = c
+                .call(method::BLUETOOTH_CONNECT, json!({ "address": address }))
                 .await?;
+            println!("{}", serde_json::to_string_pretty(&r).unwrap_or_default());
         }
         cli::BluetoothCommand::Disconnect { address } => {
-            c.call(method::BLUETOOTH_DISCONNECT, json!({ "address": address }))
+            let r = c
+                .call(method::BLUETOOTH_DISCONNECT, json!({ "address": address }))
                 .await?;
+            println!("{}", serde_json::to_string_pretty(&r).unwrap_or_default());
         }
         cli::BluetoothCommand::List => {
             let r = c.call0(method::BLUETOOTH_LIST).await?;
@@ -696,18 +709,24 @@ async fn software(c: &mut DaemonClient, cmd: cli::SoftwareCommand) -> CmdResult 
 // ───────────────────────── touchpad ─────────────────────────
 
 async fn touchpad(c: &mut DaemonClient, cmd: cli::TouchpadCommand) -> CmdResult {
+    // 写侧同样回显 daemon 载荷：未接线时回执 status=not_implemented，
+    // 静默 rc=0 会被消费方读成「已生效」（§21.35 占位回执以状态字段判定）。
     match cmd {
         cli::TouchpadCommand::Status => {
             let r = c.call0(method::TOUCHPAD_STATUS).await?;
             println!("{}", serde_json::to_string_pretty(&r).unwrap_or_default());
         }
         cli::TouchpadCommand::On => {
-            c.call(method::TOUCHPAD_SET, json!({ "enabled": true }))
+            let r = c
+                .call(method::TOUCHPAD_SET, json!({ "enabled": true }))
                 .await?;
+            println!("{}", serde_json::to_string_pretty(&r).unwrap_or_default());
         }
         cli::TouchpadCommand::Off => {
-            c.call(method::TOUCHPAD_SET, json!({ "enabled": false }))
+            let r = c
+                .call(method::TOUCHPAD_SET, json!({ "enabled": false }))
                 .await?;
+            println!("{}", serde_json::to_string_pretty(&r).unwrap_or_default());
         }
         cli::TouchpadCommand::NaturalScroll { state } => {
             let enabled = match state.as_str() {
@@ -719,8 +738,10 @@ async fn touchpad(c: &mut DaemonClient, cmd: cli::TouchpadCommand) -> CmdResult 
                     ))
                 }
             };
-            c.call(method::TOUCHPAD_SET, json!({ "natural_scroll": enabled }))
+            let r = c
+                .call(method::TOUCHPAD_SET, json!({ "natural_scroll": enabled }))
                 .await?;
+            println!("{}", serde_json::to_string_pretty(&r).unwrap_or_default());
         }
     }
     Ok(0)
@@ -734,9 +755,12 @@ async fn kbd(c: &mut DaemonClient, cmd: cli::KbdCommand) -> CmdResult {
             let r = c.call0(method::KBD_LAYOUT_LIST).await?;
             println!("{}", serde_json::to_string_pretty(&r).unwrap_or_default());
         }
+        // 写侧回显回执：未接线时 status=not_implemented，退出码零不得作为成功判据。
         cli::KbdCommand::Layout(cli::KbdLayoutCommand::Set { layout }) => {
-            c.call(method::KBD_LAYOUT_SET, json!({ "layout": layout }))
+            let r = c
+                .call(method::KBD_LAYOUT_SET, json!({ "layout": layout }))
                 .await?;
+            println!("{}", serde_json::to_string_pretty(&r).unwrap_or_default());
         }
     }
     Ok(0)
