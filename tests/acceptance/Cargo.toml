@@ -19,21 +19,33 @@ name = "acceptance"
 path = "src/lib.rs"
 
 [dependencies]
+agent-shell-a11y.workspace = true
+agent-shell-bluetooth.workspace = true
+agent-shell-capture = { path = "../../modules/capture", default-features = false }
 agent-shell-core.workspace = true
 # 直连路径依赖 + 关默认特性：与 daemon / cli 的跨成员依赖同形，避免无 PipeWire
 # dev 头的机器（no-pipewire profile、arm64）被 portal-screencast 卡住编译。
 agent-shell-daemon = { path = "../../daemon", default-features = false }
 agent-shell-event.workspace = true
 agent-shell-input.workspace = true
+agent-shell-mime.workspace = true
+agent-shell-peripherals.workspace = true
+agent-shell-power.workspace = true
 agent-shell-rpc.workspace = true
+agent-shell-shortcut.workspace = true
+agent-shell-software.workspace = true
+agent-shell-systemd.workspace = true
 async-trait.workspace = true
+futures.workspace = true
+libc.workspace = true
 serde_json.workspace = true
 tempfile = "3"
 tokio.workspace = true
+zbus.workspace = true
+zvariant.workspace = true
 
 [dev-dependencies]
-libc.workspace = true
-zbus.workspace = true
+agent-shell-rootd = { path = "../../rootd" }
 
 [[test]]
 name = "TC-events-01"
@@ -70,3 +82,247 @@ path = "TC-tech-05.rs"
 [[test]]
 name = "TC-tech-06"
 path = "TC-tech-06.rs"
+
+[[test]]
+name = "TC-doctor-01"
+path = "TC-doctor-01.rs"
+
+[[test]]
+name = "TC-doctor-02"
+path = "TC-doctor-02.rs"
+
+[[test]]
+name = "TC-doctor-03"
+path = "TC-doctor-03.rs"
+
+[[test]]
+name = "TC-doctor-04"
+path = "TC-doctor-04.rs"
+
+[[test]]
+name = "TC-doctor-05"
+path = "TC-doctor-05.rs"
+
+[[test]]
+name = "TC-doctor-06"
+path = "TC-doctor-06.rs"
+
+[[test]]
+name = "TC-doctor-07"
+path = "TC-doctor-07.rs"
+
+[[test]]
+name = "TC-doctor-08"
+path = "TC-doctor-08.rs"
+
+[[test]]
+name = "TC-windows-01"
+path = "TC-windows-01.rs"
+
+[[test]]
+name = "TC-windows-02"
+path = "TC-windows-02.rs"
+
+[[test]]
+name = "TC-windows-03"
+path = "TC-windows-03.rs"
+
+[[test]]
+name = "TC-windows-04"
+path = "TC-windows-04.rs"
+
+[[test]]
+name = "TC-windows-05"
+path = "TC-windows-05.rs"
+
+[[test]]
+name = "TC-windows-06"
+path = "TC-windows-06.rs"
+
+[[test]]
+name = "TC-windows-07"
+path = "TC-windows-07.rs"
+
+[[test]]
+name = "TC-windows-08"
+path = "TC-windows-08.rs"
+
+[[test]]
+name = "TC-workspaces-01"
+path = "TC-workspaces-01.rs"
+
+[[test]]
+name = "TC-workspaces-02"
+path = "TC-workspaces-02.rs"
+
+[[test]]
+name = "TC-input-01"
+path = "TC-input-01.rs"
+
+[[test]]
+name = "TC-input-02"
+path = "TC-input-02.rs"
+
+[[test]]
+name = "TC-input-04"
+path = "TC-input-04.rs"
+
+[[test]]
+name = "TC-input-05"
+path = "TC-input-05.rs"
+
+[[test]]
+name = "TC-input-06"
+path = "TC-input-06.rs"
+
+[[test]]
+name = "TC-capture-01"
+path = "TC-capture-01.rs"
+
+[[test]]
+name = "TC-capture-02"
+path = "TC-capture-02.rs"
+
+[[test]]
+name = "TC-capture-03"
+path = "TC-capture-03.rs"
+
+[[test]]
+name = "TC-capture-04"
+path = "TC-capture-04.rs"
+
+[[test]]
+name = "TC-capture-05"
+path = "TC-capture-05.rs"
+
+[[test]]
+name = "TC-atspi-01"
+path = "TC-atspi-01.rs"
+
+[[test]]
+name = "TC-atspi-02"
+path = "TC-atspi-02.rs"
+
+[[test]]
+name = "TC-atspi-03"
+path = "TC-atspi-03.rs"
+
+[[test]]
+name = "TC-atspi-04"
+path = "TC-atspi-04.rs"
+
+[[test]]
+name = "TC-atspi-05"
+path = "TC-atspi-05.rs"
+
+[[test]]
+name = "TC-events-02"
+path = "TC-events-02.rs"
+
+[[test]]
+name = "TC-events-03"
+path = "TC-events-03.rs"
+
+[[test]]
+name = "TC-events-04"
+path = "TC-events-04.rs"
+
+[[test]]
+name = "TC-events-05"
+path = "TC-events-05.rs"
+
+[[test]]
+name = "TC-system-01"
+path = "TC-system-01.rs"
+
+[[test]]
+name = "TC-system-02"
+path = "TC-system-02.rs"
+
+[[test]]
+name = "TC-system-03"
+path = "TC-system-03.rs"
+
+[[test]]
+name = "TC-system-04"
+path = "TC-system-04.rs"
+
+[[test]]
+name = "TC-system-05"
+path = "TC-system-05.rs"
+
+[[test]]
+name = "TC-system-06"
+path = "TC-system-06.rs"
+
+[[test]]
+name = "TC-system-07"
+path = "TC-system-07.rs"
+
+[[test]]
+name = "TC-system-08"
+path = "TC-system-08.rs"
+
+[[test]]
+name = "TC-system-09"
+path = "TC-system-09.rs"
+
+[[test]]
+name = "TC-system-10"
+path = "TC-system-10.rs"
+
+[[test]]
+name = "TC-rootd-01"
+path = "TC-rootd-01.rs"
+
+[[test]]
+name = "TC-rootd-02"
+path = "TC-rootd-02.rs"
+
+[[test]]
+name = "TC-rootd-03"
+path = "TC-rootd-03.rs"
+
+[[test]]
+name = "TC-rootd-04"
+path = "TC-rootd-04.rs"
+
+[[test]]
+name = "TC-rootd-05"
+path = "TC-rootd-05.rs"
+
+[[test]]
+name = "TC-rootd-06"
+path = "TC-rootd-06.rs"
+
+[[test]]
+name = "TC-rootd-07"
+path = "TC-rootd-07.rs"
+
+[[test]]
+name = "TC-rootd-08"
+path = "TC-rootd-08.rs"
+
+[[test]]
+name = "TC-toolchain-01"
+path = "TC-toolchain-01.rs"
+
+[[test]]
+name = "TC-toolchain-02"
+path = "TC-toolchain-02.rs"
+
+[[test]]
+name = "TC-toolchain-03"
+path = "TC-toolchain-03.rs"
+
+[[test]]
+name = "TC-toolchain-04"
+path = "TC-toolchain-04.rs"
+
+[[test]]
+name = "TC-toolchain-05"
+path = "TC-toolchain-05.rs"
+
+[[test]]
+name = "TC-mcp-01"
+path = "TC-mcp-01.rs"

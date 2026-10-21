@@ -131,6 +131,143 @@ enum ScriptingProbe {
     Ok,
 }
 
+/// doctor 行渲染输入：把探测真值投影为纯数据，供渲染顺序与状态判定单测。
+///
+/// 真实 KWin 会话才能提供 Wayland 协议全局；渲染逻辑与探测解耦后，五条子行
+/// 的完整性、顺序与就绪态可以在组件单测中直接证伪。
+#[derive(Clone, Debug)]
+struct DoctorInputs {
+    /// Wayland 协议行；`None` = 本会话无协议通道（该行与输入注入行不渲染）。
+    protocol: Option<ProtocolRow>,
+    /// 探测到的 KWin 版本（`"unknown"` = 版本探测失败）。
+    kwin_version: String,
+    /// `/Scripting` 桥接探测态。
+    scripting: ScriptingProbe,
+    /// 输入注入行（仅 `protocol` 为 `Some` 时渲染）。
+    input: InputRow,
+    /// 事件脚本行。
+    event: EventRow,
+}
+
+/// Wayland 协议行输入：已绑定全局数与逐协议明细。
+#[derive(Clone, Debug)]
+struct ProtocolRow {
+    bound: usize,
+    detail: String,
+}
+
+/// 输入注入行输入。
+#[derive(Clone, Debug)]
+enum InputRow {
+    /// 原生注入已认证。
+    Authenticated,
+    /// 原生注入已绑定、首次注入时认证。
+    Bound,
+    /// 未绑定：给出可归因原因（含授权条目摘要）。
+    Missing { reasons: Vec<String> },
+}
+
+/// 事件脚本行输入。
+#[derive(Clone, Debug)]
+enum EventRow {
+    /// 本进程装配成功。
+    Loaded,
+    /// 本进程装配失败（诊断）。
+    Failed(String),
+    /// 外部实例已注册（本进程未加载）。
+    ExternalReady,
+    /// 外部实例注册失败。
+    ExternalFailed(String),
+    /// KWin 侧实例在运行、本进程未持有句柄。
+    LoadedInKwin,
+    /// 尚未装配（懒启动）。
+    Unloaded,
+}
+
+/// 渲染 doctor 子行：顺序固定为 Wayland 协议、KWin 服务、D-Bus 桥接、
+/// 输入注入、事件脚本（前两行仅在协议通道存在时渲染协议行与输入行）。
+fn render_doctor_lines(inputs: &DoctorInputs) -> Vec<String> {
+    let mut lines = Vec::new();
+    if let Some(p) = &inputs.protocol {
+        lines.push(format!(
+            "{} Wayland 协议 : {}/3 globals bound ({})",
+            if p.bound > 0 { "✓" } else { "⚠" },
+            p.bound,
+            p.detail
+        ));
+    }
+    // 版本探测结果即 org.kde.KWin 可达性的真实证据（构造时已执行）。
+    lines.push(format!(
+        "{} KWin 服务   : org.kde.KWin {}",
+        if inputs.kwin_version != "unknown" {
+            "✓"
+        } else {
+            "⚠"
+        },
+        match inputs.kwin_version.as_str() {
+            "unknown" => "version probe failed (supportInformation)".to_string(),
+            v => format!("v{v}"),
+        }
+    ));
+    // 桥接就绪以 /Scripting 探测为证据——不再无条件打 ✓。
+    lines.push(match inputs.scripting {
+        ScriptingProbe::Ok => "✓ D-Bus 桥接 : callDBus ready (14 templates, req-id routed; \
+                       /Scripting introspected)"
+            .to_string(),
+        // 确证缺失与瞬时不可达分开呈现：两种失败态都允许重试（自愈），
+        // 窗口/工作区枚举改走会话原生通道（Wayland: org.kde.KWin +
+        // wl_registry；X11: EWMH）。
+        ScriptingProbe::FailPermanent => "⚠ D-Bus 桥接 : /Scripting 未就绪（未注册/确证缺失）；\
+                        窗口/工作区走会话原生通道，Scripting 按需重试"
+            .to_string(),
+        ScriptingProbe::FailTransient => "⚠ D-Bus 桥接 : /Scripting 未就绪（不可达/瞬时）；\
+                        窗口/工作区走会话原生通道，Scripting 按需重试"
+            .to_string(),
+        ScriptingProbe::Unset => {
+            "⚠ D-Bus 桥接 : 未探测（调用 ensure_scripting_probe 后更新）".to_string()
+        }
+    });
+    if inputs.protocol.is_some() {
+        // 注入路径在首次注入前 authenticate（`input.send` 不再依赖 doctor 先行
+        // 认证），故「bound 未认证」是正常态而非告警；未绑定时 KDE Wayland 的
+        // X11 注入候选已被排除（KWin 忽略 XWayland XTEST），链退到 libei 起的
+        // 通用降级链。
+        lines.push(match &inputs.input {
+            InputRow::Authenticated => "✓ 输入注入   : fake_input authenticated ✓".to_string(),
+            InputRow::Bound => {
+                "✓ 输入注入   : fake_input bound（原生注入候选，首次注入时认证）".to_string()
+            }
+            // 未绑定必须可归因（装配不变量：空槽给具体原因）：给出 KWin 的绑定
+            // 失败原因与授权条目状态——「无 fake_input」本身不区分缺条目、
+            // Exec 不匹配与 KWin 未放行，三者修复动作不同。
+            InputRow::Missing { reasons } => format!("⚠ 输入注入   : {}", reasons.join("；")),
+        });
+    }
+    // 事件脚本是懒启动（subscribe 时才 load），未启动前如实报告；
+    // 启动后以信号注册结果为准（成功 / 失败诊断），而非仅「loaded」。
+    lines.push(match &inputs.event {
+        EventRow::Loaded => {
+            "✓ 事件脚本    : 已装配（QTimer 轮询 windowList 差分 + workspace 信号）".to_string()
+        }
+        EventRow::Failed(msg) => format!("✗ 事件脚本    : monitor failed to start: {msg}"),
+        EventRow::ExternalReady => {
+            "⚠ 事件脚本    : 检测到外部实例已注册（本组件未加载，疑似残留 event_monitor）"
+                .to_string()
+        }
+        EventRow::ExternalFailed(msg) => {
+            format!("✗ 事件脚本    : 外部实例信号注册失败: {msg}")
+        }
+        EventRow::LoadedInKwin => {
+            "✓ 事件脚本    : 已装配（KWin 侧 event_monitor 实例在运行；本进程未持有句柄）"
+                .to_string()
+        }
+        EventRow::Unloaded => {
+            "⚠ 事件脚本    : 未加载（懒启动，首次 events subscribe 时装配）".to_string()
+        }
+    });
+    lines
+}
+
 impl KWinCompositor {
     /// org_kde_* 私有协议通道引用（含派发队列）。
     fn protocols(&self) -> Option<&KWinProtocols> {
@@ -330,9 +467,7 @@ impl KWinCompositor {
         loaded_in_kwin: bool,
         entitlement_hint: Option<&str>,
     ) -> Vec<String> {
-        let mut lines = Vec::new();
-        if let Some(p) = &self.protocols {
-            let bound = p.bound_count();
+        let protocol = self.protocols.as_ref().map(|p| {
             let detail = [
                 (
                     "window_mgmt",
@@ -347,62 +482,19 @@ impl KWinCompositor {
             .filter_map(|(n, v)| v.map(|v| format!("{n} {v}")))
             .collect::<Vec<_>>()
             .join(", ");
-            lines.push(format!(
-                "{} Wayland 协议 : {}/3 globals bound ({detail})",
-                if bound > 0 { "✓" } else { "⚠" },
-                bound
-            ));
-        }
-        // 版本探测结果即 org.kde.KWin 可达性的真实证据（构造时已执行）。
-        lines.push(format!(
-            "{} KWin 服务   : org.kde.KWin {}",
-            if self.version.full != "unknown" {
-                "✓"
-            } else {
-                "⚠"
-            },
-            match self.version.full.as_str() {
-                "unknown" => "version probe failed (supportInformation)".to_string(),
-                v => format!("v{v}"),
-            }
-        ));
-        // 桥接就绪以 /Scripting 探测为证据——不再无条件打 ✓。
-        lines.push(match self.scripting_probe_state() {
-            ScriptingProbe::Ok => "✓ D-Bus 桥接 : callDBus ready (14 templates, req-id routed; \
-                           /Scripting introspected)"
-                .to_string(),
-            // 确证缺失与瞬时不可达分开呈现：两种失败态都允许重试（自愈），
-            // 窗口/工作区枚举改走会话原生通道（Wayland: org.kde.KWin +
-            // wl_registry；X11: EWMH）。
-            ScriptingProbe::FailPermanent => {
-                "⚠ D-Bus 桥接 : /Scripting 未就绪（未注册/确证缺失）；\
-                            窗口/工作区走会话原生通道，Scripting 按需重试"
-                    .to_string()
-            }
-            ScriptingProbe::FailTransient => "⚠ D-Bus 桥接 : /Scripting 未就绪（不可达/瞬时）；\
-                            窗口/工作区走会话原生通道，Scripting 按需重试"
-                .to_string(),
-            ScriptingProbe::Unset => {
-                "⚠ D-Bus 桥接 : 未探测（调用 ensure_scripting_probe 后更新）".to_string()
+            ProtocolRow {
+                bound: p.bound_count(),
+                detail,
             }
         });
-        if let Some(p) = &self.protocols {
-            // 注入路径在首次注入前 authenticate（`input.send` 不再依赖 doctor 先行
-            // 认证），故「bound 未认证」是正常态而非告警；未绑定时 KDE Wayland 的
-            // X11 注入候选已被排除（KWin 忽略 XWayland XTEST），链退到 libei 起的
-            // 通用降级链。
-            match &p.fake_input {
-                Some(fi) if fi.is_authenticated() => {
-                    lines.push("✓ 输入注入   : fake_input authenticated ✓".into())
-                }
-                Some(_) => lines
-                    .push("✓ 输入注入   : fake_input bound（原生注入候选，首次注入时认证）".into()),
-                // 未绑定必须可归因（装配不变量：空槽给具体原因）：给出 KWin 的绑定
-                // 失败原因与授权条目状态——「无 fake_input」本身不区分缺条目、
-                // Exec 不匹配与 KWin 未放行，三者修复动作不同。
+        let input = match &self.protocols {
+            Some(p) => match &p.fake_input {
+                Some(fi) if fi.is_authenticated() => InputRow::Authenticated,
+                Some(_) => InputRow::Bound,
                 None => {
-                    let mut detail = vec!["无 fake_input（降级 libei/ydotool/uinput）".to_string()];
-                    detail.extend(
+                    let mut reasons =
+                        vec!["无 fake_input（降级 libei/ydotool/uinput）".to_string()];
+                    reasons.extend(
                         p.bind_failures()
                             .iter()
                             .filter(|(name, _)| *name == "org_kde_kwin_fake_input")
@@ -410,50 +502,44 @@ impl KWinCompositor {
                     );
                     // 授权条目摘要：async 入口已预计算（见 `doctor_lines_async`）；
                     // 同步入口未预计算，就地生成。
-                    detail.push(match entitlement_hint {
+                    reasons.push(match entitlement_hint {
                         Some(hint) => hint.to_string(),
                         None => entitlement::hint(),
                     });
-                    lines.push(format!("⚠ 输入注入   : {}", detail.join("；")));
+                    InputRow::Missing { reasons }
                 }
-            }
-        }
-        // 事件脚本是懒启动（subscribe 时才 load），未启动前如实报告；
-        // 启动后以信号注册结果为准（成功 / 失败诊断），而非仅「loaded」。
-        let event_status = self
+            },
+            // 无协议通道时输入注入行不渲染；占位值不被使用。
+            None => InputRow::Missing {
+                reasons: Vec::new(),
+            },
+        };
+        let event = match self
             .event_registration
             .try_lock()
             .map(|s| s.clone())
-            .unwrap_or(None);
-        lines.push(match event_status {
-            Some(Ok(())) => {
-                "✓ 事件脚本    : 已装配（QTimer 轮询 windowList 差分 + workspace 信号）".to_string()
-            }
-            Some(Err(msg)) => {
-                format!("✗ 事件脚本    : monitor failed to start: {msg}")
-            }
+            .unwrap_or(None)
+        {
+            Some(Ok(())) => EventRow::Loaded,
+            Some(Err(msg)) => EventRow::Failed(msg),
             // 本组件未加载：若残留/外部实例曾发出注册标记（无等待者被记录），
             // 据此区分「加载后零注册」与真正的「未加载」。
             None => match self.bridge.late_registration() {
-                Some(RegistrationOutcome::Ready) => {
-                    "⚠ 事件脚本    : 检测到外部实例已注册（本组件未加载，疑似残留 event_monitor）"
-                        .to_string()
-                }
-                Some(RegistrationOutcome::Failed(msg)) => {
-                    format!("✗ 事件脚本    : 外部实例信号注册失败: {msg}")
-                }
+                Some(RegistrationOutcome::Ready) => EventRow::ExternalReady,
+                Some(RegistrationOutcome::Failed(msg)) => EventRow::ExternalFailed(msg),
                 // 本进程未加载但 KWin 侧实例仍在：本会话已订阅过事件
                 //（脚本不随瞬态 daemon 退出卸载），如实报「已装配」。
-                None if loaded_in_kwin => {
-                    "✓ 事件脚本    : 已装配（KWin 侧 event_monitor 实例在运行；本进程未持有句柄）"
-                        .to_string()
-                }
-                None => {
-                    "⚠ 事件脚本    : 未加载（懒启动，首次 events subscribe 时装配）".to_string()
-                }
+                None if loaded_in_kwin => EventRow::LoadedInKwin,
+                None => EventRow::Unloaded,
             },
-        });
-        lines
+        };
+        render_doctor_lines(&DoctorInputs {
+            protocol,
+            kwin_version: self.version.full.clone(),
+            scripting: self.scripting_probe_state(),
+            input,
+            event,
+        })
     }
 
     /// doctor 输出的异步版本：在渲染桥接行前触发一次 `/Scripting` 探测
@@ -2813,6 +2899,87 @@ mod tests {
                 .any(|l| l.contains("⚠ 事件脚本") && l.contains("未加载")),
             "doctor must restore unloaded after a new probe: {lines:#?}"
         );
+    }
+
+    /// AC-02 生成侧：五条子行的完整性、固定顺序与逐行就绪态/原因。
+    ///
+    /// 渲染器与探测解耦后，任何一行缺失、顺序变化或状态映射错误都会让本测试
+    /// 失败；`for_test` 的假 KWin bus 无法合成 org_kde_* Wayland 全局，故以
+    /// 纯渲染输入覆盖生成逻辑，探测真值由本文件其余 `for_test` 用例覆盖。
+    #[test]
+    fn doctor_lines_render_five_rows_in_fixed_order_with_readiness() {
+        let inputs = |event: EventRow| DoctorInputs {
+            protocol: Some(ProtocolRow {
+                bound: 3,
+                detail: "window_mgmt v2, fake_input v5+, vd_mgmt bound".into(),
+            }),
+            kwin_version: "6.11.2".into(),
+            scripting: ScriptingProbe::Ok,
+            input: InputRow::Missing {
+                reasons: vec![
+                    "无 fake_input（降级 libei/ydotool/uinput）".into(),
+                    "org_kde_kwin_fake_input 未绑定".into(),
+                ],
+            },
+            event,
+        };
+
+        let lines = render_doctor_lines(&inputs(EventRow::Loaded));
+        assert_eq!(
+            lines.len(),
+            5,
+            "five sub-rows must always be rendered: {lines:#?}"
+        );
+        let names = [
+            "Wayland 协议",
+            "KWin 服务",
+            "D-Bus 桥接",
+            "输入注入",
+            "事件脚本",
+        ];
+        for (row, name) in lines.iter().zip(names) {
+            assert!(row.contains(name), "row must name {name}: {row}");
+            assert!(
+                ["✓", "⚠", "✗"].iter().any(|p| row.starts_with(p)),
+                "row must carry a readiness prefix: {row}"
+            );
+        }
+        assert!(lines[0].starts_with("✓ Wayland 协议"));
+        assert!(lines[1].starts_with("✓ KWin 服务"));
+        assert!(lines[2].starts_with("✓ D-Bus 桥接"));
+        assert!(lines[3].starts_with("⚠ 输入注入"));
+        assert!(lines[4].starts_with("✓ 事件脚本"));
+
+        // 未加载/失败只翻转事件脚本行，其余四行与顺序保持不变。
+        let unloaded = render_doctor_lines(&inputs(EventRow::Unloaded));
+        assert_eq!(unloaded[..4], lines[..4]);
+        assert!(unloaded[4].starts_with("⚠ 事件脚本") && unloaded[4].contains("懒启动"));
+        let failed = render_doctor_lines(&inputs(EventRow::Failed("boom".into())));
+        assert_eq!(failed[..4], lines[..4]);
+        assert!(failed[4].starts_with("✗ 事件脚本") && failed[4].contains("boom"));
+
+        // 版本/桥接/注入就绪态错误必须反映到对应行（不是恒 ✓）。
+        let degraded = render_doctor_lines(&DoctorInputs {
+            kwin_version: "unknown".into(),
+            scripting: ScriptingProbe::FailTransient,
+            input: InputRow::Bound,
+            ..inputs(EventRow::Loaded)
+        });
+        assert!(
+            degraded[1].starts_with("⚠ KWin 服务") && degraded[1].contains("version probe failed")
+        );
+        assert!(degraded[2].starts_with("⚠ D-Bus 桥接") && degraded[2].contains("未就绪"));
+        assert!(degraded[3].starts_with("✓ 输入注入") && degraded[3].contains("bound"));
+
+        // 无协议通道：不渲染协议行与输入注入行，其余三行顺序不变。
+        let no_protocol = render_doctor_lines(&DoctorInputs {
+            protocol: None,
+            ..inputs(EventRow::Loaded)
+        });
+        assert_eq!(no_protocol.len(), 3, "{no_protocol:#?}");
+        assert!(no_protocol[0].contains("KWin 服务"));
+        assert!(no_protocol[1].contains("D-Bus 桥接"));
+        assert!(no_protocol[2].contains("事件脚本"));
     }
 
     /// `rect_matches`：命中维度精确匹配，`None` 维度跳过——回读校验的
