@@ -11,6 +11,8 @@ use std::process::{Child, Command, Stdio};
 use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 
+use serde_json::Value;
+
 /// daemon 装配（compositor/portal/a11y 探测）后才服务请求，等待窗口覆盖冷启动。
 const READY_TIMEOUT: Duration = Duration::from_secs(60);
 /// CLI 单命令上限：超过即说明它在等某个 30s 锁窗口，而非走端点。
@@ -59,17 +61,27 @@ static DAEMON_BINARY: LazyLock<PathBuf> = LazyLock::new(|| {
     // `CARGO` 由驱动本次测试的 cargo 在运行时注入：用它而不是 PATH，避免命中
     // 另一个工具链的 cargo；直接执行测试二进制时退回 PATH。
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
-    let status = Command::new(&cargo)
-        .current_dir(&root)
-        .args([
-            "build",
-            "--quiet",
-            "--offline",
-            "-p",
-            "agent-shell-daemon",
-            "--bin",
-            "agent-shell-daemon",
-        ])
+    let mut build = Command::new(&cargo);
+    build.current_dir(&root).args([
+        "build",
+        "--quiet",
+        "--offline",
+        "-p",
+        "agent-shell-daemon",
+        "--bin",
+        "agent-shell-daemon",
+    ]);
+    // 无 PipeWire dev 头的机器（CI 的 no-pipewire profile、arm64 发行构建）：
+    // `portal-screencast` 编译期排除才能产出 daemon（与 tests/acceptance 依赖
+    // daemon 时的 default-features=false 同口径）。有 dev 头的环境保持默认特性。
+    let pipewire_dev = Command::new("pkg-config")
+        .args(["--exists", "libpipewire-0.3"])
+        .status()
+        .is_ok_and(|status| status.success());
+    if !pipewire_dev {
+        build.arg("--no-default-features");
+    }
+    let status = build
         .status()
         .unwrap_or_else(|e| panic!("cannot run `{cargo} build` in {}: {e}", root.display()));
     assert!(
@@ -323,4 +335,120 @@ fn target_dir_resolution_honours_cargo_target_dir() {
         resolve_target_dir(Some("build-target".into())),
         root.join("build-target")
     );
+}
+
+/// 原始 socket 往返：发任意方法与参数，返回响应的 `result`（透传对照用）。
+///
+/// 端点是行分隔 JSON-RPC：请求必须带换行，否则 daemon 的逐行读取永远凑不齐
+/// 一行，连接上不会有任何回执。
+fn rpc_result_over_socket(path: &Path, method: &str, params: &str) -> Result<Value, String> {
+    let mut stream = UnixStream::connect(path).map_err(|e| e.to_string())?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .map_err(|e| format!("set_read_timeout: {e}"))?;
+    let req = format!(r#"{{"jsonrpc":"2.0","id":1,"method":"{method}","params":{params}}}"#) + "\n";
+    stream
+        .write_all(req.as_bytes())
+        .map_err(|e| format!("write {method}: {e}"))?;
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    reader
+        .read_line(&mut line)
+        .map_err(|e| format!("read {method}: {e}"))?;
+    let v: Value = serde_json::from_str(&line).map_err(|e| format!("bad response: {e}: {line}"))?;
+    v.get("result")
+        .cloned()
+        .ok_or_else(|| format!("response without result: {line}"))
+}
+
+/// 未接线写侧占位回执可见性回归。
+///
+/// 9 个未接线写侧子命令（file trash / file open-directory / mime set /
+/// bluetooth connect / bluetooth disconnect / touchpad on / touchpad off /
+/// touchpad natural-scroll / kbd layout set）
+/// 得到 daemon 的 not_implemented 回执时必须把回执打印到 stdout——旧行为
+/// 只 `call().await?` 吞掉返回值，rc=0 且 stdout 无载荷，消费方无法以
+/// 状态字段判定「未实现」（AC-105 判据）。
+///
+/// 正向钉住：每个命令 rc=0 且 stdout 载荷 `status=not_implemented`、
+/// `service` 与方法名一一对应。
+/// 反证探针：同一请求经原始 socket 直调 daemon 的响应 `result` 与 CLI
+/// 打印的载荷逐字段相等——可见性来自 daemon 真实回执的透传，而非 CLI
+/// 硬编码或丢弃后伪造；若未来接线，status 不再是 not_implemented，
+/// 本用例随 `PLACEHOLDER_SERVICES` 摘除同步更新。
+#[test]
+fn placeholder_receipts_visible_for_unwired_write_commands() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let daemon = SocketDaemon::start(dir.path());
+
+    // (CLI 参数, 方法名, 直调载荷) —— 方法与载荷与 `cli/src/main.rs` 实发同形
+    // （file/mime/kbd 均为位置参数子命令）。
+    let cases: &[(&[&str], &str, &str)] = &[
+        (
+            &["file", "trash", "/tmp/probe"],
+            "file.trash",
+            r#"{"path":"/tmp/probe"}"#,
+        ),
+        (
+            &["file", "open-directory", "/tmp/probe"],
+            "file.open_directory",
+            r#"{"path":"/tmp/probe"}"#,
+        ),
+        (
+            &["mime", "set", "text/plain", "probe.desktop"],
+            "mime.set",
+            r#"{"mime":"text/plain","app":"probe.desktop"}"#,
+        ),
+        (
+            &["bluetooth", "connect", "AA:BB:CC:DD:EE:FF"],
+            "bluetooth.connect",
+            r#"{"address":"AA:BB:CC:DD:EE:FF"}"#,
+        ),
+        (
+            &["bluetooth", "disconnect", "AA:BB:CC:DD:EE:FF"],
+            "bluetooth.disconnect",
+            r#"{"address":"AA:BB:CC:DD:EE:FF"}"#,
+        ),
+        (&["touchpad", "on"], "touchpad.set", r#"{"enabled":true}"#),
+        (&["touchpad", "off"], "touchpad.set", r#"{"enabled":false}"#),
+        (
+            &["touchpad", "natural-scroll", "on"],
+            "touchpad.set",
+            r#"{"natural_scroll":true}"#,
+        ),
+        (
+            &["kbd", "layout", "set", "us"],
+            "kbd.layout.set",
+            r#"{"layout":"us"}"#,
+        ),
+    ];
+
+    for (args, service, params) in cases {
+        let (out, _) = run_cli(&daemon, args);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            out.status.success(),
+            "{args:?} must exit 0 against the unwired daemon; stderr: {stderr}"
+        );
+        let v: Value = serde_json::from_str(&stdout).unwrap_or_else(|e| {
+            panic!("{args:?} must print a receipt JSON on stdout: {e}\nstdout: {stdout}")
+        });
+        assert_eq!(
+            v["status"], "not_implemented",
+            "{args:?} receipt must carry status=not_implemented; stdout: {stdout}"
+        );
+        assert_eq!(
+            v["service"], *service,
+            "{args:?} receipt must name the method; stdout: {stdout}"
+        );
+
+        // 反证探针：CLI 打印的载荷必须与 daemon 对同请求的原生回执逐字段相等。
+        let direct = rpc_result_over_socket(&daemon.socket, service, params)
+            .unwrap_or_else(|e| panic!("direct rpc for {service} failed: {e}"));
+        assert_eq!(
+            direct, v,
+            "CLI printed receipt must equal the daemon result verbatim for {service}"
+        );
+    }
 }
