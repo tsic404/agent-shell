@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use rmcp::model::{
     CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, ListToolsResult,
-    PaginatedRequestParams, ServerInfo, Tool,
+    PaginatedRequestParams, ServerCapabilities, ServerInfo, Tool,
 };
 use rmcp::service::{serve_server, RequestContext, RoleServer};
 use rmcp::transport::stdio;
@@ -149,10 +149,13 @@ impl AgentShellMcpServer {
             // Core 7 tools (§17.3)
             make_tool(
                 "list_windows",
-                "列出所有窗口，含 app_id/title/pid/geometry/workspace/stacking_order/states/window_type/keep_above",
+                "列出窗口，含 app_id/title/pid/geometry/workspace/stacking_order/states/window_type/keep_above；可按 app_id 或工作区原生标识过滤",
                 json!({
                     "type": "object",
-                    "properties": { "app_id": {"type": "string"}, "workspace": {"type": "integer"} }
+                    "properties": {
+                        "app_id": {"type": "string", "description": "应用标识过滤（子串匹配，与命令面 windows list 一致）"},
+                        "workspace": {"type": "string", "description": "工作区原生标识（windows list 的 workspace 列，与 workspaces list 的 id 同源），精确匹配"}
+                    }
                 }),
             ),
             make_tool(
@@ -165,10 +168,15 @@ impl AgentShellMcpServer {
             ),
             make_tool(
                 "click_element",
-                "语义化点击元素：按无障碍角色+名称，优先 AT-SPI，降级坐标",
+                "语义化点击元素：按无障碍角色+名称定位并触发动作接口；定位不到或无障碍不可用时按 fallback_coordinate 坐标点击",
                 json!({
                     "type": "object",
-                    "properties": { "role": {"type":"string","enum":["button","menu_item","checkbox"]}, "name": {"type":"string"}, "window": {"type":"string"}, "fallback_coordinate": {"type":"array","items":{"type":"number"}} }
+                    "properties": {
+                        "role": {"type":"string","enum":["button","menu_item","checkbox"],"description": "无障碍角色（AT-SPI 角色名归一匹配）"},
+                        "name": {"type":"string","description": "无障碍名称（精确匹配）"},
+                        "fallback_coordinate": {"type":"array","items":{"type":"integer"},"minItems":2,"maxItems":2,"description": "坐标兜底 [x, y]：元素未命中或无障碍不可达时使用"}
+                    },
+                    "anyOf": [{"required":["role"]},{"required":["name"]}]
                 }),
             ),
             make_tool(
@@ -193,26 +201,32 @@ impl AgentShellMcpServer {
                 }),
             ),
             make_tool(
-                "get_a11y_tree",
-                "获取指定窗口的无障碍树（JSON）",
+                "query_a11y_elements",
+                "查询无障碍元素：按角色、按名称或全树（all=true）三种方式，角色与名称可组合；结果含 count 与 elements（bus_name/path/name/role/role_code/states）",
                 json!({
                     "type": "object",
-                    "properties": { "window": {"type":"string"}, "depth": {"type":"integer","default":5} }
+                    "properties": {
+                        "role": {"type":"string", "description": "角色过滤（AT-SPI 角色名归一匹配，如 button/menu item/checkbox）"},
+                        "name": {"type":"string", "description": "名称过滤（精确匹配）"},
+                        "all": {"type":"boolean","default":false, "description": "全树查询开关：无 role/name 时必须为 true；提供过滤条件时仍按条件过滤"}
+                    }
                 }),
             ),
             make_tool(
                 "subscribe_events",
-                "订阅桌面事件（window_opened/focused/closed, workspace_changed）。MCP 无流式通知通道，仅返回 subscriber_id 句柄，事件暂不投递到本连接",
+                "订阅桌面事件（filter 取值见事件词表：类别名如 window/workspace，或事件名如 WindowOpened）。MCP 无流式通知通道，仅返回订阅句柄（subscriber_id），事件不投递到本连接",
                 json!({
                     "type": "object",
-                    "properties": { "events": {"type":"array","items":{"type":"string"}} }
+                    "properties": {
+                        "events": {"type":"array","items":{"type":"string"}, "description": "事件过滤词表（逗号连接后作为订阅过滤器）；缺省订阅全部"}
+                    }
                 }),
             ),
             // Extension 11 tools (§21.35) — total 18
             make_tool(
                 "security_check",
-                "检查某操作是否被授权",
-                json!({"type":"object","properties":{"operation":{"type":"string"}}}),
+                "检查某操作是否被授权：返回安全策略真值；可选 operation 附带该操作名的判定（allow/confirm/deny，与门禁同源）",
+                json!({"type":"object","properties":{"operation":{"type":"string","description":"操作名（如 screenshot.capture / windows.focus / mount.mount）；省略则只返回策略真值"}}}),
             ),
             make_tool(
                 "daemon_status",
@@ -265,50 +279,43 @@ impl AgentShellMcpServer {
 
     /// 将工具名映射到 daemon RPC 方法 + 参数适配。
     ///
-    /// MCP 工具 schema（§17.3）与 daemon RPC 参数契约不同——
-    /// 此函数完成从 MCP 参数到 RPC 参数的转换。
-    fn map_tool(tool_name: &str, args: &Value) -> Option<(&'static str, Value)> {
-        let (method, params) = match tool_name {
+    /// MCP 工具 schema（§17.3）与 daemon RPC 参数契约不同——此函数完成从
+    /// MCP 参数到 RPC 参数的转换。需要多步 RPC 的工具（定位后再操作、参数
+    /// 组合校验）返回 `Ok(None)`，由 [`Self::execute_tool`] 分派；参数本身
+    /// 不合法返回 `Err`（不静默丢弃声明过的入参）。
+    fn map_tool(tool_name: &str, args: &Value) -> Result<Option<(&'static str, Value)>, String> {
+        let mapped = match tool_name {
             "list_windows" => {
-                // 直接透传 app_id 过滤（daemon windows.list 接受 filter）
-                let filter = args.get("app_id").and_then(|v| v.as_str());
-                let p = json!({ "filter": filter });
-                ("windows.list", p)
+                // app_id → 命令面同名的 filter；workspace → 服务侧工作区谓词。
+                // 原值转发：类型校验由服务端统一执行（不在投射层静默丢弃）。
+                let filter = args.get("app_id").cloned().unwrap_or(Value::Null);
+                let workspace = args.get("workspace").cloned().unwrap_or(Value::Null);
+                (
+                    "windows.list",
+                    json!({ "filter": filter, "workspace": workspace }),
+                )
             }
-            "focus_window" | "wait_for_window" => {
-                // These tools are handled by execute_tool (multi-step RPC).
-                return None;
+            "focus_window" | "wait_for_window" | "click_element" | "screenshot" => {
+                // 多步解析或入参组合校验：由 execute_tool 处理。
+                return Ok(None);
             }
-            "click_element" => ("a11y.status", json!({})),
-            "screenshot" => {
-                let window = args.get("window").and_then(|v| v.as_str());
-                let area: Option<[i32; 4]> = args.get("area").and_then(|a| {
-                    a.as_array().and_then(|arr| {
-                        if arr.len() == 4 {
-                            let vals: Vec<i32> = arr
-                                .iter()
-                                .filter_map(|v| v.as_i64().map(|i| i as i32))
-                                .collect();
-                            if vals.len() == 4 {
-                                Some([vals[0], vals[1], vals[2], vals[3]])
-                            } else {
-                                None
-                            }
-                        } else {
-                            None
-                        }
-                    })
+            "query_a11y_elements" => {
+                // 三个入参原样转发：daemon 侧负责类型校验与「必须有 role/name 或 all」。
+                let p = json!({
+                    "role": args.get("role"),
+                    "name": args.get("name"),
+                    "all": args.get("all"),
                 });
-                let output_path = format!("/tmp/agent-shell-mcp-{}.ppm", std::process::id());
-                let p = json!({ "window": window, "area": area, "output_path": output_path });
-                ("screenshot.capture", p)
+                ("a11y.query", p)
             }
-            "get_a11y_tree" => {
-                // §17.3: 获取无障碍树——v1 返回 AT-SPI 状态（树查询待 Phase 2）
-                ("a11y.status", json!({}))
+            "subscribe_events" => {
+                let filter = event_filter(args)?;
+                ("events.subscribe", json!({ "filter": filter }))
             }
-            "subscribe_events" => ("events.subscribe", args.clone()),
-            "security_check" => ("security.status", args.clone()),
+            "security_check" => {
+                let operation = args.get("operation").cloned().unwrap_or(Value::Null);
+                ("security.status", json!({ "operation": operation }))
+            }
             "daemon_status" => ("daemon.status", json!({})),
             "ime_set_engine" => ("ime.engine.set", args.clone()),
             "ime_type" => ("ime.type", args.clone()),
@@ -319,9 +326,9 @@ impl AgentShellMcpServer {
             "default_app_set" => ("mime.set", args.clone()),
             "bluetooth_scan" => ("bluetooth.scan", json!({})),
             "list_timers" => ("timer.list", json!({})),
-            _ => return None,
+            _ => return Err(format!("unknown tool: {tool_name}")),
         };
-        Some((method, params))
+        Ok(Some(mapped))
     }
 
     /// 执行工具调用——处理需要多步 RPC 的工具（如 focus_window 先解析再操作）。
@@ -329,14 +336,119 @@ impl AgentShellMcpServer {
         match tool_name {
             "focus_window" => self.execute_focus_window(args).await,
             "wait_for_window" => self.execute_wait_for_window(args).await,
+            "click_element" => self.execute_click_element(args).await,
+            "screenshot" => self.execute_screenshot(args).await,
             _ => {
-                let (method, params) = match Self::map_tool(tool_name, args) {
+                let (method, params) = match Self::map_tool(tool_name, args)? {
                     Some(m) => m,
                     None => return Err(format!("unknown tool: {tool_name}")),
                 };
                 self.conn.lock().await.call(method, params).await
             }
         }
+    }
+
+    /// click_element：`a11y.query` 按 role/name 定位 → `a11y.action` 触发动作接口。
+    ///
+    /// 与命令面同语义：零命中或无障碍不可达时用 `fallback_coordinate` 坐标
+    /// 点击兜底（无兜底则如实报错）；多命中不猜——报歧义并要求收窄条件
+    /// （契约：目标解析多命中必须报错）。
+    async fn execute_click_element(&self, args: &Value) -> Result<Value, String> {
+        let role = args.get("role").and_then(Value::as_str);
+        let name = args.get("name").and_then(Value::as_str);
+        if role.is_none() && name.is_none() {
+            return Err("click_element requires `role` and/or `name`".to_string());
+        }
+        let fallback = parse_fallback_coordinate(args)?;
+
+        let located = {
+            let mut conn = self.conn.lock().await;
+            conn.call(
+                "a11y.query",
+                json!({ "role": role, "name": name, "all": false }),
+            )
+            .await
+        };
+        let elements = match located {
+            Ok(value) => value
+                .get("elements")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default(),
+            Err(e) => {
+                // 无障碍不可达：有坐标兜底就走兜底，否则原样上抛（错误码不降级）。
+                return match fallback {
+                    Some((x, y)) => self.click_at(x, y).await,
+                    None => Err(e),
+                };
+            }
+        };
+        if elements.is_empty() {
+            return match fallback {
+                Some((x, y)) => self.click_at(x, y).await,
+                None => Err(format!(
+                    "a11y element not found (role={role:?}, name={name:?}); \
+                     pass `fallback_coordinate` for a coordinate click"
+                )),
+            };
+        }
+        if elements.len() > 1 {
+            let candidates: Vec<String> = elements
+                .iter()
+                .take(5)
+                .map(|el| {
+                    format!(
+                        "{:?} ({}) at {}",
+                        el.get("name").and_then(Value::as_str).unwrap_or("?"),
+                        el.get("role").and_then(Value::as_str).unwrap_or("?"),
+                        el.get("path").and_then(Value::as_str).unwrap_or("?"),
+                    )
+                })
+                .collect();
+            return Err(format!(
+                "a11y element ambiguous: {} matches for role={role:?}, name={name:?}; \
+                 narrow `role`/`name`; candidates: {}",
+                elements.len(),
+                candidates.join(", ")
+            ));
+        }
+        let element = &elements[0];
+        let path = element
+            .get("path")
+            .and_then(Value::as_str)
+            .ok_or("malformed a11y.query element: missing path")?;
+        let bus = element.get("bus_name").and_then(Value::as_str);
+        let action = {
+            let mut conn = self.conn.lock().await;
+            conn.call("a11y.action", json!({ "path": path, "bus": bus }))
+                .await
+        };
+        match action {
+            Ok(value) => Ok(value),
+            Err(e) => match fallback {
+                Some((x, y)) => self.click_at(x, y).await,
+                None => Err(e),
+            },
+        }
+    }
+
+    /// 坐标兜底点击（`input.send` click，左键 + 绝对坐标）；结果原样返回。
+    async fn click_at(&self, x: i64, y: i64) -> Result<Value, String> {
+        let mut conn = self.conn.lock().await;
+        conn.call(
+            "input.send",
+            json!({ "kind": "click", "payload": { "button": "left", "at": [x, y] } }),
+        )
+        .await
+    }
+
+    /// screenshot：`target` 选择器决定实际捕获范围（全屏 / 窗口 / 区域）。
+    ///
+    /// 选择器与其它入参冲突时报错，不静默丢弃——否则 `target` 形同虚设。
+    async fn execute_screenshot(&self, args: &Value) -> Result<Value, String> {
+        let params = screenshot_params(args)?;
+        let mut conn = self.conn.lock().await;
+        conn.call("screenshot.capture", params).await
     }
 
     /// focus_window: 先 windows.list 取列表，按 app_id/title/pid 解析 native_id，再 windows.op focus。
@@ -428,9 +540,7 @@ impl Default for AgentShellMcpServer {
 
 impl ServerHandler for AgentShellMcpServer {
     fn get_info(&self) -> ServerInfo {
-        let mut info = ServerInfo::default();
-        info.instructions = Some("agent-shell MCP server for Linux desktop automation".into());
-        info
+        server_info()
     }
 
     fn list_tools(
@@ -479,6 +589,131 @@ fn make_tool(name: &'static str, desc: &'static str, schema: Value) -> Tool {
     tool.description = Some(Cow::Borrowed(desc));
     tool.input_schema = Arc::new(schema.as_object().cloned().unwrap_or_default());
     tool
+}
+
+/// 握手信息：指令字段 + 工具能力声明。
+///
+/// 工具能力必须显式声明——调用方据此判定 `tools/list` 与 `tools/call` 可用；
+/// 空 capabilities 会被读成「本服务不提供工具」。
+fn server_info() -> ServerInfo {
+    let mut info = ServerInfo::default();
+    info.instructions = Some("agent-shell MCP server for Linux desktop automation".into());
+    info.capabilities = ServerCapabilities::builder().enable_tools().build();
+    info
+}
+
+/// `subscribe_events.events` → daemon `events.subscribe` 的 `filter` 串。
+///
+/// 词表值由 daemon 校验（非法值返回 InvalidParams 并列出全部合法取值）；
+/// 空数组与缺省同义：订阅全部事件。
+fn event_filter(args: &Value) -> Result<Option<String>, String> {
+    let Some(value) = args.get("events").filter(|v| !v.is_null()) else {
+        return Ok(None);
+    };
+    let items = value
+        .as_array()
+        .ok_or("subscribe_events events must be an array of strings")?;
+    let mut tokens = Vec::with_capacity(items.len());
+    for item in items {
+        tokens.push(
+            item.as_str()
+                .ok_or("subscribe_events events must be an array of strings")?,
+        );
+    }
+    Ok((!tokens.is_empty()).then(|| tokens.join(",")))
+}
+
+/// `screenshot.area` → `[x, y, width, height]`。
+///
+/// 非 4 元、非整数或超出 32 位像素域一律报错——坏载荷不得被静默忽略后
+/// 变成另一种捕获范围。
+fn parse_area(args: &Value) -> Result<Option<[i32; 4]>, String> {
+    let Some(value) = args.get("area").filter(|v| !v.is_null()) else {
+        return Ok(None);
+    };
+    let items = value
+        .as_array()
+        .ok_or("screenshot area must be [x, y, width, height]")?;
+    if items.len() != 4 {
+        return Err("screenshot area must be [x, y, width, height]".to_string());
+    }
+    let mut out = [0i32; 4];
+    for (slot, item) in out.iter_mut().zip(items) {
+        let value = item
+            .as_i64()
+            .ok_or("screenshot area components must be integers")?;
+        *slot = i32::try_from(value)
+            .map_err(|_| "screenshot area component out of 32-bit pixel range".to_string())?;
+    }
+    Ok(Some(out))
+}
+
+/// `screenshot.target` 选择器语义 → `screenshot.capture` 参数。
+///
+/// `target` 显式给出时与 window/area 的组合必须自洽，冲突即报错；缺省时按
+/// 已给入参推断（区域 → 区域捕获，窗口 → 窗口捕获，否则全屏）。
+fn screenshot_params(args: &Value) -> Result<Value, String> {
+    let window = args.get("window").and_then(Value::as_str);
+    let area = parse_area(args)?;
+    let target = match args.get("target") {
+        None | Some(Value::Null) => match (area, window) {
+            (Some(_), _) => "area",
+            (None, Some(_)) => "window",
+            (None, None) => "screen",
+        },
+        Some(Value::String(s)) => match s.as_str() {
+            "screen" | "window" | "area" => s.as_str(),
+            other => {
+                return Err(format!(
+                    "unknown screenshot target: {other} (expect screen|window|area)"
+                ))
+            }
+        },
+        Some(_) => return Err("screenshot target must be a string".to_string()),
+    };
+    let (window, area) = match target {
+        "screen" => {
+            if window.is_some() || area.is_some() {
+                return Err(
+                    "screenshot target=screen takes neither `window` nor `area`".to_string()
+                );
+            }
+            (None, None)
+        }
+        "window" => {
+            let window = window.ok_or("screenshot target=window requires `window`")?;
+            if area.is_some() {
+                return Err("screenshot target=window takes `window` but not `area`".to_string());
+            }
+            (Some(window), None)
+        }
+        _ => {
+            let area = area.ok_or("screenshot target=area requires `area`")?;
+            if window.is_some() {
+                return Err("screenshot target=area takes `area` but not `window`".to_string());
+            }
+            (None, Some(area))
+        }
+    };
+    let output_path = format!("/tmp/agent-shell-mcp-{}.ppm", std::process::id());
+    Ok(json!({ "window": window, "area": area, "output_path": output_path }))
+}
+
+/// `click_element.fallback_coordinate` → `[x, y]`。
+fn parse_fallback_coordinate(args: &Value) -> Result<Option<(i64, i64)>, String> {
+    let Some(value) = args.get("fallback_coordinate").filter(|v| !v.is_null()) else {
+        return Ok(None);
+    };
+    let items = value
+        .as_array()
+        .ok_or("fallback_coordinate must be [x, y] integers")?;
+    if items.len() != 2 {
+        return Err("fallback_coordinate must be [x, y] integers".to_string());
+    }
+    let (Some(x), Some(y)) = (items[0].as_i64(), items[1].as_i64()) else {
+        return Err("fallback_coordinate must be [x, y] integers".to_string());
+    };
+    Ok(Some((x, y)))
 }
 
 /// 从 windows.list 结果中按 app_id/title/pid/window_id 解析 native_id。
@@ -586,10 +821,30 @@ mod tests {
         let names: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
         assert!(names.contains(&"list_windows"));
         assert!(names.contains(&"focus_window"));
+        assert!(names.contains(&"click_element"));
         assert!(names.contains(&"screenshot"));
+        assert!(names.contains(&"query_a11y_elements"));
         assert!(names.contains(&"ime_type"));
         assert!(names.contains(&"daemon_status"));
         assert!(names.contains(&"subscribe_events"));
+        assert!(names.contains(&"security_check"));
+    }
+
+    #[test]
+    fn initialize_declares_tools_capability() {
+        // 握手必须声明工具能力：空 capabilities 会被读成「不提供工具」。
+        let info = server_info();
+        assert!(
+            info.capabilities.tools.is_some(),
+            "initialize must declare `capabilities.tools`"
+        );
+        let wire = serde_json::to_value(&info).expect("ServerInfo serializable");
+        assert!(
+            wire.get("capabilities")
+                .and_then(|c| c.get("tools"))
+                .is_some(),
+            "wire capabilities must carry `tools`: {wire}"
+        );
     }
 
     #[test]
@@ -610,39 +865,144 @@ mod tests {
 
     #[test]
     fn test_map_tool_list_windows() {
-        let (m, p) =
-            AgentShellMcpServer::map_tool("list_windows", &json!({"app_id": "firefox"})).unwrap();
+        let (m, p) = AgentShellMcpServer::map_tool(
+            "list_windows",
+            &json!({"app_id": "firefox", "workspace": "3"}),
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(m, "windows.list");
         assert_eq!(p["filter"], "firefox");
+        assert_eq!(p["workspace"], "3", "workspace must reach the service");
     }
 
     #[test]
-    fn test_map_tool_screenshot_adds_output_path() {
-        let (m, p) =
-            AgentShellMcpServer::map_tool("screenshot", &json!({"target": "screen"})).unwrap();
-        assert_eq!(m, "screenshot.capture");
+    fn test_map_tool_query_a11y_elements_forwards_three_inputs() {
+        let (m, p) = AgentShellMcpServer::map_tool(
+            "query_a11y_elements",
+            &json!({"role": "button", "name": "OK", "all": true}),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(m, "a11y.query");
+        assert_eq!(p["role"], "button");
+        assert_eq!(p["name"], "OK");
+        assert_eq!(p["all"], true);
+    }
+
+    #[test]
+    fn test_map_tool_subscribe_events_filters() {
+        let (m, p) = AgentShellMcpServer::map_tool(
+            "subscribe_events",
+            &json!({"events": ["WindowOpened", "workspace"]}),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(m, "events.subscribe");
+        assert_eq!(p["filter"], "WindowOpened,workspace");
+
+        // 缺省/空数组 = 订阅全部：filter 为空，daemon 视为 EventFilter::all。
+        let (_, p) = AgentShellMcpServer::map_tool("subscribe_events", &json!({"events": []}))
+            .unwrap()
+            .unwrap();
+        assert_eq!(p["filter"], Value::Null);
+    }
+
+    #[test]
+    fn test_map_tool_subscribe_events_rejects_non_strings() {
+        let args = json!({"events": [1]});
+        assert!(AgentShellMcpServer::map_tool("subscribe_events", &args).is_err());
+    }
+
+    #[test]
+    fn test_map_tool_security_check_forwards_operation() {
+        let (m, p) = AgentShellMcpServer::map_tool(
+            "security_check",
+            &json!({"operation": "screenshot.capture"}),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(m, "security.status");
+        assert_eq!(p["operation"], "screenshot.capture");
+    }
+
+    #[test]
+    fn test_screenshot_params_target_selects_capture_scope() {
+        // target=screen：不含 window/area。
+        let p = screenshot_params(&json!({"target": "screen"})).unwrap();
+        assert!(p["window"].is_null());
+        assert!(p["area"].is_null());
         assert!(p["output_path"].as_str().is_some(), "must have output_path");
-    }
 
-    #[test]
-    fn test_map_tool_screenshot_with_area() {
-        let (m, p) =
-            AgentShellMcpServer::map_tool("screenshot", &json!({"area": [0, 0, 800, 600]}))
-                .unwrap();
-        assert_eq!(m, "screenshot.capture");
+        // target=window：window 生效，area 不出现。
+        let p = screenshot_params(&json!({"target": "window", "window": "1234"})).unwrap();
+        assert_eq!(p["window"], "1234");
+        assert!(p["area"].is_null());
+
+        // target=area：area 生效，window 不出现。
+        let p = screenshot_params(&json!({"target": "area", "area": [0, 0, 800, 600]})).unwrap();
         assert_eq!(p["area"], json!([0, 0, 800, 600]));
+        assert!(p["window"].is_null());
+
+        // 缺省 target：按入参推断。
+        let p = screenshot_params(&json!({"area": [1, 2, 3, 4]})).unwrap();
+        assert_eq!(p["area"], json!([1, 2, 3, 4]));
+        let p = screenshot_params(&json!({"window": "42"})).unwrap();
+        assert_eq!(p["window"], "42");
     }
 
     #[test]
-    fn test_map_tool_focus_window_not_in_map_tool() {
-        assert!(AgentShellMcpServer::map_tool("focus_window", &json!({"app_id": "x"})).is_none());
-    }
-
-    #[test]
-    fn test_map_tool_wait_for_window_not_in_map_tool() {
+    fn test_screenshot_params_rejects_conflicting_selector() {
+        // target 与选择器组合矛盾时必须报错，不得静默忽略。
+        assert!(screenshot_params(&json!({"target": "screen", "window": "1"})).is_err());
+        assert!(screenshot_params(&json!({"target": "screen", "area": [0, 0, 1, 1]})).is_err());
+        assert!(screenshot_params(&json!({"target": "window"})).is_err());
+        assert!(screenshot_params(
+            &json!({"target": "window", "window": "1", "area": [0, 0, 1, 1]})
+        )
+        .is_err());
+        assert!(screenshot_params(&json!({"target": "area"})).is_err());
         assert!(
-            AgentShellMcpServer::map_tool("wait_for_window", &json!({"app_id": "x"})).is_none()
+            screenshot_params(&json!({"target": "area", "area": [0, 0, 1, 1], "window": "1"}))
+                .is_err()
         );
+        assert!(screenshot_params(&json!({"target": "fullscreen"})).is_err());
+        // 区域形状不合法不得被静默丢弃（旧实现 filter_map 会丢分量）。
+        assert!(screenshot_params(&json!({"target": "area", "area": [0, 0, 1]})).is_err());
+        assert!(screenshot_params(&json!({"target": "area", "area": [0, 0, 1, "x"]})).is_err());
+    }
+
+    #[test]
+    fn test_fallback_coordinate_shape() {
+        assert_eq!(
+            parse_fallback_coordinate(&json!({"fallback_coordinate": [10, 20]})).unwrap(),
+            Some((10, 20))
+        );
+        assert_eq!(parse_fallback_coordinate(&json!({})).unwrap(), None);
+        assert!(parse_fallback_coordinate(&json!({"fallback_coordinate": [1]})).is_err());
+        assert!(parse_fallback_coordinate(&json!({"fallback_coordinate": [1, 2, 3]})).is_err());
+    }
+
+    #[test]
+    fn test_map_tool_multi_step_tools_are_not_single_step() {
+        for tool in [
+            "focus_window",
+            "wait_for_window",
+            "click_element",
+            "screenshot",
+        ] {
+            assert!(
+                AgentShellMcpServer::map_tool(tool, &json!({"app_id": "x"}))
+                    .unwrap()
+                    .is_none(),
+                "{tool} must be dispatched by execute_tool"
+            );
+        }
+    }
+
+    #[test]
+    fn test_map_tool_unknown() {
+        assert!(AgentShellMcpServer::map_tool("unknown", &Value::Null).is_err());
     }
 
     #[test]
@@ -755,10 +1115,6 @@ mod tests {
         assert!(id.is_none());
     }
 
-    #[test]
-    fn test_map_tool_unknown() {
-        assert!(AgentShellMcpServer::map_tool("unknown", &Value::Null).is_none());
-    }
     /// MCP 注入的 target 目录用 CARGO_MANIFEST_DIR 拼绝对路径——CWD 无关。
     /// 验证候选目录列表中包含基于 CARGO_MANIFEST_DIR 的 target/debug 与
     /// target/release 绝对路径。

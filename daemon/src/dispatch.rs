@@ -92,7 +92,7 @@ pub async fn dispatch(daemon: &mut Daemon, req: &Request) -> Response {
         method::IME_ENGINE_CURRENT => ime_engine_current(daemon).await,
         method::IME_TYPE => ime_type(daemon, req).await,
         // ── 安全边界（§22.7 D6）──
-        method::SECURITY_STATUS => security_status(daemon).await,
+        method::SECURITY_STATUS => security_status(daemon, req).await,
         method::SECURITY_GRANT => security_grant(daemon, req).await,
         method::SECURITY_REVOKE => security_revoke(daemon, req).await,
         method::SECURITY_AUDIT => security_audit(daemon, req).await,
@@ -155,27 +155,9 @@ pub async fn dispatch(daemon: &mut Daemon, req: &Request) -> Response {
     }
 }
 
-/// 方法名 → 权限操作映射（统一 gate 用）。`security.*` 与未知方法返回 `None`。
-fn operation_for(method_name: &str, params: &Option<Value>) -> Option<Operation> {
+/// 方法名 → 权限级别表（统一 gate 与判定查询共用同一张表）。
+fn operation_levels() -> &'static [(&'static str, PermissionLevel)] {
     use PermissionLevel::*;
-
-    if method_name == method::WINDOW_OP {
-        // windows.op 按 params.op 细分级别（close=L2，其余写操作=L1）。
-        let kind = params
-            .as_ref()
-            .and_then(|p| p.get("op"))
-            .and_then(|v| v.as_str());
-        return Some(match kind {
-            Some("close") => Operation::new("windows.close", L2),
-            Some("focus") => Operation::new("windows.focus", L1),
-            Some("move") => Operation::new("windows.move", L1),
-            Some("resize") => Operation::new("windows.resize", L1),
-            Some("minimize") => Operation::new("windows.minimize", L1),
-            Some("restore") => Operation::new("windows.restore", L1),
-            _ => return None, // 非法/缺省 op 交 handler 报 InvalidParams。
-        });
-    }
-
     const OPS: &[(&str, PermissionLevel)] = &[
         (method::DOCTOR, L0),
         (method::INFO, L0),
@@ -241,8 +223,50 @@ fn operation_for(method_name: &str, params: &Option<Value>) -> Option<Operation>
         (method::SYSCTL_GET, L0),
         (method::SYSCTL_SET, L3),
     ];
-    OPS.iter()
+    OPS
+}
+
+/// `windows.op` 按 `params.op` 细分的操作名与级别（close=L2，其余写操作=L1）。
+fn window_op_operation(kind: &str) -> Option<Operation> {
+    use PermissionLevel::*;
+    Some(match kind {
+        "close" => Operation::new("windows.close", L2),
+        "focus" => Operation::new("windows.focus", L1),
+        "move" => Operation::new("windows.move", L1),
+        "resize" => Operation::new("windows.resize", L1),
+        "minimize" => Operation::new("windows.minimize", L1),
+        "restore" => Operation::new("windows.restore", L1),
+        _ => return None, // 非法/缺省 op 交 handler 报 InvalidParams。
+    })
+}
+
+/// 方法名 → 权限操作映射（统一 gate 用）。`security.*` 与未知方法返回 `None`。
+fn operation_for(method_name: &str, params: &Option<Value>) -> Option<Operation> {
+    if method_name == method::WINDOW_OP {
+        let kind = params
+            .as_ref()
+            .and_then(|p| p.get("op"))
+            .and_then(|v| v.as_str())?;
+        return window_op_operation(kind);
+    }
+    operation_levels()
+        .iter()
         .find(|(m, _)| *m == method_name)
+        .map(|(m, l)| Operation::new(m, *l))
+}
+
+/// 按操作名反查操作与级别（`security.status` 的判定查询用）。
+///
+/// 与 [`operation_for`] 同表：表项键即操作名，`windows.op` 的细分名单独展开。
+/// 未登记的操作名返回 `None`——判定查询不得对未知操作给出猜测。
+fn operation_entry(name: &str) -> Option<Operation> {
+    // `windows.op` 的细分操作名形如 `windows.focus`，按 `windows.` 前缀还原 kind。
+    if let Some(op) = name.strip_prefix("windows.").and_then(window_op_operation) {
+        return Some(op);
+    }
+    operation_levels()
+        .iter()
+        .find(|(m, _)| *m == name)
         .map(|(m, l)| Operation::new(m, *l))
 }
 
@@ -527,6 +551,17 @@ async fn windows_list(d: &mut Daemon, req: &Request) -> RpcResult {
         .as_ref()
         .and_then(|p| p.get("filter"))
         .and_then(|v| v.as_str());
+    // 可选工作区过滤：按原生标识精确匹配（与 `workspaces.list` 的 id 同源）。
+    let workspace = match req.params.as_ref().and_then(|p| p.get("workspace")) {
+        None | Some(Value::Null) => None,
+        Some(Value::String(s)) if !s.is_empty() => Some(s.as_str()),
+        Some(_) => {
+            return Err((
+                RpcErrorCode::InvalidParams,
+                "params.workspace must be a non-empty string".to_string(),
+            ))
+        }
+    };
     // 默认 substring：不传 `match` 时保持既有 `app_id == f || title.contains(f)`
     // 语义，兼容旧 CLI 与 MCP（二者只发 `filter`）。
     let mode = match req.params.as_ref().and_then(|p| p.get("match")) {
@@ -543,7 +578,7 @@ async fn windows_list(d: &mut Daemon, req: &Request) -> RpcResult {
     let matcher = filter.map(|f| TitleMatcher::new(mode, f));
     let filtered: Vec<&WindowInfo> = wins
         .iter()
-        .filter(|w| filter_matches(w, matcher.as_ref()))
+        .filter(|w| filter_matches(w, matcher.as_ref()) && workspace_matches(w, workspace))
         .collect();
     let items: Vec<Value> = filtered.iter().map(|w| window_entry_json(w)).collect();
     Ok(json!({ "windows": items, "from_cache": from_cache }))
@@ -584,6 +619,17 @@ fn filter_matches(w: &WindowInfo, matcher: Option<&TitleMatcher>) -> bool {
     match matcher {
         None => true,
         Some(m) => m.matches_app_id(&w.app_id) || m.matches(&w.title),
+    }
+}
+
+/// `windows.list` 工作区谓词：`None` 不过滤；`Some(native_id)` 精确匹配。
+///
+/// 无工作区归属的窗口（如某些后端的面板窗）在给定过滤时不命中——
+/// 「未知归属」不得被当作「属于目标工作区」。
+fn workspace_matches(w: &WindowInfo, workspace: Option<&str>) -> bool {
+    match workspace {
+        None => true,
+        Some(id) => w.workspace_id.as_ref().is_some_and(|ws| ws.native_id == id),
     }
 }
 
@@ -847,7 +893,10 @@ async fn a11y_action(d: &Daemon, req: &Request) -> RpcResult {
 // ───────────────────────── 安全边界（§22.7 D6）─────────────────────────
 
 /// 返回当前安全配置真值：默认确认级别、白名单、黑名单、审计路径。
-async fn security_status(d: &mut Daemon) -> RpcResult {
+///
+/// 可选 `operation`：按操作名请求判定，结果放在 `check` 字段。判定走
+/// [`SecurityManager::decide`]（纯函数，不写审计）——查询本身无副作用。
+async fn security_status(d: &mut Daemon, req: &Request) -> RpcResult {
     let cfg = &d.security.config;
     let allow: serde_json::Map<_, _> = cfg
         .permissions
@@ -865,12 +914,49 @@ async fn security_status(d: &mut Daemon) -> RpcResult {
             )
         })
         .collect();
-    Ok(json!({
+    let mut status = json!({
         "default_confirm_level": cfg.security.default_confirm_level.as_str(),
         "allow": allow,
         "deny": cfg.permissions.deny,
         "audit_path": d.security.audit.path(),
-    }))
+    });
+    // 显式 null 与键缺失同义：MCP 投射层把「未提供」物化为 null，两者都返回策略真值。
+    if let Some(raw) = req
+        .params
+        .as_ref()
+        .and_then(|p| p.get("operation"))
+        .filter(|raw| !raw.is_null())
+    {
+        let op_name = match raw {
+            Value::String(s) if !s.is_empty() => s,
+            _ => {
+                return Err((
+                    RpcErrorCode::InvalidParams,
+                    "security.status operation must be a non-empty string".to_string(),
+                ))
+            }
+        };
+        let op = operation_entry(op_name).ok_or((
+            RpcErrorCode::InvalidParams,
+            format!("unknown operation: {op_name}"),
+        ))?;
+        let caller = d.caller_id.clone();
+        let check = match d.security.decide(&caller, &op) {
+            PermissionDecision::Allow => json!({
+                "operation": op.name(), "level": op.level().as_str(), "decision": "allow",
+            }),
+            PermissionDecision::Confirm(mode) => json!({
+                "operation": op.name(), "level": op.level().as_str(),
+                "decision": "confirm", "confirm_mode": mode.to_string(),
+            }),
+            PermissionDecision::Deny(reason) => json!({
+                "operation": op.name(), "level": op.level().as_str(),
+                "decision": "deny", "reason": reason,
+            }),
+        };
+        status["check"] = check;
+    }
+    Ok(status)
 }
 
 /// `security.grant {agent_id, level}` —— 授权 agent 到指定级别并持久化。
@@ -2594,6 +2680,145 @@ mod tests {
         );
         assert!(entries.iter().all(|e| e["result"].as_bool() == Some(false)));
         let _ = std::fs::remove_file(&audit_path);
+    }
+
+    #[tokio::test]
+    async fn security_status_reports_operation_decision_without_side_effects() {
+        // 判定查询与门禁同源：同一张级别表 + 同一个纯判定函数；查询本身不写审计。
+        let mut d = test_daemon().await;
+
+        let plain = security_status(&mut d, &req(method::SECURITY_STATUS, None))
+            .await
+            .expect("status without operation");
+        assert!(
+            plain.get("check").is_none(),
+            "无 operation 时不返回 check：{plain}"
+        );
+
+        // 显式 null 与键缺失同义：MCP 投射层把「未提供」物化为 null。
+        let absent = security_status(
+            &mut d,
+            &req(method::SECURITY_STATUS, Some(json!({"operation": null}))),
+        )
+        .await
+        .expect("status with explicit null operation");
+        assert_eq!(absent, plain, "显式 null 与键缺失必须返回同一份策略真值");
+
+        // 默认配置（默认确认级别 L3 → 未白名单调用方自动放行 L0..L2）。
+        let allowed = security_status(
+            &mut d,
+            &req(
+                method::SECURITY_STATUS,
+                Some(json!({"operation": "windows.list"})),
+            ),
+        )
+        .await
+        .expect("allow check");
+        assert_eq!(allowed["check"]["decision"], "allow");
+        assert_eq!(allowed["check"]["level"], "L0");
+        assert_eq!(allowed["check"]["operation"], "windows.list");
+
+        let confirm = security_status(
+            &mut d,
+            &req(
+                method::SECURITY_STATUS,
+                Some(json!({"operation": "mount.mount"})),
+            ),
+        )
+        .await
+        .expect("confirm check");
+        assert_eq!(confirm["check"]["decision"], "confirm");
+        assert_eq!(confirm["check"]["level"], "L4");
+        assert_eq!(confirm["check"]["confirm_mode"], "always");
+
+        // 黑名单优先于级别判定 → deny。
+        d.security
+            .config
+            .permissions
+            .deny
+            .insert("screenshot.*".into(), true);
+        let denied = security_status(
+            &mut d,
+            &req(
+                method::SECURITY_STATUS,
+                Some(json!({"operation": "screenshot.capture"})),
+            ),
+        )
+        .await
+        .expect("deny check");
+        assert_eq!(denied["check"]["decision"], "deny");
+        assert!(
+            denied["check"]["reason"]
+                .as_str()
+                .is_some_and(|r| r.contains("denied by policy")),
+            "deny must carry the policy reason: {denied}"
+        );
+
+        // windows.op 的细分操作名按同一张表判定。
+        let focus = security_status(
+            &mut d,
+            &req(
+                method::SECURITY_STATUS,
+                Some(json!({"operation": "windows.focus"})),
+            ),
+        )
+        .await
+        .expect("window op check");
+        assert_eq!(focus["check"]["level"], "L1");
+
+        // 未登记操作名与坏类型 → 非法参数（不对未知操作给猜测性判定）。
+        let err = security_status(
+            &mut d,
+            &req(method::SECURITY_STATUS, Some(json!({"operation": "nope"}))),
+        )
+        .await
+        .expect_err("unknown operation");
+        assert_eq!(err.0, RpcErrorCode::InvalidParams);
+        let err = security_status(
+            &mut d,
+            &req(method::SECURITY_STATUS, Some(json!({"operation": 3}))),
+        )
+        .await
+        .expect_err("non-string operation");
+        assert_eq!(err.0, RpcErrorCode::InvalidParams);
+
+        // 纯查询不产生审计记录。
+        let audit = std::fs::read_to_string(d.sandbox().audit_path()).unwrap_or_default();
+        assert!(
+            !audit.contains("windows.list") && !audit.contains("mount.mount"),
+            "status check must not write audit entries: {audit}"
+        );
+    }
+
+    #[tokio::test]
+    async fn windows_list_rejects_non_string_workspace() {
+        // 工作区过滤入参在参数解析层校验：headless（无合成器）也先报 InvalidParams。
+        let mut d = test_daemon().await;
+        let resp = dispatch(
+            &mut d,
+            &req(method::WINDOWS_LIST, Some(json!({"workspace": 3}))),
+        )
+        .await;
+        let err = resp.error.expect("error");
+        assert_eq!(err.code, RpcErrorCode::InvalidParams as i32);
+        assert!(err.message.contains("params.workspace"), "{}", err.message);
+    }
+
+    #[test]
+    fn workspace_matches_filters_by_native_id() {
+        use agent_shell_core::types::{DesktopEnvironment, WorkspaceId};
+        let mut w = win("0x1", "Term", "konsole");
+        assert!(workspace_matches(&w, None), "无过滤时全部命中");
+        assert!(
+            !workspace_matches(&w, Some("1")),
+            "无工作区归属的窗口在给定过滤时不得命中"
+        );
+        w.workspace_id = Some(WorkspaceId {
+            native_id: "1".into(),
+            de_type: DesktopEnvironment::KDE,
+        });
+        assert!(workspace_matches(&w, Some("1")));
+        assert!(!workspace_matches(&w, Some("2")));
     }
 
     #[tokio::test]

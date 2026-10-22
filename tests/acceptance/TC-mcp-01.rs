@@ -9,13 +9,17 @@
 //! 判定面是真实 `agent-shell-mcp` 进程与它按生产路径派生的 daemon：隔离
 //! HOME/XDG/会话变量后走 initialize → tools/list → tools/call。
 //!
-//! 已知产品缺口（本用例据实记录，不静默）：当前 rmcp 默认 initialize 未声明
-//! `tools` 能力（`capabilities` 为空对象），且部分工具的映射未实现其声明语义
-//! （`click_element`/`get_a11y_tree` 只返回 a11y.status；`subscribe_events` 的
-//! `events` 入参未使用；`list_windows.workspace`、`security_check.operation`、
-//! `screenshot.target` 未生效）。这些条款无法在断言里判为通过，审查/验收据此
-//! 记为缺陷；本文件断言其余可判定不变量（单页列举、参数 schema 自洽、错误码
-//! 保留、占位回执透传、结果投影）。
+//! 本用例逐条判定 AC-106 的投影不变量：
+//! - 握手声明 `capabilities.tools`；
+//! - 工具列举单页、名称唯一、schema 自洽；
+//! - 每个声明入参可观察生效（`list_windows.workspace` 到服务端工作区谓词，
+//!   `screenshot.target` 选择器自洽校验，`subscribe_events.events` 落到订阅过
+//!   滤器，`security_check.operation` 落到服务端判定（省略则返回策略真值），
+//!   `query_a11y_elements` 的 `all` 放开全树门槛）；
+//! - 映射方法真实实现工具语义（`click_element` 经 `a11y.query` 定位后走
+//!   `a11y.action`，定位失败才用 `fallback_coordinate` 坐标兜底）；
+//! - 错误保留项目错误码且不降级为成功；占位回执原样透传；成功结果的结构化
+//!   部分与文本内容逐字段一致（结果不裁剪、不改名）。
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -33,7 +37,7 @@ const TOOLS: [&str; 18] = [
     "click_element",
     "screenshot",
     "wait_for_window",
-    "get_a11y_tree",
+    "query_a11y_elements",
     "subscribe_events",
     "security_check",
     "daemon_status",
@@ -172,6 +176,30 @@ impl Mcp {
             .expect("write MCP notification");
         self.stdin.flush().await.expect("flush MCP notification");
     }
+
+    /// `tools/call` 一次往返，返回 JSON-RPC `result` 对象。
+    async fn call_tool(&mut self, name: &str, arguments: Value) -> Value {
+        let id = self
+            .send("tools/call", json!({"name": name, "arguments": arguments}))
+            .await;
+        let response = self.response(id).await;
+        response.get("result").cloned().expect("tools/call result")
+    }
+}
+
+/// `tools/call` 失败时的文本内容（成功结果返回空串）。
+fn error_text(result: &Value) -> String {
+    if result.get("isError") != Some(&json!(true)) {
+        return String::new();
+    }
+    result
+        .get("content")
+        .and_then(Value::as_array)
+        .and_then(|items| items.first())
+        .and_then(|item| item.get("text"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string()
 }
 
 impl Drop for Mcp {
@@ -184,9 +212,16 @@ impl Drop for Mcp {
 async fn mcp_projection_preserves_tools_errors_and_receipts() {
     let sandbox = tempfile::tempdir().expect("mcp sandbox");
     std::fs::create_dir_all(sandbox.path().join("home")).expect("home");
-    std::fs::create_dir_all(sandbox.path().join("config")).expect("config");
+    std::fs::create_dir_all(sandbox.path().join("config/agent-shell")).expect("config");
     std::fs::create_dir_all(sandbox.path().join("state")).expect("state");
     std::fs::create_dir_all(sandbox.path().join("run")).expect("run");
+    // 安全策略夹具：黑名单命中让 `security_check.operation` 有 deny 可观察面。
+    // daemon 在 MCP 进程启动时派生并读取该 XDG 配置目录。
+    std::fs::write(
+        sandbox.path().join("config/agent-shell/config.toml"),
+        "[permissions.deny]\n\"process.kill\" = true\n",
+    )
+    .expect("write security config");
     let binary = tokio::task::spawn_blocking(build_binaries)
         .await
         .expect("join build");
@@ -214,6 +249,14 @@ async fn mcp_projection_preserves_tools_errors_and_receipts() {
         .get("serverInfo")
         .and_then(|v| v.get("name"))
         .is_some());
+    // 握手必须声明工具能力：空 capabilities 会被读成「不提供工具」。
+    assert!(
+        result
+            .get("capabilities")
+            .and_then(|c| c.get("tools"))
+            .is_some(),
+        "initialize must declare capabilities.tools: {result}"
+    );
     mcp.send_notification("notifications/initialized").await;
 
     // 工具列举：单页、名称唯一、schema 自洽（required ⊆ properties）。
@@ -304,6 +347,182 @@ async fn mcp_projection_preserves_tools_errors_and_receipts() {
     assert_eq!(
         reparsed, *structured,
         "text content must be the structured result verbatim"
+    );
+
+    // ── 声明入参逐一可观察生效 ──────────────────────────────────────────
+    // 判定面：headless 沙箱里后端不可用，但每个入参各自改变「走到哪一步」——
+    // 参数问题报 -32602，参数放行后落到对应后端缺失的错误，两者可区分。
+
+    // query_a11y_elements.all：缺省时 daemon 拒绝无过滤全树；all=true 放行。
+    let result = mcp.call_tool("query_a11y_elements", json!({})).await;
+    let text = error_text(&result);
+    assert!(
+        text.contains("-32602") && text.contains("requires `role` and/or `name`"),
+        "full-tree query without role/name/all must be rejected: {text}"
+    );
+    let result = mcp
+        .call_tool("query_a11y_elements", json!({"all": true}))
+        .await;
+    let text = error_text(&result);
+    assert!(
+        text.contains("1002") && text.contains("AT-SPI unavailable"),
+        "all=true must pass the gate and reach a11y.query: {text}"
+    );
+
+    // click_element：按 role+name 走 a11y.query 定位（不再是 a11y.status）；
+    // 无障碍不可达时报后端不可用，而不是返回一份状态报告。
+    let result = mcp
+        .call_tool("click_element", json!({"role": "button", "name": "OK"}))
+        .await;
+    let text = error_text(&result);
+    assert!(
+        text.contains("AT-SPI unavailable"),
+        "click_element must locate through a11y.query: {text}"
+    );
+    // fallback_coordinate：无障碍不可达时改走坐标点击——错误来源不再是 a11y
+    // （输入后端也可能不可用，故只断言不再报 a11y 错误）。
+    let result = mcp
+        .call_tool(
+            "click_element",
+            json!({"role": "button", "name": "OK", "fallback_coordinate": [10, 20]}),
+        )
+        .await;
+    let text = error_text(&result);
+    assert!(
+        !text.contains("AT-SPI unavailable"),
+        "fallback_coordinate must bypass the a11y failure: {text}"
+    );
+
+    // subscribe_events.events：词表值落到订阅过滤器；非法值被服务端拒绝并列出合法取值。
+    let result = mcp
+        .call_tool("subscribe_events", json!({"events": ["WindowOpened"]}))
+        .await;
+    let text = error_text(&result);
+    assert!(
+        text.is_empty(),
+        "valid event filter must subscribe successfully: {text}"
+    );
+    assert!(
+        result["structuredContent"]["subscriber_id"]
+            .as_str()
+            .is_some_and(|id| !id.is_empty()),
+        "subscription must return a handle: {result}"
+    );
+    let result = mcp
+        .call_tool("subscribe_events", json!({"events": ["bogus"]}))
+        .await;
+    let text = error_text(&result);
+    assert!(
+        text.contains("-32602")
+            && text.contains("unknown event filter: bogus")
+            && text.contains("valid values:"),
+        "invalid event filter must be rejected with the vocabulary: {text}"
+    );
+
+    // list_windows.workspace：类型错误由服务端参数校验拒绝；合法标识放行到窗口通道。
+    let result = mcp.call_tool("list_windows", json!({"workspace": 3})).await;
+    let text = error_text(&result);
+    assert!(
+        text.contains("-32602") && text.contains("params.workspace"),
+        "workspace must reach the service-side workspace filter: {text}"
+    );
+    let result = mcp
+        .call_tool("list_windows", json!({"workspace": "1"}))
+        .await;
+    let text = error_text(&result);
+    assert!(
+        text.contains("1002") && text.contains("compositor"),
+        "a valid workspace id must pass parameter validation: {text}"
+    );
+
+    // 省略 operation 返回策略真值（反证：只认键缺失时，投射层物化的 null 会报 -32602）。
+    let result = mcp.call_tool("security_check", json!({})).await;
+    assert!(
+        result.get("isError") != Some(&json!(true)),
+        "security_check without operation must return the policy truth: {result}"
+    );
+    let structured = result.get("structuredContent").expect("structuredContent");
+    assert!(
+        structured.get("check").is_none(),
+        "policy truth must not carry a decision: {structured}"
+    );
+    assert_eq!(structured["default_confirm_level"], json!("L3"));
+    assert_eq!(structured["deny"]["process.kill"], json!(true));
+    assert!(
+        structured["allow"].is_object() && structured["audit_path"].is_string(),
+        "policy truth must carry allow and audit_path: {structured}"
+    );
+
+    // security_check.operation：判定与门禁同源（allow / confirm / deny），
+    // 未登记操作名与坏类型被拒绝。
+    let result = mcp
+        .call_tool("security_check", json!({"operation": "windows.list"}))
+        .await;
+    assert!(
+        result.get("isError") != Some(&json!(true)),
+        "security_check must succeed: {result}"
+    );
+    let structured = result.get("structuredContent").expect("structuredContent");
+    assert_eq!(structured["check"]["decision"], json!("allow"));
+    assert_eq!(structured["check"]["level"], json!("L0"));
+    let text = result["content"][0]["text"].as_str().expect("text content");
+    let reparsed: Value = serde_json::from_str(text).expect("text is JSON");
+    assert_eq!(
+        reparsed, *structured,
+        "security status projection must be verbatim"
+    );
+    let result = mcp
+        .call_tool("security_check", json!({"operation": "mount.mount"}))
+        .await;
+    assert_eq!(
+        result["structuredContent"]["check"]["decision"],
+        json!("confirm"),
+        "L4 operation must require confirmation: {result}"
+    );
+    let result = mcp
+        .call_tool("security_check", json!({"operation": "process.kill"}))
+        .await;
+    assert_eq!(
+        result["structuredContent"]["check"]["decision"],
+        json!("deny"),
+        "deny-listed operation must be denied: {result}"
+    );
+    let result = mcp
+        .call_tool("security_check", json!({"operation": "nope"}))
+        .await;
+    let text = error_text(&result);
+    assert!(
+        text.contains("-32602") && text.contains("unknown operation: nope"),
+        "unknown operation must be rejected: {text}"
+    );
+
+    // screenshot.target：选择器与其它入参自洽校验；合法选择器放行到捕获通道。
+    let result = mcp
+        .call_tool("screenshot", json!({"target": "window"}))
+        .await;
+    let text = error_text(&result);
+    assert!(
+        text.contains("requires `window`"),
+        "target=window without window must be rejected: {text}"
+    );
+    let result = mcp
+        .call_tool(
+            "screenshot",
+            json!({"target": "screen", "area": [0, 0, 10, 10]}),
+        )
+        .await;
+    let text = error_text(&result);
+    assert!(
+        text.contains("takes neither"),
+        "target=screen with area must be rejected: {text}"
+    );
+    let result = mcp
+        .call_tool("screenshot", json!({"target": "screen"}))
+        .await;
+    let text = error_text(&result);
+    assert!(
+        text.contains("1002") && text.contains("capture unavailable"),
+        "target=screen must reach screenshot.capture: {text}"
     );
 
     // 错误投影：项目错误码与消息保留，不降级为成功。
