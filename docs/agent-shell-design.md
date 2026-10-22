@@ -3254,92 +3254,11 @@ agent-shell --socket <path> <command>        # 直连已运行的 daemon 端点
                                              # （AGENT_SHELL_SOCKET 等价；默认自动拉起瞬态 daemon）
 ```
 
-### 17.3 MCP 服务器（工具定义）
+### 17.3 MCP 服务器（工具面投影）
 
-```rust
-// mcp/src/server.rs
-
-router.register(Tool::new("list_windows")
-    .description("列出所有窗口，含 app_id/title/pid/geometry/workspace")
-    .input_schema(json!({
-        "type": "object",
-        "properties": {
-            "app_id": {"type": "string"},
-            "workspace": {"type": "integer"}
-        }
-    }))
-    .handler(|params| async move {
-        let filter = params.app_id.as_deref();
-        let windows = backend.list_windows().await?;
-        Ok(json!(windows.into_iter()
-            .filter(|w| filter.map_or(true, |f| w.app_id == f))
-            .collect::<Vec<_>>()))
-    }));
-
-router.register(Tool::new("focus_window")
-    .description("聚焦窗口：支持 app_id/title/pid 定位")
-    .input_schema(json!({
-        "type": "object",
-        "properties": {
-            "app_id": {"type": "string"}, "title": {"type": "string"},
-            "pid": {"type": "integer"}, "window_id": {"type": "string"}
-        }
-    })));
-
-router.register(Tool::new("click_element")
-    .description("语义化点击元素：按无障碍角色+名称，优先 AT-SPI，降级坐标")
-    .input_schema(json!({
-        "type": "object",
-        "properties": {
-            "role": {"type": "string", "enum": ["button","menu_item","checkbox"]},
-            "name": {"type": "string"},
-            "window": {"type": "string"},
-            "fallback_coordinate": {"type": "array", "items": {"type": "number"}}
-        }
-    })));
-
-router.register(Tool::new("screenshot")
-    .description("截图：全屏/窗口/区域，返回文件路径")
-    .input_schema(json!({
-        "type": "object",
-        "properties": {
-            "target": {"type": "string", "enum": ["screen","window","area"]},
-            "window": {"type": "string"},
-            "area": {"type": "array", "items": {"type": "integer"}, "minItems": 4, "maxItems": 4}
-        }
-    })));
-
-router.register(Tool::new("wait_for_window")
-    .description("等待窗口出现，带超时")
-    .input_schema(json!({
-        "type": "object",
-        "properties": {
-            "app_id": {"type": "string"},
-            "timeout": {"type": "string", "description": "人类可读超时时长（如 10s/500ms/2m/1h），与 CLI --timeout 对齐；与 timeout_ms 二选一"},
-            "timeout_ms": {"type": "integer", "minimum": 0, "default": 15000, "description": "超时毫秒（默认 15000）；已被 timeout 取代，保留兼容"}
-        },
-        "required": ["app_id"]
-    })));
-
-router.register(Tool::new("get_a11y_tree")
-    .description("获取指定窗口的无障碍树（JSON）")
-    .input_schema(json!({
-        "type": "object",
-        "properties": {
-            "window": {"type": "string"},
-            "depth": {"type": "integer", "default": 5}
-        }
-    })));
-
-router.register(Tool::new("subscribe_events")
-    .description("订阅桌面事件：window_opened/focused/closed, workspace_changed")
-    .input_schema(json!({
-        "type": "object",
-        "properties": {
-            "events": {"type": "array", "items": {"type": "string"}}
-        }
-    })));
-```
+MCP 工具面是同一方法面在 MCP 协议上的投影：只约束规则与不变量，不冻结具体工具名
+与入参 schema（设计仓 `docs/02-contracts.md` C-013）。工具注册表以
+`mcp/src/server.rs` 为唯一来源；本节不再复述工具清单，避免副本随实现漂移。
 
 ### 17.4 SDK 编程接口（已并入 shell + rpc）
 
@@ -3375,7 +3294,7 @@ impl AgentShell {
 ```
 ✓ Agent 形态    : CLI ✓, MCP ✓, JSON-RPC ✓, D-Bus ✓, shell ✓
 ✓ CLI 命令集     : 21 commands (window/workspace/monitor/system/agent)
-✓ MCP 工具集     : 18 tools registered (list_windows, focus, move, ...)
+✓ MCP 工具集     : 18 tools registered
 ✓ shell 绑定     : rust ✓（无独立 SDK crate，已并入 shell + rpc）
 ```
 
@@ -4676,20 +4595,9 @@ agent-shell theme set dark
 
 ### 21.11 MCP 工具扩展
 
-```rust
-// 新增工具
-Tool::new("apply_display_layout").description("设置屏幕布局: 分辨率、位置、缩放、主屏").input_schema(...);
-Tool::new("set_volume").description("设置系统音量 0-100").input_schema(...);
-Tool::new("wifi_scan_connect").description("扫描并连接 WiFi").input_schema(...);
-Tool::new("launch_app").description("启动应用 (桌面文件/命令/URI)").input_schema(...);
-Tool::new("send_notification").description("发送桌面通知").input_schema(...);
-Tool::new("get_battery").description("获取电池状态").input_schema(...);
-Tool::new("lock_screen").description("锁屏").input_schema(...);
-Tool::new("clipboard_read").description("读取剪贴板").input_schema(...);
-Tool::new("clipboard_write").description("写入剪贴板").input_schema(...);
-Tool::new("set_wallpaper").description("设置壁纸").input_schema(...);
-Tool::new("set_color_scheme").description("切换深色/浅色模式").input_schema(...);
-```
+MCP 工具面见 §17.3：工具名与入参 schema 由实现决定，以
+`mcp/src/server.rs` 的注册表为唯一来源，本节不再复述清单（设计仓
+`docs/02-contracts.md` C-013）。
 
 ### 21.12 项目结构扩展
 
@@ -5188,21 +5096,9 @@ agent-shell kill 1234 [--signal 9]
 
 ### 21.19 MCP 工具扩展
 
-```rust
-// 新增工具
-Tool::new("systemd_list_units").description("列出 systemd 单元").input_schema(...);
-Tool::new("systemd_start_unit").description("启动 systemd 服务").input_schema(...);
-Tool::new("systemd_stop_unit").description("停止 systemd 服务").input_schema(...);
-Tool::new("systemd_enable_unit").description("启用 systemd 服务（开机自启）").input_schema(...);
-Tool::new("journal_query").description("查询系统日志").input_schema(...);
-Tool::new("journal_follow").description("实时跟踪日志").input_schema(/* streaming SSE */);
-Tool::new("dbus_list_services").description("列出 D-Bus 服务").input_schema(...);
-Tool::new("dbus_introspect").description("内省 D-Bus 对象").input_schema(...);
-Tool::new("system_info").description("获取系统信息（主机名/内核/OS）").input_schema(...);
-Tool::new("disk_usage").description("磁盘用量").input_schema(...);
-Tool::new("list_processes").description("列出进程").input_schema(...);
-Tool::new("kill_process").description("发送信号给进程").input_schema(...);
-```
+MCP 工具面见 §17.3：工具名与入参 schema 由实现决定，以
+`mcp/src/server.rs` 的注册表为唯一来源，本节不再复述清单（设计仓
+`docs/02-contracts.md` C-013）。
 
 ### 21.20 项目结构扩展
 
@@ -6121,26 +6017,9 @@ agent-shell timer next backup.timer
 `BackendUnavailable`（文案含逐段根因）；后端在位但执行失败 → `BackendError`。
 `shortcut.bind` 在 KGlobalAccel 回读不到目标键码时同样报错，不谎报成功。
 
-**MCP 新增工具**：
-```rust
-Tool::new("security_check").description("检查某操作是否被授权").input_schema(...);
-Tool::new("daemon_status").description("daemon 状态和 portal session").input_schema(...);
-Tool::new("ime_set_engine").description("切换输入法引擎").input_schema(...);
-Tool::new("ime_type").description("通过输入法输入文本（支持非 ASCII）").input_schema(...);
-Tool::new("set_brightness").description("设置屏幕亮度 0-100").input_schema(...);
-Tool::new("file_picker").description("打开文件选择器并返回路径").input_schema(...);
-Tool::new("file_trash").description("移动文件到回收站").input_schema(...);
-Tool::new("default_app_get").description("查询默认应用").input_schema(...);
-Tool::new("default_app_set").description("设置默认应用").input_schema(...);
-Tool::new("bluetooth_scan").description("扫描蓝牙设备").input_schema(...);
-Tool::new("bluetooth_connect").description("连接蓝牙设备").input_schema(...);
-Tool::new("flatpak_list").description("列出 Flatpak 应用").input_schema(...);
-Tool::new("touchpad_set").description("开关触控板/设置自然滚动").input_schema(...);
-Tool::new("keyboard_layout_set").description("设置键盘布局").input_schema(...);
-Tool::new("secret_set").description("存储密钥").input_schema(...);
-Tool::new("secret_get").description("读取密钥").input_schema(...);
-Tool::new("list_timers").description("列出 systemd timer").input_schema(...);
-```
+**MCP 工具面**：工具名与入参 schema 由实现决定，以 `mcp/src/server.rs` 的
+注册表为唯一来源，本节不再复述清单（设计仓 `docs/02-contracts.md` C-013；
+见 §17.3）。
 
 ### 21.36 版本兼容矩阵（2026-08-21 实测）
 
