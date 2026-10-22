@@ -11,6 +11,20 @@
 //! 会话隔离与并发约束见 [`headless_session`]：一个测试目标内保持单个
 //! `#[tokio::test]`。
 
+pub mod a11y;
+pub mod bus;
+pub mod compositor;
+pub mod events;
+pub mod input;
+pub mod portal;
+
+pub use a11y::{element, FakeA11y};
+pub use bus::PrivateBus;
+pub use compositor::{window, workspace, FakeCompositor, FakeDesktop};
+pub use events::RecordingRawSource;
+pub use input::{RecordedOp, RecordingInput, SetupBehaviour};
+pub use portal::{PortalBehaviour, ScreenshotMock};
+
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -128,6 +142,73 @@ impl Fixture {
     /// 当前输入链的 active 后端名（判定「能力缺口不得摘除候选」用）。
     pub fn input_backend_name(&self) -> Option<&'static str> {
         self.daemon.input.as_ref().and_then(|i| i.backend_name())
+    }
+
+    /// 当前输入链的候选后端名（链序即生产选择顺序）。
+    pub fn input_chain_names(&self) -> Vec<&'static str> {
+        self.daemon
+            .input
+            .as_ref()
+            .map(|i| i.dispatcher().backend_names())
+            .unwrap_or_default()
+    }
+
+    /// 让输入组件缺席并给出装配根因（doctor/input.send 的错误透出面）。
+    pub fn set_input_unavailable(&mut self, reason: Option<&str>) {
+        self.daemon.input = None;
+        self.daemon.input_error = reason.map(str::to_string);
+    }
+
+    /// 注入验收夹具合成器；后续窗口、工作区与 doctor 语义走真实 dispatch。
+    #[cfg(debug_assertions)]
+    pub fn install_compositor(&mut self, compositor: &FakeCompositor, de_type: DesktopEnvironment) {
+        self.daemon.install_acceptance_compositor(
+            std::sync::Arc::new(compositor.clone()),
+            de_type,
+            event::EventSource::KWinWayland,
+        );
+    }
+
+    /// 替换合成器 doctor 子行（懒启动前后装载态的观测点）。
+    #[cfg(debug_assertions)]
+    pub fn set_compositor_doctor_lines(&self, lines: Vec<String>) {
+        self.daemon.set_acceptance_doctor_lines(lines);
+    }
+
+    /// 设定首次订阅交付的原始事件源（订阅装配的观测点）。
+    #[cfg(debug_assertions)]
+    pub fn set_compositor_raw_source(&self, source: Option<Box<dyn event::RawSource>>) {
+        self.daemon.set_acceptance_raw_source(source);
+    }
+
+    /// 事件管线状态：`(是否已装配, 原始源被取走次数)`。
+    #[cfg(debug_assertions)]
+    pub fn pipeline_state(&self) -> (bool, usize) {
+        (
+            self.daemon.acceptance_event_pipeline_started(),
+            self.daemon.acceptance_raw_source_taken(),
+        )
+    }
+
+    /// 注入无障碍夹具。
+    pub fn set_a11y(&mut self, a11y: FakeA11y) {
+        self.daemon.a11y = Some(std::sync::Arc::new(a11y));
+    }
+
+    /// 移除无障碍组件（判定不可达分支）。
+    pub fn clear_a11y(&mut self) {
+        self.daemon.a11y = None;
+    }
+
+    /// 裸 daemon 的只读/可变借用：验收用例按需注入其余组件（亮度、MIME、
+    /// 外设、快捷键、rootd 连接器）——这些字段都是公开装配面。
+    pub fn daemon(&self) -> &Daemon {
+        &self.daemon
+    }
+
+    /// 见 [`Self::daemon`]。
+    pub fn daemon_mut(&mut self) -> &mut Daemon {
+        &mut self.daemon
     }
 
     /// 发一条 JSON-RPC 请求（真实 `dispatch` 入口）。
@@ -391,4 +472,27 @@ fn headless_session() -> TempDir {
     std::env::set_var("XDG_CONFIG_HOME", root.path().join("config"));
     std::env::set_var("XDG_STATE_HOME", root.path().join("state"));
     root
+}
+
+/// 4×3 RGB 样例 PNG（非全黑）：供 portal 夹具产出可被捕获链校验的截图。
+///
+/// 字节内置而非运行时编码：验收夹具不引入图像编码依赖，产物确定。
+pub fn sample_png() -> Vec<u8> {
+    vec![
+        137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 4, 0, 0, 0, 3, 8, 2,
+        0, 0, 0, 59, 150, 57, 145, 0, 0, 0, 48, 73, 68, 65, 84, 120, 218, 99, 224, 18, 145, 115,
+        19, 113, 107, 18, 201, 219, 39, 50, 141, 129, 43, 197, 205, 45, 37, 175, 41, 101, 218, 190,
+        148, 125, 12, 92, 91, 242, 220, 182, 76, 107, 218, 178, 111, 223, 150, 103, 0, 234, 15, 15,
+        121, 53, 212, 26, 182, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96, 130,
+    ]
+}
+
+/// 全黑 PNG（1×1）：验证捕获链拒绝全黑产物。
+pub fn black_png() -> Vec<u8> {
+    // 1×1 RGB(0,0,0)，PNG 编码固定。
+    vec![
+        137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0, 1, 8, 2,
+        0, 0, 0, 144, 119, 83, 222, 0, 0, 0, 12, 73, 68, 65, 84, 120, 218, 99, 104, 96, 96, 0, 0,
+        0, 4, 0, 1, 155, 200, 195, 167, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96, 130,
+    ]
 }

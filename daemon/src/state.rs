@@ -19,12 +19,31 @@ use agent_shell_core::types::{WindowInfo, WorkspaceInfo};
 use agent_shell_power::{BrightnessController, BrightnessOps};
 use event::{EventHub, EventRing};
 use std::time::{Duration, Instant};
+/// 验收夹具合成器：以 trait 对象替换真实桌面通道。
+///
+/// 只在 debug 构建编译。无图形 CI 无法连接 KWin/DDE/Mutter，
+/// 验收用例用它让窗口、工作区与 doctor 语义走真实 `dispatch` 与状态缓存路径，
+/// 而不是退化成只能断言「后端不可用」。
+#[cfg(debug_assertions)]
+struct AcceptanceCompositor {
+    component: std::sync::Arc<dyn CompositorComponent>,
+    de_type: agent_shell_core::types::DesktopEnvironment,
+    event_source: event::EventSource,
+    doctor_lines: std::sync::Mutex<Vec<String>>,
+    /// 事件管线装配源；None = 无原生流（查询差分兜底）。
+    raw_source: std::sync::Mutex<Option<Box<dyn event::RawSource>>>,
+    /// 原始事件源被管线取走的次数（订阅装配的观测点）。
+    raw_source_taken: std::sync::atomic::AtomicUsize,
+}
+
 /// daemon 持有的合成器后端。KDE 会话装 KWin，DDE 会话装 DdeCompositor，
 /// GNOME 会话装 MutterCompositor（D-Bus Eval/Extension 双路径）。
 enum CompositorBackend {
     Kwin(Box<KWinCompositor>),
     Dde(DdeCompositor),
     Mutter(Box<MutterCompositor>),
+    #[cfg(debug_assertions)]
+    Acceptance(AcceptanceCompositor),
 }
 
 /// 原始事件源装配结果（区分「就绪 / 无原生流 / 失败」三态）。
@@ -43,6 +62,8 @@ impl CompositorBackend {
             Self::Kwin(c) => c.as_ref(),
             Self::Dde(c) => c,
             Self::Mutter(c) => c.as_ref(),
+            #[cfg(debug_assertions)]
+            Self::Acceptance(c) => c.component.as_ref(),
         }
     }
 
@@ -52,6 +73,8 @@ impl CompositorBackend {
             Self::Kwin(_) => "kwin-compositor",
             Self::Dde(c) => c.name(),
             Self::Mutter(c) => c.name(),
+            #[cfg(debug_assertions)]
+            Self::Acceptance(_) => "acceptance-compositor",
         }
     }
 
@@ -106,6 +129,8 @@ impl CompositorBackend {
             },
             Self::Dde(c) => dde_event_source(c.compositor.kind()),
             Self::Mutter(c) => mutter_event_source(c.path_kind()),
+            #[cfg(debug_assertions)]
+            Self::Acceptance(c) => c.event_source.clone(),
         }
     }
 
@@ -116,6 +141,12 @@ impl CompositorBackend {
             Self::Kwin(c) => c.doctor_lines_async().await,
             Self::Dde(c) => c.doctor_lines_async().await,
             Self::Mutter(c) => c.doctor_lines_async().await,
+            #[cfg(debug_assertions)]
+            Self::Acceptance(c) => c
+                .doctor_lines
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .clone(),
         }
     }
 
@@ -127,6 +158,8 @@ impl CompositorBackend {
             Self::Kwin(_) => agent_shell_core::types::DesktopEnvironment::KDE,
             Self::Dde(c) => dde_de_type(c.compositor.kind()),
             Self::Mutter(_) => agent_shell_core::types::DesktopEnvironment::GNOME,
+            #[cfg(debug_assertions)]
+            Self::Acceptance(c) => c.de_type,
         }
     }
 
@@ -142,6 +175,20 @@ impl CompositorBackend {
                 Err(e) => RawSourceOutcome::Failed(e.to_string()),
             },
             Self::Dde(_) | Self::Mutter(_) => RawSourceOutcome::Unavailable,
+            #[cfg(debug_assertions)]
+            Self::Acceptance(c) => match c
+                .raw_source
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .take()
+            {
+                Some(source) => {
+                    c.raw_source_taken
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    RawSourceOutcome::Ready(source)
+                }
+                None => RawSourceOutcome::Unavailable,
+            },
         }
     }
 }
@@ -725,6 +772,68 @@ impl Daemon {
     pub(crate) fn with_compositor_none(mut self) -> Self {
         self.compositor = None;
         self
+    }
+
+    /// 验收夹具：以给定组件充当会话合成器。
+    ///
+    /// 只在 debug 构建编译；无图形 CI 无法建立真实桌面连接，
+    /// 验收用例据此让窗口、工作区、doctor 与事件订阅走生产状态机。
+    /// release 生产构建（`debug_assertions=false`）不含该路径。
+    #[cfg(debug_assertions)]
+    pub fn install_acceptance_compositor(
+        &mut self,
+        component: std::sync::Arc<dyn CompositorComponent>,
+        de_type: agent_shell_core::types::DesktopEnvironment,
+        event_source: event::EventSource,
+    ) {
+        self.compositor = Some(std::sync::Arc::new(CompositorBackend::Acceptance(
+            AcceptanceCompositor {
+                component,
+                de_type,
+                event_source,
+                doctor_lines: std::sync::Mutex::new(Vec::new()),
+                raw_source: std::sync::Mutex::new(None),
+                raw_source_taken: std::sync::atomic::AtomicUsize::new(0),
+            },
+        )));
+        self.cache.clear();
+        self.cached_at = None;
+    }
+
+    /// 验收夹具：事件管线是否已由首次订阅装配。
+    ///
+    /// 只在 debug 构建存在。装配标志是生产状态机的一部分；验收据此断言
+    /// 「订阅前未装配、订阅后已装配、再次订阅不重复装配」。
+    #[cfg(debug_assertions)]
+    pub fn acceptance_event_pipeline_started(&self) -> bool {
+        self.event_pipeline_started
+    }
+
+    /// 验收夹具：原始事件源被管线取走的次数。
+    #[cfg(debug_assertions)]
+    pub fn acceptance_raw_source_taken(&self) -> usize {
+        match self.compositor.as_deref() {
+            Some(CompositorBackend::Acceptance(c)) => {
+                c.raw_source_taken.load(std::sync::atomic::Ordering::SeqCst)
+            }
+            _ => 0,
+        }
+    }
+
+    /// 验收夹具：替换合成器的 doctor 子行（模拟懒启动前后装载态变化）。
+    #[cfg(debug_assertions)]
+    pub fn set_acceptance_doctor_lines(&self, lines: Vec<String>) {
+        if let Some(CompositorBackend::Acceptance(c)) = self.compositor.as_deref() {
+            *c.doctor_lines.lock().unwrap_or_else(|p| p.into_inner()) = lines;
+        }
+    }
+
+    /// 验收夹具：设定首次订阅时交付的原始事件源（None 保持差分兜底）。
+    #[cfg(debug_assertions)]
+    pub fn set_acceptance_raw_source(&self, source: Option<Box<dyn event::RawSource>>) {
+        if let Some(CompositorBackend::Acceptance(c)) = self.compositor.as_deref() {
+            *c.raw_source.lock().unwrap_or_else(|p| p.into_inner()) = source;
+        }
     }
 }
 

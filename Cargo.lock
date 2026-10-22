@@ -24,17 +24,29 @@ dependencies = [
 name = "agent-shell-acceptance"
 version = "0.1.0"
 dependencies = [
+ "agent-shell-a11y",
+ "agent-shell-bluetooth",
+ "agent-shell-capture",
  "agent-shell-core",
  "agent-shell-daemon",
  "agent-shell-event",
  "agent-shell-input",
+ "agent-shell-mime",
+ "agent-shell-peripherals",
+ "agent-shell-power",
+ "agent-shell-rootd",
  "agent-shell-rpc",
+ "agent-shell-shortcut",
+ "agent-shell-software",
+ "agent-shell-systemd",
  "async-trait",
+ "futures",
  "libc",
  "serde_json",
  "tempfile",
  "tokio",
  "zbus",
+ "zvariant",
 ]
 
 [[package]]
