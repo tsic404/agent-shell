@@ -117,6 +117,8 @@ impl Mcp {
             .env("XDG_STATE_HOME", sandbox.join("state"))
             .env("XDG_RUNTIME_DIR", sandbox.join("run"))
             .env("XDG_SESSION_TYPE", "tty")
+            // PATH 置空：隐去宿主 ydotool/xdotool，让「输入链为空」是前提而非宿主巧合。
+            .env("PATH", "")
             .env_remove("DISPLAY")
             .env_remove("WAYLAND_DISPLAY")
             .env_remove("WAYLAND_SOCKET")
@@ -379,8 +381,8 @@ async fn mcp_projection_preserves_tools_errors_and_receipts() {
         text.contains("AT-SPI unavailable"),
         "click_element must locate through a11y.query: {text}"
     );
-    // fallback_coordinate：无障碍不可达时改走坐标点击——错误来源不再是 a11y
-    // （输入后端也可能不可用，故只断言不再报 a11y 错误）。
+    // fallback_coordinate：无障碍不可达时改走坐标点击——必须落到输入后端：
+    // 报输入侧的 1002 与输入链失败文案，错误不来自 a11y（a11y 不可达同为 1002）。
     let result = mcp
         .call_tool(
             "click_element",
@@ -388,8 +390,16 @@ async fn mcp_projection_preserves_tools_errors_and_receipts() {
         )
         .await;
     let text = error_text(&result);
+    // 输入链的两种宿主态都必须被认作输入侧失败：空链（无候选）与有候选但
+    // 缺绝对坐标能力（如宿主 /dev/uinput 可写、沙箱无桌面几何）。
+    let input_failure = text.contains("input unavailable in this session")
+        || text.contains("input: no backend in this session can perform");
     assert!(
-        !text.contains("AT-SPI unavailable"),
+        text.contains("1002") && input_failure,
+        "fallback_coordinate must reach the input backend and keep its error code: {text}"
+    );
+    assert!(
+        !text.to_lowercase().contains("a11y") && !text.contains("AT-SPI"),
         "fallback_coordinate must bypass the a11y failure: {text}"
     );
 
