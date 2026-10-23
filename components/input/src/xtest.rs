@@ -430,16 +430,20 @@ mod tests {
     /// CI 的 Xvfb 步骤以本变量声明「`$DISPLAY` 必为带 XTEST 扩展的 X server」。
     const LIVE_X11_ENV: &str = "AGENT_SHELL_LIVE_X11";
 
+    /// CI 的不广告 XTEST 步骤以本变量声明「`$DISPLAY` 可连接但不广告 XTEST」。
+    const NO_XTEST_ENV: &str = "AGENT_SHELL_X11_NO_XTEST";
+
     /// 构造门控必须与服务端 XTEST 扩展广告一致（§12.1 X11 行、C-054）。
     ///
     /// 无 `DISPLAY`：断言可归因的构造失败（默认 CI 的 headless 面）。
-    /// 有 `DISPLAY`：独立连接读取扩展表作对照，断言构造成功 ⇔ 服务端广告
-    /// XTEST。默认 CI 的 Xvfb 步骤置位 `AGENT_SHELL_LIVE_X11` 并运行本目标：
-    /// 该面要求连接成功、扩展存在且构造成功，正例断言因此实际执行，而不是
-    /// 以 ignore 标记记账。
+    /// 有 `DISPLAY`：独立连接读扩展表作对照，断言构造成功 ⇔ 服务端广告
+    /// XTEST。Xvfb 面（置位 `AGENT_SHELL_LIVE_X11`）要求广告且构造成功；
+    /// 不广告 XTEST 面（置位 `AGENT_SHELL_X11_NO_XTEST`）要求不广告且构造以
+    /// `BackendUnavailable` 失败——跳过探测（可用恒真）只在该面暴露。
     #[tokio::test]
     async fn construction_gate_matches_server_xtest_advertisement() {
         let live_required = std::env::var_os(LIVE_X11_ENV).is_some();
+        let no_xtest_required = std::env::var_os(NO_XTEST_ENV).is_some();
         if std::env::var_os("DISPLAY").is_none() {
             let Err(err) = XTestInput::new() else {
                 panic!("connect(None) must fail without DISPLAY");
@@ -451,6 +455,10 @@ mod tests {
             assert!(
                 !live_required,
                 "{LIVE_X11_ENV} 已置位但 DISPLAY 未设置：Xvfb 夹具未生效"
+            );
+            assert!(
+                !no_xtest_required,
+                "{NO_XTEST_ENV} 已置位但 DISPLAY 未设置：不广告 XTEST 的夹具未生效"
             );
             return;
         }
@@ -470,6 +478,10 @@ mod tests {
                     !live_required,
                     "{LIVE_X11_ENV} 已置位但 DISPLAY 不可连接：{e:?}"
                 );
+                assert!(
+                    !no_xtest_required,
+                    "{NO_XTEST_ENV} 已置位但 DISPLAY 不可连接：{e:?}"
+                );
                 return;
             }
         };
@@ -479,6 +491,12 @@ mod tests {
             .is_some();
         if live_required {
             assert!(advertised, "Xvfb 夹具必须广告 XTEST 扩展");
+        }
+        if no_xtest_required {
+            assert!(
+                !advertised,
+                "{NO_XTEST_ENV} 已置位但服务端仍广告 XTEST：不广告 XTEST 的夹具未生效"
+            );
         }
         match XTestInput::new() {
             Ok(xt) => {

@@ -77,6 +77,18 @@ jobs:
           sudo apt-get install -y xvfb xauth
           AGENT_SHELL_LIVE_X11=1 xvfb-run -a cargo test -p agent-shell-input --lib
 
+      - name: Test (Rust, X11 fixture without XTEST)
+        if: matrix.profile == 'default'
+        # 「构造成功 ⇔ 服务端广告 XTEST」只有两侧都被观测到才有判别力：上一步
+        # 只有广告面，跳过扩展探测（可用恒真）的实现在该面同样成功。本步骤用
+        # -extension XTEST 去掉扩展、保留可连接套接字，AGENT_SHELL_X11_NO_XTEST
+        # 让用例断言该面前提（可达且不广告）与构造以 BackendUnavailable 失败。
+        run: |
+          sudo apt-get install -y xvfb xauth
+          AGENT_SHELL_X11_NO_XTEST=1 xvfb-run -a \
+            -s "-screen 0 1280x1024x24 -extension XTEST" \
+            cargo test -p agent-shell-input --lib
+
       - name: Build (Rust)
         if: matrix.profile == 'default'
         run: cargo build --release
