@@ -2,7 +2,7 @@
 //!
 //! - 场景：完整报告、顶层行顺序、无废弃标签、缺失行的显式状态
 //! - 判据：行名与顺序正确、无废弃标签、完整环境零退出；缺失行有明确状态
-//!   说明而非静默省略
+//!   与括注原因而非静默省略
 //! - 执行：`cargo test -p agent-shell-acceptance --test TC-doctor-01`
 //!
 //! 判定面是真实 `doctor.run`。完整环境由夹具建立：私有 session bus 上的
@@ -32,6 +32,20 @@ fn top_level_label(line: &str) -> Option<&'static str> {
 
 fn doctor_of(value: Value) -> DoctorResult {
     serde_json::from_value(value).expect("DoctorResult deserializes")
+}
+
+/// 行内全角括注（`（…）`）的内容；无括注或括注为空返回 `None`。
+///
+/// 根因自身也可能带括注（如夹具注入的隔离说明），故取首个开括号到最后一个
+/// 闭括号的内容——只有外层括注才是原因呈递位。
+fn annotation(line: &str) -> Option<&str> {
+    let start = line.find('（')? + '（'.len_utf8();
+    let close = line.rfind('）')?;
+    if close <= start {
+        return None;
+    }
+    let text = line.get(start..close)?.trim();
+    (!text.is_empty()).then_some(text)
 }
 
 #[tokio::test]
@@ -87,10 +101,9 @@ async fn health_report_has_fixed_top_level_order_and_explicit_statuses() {
 
     // 不可用环境：每一行仍有显式状态，不静默省略。
     // 摘除装配结果，使 daemon 状态等同整链探测失败——只隐 PATH 覆盖不到不经 PATH 解析的 /dev/uinput。
+    const INPUT_REASON: &str = "输入面被夹具隔离（PATH 置空，/dev/uinput 不参与装配）";
     let mut unavailable = Fixture::start_with_env(&[("PATH", String::new())]).await;
-    unavailable.set_input_unavailable(Some(
-        "输入面被夹具隔离（PATH 置空，/dev/uinput 不参与装配）",
-    ));
+    unavailable.set_input_unavailable(Some(INPUT_REASON));
     let report = doctor_of(unavailable.call_ok(method::DOCTOR, None).await);
     let labels: Vec<&str> = report
         .lines
@@ -108,21 +121,45 @@ async fn health_report_has_fixed_top_level_order_and_explicit_statuses() {
         "unavailable environment must report unhealthy; got:\n{}",
         report.lines.join("\n")
     );
-    for label in ["合成器", "截图捕获", "输入后端"] {
-        let line = report
+    let row_of = |label: &'static str| {
+        report
             .lines
             .iter()
             .find(|line| top_level_label(line) == Some(label))
-            .unwrap_or_else(|| panic!("missing {label} row"));
+            .unwrap_or_else(|| panic!("missing {label} row"))
+    };
+    for label in ["合成器", "截图捕获", "输入后端"] {
+        let line = row_of(label);
         assert!(
             line.starts_with('✗'),
             "{label} row must carry an explicit unavailable status: {line}"
         );
+        // 标签后的分隔符与说明都必须在场：只留状态词等于静默省略原因。
+        let status = line
+            .split_once(':')
+            .unwrap_or_else(|| {
+                panic!("{label} row must keep the `<label>: <status>` shape: {line}")
+            })
+            .1;
         assert!(
-            line.len() > format!("✗ {label}").len() + 3,
-            "{label} row must give a reason, got: {line}"
+            !status.trim().is_empty(),
+            "{label} row must state a reason after the label, got: {line}"
         );
     }
+    // 截图与输入行以全角括注呈递原因，括注为空即根因被摘掉。合成器行在
+    // 生产侧是固定状态短句（文案由 TC-doctor-08 锚定），故不在此列。
+    for label in ["截图捕获", "输入后端"] {
+        assert!(
+            annotation(row_of(label)).is_some(),
+            "{label} row must carry a non-empty parenthesized reason, got: {}",
+            row_of(label)
+        );
+    }
+    assert_eq!(
+        annotation(row_of("输入后端")),
+        Some(INPUT_REASON),
+        "input row must surface the assembly root cause inside the annotation"
+    );
     // 废弃标签不得出现（C-020）。
     for legacy in ["主后端", "事件流"] {
         assert!(
