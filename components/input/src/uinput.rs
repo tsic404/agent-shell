@@ -221,10 +221,52 @@ fn valid(desktop: Option<Rect>) -> Option<Rect> {
     desktop.filter(|d| d.width > 0 && d.height > 0)
 }
 
+/// `/dev/uinput` 写入句柄边界。
+///
+/// 生产路径直写设备节点；测试替身只替换内核 ioctl/写入，几何与能力判定仍走
+/// 生产代码——建链期语义因此能在没有 `/dev/uinput` 的环境（CI 常态）实际执行
+/// 断言，而不是以零断言的提前返回记账。
+enum Device {
+    /// 已打开的 `/dev/uinput` 写句柄。
+    Uinput(std::fs::File),
+    /// 测试替身：登记与写入立即成功，不触碰内核。
+    #[cfg(test)]
+    Detached,
+}
+
+impl Device {
+    /// 注册虚拟设备（ioctl 位设置 + legacy setup write + UI_DEV_CREATE）。
+    fn register(&self) -> std::io::Result<()> {
+        match self {
+            Self::Uinput(file) => register_device(file),
+            #[cfg(test)]
+            Self::Detached => Ok(()),
+        }
+    }
+
+    /// 写一条 `input_event`（不含 SYN）。
+    fn write(&self, type_: u16, code: u16, value: i32) -> std::io::Result<()> {
+        match self {
+            Self::Uinput(file) => write_event(file, type_, code, value),
+            #[cfg(test)]
+            Self::Detached => Ok(()),
+        }
+    }
+
+    /// 帧尾 `SYN_REPORT`。
+    fn sync(&self) -> std::io::Result<()> {
+        match self {
+            Self::Uinput(file) => sync(file),
+            #[cfg(test)]
+            Self::Detached => Ok(()),
+        }
+    }
+}
+
 /// uinput 直写注入后端。
 pub struct UinputInput {
-    /// 已打开的 `/dev/uinput` 写句柄（构造时探测可写性）。
-    file: std::fs::File,
+    /// 设备写入边界（生产为 `/dev/uinput`，构造时探测可写性）。
+    device: Device,
     /// 桌面逻辑几何；`None` 时绝对坐标无法换算成设备轴值。
     /// `Arc` 供重取经 `spawn_blocking` 移入阻塞线程（[`DesktopGeometry::refresh_blocking`]）。
     geometry: std::sync::Arc<DesktopGeometry>,
@@ -262,7 +304,7 @@ impl UinputInput {
     }
 
     fn open(geometry: DesktopGeometry) -> Result<Self> {
-        let file = open_uinput().map_err(|e| {
+        let device = open_uinput().map_err(|e| {
             // 按 errno 区分诊断：节点缺失（ENOENT/ENODEV）与权限不足（EACCES/EPERM）
             // 是两种不同的环境故障，混用「not writable」会误导排障。
             let reason = match e.raw_os_error() {
@@ -274,12 +316,39 @@ impl UinputInput {
             };
             AgentShellError::BackendUnavailable(reason)
         })?;
-        Ok(Self {
-            file,
+        Ok(Self::assemble(Device::Uinput(device), geometry))
+    }
+
+    /// 生产句柄与测试替身共用的装配路径。
+    fn assemble(device: Device, geometry: DesktopGeometry) -> Self {
+        Self {
+            device,
             geometry: std::sync::Arc::new(geometry),
             created: Mutex::new(false),
             inject_lock: Mutex::new(()),
-        })
+        }
+    }
+
+    /// 测试用：设备替身 + 常规几何来源构造，建链期语义不依赖 `/dev/uinput`。
+    #[cfg(test)]
+    fn detached(source: DesktopGeometrySource) -> Self {
+        Self::assemble(Device::Detached, DesktopGeometry::refreshed(source))
+    }
+
+    /// 测试用：设备替身 + 定值几何（无重取来源），即 `with_desktop(None)` 的装配形态。
+    #[cfg(test)]
+    fn detached_fixed(desktop: Option<Rect>) -> Self {
+        Self::assemble(Device::Detached, DesktopGeometry::fixed(desktop))
+    }
+
+    /// 写一条 `input_event`（不含 SYN）；失败按注入期错误归因。
+    fn emit(&self, type_: u16, code: u16, value: i32) -> Result<()> {
+        self.device.write(type_, code, value).map_err(input_err)
+    }
+
+    /// 帧尾 `SYN_REPORT`。
+    fn sync(&self) -> Result<()> {
+        self.device.sync().map_err(input_err)
     }
 
     /// 首次注入时注册虚拟设备（ioctl 位设置 + UI_DEV_CREATE），跨调用复用。
@@ -288,7 +357,7 @@ impl UinputInput {
         if *created {
             return Ok(());
         }
-        register_device(&self.file).map_err(|e| {
+        self.device.register().map_err(|e| {
             AgentShellError::BackendUnavailable(format!("uinput device setup failed: {e}"))
         })?;
         // UI_DEV_CREATE 返回只代表内核已注册设备：合成器的 libinput 尚未打开新的
@@ -489,12 +558,12 @@ impl InputService for UinputInput {
         // press 阶段统一置 1，逆序释放置 0（临时 shift 在其实体键后弹起）。
         let order = combo_to_press_sequence(combo).map_err(AgentShellError::Input)?;
         for (code, _) in &order {
-            write_event(&self.file, EV_KEY, *code as u16, 1).map_err(input_err)?;
-            sync(&self.file).map_err(input_err)?;
+            self.emit(EV_KEY, *code as u16, 1)?;
+            self.sync()?;
         }
         for (code, _) in order.iter().rev() {
-            write_event(&self.file, EV_KEY, *code as u16, 0).map_err(input_err)?;
-            sync(&self.file).map_err(input_err)?;
+            self.emit(EV_KEY, *code as u16, 0)?;
+            self.sync()?;
         }
         Ok(())
     }
@@ -507,16 +576,16 @@ impl InputService for UinputInput {
             let (code, shift) = char_to_evdev(c)
                 .ok_or_else(|| AgentShellError::Input(format!("cannot type character {c:?}")))?;
             if shift {
-                write_event(&self.file, EV_KEY, KEY_LEFTSHIFT, 1).map_err(input_err)?;
-                sync(&self.file).map_err(input_err)?;
+                self.emit(EV_KEY, KEY_LEFTSHIFT, 1)?;
+                self.sync()?;
             }
-            write_event(&self.file, EV_KEY, code as u16, 1).map_err(input_err)?;
-            sync(&self.file).map_err(input_err)?;
-            write_event(&self.file, EV_KEY, code as u16, 0).map_err(input_err)?;
-            sync(&self.file).map_err(input_err)?;
+            self.emit(EV_KEY, code as u16, 1)?;
+            self.sync()?;
+            self.emit(EV_KEY, code as u16, 0)?;
+            self.sync()?;
             if shift {
-                write_event(&self.file, EV_KEY, KEY_LEFTSHIFT, 0).map_err(input_err)?;
-                sync(&self.file).map_err(input_err)?;
+                self.emit(EV_KEY, KEY_LEFTSHIFT, 0)?;
+                self.sync()?;
             }
             if delay_ms > 0 {
                 tokio::time::sleep(std::time::Duration::from_millis(u64::from(delay_ms))).await;
@@ -536,9 +605,9 @@ impl InputService for UinputInput {
         self.ensure_created().await?;
         let dev_x = pixel_to_abs(x, desktop.x, desktop.width);
         let dev_y = pixel_to_abs(y, desktop.y, desktop.height);
-        write_event(&self.file, EV_ABS, ABS_X, dev_x).map_err(input_err)?;
-        write_event(&self.file, EV_ABS, ABS_Y, dev_y).map_err(input_err)?;
-        sync(&self.file).map_err(input_err)?;
+        self.emit(EV_ABS, ABS_X, dev_x)?;
+        self.emit(EV_ABS, ABS_Y, dev_y)?;
+        self.sync()?;
         Ok(())
     }
 
@@ -546,10 +615,10 @@ impl InputService for UinputInput {
         let _guard = self.inject_lock.lock().await;
         self.ensure_created().await?;
         let code = evdev_mouse_button(button) as u16;
-        write_event(&self.file, EV_KEY, code, 1).map_err(input_err)?;
-        sync(&self.file).map_err(input_err)?;
-        write_event(&self.file, EV_KEY, code, 0).map_err(input_err)?;
-        sync(&self.file).map_err(input_err)?;
+        self.emit(EV_KEY, code, 1)?;
+        self.sync()?;
+        self.emit(EV_KEY, code, 0)?;
+        self.sync()?;
         Ok(())
     }
 
@@ -558,13 +627,13 @@ impl InputService for UinputInput {
         self.ensure_created().await?;
         if dy != 0 {
             // 契约 dy>0=向下；evdev REL_WHEEL 正值=向上（=X11 button 4），故取反。
-            write_event(&self.file, EV_REL, REL_WHEEL, rel_wheel_value(dy)).map_err(input_err)?;
-            sync(&self.file).map_err(input_err)?;
+            self.emit(EV_REL, REL_WHEEL, rel_wheel_value(dy))?;
+            self.sync()?;
         }
         if dx != 0 {
             // REL_HWHEEL 正值=向右，与契约 dx>0=向右一致，原样写入。
-            write_event(&self.file, EV_REL, REL_HWHEEL, dx).map_err(input_err)?;
-            sync(&self.file).map_err(input_err)?;
+            self.emit(EV_REL, REL_HWHEEL, dx)?;
+            self.sync()?;
         }
         Ok(())
     }
@@ -740,30 +809,45 @@ mod tests {
 
     #[tokio::test]
     async fn geometry_source_refreshes_before_move_injection() {
-        // /dev/uinput 不可用（CI/无 uinput 内核）时跳过，不误报失败。
-        let input =
-            match UinputInput::with_geometry_source(std::sync::Arc::new(|| Some(rect(1920, 1080))))
-            {
-                Ok(i) => i,
-                Err(e) => {
-                    eprintln!("skip: {e}");
-                    return;
-                }
-            };
+        use std::sync::atomic::{AtomicI32, Ordering};
+        // 设备替身：几何与能力判定走生产代码，内核 ioctl/写入被替换——本用例在
+        // 没有 /dev/uinput 的环境（CI 常态）也实际执行全部断言，不提前返回。
+        let width = std::sync::Arc::new(AtomicI32::new(1920));
+        let source = {
+            let width = std::sync::Arc::clone(&width);
+            std::sync::Arc::new(move || Some(rect(width.load(Ordering::SeqCst), 1080)))
+        };
+        let input = UinputInput::detached(source);
+        assert_eq!(
+            input.geometry.get().map(|d| d.width),
+            Some(1920),
+            "装配期首探"
+        );
+        // 装配后显示布局变化：按过期包围盒换算会把 --at 点到用户未指定的位置。
+        width.store(2560, Ordering::SeqCst);
         input
             .ensure_ready(Op::Move(100, 100))
             .await
             .expect("重取成功即建链就绪");
-        assert_eq!(input.geometry.get().map(|d| d.width), Some(1920));
+        assert_eq!(
+            input.geometry.get().map(|d| d.width),
+            Some(2560),
+            "移动注入前必须重取几何"
+        );
+        // 非移动操作不触发重取：几何变化不影响键盘/点击建链。
+        width.store(1280, Ordering::SeqCst);
+        input
+            .ensure_ready(Op::Click(MouseButton::Left))
+            .await
+            .expect("非移动操作不依赖几何");
+        assert_eq!(
+            input.geometry.get().map(|d| d.width),
+            Some(2560),
+            "非移动操作不得触发重取"
+        );
 
         // 重取失败在建链期确认：能力缺口（不摘除候选、不按过期几何注入）。
-        let gone = match UinputInput::with_geometry_source(std::sync::Arc::new(|| None)) {
-            Ok(i) => i,
-            Err(e) => {
-                eprintln!("skip: {e}");
-                return;
-            }
-        };
+        let gone = UinputInput::detached(std::sync::Arc::new(|| None));
         assert!(
             matches!(
                 gone.ensure_ready(Op::Move(100, 100)).await,
@@ -776,8 +860,28 @@ mod tests {
             "有重取来源时不得提前宣告缺口"
         );
         assert!(
-            !gone.supports(Op::Click(MouseButton::Left)),
-            "其它操作与几何无关"
+            gone.supports(Op::Click(MouseButton::Left)),
+            "非移动操作与几何无关"
+        );
+    }
+
+    #[test]
+    fn supports_gates_move_without_refreshable_geometry() {
+        // 定值形态无重取来源：`detached` 替身的 `refreshable()` 恒 true，覆盖不到这条分支。
+        let absent = UinputInput::detached_fixed(None);
+        assert!(
+            !absent.supports(Op::Move(100, 100)),
+            "无几何且不可重取时移动必须报能力缺口"
+        );
+        assert!(
+            absent.supports(Op::Click(MouseButton::Left)),
+            "非移动操作与几何无关"
+        );
+
+        let present = UinputInput::detached_fixed(Some(rect(1920, 1080)));
+        assert!(
+            present.supports(Op::Move(100, 100)),
+            "定值几何存在时移动可注入"
         );
     }
 
@@ -827,11 +931,16 @@ mod tests {
     async fn device_creation_succeeds_with_writable_uinput() {
         // 构造路径端到端回归：legacy write(struct uinput_user_dev) → UI_DEV_CREATE。
         // 缺 write 时内核 uinput_create_device 恒 -EINVAL（QA 已复现的真实缺陷）。
-        // `/dev/uinput` 不可用（CI/无 uinput 内核）时跳过，不误报失败。
+        // 两种环境各断言一条真实分支：可写时跑内核登记路径；不可写（CI 常态）时
+        // 断言候选摘除所依赖的可归因失败，不以零断言的提前返回记账。
         let input = match UinputInput::new() {
             Ok(i) => i,
             Err(e) => {
-                eprintln!("skip: {e}");
+                assert!(
+                    matches!(e, AgentShellError::BackendUnavailable(_)),
+                    "设备节点缺失或不可写必须报后端不可用: {e:?}"
+                );
+                eprintln!("device registration not executed (no writable /dev/uinput): {e}");
                 return;
             }
         };
