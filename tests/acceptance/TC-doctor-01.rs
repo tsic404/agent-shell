@@ -7,7 +7,8 @@
 //!
 //! 判定面是真实 `doctor.run`。完整环境由夹具建立：私有 session bus 上的
 //! Screenshot portal（截图行就绪）+ 脚本化合成器（合成器行）+ 记录型输入链
-//! （输入行就绪）；不可用环境是同一夹具的 headless 形态。
+//! （输入行就绪）；不可用环境是同一夹具的 headless 形态，输入组件按装配失败摘除
+//! （只隐 PATH 覆盖不到不经 PATH 解析的 `/dev/uinput`）。
 
 use acceptance::portal::serve_screenshot_portal;
 use acceptance::{sample_png, FakeCompositor, Fixture, PrivateBus, RecordingInput, ScreenshotMock};
@@ -85,7 +86,11 @@ async fn health_report_has_fixed_top_level_order_and_explicit_statuses() {
     );
 
     // 不可用环境：每一行仍有显式状态，不静默省略。
-    let mut unavailable = Fixture::start().await;
+    // 摘除装配结果，使 daemon 状态等同整链探测失败——只隐 PATH 覆盖不到不经 PATH 解析的 /dev/uinput。
+    let mut unavailable = Fixture::start_with_env(&[("PATH", String::new())]).await;
+    unavailable.set_input_unavailable(Some(
+        "输入面被夹具隔离（PATH 置空，/dev/uinput 不参与装配）",
+    ));
     let report = doctor_of(unavailable.call_ok(method::DOCTOR, None).await);
     let labels: Vec<&str> = report
         .lines
