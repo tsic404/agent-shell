@@ -35,7 +35,14 @@ impl XTestInput {
     /// 连接 `$DISPLAY` 并探测 XTest 扩展；任一步失败返回 `Err`，
     /// dispatcher 不压入该候选。
     pub fn new() -> Result<Self> {
-        let (conn, screen_index) = RustConnection::connect(None)
+        Self::connect(None)
+    }
+
+    /// 连接指定 display（`None` 取 `$DISPLAY`）并执行同一探测。
+    ///
+    /// 显式 display 参数让测试不依赖宿主环境变量也能走到连接失败分支。
+    fn connect(display: Option<&str>) -> Result<Self> {
+        let (conn, screen_index) = RustConnection::connect(display)
             .map_err(|e| AgentShellError::BackendUnavailable(format!("x11 connect: {e}")))?;
         let setup = conn.setup();
         let screen = setup.roots.get(screen_index).ok_or_else(|| {
@@ -383,6 +390,7 @@ impl InputService for XTestInput {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use x11rb::connection::RequestConnection as _;
 
     #[test]
     fn keycodes_match_pc_at_evdev_plus_8() {
@@ -404,25 +412,83 @@ mod tests {
         assert_eq!(XTestInput::mouse_button(MouseButton::Forward), 9);
     }
 
-    /// 无 DISPLAY 时的构造失败路径：负例断言只在确定无 X server 时运行
-    /// （`DISPLAY` 未设置 ⇒ `RustConnection::connect(None)` 必然失败，
-    /// 断言无条件成立，非环境跳过）；有 X server 的真机由 ignore 测试覆盖
-    /// （`cargo test -- --ignored`）。
-    #[tokio::test]
-    async fn construction_fails_cleanly_without_display() {
-        if std::env::var_os("DISPLAY").is_none() {
-            assert!(
-                XTestInput::new().is_err(),
-                "connect(None) must fail without DISPLAY"
-            );
-        }
+    /// 不可达显示：构造必须返回可归因的 `BackendUnavailable`，不得 panic。
+    ///
+    /// 显式 display 参数让负例与宿主 `$DISPLAY` 无关——headless 与桌面会话
+    /// 得到同一结论，不是「环境缺失时零断言通过」。
+    #[test]
+    fn construction_fails_cleanly_on_unreachable_display() {
+        let Err(err) = XTestInput::connect(Some(":999")) else {
+            panic!("unreachable display must not construct");
+        };
+        assert!(
+            matches!(err, AgentShellError::BackendUnavailable(_)),
+            "got: {err:?}"
+        );
     }
 
-    /// 真机验证：有 X server + XTest 扩展时构造成功（`cargo test -- --ignored`）。
-    #[ignore = "requires a live X11 server with the XTest extension"]
+    /// CI 的 Xvfb 步骤以本变量声明「`$DISPLAY` 必为带 XTEST 扩展的 X server」。
+    const LIVE_X11_ENV: &str = "AGENT_SHELL_LIVE_X11";
+
+    /// 构造门控必须与服务端 XTEST 扩展广告一致（§12.1 X11 行、C-054）。
+    ///
+    /// 无 `DISPLAY`：断言可归因的构造失败（默认 CI 的 headless 面）。
+    /// 有 `DISPLAY`：独立连接读取扩展表作对照，断言构造成功 ⇔ 服务端广告
+    /// XTEST。默认 CI 的 Xvfb 步骤置位 `AGENT_SHELL_LIVE_X11` 并运行本目标：
+    /// 该面要求连接成功、扩展存在且构造成功，正例断言因此实际执行，而不是
+    /// 以 ignore 标记记账。
     #[tokio::test]
-    async fn live_xtest_constructs_and_probes() {
-        let xt = XTestInput::new().expect("XTestInput should construct on live X11");
-        assert!(xt.is_available().await);
+    async fn construction_gate_matches_server_xtest_advertisement() {
+        let live_required = std::env::var_os(LIVE_X11_ENV).is_some();
+        if std::env::var_os("DISPLAY").is_none() {
+            let Err(err) = XTestInput::new() else {
+                panic!("connect(None) must fail without DISPLAY");
+            };
+            assert!(
+                matches!(err, AgentShellError::BackendUnavailable(_)),
+                "got: {err:?}"
+            );
+            assert!(
+                !live_required,
+                "{LIVE_X11_ENV} 已置位但 DISPLAY 未设置：Xvfb 夹具未生效"
+            );
+            return;
+        }
+
+        let conn = match RustConnection::connect(None) {
+            Ok((conn, _)) => conn,
+            Err(e) => {
+                // `$DISPLAY` 指向不可达套接字：构造同样必须失败且可归因。
+                let Err(err) = XTestInput::new() else {
+                    panic!("unreachable DISPLAY must not construct");
+                };
+                assert!(
+                    matches!(err, AgentShellError::BackendUnavailable(_)),
+                    "got: {err:?}"
+                );
+                assert!(
+                    !live_required,
+                    "{LIVE_X11_ENV} 已置位但 DISPLAY 不可连接：{e:?}"
+                );
+                return;
+            }
+        };
+        let advertised = conn
+            .extension_information(x11rb::protocol::xtest::X11_EXTENSION_NAME)
+            .expect("查询扩展表需要可用连接")
+            .is_some();
+        if live_required {
+            assert!(advertised, "Xvfb 夹具必须广告 XTEST 扩展");
+        }
+        match XTestInput::new() {
+            Ok(xt) => {
+                assert!(advertised, "构造成功但服务端未广告 XTEST 扩展");
+                assert!(xt.is_available().await, "构造成功后 is_available 必须为真");
+            }
+            Err(AgentShellError::BackendUnavailable(_)) => {
+                assert!(!advertised, "服务端广告 XTEST 时构造不得报告不可用");
+            }
+            Err(other) => panic!("构造失败必须可归因（BackendUnavailable），got: {other:?}"),
+        }
     }
 }
