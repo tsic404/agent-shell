@@ -16,6 +16,7 @@ pub mod bus;
 pub mod compositor;
 pub mod events;
 pub mod input;
+pub mod journey;
 pub mod portal;
 
 pub use a11y::{element, FakeA11y};
