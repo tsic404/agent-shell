@@ -65,6 +65,18 @@ jobs:
           cargo build -p agent-shell-daemon --bin agent-shell-daemon
           cargo test --all-targets
 
+      - name: Test (Rust, X11 backend fixture)
+        if: matrix.profile == 'default'
+        # XTest 是原生 X11 通道（C-054）：headless runner 没有 X server，活 X11
+        # 断言只有靠 Xvfb 才实际执行。上面的 --all-targets 步骤覆盖无 DISPLAY
+        # 面的构造失败分支；本步骤用同一 lib 目标连上带 XTEST 扩展的真实 X
+        # server，覆盖构造与探测成功分支。AGENT_SHELL_LIVE_X11 让用例把该面
+        # 的正例断言设为强制（连接/扩展/构造任一失败即判失败）。两次运行的结果
+        # 行均为零忽略。
+        run: |
+          sudo apt-get install -y xvfb xauth
+          AGENT_SHELL_LIVE_X11=1 xvfb-run -a cargo test -p agent-shell-input --lib
+
       - name: Build (Rust)
         if: matrix.profile == 'default'
         run: cargo build --release
