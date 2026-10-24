@@ -19,8 +19,8 @@
           pipewire
           systemdMinimal
           pkg-config
-          # extension.js 的 GJS 语法校验（doCheck 跑 `gjs --check-syntax`）
-          gjs
+          # extension.js 语法校验（doCheck 用 node 纯解析；gjs 无 --check-syntax）
+          nodejs
         ];
 
         # agent-shell workspace 根

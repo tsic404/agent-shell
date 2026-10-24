@@ -55,6 +55,9 @@ jobs:
 
       - name: Test (Rust)
         if: matrix.profile == 'default'
+        env:
+          # JS 语法校验不得静默跳过：runner 自带 node，置位后没有可用校验器即失败。
+          AGENT_SHELL_REQUIRE_JS_SYNTAX_CHECK: 1
         # --all-targets：把 examples 的 #[test]（如 area_smoke 的 smoke_verdict
         # 纯函数单测）纳入门禁——裸 cargo test 只编译 examples、不运行其测试。
         #
