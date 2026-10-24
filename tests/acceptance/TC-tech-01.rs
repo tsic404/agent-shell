@@ -14,19 +14,10 @@
 //! 环境变量是进程级状态（夹具的 `headless_session`），本目标保持单个
 //! `#[tokio::test]`。
 
+use acceptance::apparatus::TC_TECH_TARGETS;
 use acceptance::workspace_root;
 use serde_json::Value;
 use std::process::Command;
-
-/// 设计仓用例标识（TC-tech 家族逐个核对的名单）。
-const TC_TECH_TARGETS: &[&str] = &[
-    "TC-tech-01",
-    "TC-tech-02",
-    "TC-tech-03",
-    "TC-tech-04",
-    "TC-tech-05",
-    "TC-tech-06",
-];
 
 /// 默认构建的元数据（`--no-deps`：目标集合与依赖图无关，只读本工作区事实）。
 fn default_metadata() -> Value {
