@@ -316,6 +316,8 @@ fn empty_focus_placeholder() -> agent_shell_core::types::WindowInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsString;
+    use std::path::Path;
 
     #[test]
     fn extension_js_registers_declared_interface() {
@@ -395,25 +397,264 @@ mod tests {
         )));
     }
 
+    /// 选项清单是否声明 `--check-syntax`。
+    ///
+    /// 只认以该参数开头的清单行：gjs 对未知参数打印的
+    /// `gjs: unrecognized option '--check-syntax'` 含同一字符串，不能当作支持证据。
+    fn help_advertises_check_syntax(stdout: &[u8], stderr: &[u8]) -> bool {
+        let lists_option = |raw: &[u8]| {
+            String::from_utf8_lossy(raw)
+                .lines()
+                .any(|line| line.trim_start().starts_with("--check-syntax"))
+        };
+        lists_option(stdout) || lists_option(stderr)
+    }
+
+    /// 要求开关：置位后没有可用校验器即失败，避免 CI 静默失去校验。
+    const JS_SYNTAX_REQUIRE_ENV: &str = "AGENT_SHELL_REQUIRE_JS_SYNTAX_CHECK";
+
+    /// gjs 是否支持 `--check-syntax`：以 `--help` 的选项清单为准。
+    fn gjs_supports_check_syntax(gjs_bin: &Path) -> bool {
+        match std::process::Command::new(gjs_bin).arg("--help").output() {
+            Ok(out) => help_advertises_check_syntax(&out.stdout, &out.stderr),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+            Err(e) => panic!("failed to run gjs --help: {e}"),
+        }
+    }
+
+    /// `node --check --input-type=module` 纯解析：`None` 表示 node 不可用。
+    ///
+    /// 源码走 stdin + `--input-type=module`，不受扩展名与旧版本模块自动探测影响；
+    /// `--check` 只解析不执行，extension.js 的 GNOME 导入无需可解析。
+    fn node_check_module_source(node_bin: &Path, source: &str) -> Option<Result<(), String>> {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+
+        let mut child = match Command::new(node_bin)
+            .args(["--input-type=module", "--check"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+            Err(e) => panic!("failed to run node --check: {e}"),
+        };
+        // 写入失败不单独报错：node 拒绝该命令行时由退出码与 stderr 说明原因。
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = stdin.write_all(source.as_bytes());
+        }
+        let out = child.wait_with_output().expect("wait for node --check");
+        Some(if out.status.success() {
+            Ok(())
+        } else {
+            Err(String::from_utf8_lossy(&out.stderr).into_owned())
+        })
+    }
+
+    /// node 能否执行上面的调用：用最小合法 ESM 实测。
+    ///
+    /// 旧版 node 不认 `--input-type`、PATH 上的 `node` 是别的程序时命令行会被拒；
+    /// 先探测才能把这类失败归为「工具不支持」，而不是脚本语法错误。
+    fn node_can_check_module_syntax(node_bin: &Path) -> bool {
+        matches!(
+            node_check_module_source(node_bin, "export const syntaxCheckSupported = true;\n"),
+            Some(Ok(()))
+        )
+    }
+
+    /// JS 语法校验结论：通过 / 脚本真错 / 没有可用校验器。
+    enum JsSyntaxVerdict {
+        Passed,
+        Rejected(String),
+        Unavailable(String),
+    }
+
+    /// 按 gjs → node 的顺序取第一个可用校验器；两个都不可用时返回原因而非通过。
+    fn extension_js_syntax_verdict(
+        js_path: &Path,
+        gjs_bin: &Path,
+        node_bin: &Path,
+    ) -> JsSyntaxVerdict {
+        if gjs_supports_check_syntax(gjs_bin) {
+            let out = std::process::Command::new(gjs_bin)
+                .args(["-m", "--check-syntax"])
+                .arg(js_path)
+                .output()
+                .expect("failed to run gjs --check-syntax");
+            return if out.status.success() {
+                JsSyntaxVerdict::Passed
+            } else {
+                JsSyntaxVerdict::Rejected(String::from_utf8_lossy(&out.stderr).into_owned())
+            };
+        }
+        if !node_can_check_module_syntax(node_bin) {
+            return JsSyntaxVerdict::Unavailable(
+                "gjs lacks --check-syntax and node cannot run --check --input-type=module".into(),
+            );
+        }
+        let source = std::fs::read_to_string(js_path).expect("read extension.js");
+        match node_check_module_source(node_bin, &source) {
+            Some(Ok(())) => JsSyntaxVerdict::Passed,
+            Some(Err(detail)) if detail.contains("SyntaxError") => {
+                JsSyntaxVerdict::Rejected(detail)
+            }
+            Some(Err(detail)) => JsSyntaxVerdict::Unavailable(format!(
+                "node rejected the check invocation:\n{detail}"
+            )),
+            None => JsSyntaxVerdict::Unavailable("node vanished after its capability probe".into()),
+        }
+    }
+
+    /// 裁决 + 要求开关 → 用例结果：通过 Ok，脚本错 Err，跳过由开关决定。
+    fn run_js_syntax_check(
+        js_path: &Path,
+        gjs_bin: &Path,
+        node_bin: &Path,
+        require: Option<OsString>,
+    ) -> Result<(), String> {
+        match extension_js_syntax_verdict(js_path, gjs_bin, node_bin) {
+            JsSyntaxVerdict::Passed => Ok(()),
+            JsSyntaxVerdict::Rejected(detail) => {
+                Err(format!("extension.js fails the JS syntax check:\n{detail}"))
+            }
+            JsSyntaxVerdict::Unavailable(reason) if require.is_some() => Err(format!(
+                "{JS_SYNTAX_REQUIRE_ENV} is set but no JS syntax checker is usable: {reason}"
+            )),
+            JsSyntaxVerdict::Unavailable(reason) => {
+                eprintln!("skipping JS syntax check: {reason}");
+                Ok(())
+            }
+        }
+    }
+
+    /// 判别力守护：只有选项清单声明了 `--check-syntax` 才算支持；未知参数报错里的
+    /// 同一字符串不构成支持证据。
+    #[test]
+    fn help_advertises_check_syntax_only_from_option_listing() {
+        let listing = b"Application Options:\n  -m, --module   Load as a module\n  --check-syntax Parse without executing\n";
+        let without = b"Application Options:\n  -m, --module   Load as a module\n  --version      Print version\n";
+        assert!(help_advertises_check_syntax(listing, b""));
+        assert!(help_advertises_check_syntax(b"", listing));
+        assert!(!help_advertises_check_syntax(without, b""));
+        assert!(!help_advertises_check_syntax(
+            b"",
+            b"gjs: unrecognized option '--check-syntax'\n"
+        ));
+    }
+
+    /// 支持 `--check-syntax` 的 gjs 替身：按夹具内容给出通过/语法错误。
+    const GJS_CHECKING_SH: &str = r#"#!/bin/sh
+for arg in "$@"; do
+  if [ "$arg" = "--help" ]; then
+    printf 'Application Options:\n  --check-syntax  Parse without executing\n'
+    exit 0
+  fi
+done
+for arg in "$@"; do last="$arg"; done
+if grep -qF 'function {' "$last"; then
+  echo "SyntaxError: Unexpected token '{'" >&2
+  exit 1
+fi
+exit 0
+"#;
+
+    /// 不支持 `--check-syntax` 的 gjs 替身：清单不含该参数，未知参数零退出。
+    const GJS_UNSUPPORTED_SH: &str = r#"#!/bin/sh
+for arg in "$@"; do
+  if [ "$arg" = "--help" ]; then
+    printf 'Application Options:\n  -m, --module  Load as a module\n'
+    exit 0
+  fi
+done
+echo "gjs: unrecognized option '--check-syntax'" >&2
+exit 1
+"#;
+
+    /// 写入可执行的替身程序。
+    fn write_executable(path: &Path, body: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::write(path, body).expect("write stub program");
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod stub program");
+    }
+
+    /// 两路校验都必须真的解析脚本：注入 `function {` 的夹具裁决为 Rejected，
+    /// 合法夹具通过；gjs 与 node 两条路径都覆盖，不依赖 PATH 上的真实工具。
+    #[test]
+    fn injected_syntax_error_is_rejected_on_both_checker_paths() {
+        let dir = std::env::temp_dir().join(format!(
+            "agent-shell-js-syntax-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock after epoch")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("create fixture dir");
+        let good = dir.join("good.js");
+        let bad = dir.join("bad.js");
+        std::fs::write(&good, "export const ok = true;\n").expect("write good fixture");
+        std::fs::write(&bad, "export const ok = true;\nfunction {\n").expect("write bad fixture");
+        let gjs_checking = dir.join("gjs-checking");
+        let gjs_plain = dir.join("gjs-no-check-syntax");
+        write_executable(&gjs_checking, GJS_CHECKING_SH);
+        write_executable(&gjs_plain, GJS_UNSUPPORTED_SH);
+        let no_node = dir.join("node-missing");
+
+        // gjs 路径：它确证支持该参数时，由它的退出码裁决脚本。
+        assert!(matches!(
+            extension_js_syntax_verdict(&good, &gjs_checking, &no_node),
+            JsSyntaxVerdict::Passed
+        ));
+        assert!(matches!(
+            extension_js_syntax_verdict(&bad, &gjs_checking, &no_node),
+            JsSyntaxVerdict::Rejected(_)
+        ));
+        // Rejected 优先于跳过语义：即使未置位要求开关也必须失败。
+        assert!(run_js_syntax_check(&bad, &gjs_checking, &no_node, None).is_err());
+
+        // node 路径：gjs 不支持该参数时，兜底必须真的解析而不是静默通过。
+        let node = Path::new("node");
+        if node_can_check_module_syntax(node) {
+            assert!(matches!(
+                extension_js_syntax_verdict(&good, &gjs_plain, node),
+                JsSyntaxVerdict::Passed
+            ));
+            assert!(matches!(
+                extension_js_syntax_verdict(&bad, &gjs_plain, node),
+                JsSyntaxVerdict::Rejected(_)
+            ));
+            assert!(run_js_syntax_check(&bad, &gjs_plain, node, None).is_err());
+        } else {
+            eprintln!("node unavailable; skipping node-path assertions");
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 闸门守护：无可用校验器时，置位要求变量必须失败，未置位才按跳过。
+    #[test]
+    fn missing_checker_fails_only_when_required() {
+        let js = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/src/extension.js"));
+        let missing = Path::new("/nonexistent/agent-shell-js-syntax-checker");
+        let err = run_js_syntax_check(js, missing, missing, Some(OsString::from("1")))
+            .expect_err("REQUIRE set must fail without a usable checker");
+        assert!(err.contains(JS_SYNTAX_REQUIRE_ENV), "got: {err}");
+        assert!(run_js_syntax_check(js, missing, missing, None).is_ok());
+    }
+
     #[test]
     fn extension_js_passes_gjs_syntax_check() {
-        // 🟡 审查建议：核心 D-Bus 行为仅靠 contains() 字符串断言，抓不住 GJS
-        // 语法/运行期类型错误。gjs 可用时跑 --check-syntax（-m ESM 模式）真校验；
-        // gjs 不可用（本地/无 GNOME CI）时跳过——Nix doCheck 注入 gjs 后生效。
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/src/extension.js");
-        let output = std::process::Command::new("gjs")
-            .args(["-m", "--check-syntax", path])
-            .output();
-        match output {
-            Ok(out) => assert!(
-                out.status.success(),
-                "gjs --check-syntax failed:\n{}",
-                String::from_utf8_lossy(&out.stderr)
-            ),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                eprintln!("gjs not found; skipping GJS syntax check");
-            }
-            Err(e) => panic!("failed to run gjs --check-syntax: {e}"),
+        // 核心 D-Bus 行为仅靠 contains() 字符串断言，抓不住 JS 语法/类型错误。
+        // gjs 有 --check-syntax 时以它为准；发布版 gjs 都没有该选项，此时退到
+        // node 的纯解析。跳过不等于通过：CI 置位要求变量后没有校验器即失败。
+        let path = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/src/extension.js"));
+        let require = std::env::var_os(JS_SYNTAX_REQUIRE_ENV);
+        if let Err(message) =
+            run_js_syntax_check(path, Path::new("gjs"), Path::new("node"), require)
+        {
+            panic!("{message}");
         }
     }
 
