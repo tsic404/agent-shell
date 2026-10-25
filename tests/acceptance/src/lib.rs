@@ -12,6 +12,7 @@
 //! `#[tokio::test]`。
 
 pub mod a11y;
+pub mod apparatus;
 pub mod bus;
 pub mod compositor;
 pub mod events;
