@@ -95,6 +95,11 @@ pub enum Evidence {
     BuildMetadata(String),
     /// 测试目标运行日志（目标名 + 日志全文）。
     RunLog { target: String, text: String },
+    /// 取证目标家族（名单声明 + 用例目标全集）。
+    TargetFamily {
+        declared: Vec<String>,
+        discovered: Vec<String>,
+    },
 }
 
 /// 判定函数：给定取证事实，决定一项契约义务是否成立。
@@ -343,6 +348,98 @@ fn control_skip_markers(judge: &Judge) -> Result<(), String> {
 /// 以给定行构造单行测试源，验证标记的行首形态。
 fn source_with(line: &str) -> Evidence {
     Evidence::TestSource(format!("fn one() -> u8 {{ 1 }}\n{line}\n"))
+}
+
+// ── TC-tech-02：取证目标家族 ──
+
+/// 判定：取证目标名单等于家族全集（TC-tech-02）。
+///
+/// 名单是单点收敛：删去任一成员，该目标退出其余判据的取证范围，逐项判据却
+/// 全部通过。家族全集来自环节内的用例目标本身，名单与它不一致即判不完整。
+pub fn judge_target_family(evidence: &Evidence) -> Verdict {
+    let Evidence::TargetFamily {
+        declared,
+        discovered,
+    } = evidence
+    else {
+        return Verdict::Fail("取证事实不是取证目标家族".into());
+    };
+    let mut declared_sorted = declared.clone();
+    declared_sorted.sort();
+    let mut discovered_sorted = discovered.clone();
+    discovered_sorted.sort();
+    if declared_sorted == discovered_sorted {
+        return Verdict::Pass;
+    }
+    let missing: Vec<&str> = discovered_sorted
+        .iter()
+        .map(String::as_str)
+        .filter(|case| !declared_sorted.iter().any(|entry| entry.as_str() == *case))
+        .collect();
+    let extra: Vec<&str> = declared_sorted
+        .iter()
+        .map(String::as_str)
+        .filter(|case| {
+            !discovered_sorted
+                .iter()
+                .any(|entry| entry.as_str() == *case)
+        })
+        .collect();
+    if missing.is_empty() && extra.is_empty() {
+        return Verdict::Fail(format!("取证目标名单含重复成员：{declared:?}"));
+    }
+    Verdict::Fail(format!(
+        "取证目标名单与家族全集不一致：缺 {missing:?}，多 {extra:?}"
+    ))
+}
+
+/// 反证：名单缺成员、含家族外成员与完全一致三种事实必须按语义判定。
+fn control_target_family(judge: &Judge) -> Result<(), String> {
+    fn family(cases: &[&str]) -> Vec<String> {
+        cases.iter().map(|case| (*case).to_string()).collect()
+    }
+    let all = ["TC-tech-01", "TC-tech-02", "TC-tech-07"];
+    must_pass(
+        judge,
+        Evidence::TargetFamily {
+            declared: family(&all),
+            discovered: family(&all),
+        },
+        "名单与家族全集一致时",
+    )?;
+    must_fail(
+        judge,
+        Evidence::TargetFamily {
+            declared: family(&["TC-tech-01", "TC-tech-02"]),
+            discovered: family(&all),
+        },
+        "名单缺家族成员时",
+    )?;
+    must_fail(
+        judge,
+        Evidence::TargetFamily {
+            declared: family(&["TC-tech-01", "TC-tech-02", "TC-tech-07", "TC-tech-09"]),
+            discovered: family(&all),
+        },
+        "名单含家族外成员时",
+    )?;
+    must_fail(
+        judge,
+        Evidence::TargetFamily {
+            declared: Vec::new(),
+            discovered: family(&all),
+        },
+        "名单为空时",
+    )?;
+    must_fail(
+        judge,
+        Evidence::TargetFamily {
+            declared: family(&["TC-tech-01", "TC-tech-02", "TC-tech-07", "TC-tech-07"]),
+            discovered: family(&all),
+        },
+        "名单含重复成员时",
+    )?;
+    Ok(())
 }
 
 // ── TC-tech-04：根清单排除清单与默认成员集合 ──
@@ -801,6 +898,13 @@ pub const SKIP_MARKERS_BRANCH: Branch = Branch {
     control: control_skip_markers,
 };
 
+/// TC-tech-02 取证目标家族判定分支。
+pub const TARGET_FAMILY_BRANCH: Branch = Branch {
+    id: "TC-tech-02 兜底（名单与家族全集一致即通过）",
+    judge: judge_target_family,
+    control: control_target_family,
+};
+
 /// TC-tech-04 兜底判定分支。
 pub const NO_EXCLUSION_BRANCH: Branch = Branch {
     id: "TC-tech-04 兜底（未列入排除清单即通过）",
@@ -846,6 +950,7 @@ pub const LOG_EVIDENCE_ABSENT_BRANCH: Branch = Branch {
 /// 兜底判定分支：义务成立以「未发现违规」为兜底，折叠为恒定通过即静默失效。
 pub const FALLBACK_BRANCHES: &[Branch] = &[
     SKIP_MARKERS_BRANCH,
+    TARGET_FAMILY_BRANCH,
     NO_EXCLUSION_BRANCH,
     PACKAGE_MANIFEST_BRANCH,
     LOG_EVIDENCE_BRANCH,
