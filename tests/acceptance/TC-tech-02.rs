@@ -2,18 +2,22 @@
 //!
 //! - 场景：测试源不含跳过标记与整文件条件编译豁免
 //! - 判据：测试源无忽略标记、无整文件条件编译豁免；出现任一即判失败；同文件内
-//!   的普通条件断言不在此列
+//!   的普通条件断言不在此列。取证目标名单与用例目标全集不一致即判失败
 //! - 执行：`cargo test -p agent-shell-acceptance --test TC-tech-02`
 //!
 //! 取证对象由包清单的 `[[test]]` 声明与目录遍历**双向核对**得到：清单声明的
 //! 每个目标路径都必须是目录内的源文件，目录内每个 `*.rs`（排除 `src/`）也都
-//! 必须在清单中声明——新增用例目标漏声明或漏扫描都判失败。匹配器与反证入口在
-//! `acceptance::apparatus`（折行属性按括号平衡拼接后判定），与折叠判别力用例
-//! （TC-tech-07）同源。
+//! 必须在清单中声明——新增用例目标漏声明或漏扫描都判失败。名单
+//! （`apparatus::TC_TECH_TARGETS`）另与目录内 `TC-tech-*` 用例目标全集核对：
+//! 删去任一成员即判取证家族不完整，其余目标全部通过也不构成覆盖证据。匹配器
+//! 与反证入口在 `acceptance::apparatus`（折行属性按括号平衡拼接后判定），与
+//! 折叠判别力用例（TC-tech-07）同源。
 //!
 //! 夹具的 `headless_session` 是进程级环境修改，本目标不装配 daemon，无副作用。
 
-use acceptance::apparatus::{self, Evidence, SKIP_MARKERS_BRANCH};
+use acceptance::apparatus::{
+    self, Evidence, SKIP_MARKERS_BRANCH, TARGET_FAMILY_BRANCH, TC_TECH_TARGETS,
+};
 use acceptance::workspace_root;
 use std::path::{Path, PathBuf};
 
@@ -56,10 +60,22 @@ fn directory_sources(dir: &Path) -> Vec<String> {
     names
 }
 
+/// 目录内 `TC-tech-*.rs` 对应的用例标识全集。
+fn tc_tech_family(sources: &[String]) -> Vec<String> {
+    sources
+        .iter()
+        .filter_map(|name| name.strip_suffix(".rs"))
+        .filter(|case| case.starts_with("TC-tech-"))
+        .map(str::to_string)
+        .collect()
+}
+
 #[test]
 fn no_ignore_markers_or_file_level_cfg_in_acceptance_sources() {
-    // 基线反证：合法标记必须被判失败，近似串与注释必须放行。
-    apparatus::assert_baseline(&[SKIP_MARKERS_BRANCH]).unwrap_or_else(|e| panic!("{e}"));
+    // 基线反证：合法标记必须被判失败，近似串与注释必须放行；名单缺成员或含
+    // 家族外成员必须被判失败，完全一致必须放行。
+    apparatus::assert_baseline(&[SKIP_MARKERS_BRANCH, TARGET_FAMILY_BRANCH])
+        .unwrap_or_else(|e| panic!("{e}"));
 
     let dir = workspace_root().join("tests/acceptance");
     let manifest = std::fs::read_to_string(dir.join("Cargo.toml"))
@@ -79,6 +95,17 @@ fn no_ignore_markers_or_file_level_cfg_in_acceptance_sources() {
         !declared.is_empty(),
         "tests/acceptance/Cargo.toml 未声明任何 [[test]] 目标"
     );
+
+    // 取证目标家族不得收窄：名单必须含目录内全部 TC-tech 用例目标。
+    let family: Vec<String> = TC_TECH_TARGETS
+        .iter()
+        .map(|target| (*target).to_string())
+        .collect();
+    apparatus::judge_target_family(&Evidence::TargetFamily {
+        declared: family,
+        discovered: tc_tech_family(&discovered),
+    })
+    .require_pass("TC-tech-02 · 取证目标家族");
 
     for relative in &declared {
         let path: PathBuf = dir.join(relative);
