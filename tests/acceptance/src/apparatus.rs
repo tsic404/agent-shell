@@ -176,6 +176,26 @@ fn must_fail(judge: &Judge, evidence: Evidence, case: &str) -> Result<(), String
     }
 }
 
+/// 断言判定为失败，且失败原因指认被断言的分支（反证的判别力形态）。
+///
+/// 同一判定内多个分支共用「判失败」结局时，只核对失败与否会让兄弟分支的失败
+/// 冒充本分支的判别力；`fragment` 是本分支独有的原因片段，命中即判该失败可归
+/// 到被断言的分支。
+fn must_fail_matching(
+    judge: &Judge,
+    evidence: Evidence,
+    case: &str,
+    fragment: &str,
+) -> Result<(), String> {
+    match judge(&evidence) {
+        Verdict::Fail(reason) if reason.contains(fragment) => Ok(()),
+        Verdict::Fail(reason) => Err(format!(
+            "{case}必须判失败且原因指认该分支（应含 `{fragment}`），实际原因 {reason:?}"
+        )),
+        other => Err(format!("{case}必须判失败，实际为 {other:?}")),
+    }
+}
+
 /// 断言判定为通过（反证的另一侧：判定不得恒失败）。
 fn must_pass(judge: &Judge, evidence: Evidence, case: &str) -> Result<(), String> {
     match judge(&evidence) {
@@ -393,7 +413,8 @@ pub fn judge_target_family(evidence: &Evidence) -> Verdict {
     ))
 }
 
-/// 反证：名单缺成员、含家族外成员与完全一致三种事实必须按语义判定。
+/// 反证：一致必须放行；缺成员、含家族外成员、名单为空与重复成员必须判失败，
+/// 且失败原因指认对应分支。
 fn control_target_family(judge: &Judge) -> Result<(), String> {
     fn family(cases: &[&str]) -> Vec<String> {
         cases.iter().map(|case| (*case).to_string()).collect()
@@ -407,37 +428,41 @@ fn control_target_family(judge: &Judge) -> Result<(), String> {
         },
         "名单与家族全集一致时",
     )?;
-    must_fail(
+    must_fail_matching(
         judge,
         Evidence::TargetFamily {
             declared: family(&["TC-tech-01", "TC-tech-02"]),
             discovered: family(&all),
         },
         "名单缺家族成员时",
+        "缺 [\"TC-tech-07\"]，多 []",
     )?;
-    must_fail(
+    must_fail_matching(
         judge,
         Evidence::TargetFamily {
             declared: family(&["TC-tech-01", "TC-tech-02", "TC-tech-07", "TC-tech-09"]),
             discovered: family(&all),
         },
         "名单含家族外成员时",
+        "缺 []，多 [\"TC-tech-09\"]",
     )?;
-    must_fail(
+    must_fail_matching(
         judge,
         Evidence::TargetFamily {
             declared: Vec::new(),
             discovered: family(&all),
         },
         "名单为空时",
+        "缺 [\"TC-tech-01\", \"TC-tech-02\", \"TC-tech-07\"]，多 []",
     )?;
-    must_fail(
+    must_fail_matching(
         judge,
         Evidence::TargetFamily {
             declared: family(&["TC-tech-01", "TC-tech-02", "TC-tech-07", "TC-tech-07"]),
             discovered: family(&all),
         },
         "名单含重复成员时",
+        "含重复成员",
     )?;
     Ok(())
 }
