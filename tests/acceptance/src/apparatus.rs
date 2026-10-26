@@ -29,6 +29,7 @@ pub const TC_TECH_TARGETS: &[&str] = &[
     "TC-tech-06",
     "TC-tech-07",
     "TC-tech-08",
+    "TC-tech-09",
 ];
 
 /// 判据分支的结局：未通过不等于跳过。
