@@ -1,18 +1,18 @@
 [Unit]
 Description=agent-shell user-session daemon (persistent connections, §22.2 D1)
-# D-Bus session activation：首个需要 daemon 的操作自动拉起。
-# 由 agent-shell-daemon.service（dbus service 文件）按需激活；
-# 本 unit 定义常驻形态与失败重启策略。
+# 图形会话启动后常驻：显式套接字形态监听运行时目录（%t = $XDG_RUNTIME_DIR）。
+# 客户端以 --socket/AGENT_SHELL_SOCKET 指向同一路径接入；未指定端点的 CLI 仍
+# 派生瞬态 stdio 服务，故常驻实例用独立锁命名空间，不占用会话级单实例锁。
 PartOf=graphical-session.target
 After=graphical-session.target
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/agent-shell-daemon --idle-timeout-secs 1800
+ExecStart=/usr/bin/agent-shell-daemon --socket %t/agent-shell.sock --lock-path %t/agent-shell-daemon.lock --idle-timeout-secs 1800
 Restart=on-failure
 RestartSec=2
-# daemon 与 CLI 经 stdio JSON-RPC 互连时由调用方 fork/exec；
-# 常驻形态下 stdin/stdout 不承载协议，日志走 stderr → journal。
+# 显式套接字形态不以 stdin/stdout 承载协议：stdin 不接来源（stdio 形态在此读
+# EOF 即退），日志走 stderr → journal。
 StandardInput=null
 StandardOutput=journal
 StandardError=journal
