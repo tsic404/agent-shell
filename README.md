@@ -34,3 +34,22 @@ portal-screencast 依赖 libspa-sys 0.10.1 的 `_libspa_rs` shim 符号与 relea
 >= 0.3.37 时启用 `portal-screencast`；arm64（company-04 UOS）头版本上报不可靠，
 无视门槛强制 BE。`flake.nix` 不探测 host 头，按 nixpkgs 自带 pipewire 的版本门槛
 判定（nixos-unstable 为 1.x，恒启用 `portal-screencast`）。
+
+## 常驻服务
+
+安装包附带 user 单元 `agent-shell-daemon.service`（`graphical-session.target`），
+以显式套接字形态拉起常驻 daemon：
+
+- 端点：`$XDG_RUNTIME_DIR/agent-shell.sock`——客户端用 `--socket` 或
+  `AGENT_SHELL_SOCKET` 指向它接入常驻实例
+- 单实例锁：`$XDG_RUNTIME_DIR/agent-shell-daemon.lock`——独立命名空间，不占用
+  会话级锁，未指定端点的 CLI 仍可派生瞬态 daemon
+- 空闲 30 分钟无连接即退出（契约行为），`systemctl --user restart
+  agent-shell-daemon` 重新拉起时回收上次残留的端点文件
+- 日志进 journal：`journalctl --user -u agent-shell-daemon`
+
+```sh
+export AGENT_SHELL_SOCKET="${XDG_RUNTIME_DIR}/agent-shell.sock"
+agent-shell daemon status
+systemctl --user status agent-shell-daemon
+```
