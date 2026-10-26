@@ -10,6 +10,7 @@ description = "agent-shell CLI-daemon JSON-RPC 2.0 protocol (§22.2 D1)"
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true
+libc.workspace = true
 
 [dev-dependencies]
 tempfile = "3"

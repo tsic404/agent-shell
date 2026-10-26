@@ -1,11 +1,16 @@
 //! MCP server 实现——18 tools registered via rmcp ServerHandler。
 //!
-//! 工具调用经 stdio JSON-RPC 转发到 agent-shell daemon。daemon 在 MCP server
-//! 构造时 spawn 一次并保持长连接，避免每次调用重新 fork/exec。
+//! 工具调用经 stdio JSON-RPC 转发到 agent-shell daemon。连接选择与命令面同一条
+//! 规则（§22.2 激活策略）：`AGENT_SHELL_SOCKET` 给出显式端点时直连常驻实例，
+//! 否则派生瞬态 daemon；每个 MCP 进程同时只保持一条连接，复用于每次工具调用。
 
 use std::borrow::Cow;
+use std::collections::VecDeque;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
+use agent_shell_rpc::RpcErrorCode;
 use rmcp::model::{
     CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, ListToolsResult,
     PaginatedRequestParams, ServerCapabilities, ServerInfo, Tool,
@@ -14,37 +19,161 @@ use rmcp::service::{serve_server, RequestContext, RoleServer};
 use rmcp::transport::stdio;
 use rmcp::{ErrorData as McpError, ServerHandler};
 use serde_json::{json, Value};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStdin, ChildStdout, Command};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::net::UnixStream;
+use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
 use tracing::{error, info};
 
-/// 持久的 daemon stdio JSON-RPC 连接。spawn 一次，复用于每次工具调用。
+/// 单次请求的上限：端点连接（含对端不响应）与首个应答行各用同一上限。
+///
+/// 连接也受同一上限约束——调用方持着连接锁，端点卡住时不得让后续调用整体无响应。
+const RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// 派生形态保留的 daemon stderr 上限（字节）。进程在应答前退出时，尾部输出
+/// 就是根因（如单实例锁竞争的 `daemon already running`），不得丢弃。
+const STDERR_TAIL_CAP: usize = 64 * 1024;
+
+/// 工具调用的失败来源，决定错误码归属。
+///
+/// 远程方法错误保留 daemon 给出的错误码（C-013 投影不变量）；连接层失败没有
+/// 远程码，按项目段取值——daemon 未运行/派生失败取 1001，已连接却无响应的
+/// 后端失败取 1005。两者都不得退化成裸 `timeout`。
+#[derive(Debug)]
+enum CallError {
+    /// daemon 返回的 JSON-RPC 错误（项目码或规范码）。
+    Rpc { code: i32, message: String },
+    /// 传输不可用（派生/连接失败、进程提前退出、无响应）。
+    Transport { code: i32, message: String },
+    /// 未经远程方法的本地失败（未知工具、入参适配）。
+    Local(String),
+}
+
+impl CallError {
+    fn transport(code: RpcErrorCode, message: impl Into<String>) -> Self {
+        Self::Transport {
+            code: code as i32,
+            message: message.into(),
+        }
+    }
+
+    fn local(message: impl Into<String>) -> Self {
+        Self::Local(message.into())
+    }
+
+    fn is_transport(&self) -> bool {
+        matches!(self, Self::Transport { .. })
+    }
+
+    /// MCP 错误内容行：带码的失败保持 `RPC error <code>: <message>` 形状。
+    fn render(&self) -> String {
+        match self {
+            Self::Rpc { code, message } | Self::Transport { code, message } => {
+                format!("RPC error {code}: {message}")
+            }
+            Self::Local(message) => message.clone(),
+        }
+    }
+}
+
+/// daemon 传输：显式端点上的常驻实例，或派生的瞬态子进程。
 struct DaemonConnection {
+    /// 派生形态的子进程；显式端点形态为 None（daemon 不由本进程拉起）。
     child: Option<Child>,
-    stdin: ChildStdin,
-    reader: BufReader<ChildStdout>,
+    stdin: Box<dyn AsyncWrite + Unpin + Send>,
+    reader: BufReader<Box<dyn AsyncRead + Unpin + Send>>,
+    /// 派生形态的 stderr 尾部；显式端点形态无 stderr 管道。
+    stderr_tail: Option<Arc<Mutex<VecDeque<u8>>>>,
     next_id: u64,
+    /// 诊断用的端点描述：错误信息必须指认本连接连到哪。
+    endpoint: String,
 }
 
 impl DaemonConnection {
-    /// 定位并 spawn `agent-shell-daemon`，返回长连接。
-    fn connect() -> Result<Self, String> {
-        let bin = find_daemon_binary()?;
+    /// 建立连接：显式端点优先，否则派生瞬态 daemon。
+    async fn connect() -> Result<Self, CallError> {
+        match socket_endpoint() {
+            Some(path) => Self::connect_socket(&path).await,
+            None => Self::connect_spawned().await,
+        }
+    }
+
+    /// 直连显式端点。连不上不回退派生：端点由操作方指定，回退会把「常驻实例
+    /// 没起来」伪装成一次成功的临时实例调用。
+    async fn connect_socket(path: &Path) -> Result<Self, CallError> {
+        let unavailable =
+            |detail: String| CallError::transport(RpcErrorCode::DaemonUnavailable, detail);
+        // tokio 的 connect 是「非阻塞 connect + 等可写」：backlog 满或端点进程被
+        // SIGSTOP 时永不就绪。调用方持着连接锁，不设上限就会让此后每次 tools/call
+        // 整体无响应且没有错误行——上限与应答死线同值，超时按 1001 显式失败。
+        let stream = tokio::time::timeout(RESPONSE_TIMEOUT, UnixStream::connect(path))
+            .await
+            .map_err(|_| {
+                unavailable(format!(
+                    "cannot connect to daemon socket {} within {}s (AGENT_SHELL_SOCKET names \
+                     the resident endpoint; drop it to auto-spawn a transient daemon)",
+                    path.display(),
+                    RESPONSE_TIMEOUT.as_secs()
+                ))
+            })?
+            .map_err(|e| {
+                unavailable(format!(
+                    "cannot connect to daemon socket {}: {e} (AGENT_SHELL_SOCKET names the \
+                     resident endpoint; drop it to auto-spawn a transient daemon)",
+                    path.display()
+                ))
+            })?;
+        let peer = stream.peer_cred().map_err(|e| {
+            unavailable(format!(
+                "cannot read peer credentials of {}: {e}",
+                path.display()
+            ))
+        })?;
+        agent_shell_rpc::endpoint::verify_peer_uid(
+            path,
+            peer.uid(),
+            agent_shell_rpc::endpoint::current_uid(),
+        )
+        .map_err(|detail| CallError::transport(RpcErrorCode::DaemonUnavailable, detail))?;
+        let (read, write) = stream.into_split();
+        Ok(Self {
+            child: None,
+            stdin: Box::new(write),
+            reader: BufReader::new(Box::new(read)),
+            stderr_tail: None,
+            next_id: 1,
+            endpoint: format!("socket {}", path.display()),
+        })
+    }
+
+    /// 自动激活：派生瞬态 daemon（stdio 承载 JSON-RPC），stderr 收尾部供诊断。
+    async fn connect_spawned() -> Result<Self, CallError> {
+        let unavailable =
+            |detail: String| CallError::transport(RpcErrorCode::DaemonUnavailable, detail);
+        let bin = find_daemon_binary().map_err(unavailable)?;
         let mut child = Command::new(&bin)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
             .kill_on_drop(true)
             .spawn()
-            .map_err(|e| format!("spawn daemon: {e}"))?;
-        let stdin = child.stdin.take().ok_or("no daemon stdin")?;
-        let stdout = child.stdout.take().ok_or("no daemon stdout")?;
+            .map_err(|e| unavailable(format!("spawn {bin}: {e}")))?;
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| unavailable(format!("{bin} has no stdin")))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| unavailable(format!("{bin} has no stdout")))?;
+        let stderr_tail = child.stderr.take().map(spawn_stderr_drain);
         Ok(Self {
             child: Some(child),
-            stdin,
-            reader: BufReader::new(stdout),
+            stdin: Box::new(stdin),
+            reader: BufReader::new(Box::new(stdout)),
+            stderr_tail,
             next_id: 1,
+            endpoint: format!("spawned {bin}"),
         })
     }
 
@@ -54,59 +183,92 @@ impl DaemonConnection {
     /// 通知（无 `id`）。本方法循环读取并按 `id` 有无区分：通知直接跳过，
     /// 直到拿到匹配本请求 id 的响应——避免后续任何工具调用把通知误解析
     /// 为响应。
-    async fn call(&mut self, method: &str, params: Value) -> Result<Value, String> {
+    async fn call(&mut self, method: &str, params: Value) -> Result<Value, CallError> {
         let id = self.next_id;
         self.next_id += 1;
         let req = agent_shell_rpc::Request::new(id, method, params);
         let line = req.to_line();
+        let endpoint = self.endpoint.clone();
+        let spawned = self.child.is_some();
 
-        self.stdin
-            .write_all(line.as_bytes())
-            .await
-            .map_err(|e| format!("write: {e}"))?;
-        self.stdin
-            .flush()
-            .await
-            .map_err(|e| format!("flush: {e}"))?;
+        self.stdin.write_all(line.as_bytes()).await.map_err(|e| {
+            CallError::transport(
+                RpcErrorCode::DaemonUnavailable,
+                format!("write to {endpoint}: {e}"),
+            )
+        })?;
+        self.stdin.flush().await.map_err(|e| {
+            CallError::transport(
+                RpcErrorCode::DaemonUnavailable,
+                format!("flush to {endpoint}: {e}"),
+            )
+        })?;
 
-        // 仅首个读使用 10s 死线；订阅激活期间 `events.notify` 会持续流入，
-        // 每次读到通知后重入循环即重置死线，避免后续工具调用因活跃订阅
-        // 误报 timeout（审查建议 3）。
+        // 仅首个读使用死线；订阅激活期间 `events.notify` 会持续流入，每次读到
+        // 通知后重入循环即重置死线，避免后续工具调用因活跃订阅误报超时。
         let mut first = true;
         loop {
             let mut buf = String::new();
             let read = if first {
                 first = false;
-                tokio::time::timeout(
-                    std::time::Duration::from_secs(10),
-                    self.reader.read_line(&mut buf),
-                )
-                .await
-                .map_err(|_| "timeout".to_string())?
-                .map_err(|e| format!("read: {e}"))?
-            } else {
-                self.reader
-                    .read_line(&mut buf)
+                tokio::time::timeout(RESPONSE_TIMEOUT, self.reader.read_line(&mut buf))
                     .await
-                    .map_err(|e| format!("read: {e}"))?
-            };
-            if read == 0 {
-                return Err("daemon closed connection before responding".to_string());
+                    .map_err(|_| no_response_error(&endpoint, spawned, method))?
+            } else {
+                self.reader.read_line(&mut buf).await
             }
-            let msg: Value = serde_json::from_str(&buf).map_err(|e| format!("parse: {e}"))?;
+            .map_err(|e| {
+                CallError::transport(
+                    RpcErrorCode::BackendError,
+                    format!("read from {endpoint}: {e}"),
+                )
+            })?;
+            if read == 0 {
+                // 派生形态下 stdout 随子进程退出而关闭，EOF 即「应答前退出」；
+                // 不再另起 select 观察进程退出，避免已入管道但未成行的应答被丢弃。
+                let status = match self.child.as_mut() {
+                    Some(child) => child.try_wait().ok().flatten(),
+                    None => None,
+                };
+                return Err(closed_error(&endpoint, &self.stderr_tail, status).await);
+            }
+            let msg: Value = serde_json::from_str(&buf).map_err(|e| {
+                CallError::transport(
+                    RpcErrorCode::BackendError,
+                    format!("malformed response line from {endpoint}: {e}"),
+                )
+            })?;
             if msg.get("id").is_none() {
                 // events.notify 通知：不属于本请求，继续等待响应。
                 continue;
             }
-            let resp =
-                agent_shell_rpc::Response::from_line(&buf).map_err(|e| format!("parse: {e}"))?;
+            let resp = agent_shell_rpc::Response::from_line(&buf).map_err(|e| {
+                CallError::transport(
+                    RpcErrorCode::BackendError,
+                    format!("malformed response line from {endpoint}: {e}"),
+                )
+            })?;
             if resp.id != id {
-                return Err(format!("response id mismatch: got {} want {}", resp.id, id));
+                return Err(CallError::transport(
+                    RpcErrorCode::BackendError,
+                    format!(
+                        "response id mismatch from {endpoint}: got {} want {}",
+                        resp.id, id
+                    ),
+                ));
             }
             if let Some(err) = resp.error {
-                return Err(format!("RPC error {}: {}", err.code, err.message));
+                return Err(CallError::Rpc {
+                    code: err.code,
+                    message: err.message,
+                });
             }
-            return resp.result.ok_or_else(|| "empty result".to_string());
+            return resp.result.ok_or_else(|| {
+                CallError::transport(
+                    RpcErrorCode::BackendError,
+                    format!("empty result from {endpoint} for {method}"),
+                )
+            });
         }
     }
 
@@ -126,21 +288,143 @@ impl Drop for DaemonConnection {
     }
 }
 
+/// 连接在应答前结束（EOF）：daemon 退出或端点对端关闭。
+///
+/// 派生形态 stdout 随子进程退出而关闭，`try_wait` 通常已能给出退出状态；未收割到
+/// 时只少一行状态，不改变「显式失败 + stderr 根因」的语义。
+async fn closed_error(
+    endpoint: &str,
+    tail: &Option<Arc<Mutex<VecDeque<u8>>>>,
+    status: Option<std::process::ExitStatus>,
+) -> CallError {
+    let detail = stderr_tail_text(tail).await;
+    let base = match status {
+        Some(status) => format!("daemon ({endpoint}) exited before responding ({status})"),
+        None => format!("daemon ({endpoint}) closed the connection before responding"),
+    };
+    CallError::transport(RpcErrorCode::DaemonUnavailable, with_stderr(base, &detail))
+}
+
+/// 追加 stderr 尾部：空输出不加分隔符，错误行保持单行。
+fn with_stderr(mut message: String, detail: &str) -> String {
+    if !detail.is_empty() {
+        message.push_str("; daemon stderr: ");
+        message.push_str(detail);
+    }
+    message
+}
+
+/// 派生 daemon 的 stderr 尾部缓冲：后台任务持续排空管道（管道写满会让 daemon
+/// 阻塞），只保留最近 [`STDERR_TAIL_CAP`] 字节供退出诊断。
+fn spawn_stderr_drain(mut stderr: tokio::process::ChildStderr) -> Arc<Mutex<VecDeque<u8>>> {
+    let tail = Arc::new(Mutex::new(VecDeque::with_capacity(STDERR_TAIL_CAP)));
+    let shared = Arc::clone(&tail);
+    tokio::spawn(async move {
+        let mut chunk = [0u8; 4096];
+        loop {
+            match stderr.read(&mut chunk).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    let mut buf = shared.lock().await;
+                    buf.extend(&chunk[..n]);
+                    if buf.len() > STDERR_TAIL_CAP {
+                        let excess = buf.len() - STDERR_TAIL_CAP;
+                        buf.drain(..excess);
+                    }
+                }
+            }
+        }
+    });
+    tail
+}
+
+/// 错误行里引用的 stderr 末段上限与行数上限。
+///
+/// 缓冲本身按 [`STDERR_TAIL_CAP`] 保留（诊断需要），但错误信息面向用户：一次工具
+/// 失败不得变成上千行日志，只引用最后几行。
+const STDERR_ERROR_BYTES: usize = 2 * 1024;
+const STDERR_ERROR_LINES: usize = 4;
+
+/// 尾部缓冲的可读文本（无缓冲或空输出时为空串）。
+///
+/// 只取最后 [`STDERR_ERROR_BYTES`] 字节与最后 [`STDERR_ERROR_LINES`] 行，换行折叠为
+/// ` | `，错误行保持单行可读。
+async fn stderr_tail_text(tail: &Option<Arc<Mutex<VecDeque<u8>>>>) -> String {
+    let Some(tail) = tail else {
+        return String::new();
+    };
+    let buf = tail.lock().await;
+    let start = buf.len().saturating_sub(STDERR_ERROR_BYTES);
+    let bytes: Vec<u8> = buf.iter().skip(start).copied().collect();
+    let text = String::from_utf8_lossy(&bytes);
+    let lines: Vec<&str> = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+    let kept = &lines[lines.len().saturating_sub(STDERR_ERROR_LINES)..];
+    kept.join(" | ")
+}
+
+/// 首个应答行超时：派生形态下把单实例锁等待这一常见根因写进错误，操作方据此
+/// 改为接入常驻实例，而不是把上限当修复。
+fn no_response_error(endpoint: &str, spawned: bool, method: &str) -> CallError {
+    let hint = if spawned {
+        "; a spawned daemon waits up to 30s on the session single-instance lock when a \
+         resident daemon holds it — point AGENT_SHELL_SOCKET at the resident endpoint to reuse it"
+    } else {
+        ""
+    };
+    CallError::transport(
+        RpcErrorCode::BackendError,
+        format!(
+            "no response from {endpoint} within {}s for {method}{hint}",
+            RESPONSE_TIMEOUT.as_secs()
+        ),
+    )
+}
+
+/// 显式端点：`AGENT_SHELL_SOCKET`（空白视为未设置；判据在
+/// `agent_shell_rpc::endpoint`，与命令面 `--socket` 同源）。
+fn socket_endpoint() -> Option<PathBuf> {
+    std::env::var_os("AGENT_SHELL_SOCKET")
+        .map(PathBuf::from)
+        .filter(|path| !agent_shell_rpc::endpoint::is_blank(path))
+}
+
 /// MCP server——桥接 MCP 工具调用到 agent-shell daemon。
 pub struct AgentShellMcpServer {
-    conn: Mutex<DaemonConnection>,
+    /// 懒建立的 daemon 连接；传输层失败后丢弃，下次调用重新建立。
+    conn: Mutex<Option<DaemonConnection>>,
 }
 
 impl AgentShellMcpServer {
-    /// 构造 MCP server，spawn 一次 daemon 并保持长连接。
+    /// 构造 MCP server。连接按需建立：daemon 不可达是工具调用的错误（1001），
+    /// 不是进程启动失败——客户端拿到的必须是可读的项目错误码。
     pub fn new() -> Self {
-        let conn = DaemonConnection::connect().unwrap_or_else(|e| {
-            error!(error = %e, "failed to spawn agent-shell daemon");
-            panic!("agent-shell daemon unavailable: {e}");
-        });
         Self {
-            conn: Mutex::new(conn),
+            conn: Mutex::new(None),
         }
+    }
+
+    /// 一次远程方法调用：连接按需建立并串行复用（每个进程同时一条连接）。
+    async fn rpc(&self, method: &str, params: Value) -> Result<Value, CallError> {
+        let mut slot = self.conn.lock().await;
+        if slot.is_none() {
+            *slot = Some(DaemonConnection::connect().await?);
+        }
+        let conn = slot.as_mut().ok_or_else(|| {
+            CallError::transport(
+                RpcErrorCode::DaemonUnavailable,
+                "daemon connection not established",
+            )
+        })?;
+        let result = conn.call(method, params).await;
+        if matches!(&result, Err(e) if e.is_transport()) {
+            // 断链不留在槽里：下次调用重新建立连接（失败的调用本身不重试）。
+            *slot = None;
+        }
+        result
     }
 
     /// 构建 18 个注册工具。
@@ -160,10 +444,11 @@ impl AgentShellMcpServer {
             ),
             make_tool(
                 "focus_window",
-                "聚焦窗口：支持 app_id/title/pid 定位",
+                "聚焦窗口：按 window_id（原生标识，精确）或 app_id/title/pid 定位；多命中报歧义",
                 json!({
                     "type": "object",
-                    "properties": { "app_id": {"type":"string"}, "title": {"type":"string"}, "pid": {"type":"integer"}, "window_id": {"type":"string"} }
+                    "properties": { "app_id": {"type":"string"}, "title": {"type":"string"}, "pid": {"type":"integer"}, "window_id": {"type":"string"}},
+                    "anyOf": [{"required":["window_id"]},{"required":["app_id"]},{"required":["title"]},{"required":["pid"]}]
                 }),
             ),
             make_tool(
@@ -332,18 +617,19 @@ impl AgentShellMcpServer {
     }
 
     /// 执行工具调用——处理需要多步 RPC 的工具（如 focus_window 先解析再操作）。
-    async fn execute_tool(&self, tool_name: &str, args: &Value) -> Result<Value, String> {
+    async fn execute_tool(&self, tool_name: &str, args: &Value) -> Result<Value, CallError> {
         match tool_name {
             "focus_window" => self.execute_focus_window(args).await,
             "wait_for_window" => self.execute_wait_for_window(args).await,
             "click_element" => self.execute_click_element(args).await,
             "screenshot" => self.execute_screenshot(args).await,
             _ => {
-                let (method, params) = match Self::map_tool(tool_name, args)? {
-                    Some(m) => m,
-                    None => return Err(format!("unknown tool: {tool_name}")),
-                };
-                self.conn.lock().await.call(method, params).await
+                let (method, params) =
+                    match Self::map_tool(tool_name, args).map_err(CallError::local)? {
+                        Some(m) => m,
+                        None => return Err(CallError::local(format!("unknown tool: {tool_name}"))),
+                    };
+                self.rpc(method, params).await
             }
         }
     }
@@ -353,22 +639,22 @@ impl AgentShellMcpServer {
     /// 与命令面同语义：零命中或无障碍不可达时用 `fallback_coordinate` 坐标
     /// 点击兜底（无兜底则如实报错）；多命中不猜——报歧义并要求收窄条件
     /// （契约：目标解析多命中必须报错）。
-    async fn execute_click_element(&self, args: &Value) -> Result<Value, String> {
+    async fn execute_click_element(&self, args: &Value) -> Result<Value, CallError> {
         let role = args.get("role").and_then(Value::as_str);
         let name = args.get("name").and_then(Value::as_str);
         if role.is_none() && name.is_none() {
-            return Err("click_element requires `role` and/or `name`".to_string());
+            return Err(CallError::local(
+                "click_element requires `role` and/or `name`",
+            ));
         }
-        let fallback = parse_fallback_coordinate(args)?;
+        let fallback = parse_fallback_coordinate(args).map_err(CallError::local)?;
 
-        let located = {
-            let mut conn = self.conn.lock().await;
-            conn.call(
+        let located = self
+            .rpc(
                 "a11y.query",
                 json!({ "role": role, "name": name, "all": false }),
             )
-            .await
-        };
+            .await;
         let elements = match located {
             Ok(value) => value
                 .get("elements")
@@ -386,10 +672,10 @@ impl AgentShellMcpServer {
         if elements.is_empty() {
             return match fallback {
                 Some((x, y)) => self.click_at(x, y).await,
-                None => Err(format!(
+                None => Err(CallError::local(format!(
                     "a11y element not found (role={role:?}, name={name:?}); \
                      pass `fallback_coordinate` for a coordinate click"
-                )),
+                ))),
             };
         }
         if elements.len() > 1 {
@@ -405,24 +691,22 @@ impl AgentShellMcpServer {
                     )
                 })
                 .collect();
-            return Err(format!(
+            return Err(CallError::local(format!(
                 "a11y element ambiguous: {} matches for role={role:?}, name={name:?}; \
                  narrow `role`/`name`; candidates: {}",
                 elements.len(),
                 candidates.join(", ")
-            ));
+            )));
         }
         let element = &elements[0];
         let path = element
             .get("path")
             .and_then(Value::as_str)
-            .ok_or("malformed a11y.query element: missing path")?;
+            .ok_or_else(|| CallError::local("malformed a11y.query element: missing path"))?;
         let bus = element.get("bus_name").and_then(Value::as_str);
-        let action = {
-            let mut conn = self.conn.lock().await;
-            conn.call("a11y.action", json!({ "path": path, "bus": bus }))
-                .await
-        };
+        let action = self
+            .rpc("a11y.action", json!({ "path": path, "bus": bus }))
+            .await;
         match action {
             Ok(value) => Ok(value),
             Err(e) => match fallback {
@@ -433,9 +717,8 @@ impl AgentShellMcpServer {
     }
 
     /// 坐标兜底点击（`input.send` click，左键 + 绝对坐标）；结果原样返回。
-    async fn click_at(&self, x: i64, y: i64) -> Result<Value, String> {
-        let mut conn = self.conn.lock().await;
-        conn.call(
+    async fn click_at(&self, x: i64, y: i64) -> Result<Value, CallError> {
+        self.rpc(
             "input.send",
             json!({ "kind": "click", "payload": { "button": "left", "at": [x, y] } }),
         )
@@ -445,50 +728,53 @@ impl AgentShellMcpServer {
     /// screenshot：`target` 选择器决定实际捕获范围（全屏 / 窗口 / 区域）。
     ///
     /// 选择器与其它入参冲突时报错，不静默丢弃——否则 `target` 形同虚设。
-    async fn execute_screenshot(&self, args: &Value) -> Result<Value, String> {
-        let params = screenshot_params(args)?;
-        let mut conn = self.conn.lock().await;
-        conn.call("screenshot.capture", params).await
+    async fn execute_screenshot(&self, args: &Value) -> Result<Value, CallError> {
+        let params = screenshot_params(args).map_err(CallError::local)?;
+        self.rpc("screenshot.capture", params).await
     }
 
-    /// focus_window: 先 windows.list 取列表，按 app_id/title/pid 解析 native_id，再 windows.op focus。
-    async fn execute_focus_window(&self, args: &Value) -> Result<Value, String> {
-        let mut conn = self.conn.lock().await;
+    /// focus_window: 先 windows.list 取列表，按 window_id/app_id/title/pid
+    /// 解析 native_id，再 windows.op focus。
+    ///
+    /// 选择条件至少给一个：缺省即参数非法，本地失败、不触达服务（与
+    /// `click_element` 的 `anyOf` + 本地 guard 同一做法）。
+    async fn execute_focus_window(&self, args: &Value) -> Result<Value, CallError> {
+        ensure_focus_selector(args)?;
 
         // 1. 取窗口列表
-        let list_result = conn
-            .call("windows.list", json!({ "filter": Value::Null }))
+        let list_result = self
+            .rpc("windows.list", json!({ "filter": Value::Null }))
             .await?;
-        let windows = list_result
-            .get("windows")
-            .and_then(|v| v.as_array())
-            .ok_or("malformed windows.list response")?;
+        let windows: Vec<agent_shell_rpc::WindowEntry> =
+            serde_json::from_value(list_result.get("windows").cloned().unwrap_or(Value::Null))
+                .map_err(|e| {
+                    CallError::transport(
+                        RpcErrorCode::BackendError,
+                        format!("malformed windows.list response: {e}"),
+                    )
+                })?;
 
-        // 2. 按 app_id/title/pid/window_id 解析 native_id
-        let native_id = resolve_target(args, windows).ok_or_else(|| {
-            "window not found (no match for app_id/title/pid/window_id)".to_string()
-        })?;
+        // 2. 按 window_id/app_id/title/pid 解析目标（多命中报歧义，见 resolve_target）
+        let native_id = resolve_target(args, &windows)?;
 
         // 3. 发 windows.op focus
         let op_params = json!({ "op": "focus", "target": native_id });
-        conn.call("windows.op", op_params).await
+        self.rpc("windows.op", op_params).await
     }
 
     /// wait_for_window: 轮询 windows.list + filter，直到匹配或超时。
-    async fn execute_wait_for_window(&self, args: &Value) -> Result<Value, String> {
+    async fn execute_wait_for_window(&self, args: &Value) -> Result<Value, CallError> {
         let app_id = args
             .get("app_id")
             .and_then(|v| v.as_str())
-            .ok_or("missing required param: app_id")?;
-        let timeout_ms = Self::resolve_timeout_ms(args)?;
+            .ok_or_else(|| CallError::local("missing required param: app_id"))?;
+        let timeout_ms = Self::resolve_timeout_ms(args).map_err(CallError::local)?;
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
 
         loop {
-            let mut conn = self.conn.lock().await;
-            let list_result = conn
-                .call("windows.list", json!({ "filter": app_id }))
+            let list_result = self
+                .rpc("windows.list", json!({ "filter": app_id }))
                 .await?;
-            drop(conn);
 
             let windows = list_result.get("windows").and_then(|v| v.as_array());
             if let Some(wins) = windows {
@@ -574,7 +860,8 @@ impl ServerHandler for AgentShellMcpServer {
                     Ok(result.into())
                 }
                 Err(e) => Ok(CallToolResult::error(vec![ContentBlock::text(format!(
-                    "error: {e}"
+                    "error: {}",
+                    e.render()
                 ))])
                 .into()),
             }
@@ -716,57 +1003,100 @@ fn parse_fallback_coordinate(args: &Value) -> Result<Option<(i64, i64)>, String>
     Ok(Some((x, y)))
 }
 
-/// 从 windows.list 结果中按 app_id/title/pid/window_id 解析 native_id。
+/// `focus_window` 的选择条件：至少给一个（schema `anyOf` 的本地对应判据）。
 ///
-/// 优先级：window_id（精确 native_id）→ app_id（精确）→ title（子串包含）→ pid。
-fn resolve_target(args: &Value, windows: &[Value]) -> Option<String> {
-    // window_id: 直接作为 native_id 使用
-    if let Some(wid) = args.get("window_id").and_then(|v| v.as_str()) {
-        if windows
+/// 全部缺省时 `resolve_target` 只能拼出空 label 的「未命中」文案，把参数问题伪装成
+/// 目标不存在；这里先按参数非法显式失败，且先于 `windows.list`，无效 RPC。
+fn ensure_focus_selector(args: &Value) -> Result<(), CallError> {
+    const KEYS: [&str; 4] = ["window_id", "app_id", "title", "pid"];
+    let present = KEYS
+        .iter()
+        .any(|key| args.get(*key).is_some_and(|value| !value.is_null()));
+    if present {
+        return Ok(());
+    }
+    Err(CallError::local(
+        "focus_window requires one of window_id/app_id/title/pid",
+    ))
+}
+
+/// 从 `windows.list` 结果中按 window_id/app_id/title/pid 解析目标窗口。
+///
+/// 选择条件优先级：window_id（原生标识精确，含花括号等价）→ app_id（精确）→
+/// title（子串包含）→ pid（精确）。判定在
+/// [`agent_shell_rpc::window_target`]，与命令面同源：
+/// - 命中的那一档多命中即报歧义（匹配数 + 候选），不得静默取首个；
+/// - 显式 `window_id` 失配即报未命中，绝不落回其余模糊条件——显式标识被静默忽略会
+///   把写操作施加到另一扇窗口上。
+fn resolve_target(
+    args: &Value,
+    windows: &[agent_shell_rpc::WindowEntry],
+) -> Result<String, CallError> {
+    use agent_shell_rpc::window_target;
+
+    fn pick<'a>(
+        windows: &'a [agent_shell_rpc::WindowEntry],
+        label: String,
+        matches: Vec<&'a agent_shell_rpc::WindowEntry>,
+    ) -> Result<String, CallError> {
+        window_target::expect_single(&label, matches, windows)
+            .map(|window| window.native_id.clone())
+            .map_err(CallError::local)
+    }
+
+    // 显式标识：精确匹配是终局判定，失配不进入下面的模糊档。
+    if let Some(window_id) = args.get("window_id").and_then(Value::as_str) {
+        let matches: Vec<&agent_shell_rpc::WindowEntry> = windows
             .iter()
-            .any(|w| w.get("native_id").and_then(|v| v.as_str()) == Some(wid))
-        {
-            return Some(wid.to_string());
-        }
+            .filter(|window| window_target::native_id_matches(window_id, &window.native_id))
+            .collect();
+        return pick(windows, format!("window_id={window_id:?}"), matches);
     }
-    // app_id: 精确匹配
-    if let Some(app_id) = args.get("app_id").and_then(|v| v.as_str()) {
-        if let Some(w) = windows
+
+    if let Some(app_id) = args.get("app_id").and_then(Value::as_str) {
+        let matches: Vec<&agent_shell_rpc::WindowEntry> = windows
             .iter()
-            .find(|w| w.get("app_id").and_then(|v| v.as_str()) == Some(app_id))
-        {
-            return w
-                .get("native_id")
-                .and_then(|v| v.as_str())
-                .map(String::from);
+            .filter(|window| window.app_id == app_id)
+            .collect();
+        if !matches.is_empty() {
+            return pick(windows, format!("app_id={app_id:?}"), matches);
         }
     }
-    // title: 子串包含
-    if let Some(title) = args.get("title").and_then(|v| v.as_str()) {
-        if let Some(w) = windows.iter().find(|w| {
-            w.get("title")
-                .and_then(|v| v.as_str())
-                .is_some_and(|t| t.contains(title))
-        }) {
-            return w
-                .get("native_id")
-                .and_then(|v| v.as_str())
-                .map(String::from);
-        }
-    }
-    // pid: 精确匹配
-    if let Some(pid) = args.get("pid").and_then(|v| v.as_u64()) {
-        if let Some(w) = windows
+
+    if let Some(title) = args.get("title").and_then(Value::as_str) {
+        let matches: Vec<&agent_shell_rpc::WindowEntry> = windows
             .iter()
-            .find(|w| w.get("pid").and_then(|v| v.as_u64()) == Some(pid))
-        {
-            return w
-                .get("native_id")
-                .and_then(|v| v.as_str())
-                .map(String::from);
+            .filter(|window| window.title.contains(title))
+            .collect();
+        if !matches.is_empty() {
+            return pick(windows, format!("title={title:?}"), matches);
         }
     }
-    None
+
+    if let Some(pid) = args.get("pid").and_then(Value::as_u64) {
+        let matches: Vec<&agent_shell_rpc::WindowEntry> = windows
+            .iter()
+            .filter(|window| u64::from(window.pid) == pid)
+            .collect();
+        if !matches.is_empty() {
+            return pick(windows, format!("pid={pid}"), matches);
+        }
+    }
+
+    // 全部条件零命中：与命令面同一文案，列出可见窗口供定位。
+    let selectors: Vec<String> = ["window_id", "app_id", "title", "pid"]
+        .into_iter()
+        .filter_map(|key| {
+            args.get(key)
+                .filter(|value| !value.is_null())
+                .map(|value| format!("{key}={value}"))
+        })
+        .collect();
+    Err(CallError::local(format!(
+        "window not found: {}; visible titles: {}",
+        selectors.join(", "),
+        agent_shell_rpc::window_target::candidates(windows)
+    )))
 }
 
 /// 定位 daemon 二进制（委托 agent-shell-rpc::daemon_bin）。
@@ -1067,52 +1397,52 @@ mod tests {
 
     #[test]
     fn test_resolve_target_by_app_id() {
-        let windows = json!([
-            {"native_id": "0x1", "app_id": "firefox", "title": "Firefox", "pid": 100},
-            {"native_id": "0x2", "app_id": "code", "title": "VS Code", "pid": 200},
-        ]);
-        let id = resolve_target(&json!({"app_id": "firefox"}), windows.as_array().unwrap());
-        assert_eq!(id.as_deref(), Some("0x1"));
+        let windows = vec![
+            window_entry("0x1", "Firefox", "firefox", 100),
+            window_entry("0x2", "VS Code", "code", 200),
+        ];
+        let id = resolve_target(&json!({"app_id": "firefox"}), &windows).expect("app_id match");
+        assert_eq!(id, "0x1");
     }
 
     #[test]
     fn test_resolve_target_by_title_substring() {
-        let windows = json!([
-            {"native_id": "0x1", "app_id": "firefox", "title": "Firefox - Main", "pid": 100},
-        ]);
-        let id = resolve_target(&json!({"title": "Main"}), windows.as_array().unwrap());
-        assert_eq!(id.as_deref(), Some("0x1"));
+        let windows = vec![window_entry("0x1", "Firefox - Main", "firefox", 100)];
+        let id = resolve_target(&json!({"title": "Main"}), &windows).expect("title substring");
+        assert_eq!(id, "0x1");
     }
 
     #[test]
     fn test_resolve_target_by_pid() {
-        let windows = json!([
-            {"native_id": "0x1", "app_id": "firefox", "title": "Firefox", "pid": 100},
-            {"native_id": "0x2", "app_id": "code", "title": "Code", "pid": 200},
-        ]);
-        let id = resolve_target(&json!({"pid": 200}), windows.as_array().unwrap());
-        assert_eq!(id.as_deref(), Some("0x2"));
+        let windows = vec![
+            window_entry("0x1", "Firefox", "firefox", 100),
+            window_entry("0x2", "Code", "code", 200),
+        ];
+        let id = resolve_target(&json!({"pid": 200}), &windows).expect("pid match");
+        assert_eq!(id, "0x2");
     }
 
     #[test]
     fn test_resolve_target_by_window_id() {
-        let windows = json!([
-            {"native_id": "0x1", "app_id": "firefox", "title": "Firefox", "pid": 100},
-        ]);
-        let id = resolve_target(&json!({"window_id": "0x1"}), windows.as_array().unwrap());
-        assert_eq!(id.as_deref(), Some("0x1"));
+        let windows = vec![window_entry("0x1", "Firefox", "firefox", 100)];
+        let id = resolve_target(&json!({"window_id": "0x1"}), &windows).expect("native_id match");
+        assert_eq!(id, "0x1");
     }
 
     #[test]
     fn test_resolve_target_no_match() {
-        let windows = json!([
-            {"native_id": "0x1", "app_id": "firefox", "title": "Firefox", "pid": 100},
-        ]);
-        let id = resolve_target(
-            &json!({"app_id": "nonexistent"}),
-            windows.as_array().unwrap(),
+        let windows = vec![window_entry("0x1", "Firefox", "firefox", 100)];
+        let err = resolve_target(&json!({"app_id": "nonexistent"}), &windows)
+            .expect_err("no window carries that app_id")
+            .render();
+        assert!(
+            err.contains("window not found: app_id=\"nonexistent\""),
+            "{err}"
         );
-        assert!(id.is_none());
+        assert!(
+            err.contains("[0x1] Firefox"),
+            "not-found must list visible titles: {err}"
+        );
     }
 
     /// MCP 注入的 target 目录用 CARGO_MANIFEST_DIR 拼绝对路径——CWD 无关。
@@ -1138,5 +1468,181 @@ mod tests {
             dirs.iter().any(|d| d == &*rel.to_string_lossy()),
             "target/release (absolute) must be a candidate: {dirs:?}"
         );
+    }
+
+    fn window_entry(
+        native_id: &str,
+        title: &str,
+        app_id: &str,
+        pid: u32,
+    ) -> agent_shell_rpc::WindowEntry {
+        agent_shell_rpc::WindowEntry {
+            native_id: native_id.into(),
+            title: title.into(),
+            app_id: app_id.into(),
+            pid,
+            x: None,
+            y: None,
+            width: None,
+            height: None,
+            workspace: None,
+            stacking_order: 0,
+            states: vec![],
+            window_type: "Normal".into(),
+            keep_above: false,
+        }
+    }
+
+    /// 多命中必须报歧义：匹配数 + 候选都在错误里，不得静默取首个。
+    #[test]
+    fn resolve_target_rejects_multiple_matches() {
+        let windows = vec![
+            window_entry("w1", "Terminal", "kitty", 10),
+            window_entry("w2", "Terminal", "kitty", 11),
+            window_entry("w3", "Files", "nautilus", 12),
+        ];
+        let err = resolve_target(&json!({"app_id": "kitty"}), &windows)
+            .expect_err("two windows with the same app_id must be ambiguous")
+            .render();
+        assert!(err.contains("2 windows match app_id=\"kitty\""), "{err}");
+        assert!(err.contains("disambiguate with id:"), "{err}");
+        assert!(
+            err.contains("[w1] Terminal") && err.contains("[w2] Terminal"),
+            "{err}"
+        );
+    }
+
+    /// 显式 window_id 失配即未命中：不得落回同一次调用里的 app_id/title/pid。
+    #[test]
+    fn resolve_target_does_not_fall_back_after_window_id_mismatch() {
+        let windows = vec![window_entry("w1", "Terminal", "kitty", 10)];
+        let err = resolve_target(
+            &json!({"window_id": "w-missing", "app_id": "kitty", "pid": 10}),
+            &windows,
+        )
+        .expect_err("explicit window_id must not fall back to fuzzy selectors")
+        .render();
+        assert!(
+            err.contains("window not found: window_id=\"w-missing\""),
+            "{err}"
+        );
+        assert!(
+            err.contains("[w1] Terminal"),
+            "not-found must list visible titles: {err}"
+        );
+    }
+
+    /// 显式标识与 KWin 的 `{uuid}` 原文等价；零命中错误带可见窗口。
+    #[test]
+    fn resolve_target_accepts_braced_window_id_and_reports_misses() {
+        let windows = vec![
+            window_entry("{e6f8-4a2c}", "Editor", "kate", 10),
+            window_entry("w2", "Terminal", "konsole", 11),
+        ];
+        assert_eq!(
+            resolve_target(&json!({"window_id": "e6f8-4a2c"}), &windows).expect("bare uuid"),
+            "{e6f8-4a2c}"
+        );
+        let err = resolve_target(&json!({"app_id": "nope"}), &windows)
+            .expect_err("missing app_id must not match")
+            .render();
+        assert!(err.contains("window not found: app_id=\"nope\""), "{err}");
+        assert!(err.contains("[w2] Terminal"), "{err}");
+    }
+
+    /// 唯一命中按优先级返回：app_id 精确优先于标题子串。
+    #[test]
+    fn resolve_target_returns_unique_match() {
+        let windows = vec![
+            window_entry("w1", "Terminal — zsh", "kitty", 10),
+            window_entry("w2", "Terminal — ssh", "konsole", 11),
+        ];
+        assert_eq!(
+            resolve_target(&json!({"app_id": "konsole"}), &windows).expect("unique app_id"),
+            "w2"
+        );
+        // 标题子串同命中两扇窗口 → 歧义，而不是取首个。
+        assert!(resolve_target(&json!({"title": "Terminal"}), &windows).is_err());
+    }
+
+    /// 错误行只引用 stderr 末段：多行日志折叠为单行，且只保留最后几行。
+    #[tokio::test]
+    async fn stderr_text_keeps_only_the_tail() {
+        let mut buf = std::collections::VecDeque::new();
+        for i in 0..500 {
+            buf.extend(format!("line {i}: noise\n").bytes());
+        }
+        let text = stderr_tail_text(&Some(Arc::new(Mutex::new(buf)))).await;
+        assert!(
+            !text.contains('\n'),
+            "error line must stay single-line: {text}"
+        );
+        assert!(
+            text.contains("line 499: noise"),
+            "tail must keep the last line: {text}"
+        );
+        assert!(
+            !text.contains("line 0: noise"),
+            "old lines must be dropped: {text}"
+        );
+        assert_eq!(
+            text.matches(" | ").count(),
+            STDERR_ERROR_LINES - 1,
+            "only {STDERR_ERROR_LINES} lines may survive: {text}"
+        );
+        assert!(
+            text.len() <= STDERR_ERROR_BYTES,
+            "tail must be bounded: {}",
+            text.len()
+        );
+        assert!(stderr_tail_text(&None).await.is_empty());
+    }
+
+    /// schema 与本地 guard 同源：四个选择条件至少要给一个。
+    #[test]
+    fn focus_window_schema_requires_a_selector() {
+        let tools = AgentShellMcpServer::build_tools();
+        let tool = tools
+            .iter()
+            .find(|tool| tool.name.as_ref() == "focus_window")
+            .expect("focus_window tool registered");
+        let any_of = tool
+            .input_schema
+            .get("anyOf")
+            .and_then(|value| value.as_array())
+            .expect("focus_window schema carries anyOf");
+        assert_eq!(any_of.len(), 4, "one branch per selector: {any_of:?}");
+        for key in ["window_id", "app_id", "title", "pid"] {
+            assert!(
+                any_of.iter().any(|branch| branch["required"]
+                    .as_array()
+                    .is_some_and(|required| required.iter().any(|v| v.as_str() == Some(key)))),
+                "anyOf must require {key}: {any_of:?}"
+            );
+        }
+    }
+
+    /// 空选择条件是参数非法：给出可读文案，而不是空 label 的「未命中」。
+    #[test]
+    fn focus_window_rejects_empty_selectors() {
+        let err = ensure_focus_selector(&json!({}))
+            .expect_err("no selector must be rejected")
+            .render();
+        assert!(
+            err.contains("focus_window requires one of window_id/app_id/title/pid"),
+            "{err}"
+        );
+        assert!(ensure_focus_selector(&json!({"window_id": null, "app_id": null})).is_err());
+        for args in [
+            json!({"window_id": "w1"}),
+            json!({"app_id": "kitty"}),
+            json!({"title": "Terminal"}),
+            json!({"pid": 42}),
+        ] {
+            assert!(
+                ensure_focus_selector(&args).is_ok(),
+                "{args} carries a selector"
+            );
+        }
     }
 }

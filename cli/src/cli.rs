@@ -770,7 +770,8 @@ fn parse_key_name(name: &str) -> Result<KeyName, String> {
 /// 窗口目标解析：标题子串 / `id:<native_id>` / 裸 `native_id`（daemon 返回的 WindowEntry）。
 ///
 /// 匹配顺序：显式 id（`id:` 前缀或与 `native_id` 精确相等）→ 标题精确 →
-/// 标题/app_id 子串。未命中时错误信息列出候选（QA 定位失败的常见原因是不在目标会话内）。
+/// 标题/app_id 子串。只保留命令面自己的语法；标识等价、多命中报错与候选渲染由
+/// [`agent_shell_rpc::window_target`] 提供，与 MCP 工具面同源。
 pub fn resolve_target_entry<'a>(
     spec: &str,
     windows: &'a [agent_shell_rpc::WindowEntry],
@@ -778,14 +779,14 @@ pub fn resolve_target_entry<'a>(
     let matches: Vec<&agent_shell_rpc::WindowEntry> = match spec.strip_prefix("id:") {
         Some(id) => windows
             .iter()
-            .filter(|w| native_id_matches(id, &w.native_id))
+            .filter(|w| agent_shell_rpc::window_target::native_id_matches(id, &w.native_id))
             .collect(),
         None => {
             // 裸 native_id 回退：`windows list` 返回的 native_id（如 KWin 的
             // `{uuid}`）可直接复用，无需改写为 `id:{uuid}`。
             let by_id: Vec<_> = windows
                 .iter()
-                .filter(|w| native_id_matches(spec, &w.native_id))
+                .filter(|w| agent_shell_rpc::window_target::native_id_matches(spec, &w.native_id))
                 .collect();
             if !by_id.is_empty() {
                 by_id
@@ -803,43 +804,8 @@ pub fn resolve_target_entry<'a>(
             }
         }
     };
-    match matches.len() {
-        0 => Err(format!(
-            "window not found: {spec:?}; visible titles: {}",
-            titles(windows.iter())
-        )),
-        1 => Ok(matches[0]),
-        n => Err(format!(
-            "{n} windows match {spec:?}, disambiguate with id:; candidates: {}",
-            titles(matches.into_iter())
-        )),
-    }
-}
-
-/// 候选 id 是否命中 native_id：精确相等，或互为 `{...}` 包裹形式。
-///
-/// KWin `internalId.toString()` 产出 `{uuid}`，用户可能裸传 `uuid` 或原文
-/// `{uuid}`；剥离单层花括号后比较可同时覆盖两种写法。
-fn native_id_matches(candidate: &str, native_id: &str) -> bool {
-    candidate == native_id || strip_braces(candidate) == strip_braces(native_id)
-}
-
-/// 剥离单层 `{...}` 花括号；非包裹形式原样返回。
-fn strip_braces(s: &str) -> &str {
-    s.strip_prefix('{')
-        .and_then(|rest| rest.strip_suffix('}'))
-        .unwrap_or(s)
-}
-
-fn titles<'a, I>(windows: I) -> String
-where
-    I: IntoIterator<Item = &'a agent_shell_rpc::WindowEntry>,
-{
-    windows
-        .into_iter()
-        .map(|w| format!("[{}] {}", w.native_id, w.title))
-        .collect::<Vec<_>>()
-        .join(", ")
+    // 多命中报歧义、零命中列可见窗口：判据在共用模块，命令面只提供选择条件描述。
+    agent_shell_rpc::window_target::expect_single(&format!("{spec:?}"), matches, windows)
 }
 
 /// `--at` 的统一格式提示：clap 解析误用（[`at_syntax_hint`]）与运行时

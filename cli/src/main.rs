@@ -55,11 +55,11 @@ async fn dispatch(args: Cli) -> CmdResult {
     }
 }
 
-/// 显式端点归一化：空白值视为未设置（与 daemon 侧 `AGENT_SHELL_LOCK` 同一判据：
-/// `trim()` 后为空即忽略），否则 `AGENT_SHELL_SOCKET=` 或纯空格会变成空的相对路径
-/// 端点。非空值保持原样（不 trim，避免悄悄改写用户给的路径）。
+/// 显式端点归一化：空白值视为未设置（判据在 `agent_shell_rpc::endpoint`，与 MCP
+/// 入口同源），否则 `AGENT_SHELL_SOCKET=` 或纯空格会变成空的相对路径端点。
+/// 非空值保持原样（不 trim，避免悄悄改写用户给的路径）。
 fn socket_endpoint(socket: Option<PathBuf>) -> Option<PathBuf> {
-    socket.filter(|path| !path.to_string_lossy().trim().is_empty())
+    socket.filter(|path| !agent_shell_rpc::endpoint::is_blank(path))
 }
 
 /// 本地可判定的参数校验（无 I/O、无 daemon 依赖），在 daemon 连接之前执行。

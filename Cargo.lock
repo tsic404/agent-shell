@@ -282,7 +282,6 @@ dependencies = [
  "agent-shell-event",
  "agent-shell-rpc",
  "clap",
- "libc",
  "parking_lot",
  "rustyline",
  "serde",
@@ -657,6 +656,7 @@ dependencies = [
 name = "agent-shell-rpc"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "serde",
  "serde_json",
  "tempfile",

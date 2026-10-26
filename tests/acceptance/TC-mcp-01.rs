@@ -20,14 +20,18 @@
 //!   `a11y.action`，定位失败才用 `fallback_coordinate` 坐标兜底）；
 //! - 错误保留项目错误码且不降级为成功；占位回执原样透传；成功结果的结构化
 //!   部分与文本内容逐字段一致（结果不裁剪、不改名）。
+//! - 常驻实例在场时入口接入 `AGENT_SHELL_SOCKET` 指定的实例：订阅在同一实例
+//!   可数，桌面依赖方法返回项目错误码而不是传输超时。
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use acceptance::workspace_root;
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::UnixListener;
 use tokio::process::{Child, ChildStdin, ChildStdout};
 
 /// 期望的 18 个工具名（与 `mcp/src/server.rs` 的注册表一致）。
@@ -62,7 +66,14 @@ fn target_dir(root: &Path) -> PathBuf {
         .unwrap_or_else(|| root.join("target"))
 }
 
-fn build_binaries() -> PathBuf {
+/// 判定面用到的三个真实二进制。
+struct Bins {
+    mcp: PathBuf,
+    daemon: PathBuf,
+    cli: PathBuf,
+}
+
+fn build_binaries() -> Bins {
     let root = workspace_root();
     let output = Command::new(cargo())
         .current_dir(&root)
@@ -77,15 +88,19 @@ fn build_binaries() -> PathBuf {
             "agent-shell-daemon",
             "--bin",
             "agent-shell-daemon",
+            "-p",
+            "agent-shell-cli",
+            "--bin",
+            "agent-shell",
             // 与 CI 的 no-pipewire 腿同形：MCP 测试不依赖 portal-screencast，
             // 无 PipeWire dev 头的环境也能构建可用的 daemon。
             "--no-default-features",
         ])
         .output()
-        .expect("build MCP and daemon binaries");
+        .expect("build MCP, daemon and CLI binaries");
     assert!(
         output.status.success(),
-        "building MCP/daemon must succeed; stderr:\n{}",
+        "building MCP/daemon/CLI must succeed; stderr:\n{}",
         String::from_utf8_lossy(&output.stderr)
     );
     let profile = if cfg!(debug_assertions) {
@@ -93,9 +108,81 @@ fn build_binaries() -> PathBuf {
     } else {
         "release"
     };
-    let binary = target_dir(&root).join(profile).join("agent-shell-mcp");
-    assert!(binary.is_file(), "missing {}", binary.display());
-    binary
+    let dir = target_dir(&root).join(profile);
+    let bins = Bins {
+        mcp: dir.join("agent-shell-mcp"),
+        daemon: dir.join("agent-shell-daemon"),
+        cli: dir.join("agent-shell"),
+    };
+    for binary in [&bins.mcp, &bins.daemon, &bins.cli] {
+        assert!(binary.is_file(), "missing {}", binary.display());
+    }
+    bins
+}
+
+/// 沙箱化的端点/配置/状态目录：常驻实例与瞬态 daemon 共用同一 `XDG_RUNTIME_DIR`，
+/// 端点与默认会话锁都落在沙箱内，不触碰宿主会话。
+fn sandbox_env(command: &mut tokio::process::Command, sandbox: &Path) {
+    command
+        .env("HOME", sandbox.join("home"))
+        .env("XDG_CONFIG_HOME", sandbox.join("config"))
+        .env("XDG_STATE_HOME", sandbox.join("state"))
+        .env("XDG_RUNTIME_DIR", sandbox.join("run"))
+        .env("XDG_SESSION_TYPE", "tty")
+        // PATH 置空：隐去宿主 ydotool/xdotool，让「输入链为空」是前提而非宿主巧合。
+        .env("PATH", "")
+        .env_remove("AGENT_SHELL_LOCK")
+        .env_remove("DISPLAY")
+        .env_remove("WAYLAND_DISPLAY")
+        .env_remove("WAYLAND_SOCKET")
+        .env_remove("DBUS_SESSION_BUS_ADDRESS")
+        .env_remove("DESKTOP_SESSION")
+        .env_remove("XDG_CURRENT_DESKTOP")
+        .env_remove("AGENT_SHELL_AGENT_ID");
+}
+
+/// 以显式套接字形态拉起常驻 daemon，且**不换锁命名空间**——默认会话锁被它持有，
+/// 正是「MCP 另起瞬态 daemon」会卡住的部署形态。
+async fn start_resident(bins: &Bins, sandbox: &Path, socket: &Path) -> Child {
+    let mut command = tokio::process::Command::new(&bins.daemon);
+    command
+        .arg("--socket")
+        .arg(socket)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    sandbox_env(&mut command, sandbox);
+    let mut child = command.spawn().expect("spawn resident daemon");
+    for _ in 0..200 {
+        if tokio::net::UnixStream::connect(socket).await.is_ok() {
+            assert!(
+                sandbox.join("run/agent-shell.lock").is_file(),
+                "resident must hold the default session lock for this scenario to bite: {}",
+                socket.display()
+            );
+            return child;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let _ = child.start_kill();
+    panic!("resident daemon did not bind {}", socket.display());
+}
+
+/// 以同一端点跑一次 CLI，读数取自常驻实例自身。
+async fn cli_json(
+    bins: &Bins,
+    sandbox: &Path,
+    socket: &Path,
+    args: &[&str],
+) -> (i32, Value, String) {
+    let mut command = tokio::process::Command::new(&bins.cli);
+    command.arg("--socket").arg(socket).args(args);
+    sandbox_env(&mut command, sandbox);
+    let output = command.output().await.expect("run agent-shell");
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let value = serde_json::from_str(stdout.trim()).unwrap_or(Value::Null);
+    (output.status.code().unwrap_or(-1), value, stderr)
 }
 
 struct Mcp {
@@ -106,26 +193,17 @@ struct Mcp {
 }
 
 impl Mcp {
-    async fn start(binary: &Path, sandbox: &Path) -> Self {
+    async fn start(binary: &Path, sandbox: &Path, socket: Option<&Path>) -> Self {
         let mut command = tokio::process::Command::new(binary);
         command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .env("HOME", sandbox.join("home"))
-            .env("XDG_CONFIG_HOME", sandbox.join("config"))
-            .env("XDG_STATE_HOME", sandbox.join("state"))
-            .env("XDG_RUNTIME_DIR", sandbox.join("run"))
-            .env("XDG_SESSION_TYPE", "tty")
-            // PATH 置空：隐去宿主 ydotool/xdotool，让「输入链为空」是前提而非宿主巧合。
-            .env("PATH", "")
-            .env_remove("DISPLAY")
-            .env_remove("WAYLAND_DISPLAY")
-            .env_remove("WAYLAND_SOCKET")
-            .env_remove("DBUS_SESSION_BUS_ADDRESS")
-            .env_remove("DESKTOP_SESSION")
-            .env_remove("XDG_CURRENT_DESKTOP")
-            .env_remove("AGENT_SHELL_AGENT_ID");
+            .stderr(Stdio::null());
+        sandbox_env(&mut command, sandbox);
+        match socket {
+            Some(socket) => command.env("AGENT_SHELL_SOCKET", socket),
+            None => command.env_remove("AGENT_SHELL_SOCKET"),
+        };
         let mut child = command.spawn().expect("spawn agent-shell-mcp");
         let stdin = child.stdin.take().expect("mcp stdin");
         let stdout = BufReader::new(child.stdout.take().expect("mcp stdout"));
@@ -224,10 +302,10 @@ async fn mcp_projection_preserves_tools_errors_and_receipts() {
         "[permissions.deny]\n\"process.kill\" = true\n",
     )
     .expect("write security config");
-    let binary = tokio::task::spawn_blocking(build_binaries)
+    let bins = tokio::task::spawn_blocking(build_binaries)
         .await
         .expect("join build");
-    let mut mcp = Mcp::start(&binary, sandbox.path()).await;
+    let mut mcp = Mcp::start(&bins.mcp, sandbox.path(), None).await;
 
     // 握手：协议版本、服务标识与指令字段可读。
     let id = mcp
@@ -590,4 +668,351 @@ async fn mcp_projection_preserves_tools_errors_and_receipts() {
             .is_some_and(|text| text.contains("unknown tool: nope")),
         "unknown tool must be an explicit error"
     );
+}
+
+/// 常驻实例在场时的投影：端点由 `AGENT_SHELL_SOCKET` 指定时，MCP 入口必须接入
+/// 该实例，方法结果与项目错误码照常呈现。
+///
+/// 复现形态取自 QA 部署：常驻 daemon 以显式套接字形态启动，且不换锁命名空间——
+/// 默认会话锁被它持有。入口若忽略端点另起瞬态 daemon，派生进程会卡在单实例锁
+/// 上，`tools/call` 只会拿到传输失败（旧实现即固定 10 秒后的 `error: timeout`），
+/// 方法结果与项目错误码一概不可见。
+#[tokio::test]
+async fn mcp_reuses_resident_endpoint_for_method_results() {
+    let sandbox = tempfile::tempdir().expect("mcp sandbox");
+    for dir in ["home", "config/agent-shell", "state", "run"] {
+        std::fs::create_dir_all(sandbox.path().join(dir)).expect("sandbox dir");
+    }
+    // 安全策略夹具：让 security_check 有可观察的策略真值。
+    std::fs::write(
+        sandbox.path().join("config/agent-shell/config.toml"),
+        "[permissions.deny]\n\"process.kill\" = true\n",
+    )
+    .expect("write security config");
+
+    let bins = tokio::task::spawn_blocking(build_binaries)
+        .await
+        .expect("join build");
+    let socket = sandbox.path().join("run/agent-shell.sock");
+    let mut resident = start_resident(&bins, sandbox.path(), &socket).await;
+    let mut mcp = Mcp::start(&bins.mcp, sandbox.path(), Some(&socket)).await;
+
+    // 握手与列举：接入常驻实例后工具面照旧成立。
+    let id = mcp
+        .send(
+            "initialize",
+            json!({
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "clientInfo": {"name": "acceptance", "version": "1"},
+            }),
+        )
+        .await;
+    let init = mcp.response(id).await;
+    let result = init.get("result").expect("initialize result");
+    assert!(
+        result
+            .get("capabilities")
+            .and_then(|c| c.get("tools"))
+            .is_some(),
+        "initialize must declare capabilities.tools: {result}"
+    );
+    mcp.send_notification("notifications/initialized").await;
+    let id = mcp.send("tools/list", json!({})).await;
+    let list = mcp.response(id).await;
+    let tools = list["result"]["tools"]
+        .as_array()
+        .expect("tools array")
+        .clone();
+    assert_eq!(tools.len(), TOOLS.len(), "18 tools must be registered");
+
+    // 非桌面方法返回结构化结果：daemon_status 的结构化部分即方法结果。
+    let result = mcp.call_tool("daemon_status", json!({})).await;
+    assert!(
+        result.get("isError") != Some(&json!(true)),
+        "daemon_status must succeed over the resident endpoint: {result}"
+    );
+    let structured = result
+        .get("structuredContent")
+        .expect("daemon_status structuredContent");
+    assert_eq!(structured["running"], json!(true));
+    let text = result["content"][0]["text"].as_str().expect("text content");
+    let reparsed: Value = serde_json::from_str(text).expect("text is JSON");
+    assert_eq!(
+        reparsed, *structured,
+        "text content must be the structured result verbatim"
+    );
+
+    // 同一实例：MCP 侧订阅在常驻实例自身可数——两边是两个实例时计数只会落在
+    // 瞬态 daemon 上，命令行侧读到的永远是 0。
+    let result = mcp
+        .call_tool("subscribe_events", json!({"events": ["WindowOpened"]}))
+        .await;
+    assert!(
+        result["structuredContent"]["subscriber_id"]
+            .as_str()
+            .is_some_and(|id| !id.is_empty()),
+        "subscription must return a handle: {result}"
+    );
+    let (code, status, stderr) =
+        cli_json(&bins, sandbox.path(), &socket, &["daemon", "status"]).await;
+    assert_eq!(code, 0, "CLI daemon status must succeed; stderr: {stderr}");
+    assert_eq!(
+        status["subscribers"],
+        json!(1),
+        "the resident instance must see the MCP subscription (one instance, not two): {status}"
+    );
+
+    // 桌面依赖方法：返回项目错误码而不是传输超时。
+    let result = mcp.call_tool("list_windows", json!({})).await;
+    let text = error_text(&result);
+    assert!(
+        text.contains("1002") && text.contains("compositor"),
+        "desktop-dependent method must keep the project error code: {text}"
+    );
+    assert!(
+        !text.contains("timeout"),
+        "desktop-dependent method must not degrade to a transport timeout: {text}"
+    );
+    // 命令行侧同类方法对照：同一方法面在同一实例上给出同一项目错误码。
+    let (code, _, stderr) = cli_json(&bins, sandbox.path(), &socket, &["windows", "list"]).await;
+    assert_eq!(
+        code, 1,
+        "CLI windows list must fail as a remote error: {stderr}"
+    );
+    assert!(
+        stderr.contains("1002") && stderr.contains("compositor"),
+        "CLI must keep the same project error code: {stderr}"
+    );
+
+    // 占位回执原样透传（AC-105 清单方法），呈现为成功结果。
+    let result = mcp.call_tool("file_picker", json!({})).await;
+    assert!(
+        result.get("isError") != Some(&json!(true)),
+        "file_picker must be a success receipt: {result}"
+    );
+    assert_eq!(
+        result["structuredContent"],
+        json!({"status": "not_implemented", "service": "file.pick"}),
+        "placeholder receipt must pass through verbatim: {result}"
+    );
+
+    // 端点不可达：不静默回退派生实例，按 daemon 不可用（1001）显式失败。
+    let missing = sandbox.path().join("run/missing.sock");
+    let mut orphan = Mcp::start(&bins.mcp, sandbox.path(), Some(&missing)).await;
+    let id = orphan
+        .send(
+            "initialize",
+            json!({"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "acceptance", "version": "1"}}),
+        )
+        .await;
+    orphan.response(id).await;
+    let result = orphan.call_tool("daemon_status", json!({})).await;
+    let text = error_text(&result);
+    assert!(
+        text.contains("1001") && text.contains("cannot connect"),
+        "unreachable endpoint must fail with daemon-unavailable, not fall back: {text}"
+    );
+
+    let _ = resident.start_kill();
+}
+
+/// 脚本化 daemon：只回答本用例需要的方法，并记录收到的请求。
+///
+/// 无头环境里真实 daemon 没有窗口夹具（`windows.list` 直接报 1002 compositor），
+/// 而本用例判定的是 MCP 入口自身的目标解析语义。因此用协议对端顶替 daemon，
+/// 判定面仍是真实 `agent-shell-mcp` 二进制发出的 JSON-RPC 与它返回的内容。
+struct ScriptedDaemon {
+    socket: PathBuf,
+    requests: Arc<Mutex<Vec<Value>>>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl ScriptedDaemon {
+    async fn start(socket: &Path, windows: Vec<Value>) -> Self {
+        let listener = UnixListener::bind(socket).expect("bind scripted daemon");
+        let requests: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&requests);
+        let task = tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let recorded = Arc::clone(&recorded);
+                let windows = windows.clone();
+                tokio::spawn(async move {
+                    let (read, mut write) = stream.into_split();
+                    let mut lines = BufReader::new(read).lines();
+                    while let Ok(Some(line)) = lines.next_line().await {
+                        let Ok(request) = serde_json::from_str::<Value>(&line) else {
+                            continue;
+                        };
+                        let id = request.get("id").cloned().unwrap_or(Value::Null);
+                        let method = request
+                            .get("method")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string();
+                        recorded.lock().unwrap().push(request.clone());
+                        let result = match method.as_str() {
+                            "windows.list" => json!({"windows": windows, "from_cache": false}),
+                            "windows.op" => json!({
+                                "op": request["params"]["op"],
+                                "target": request["params"]["target"],
+                            }),
+                            _ => json!({}),
+                        };
+                        let response = json!({"jsonrpc": "2.0", "id": id, "result": result});
+                        let mut text = response.to_string();
+                        text.push('\n');
+                        if write.write_all(text.as_bytes()).await.is_err() {
+                            break;
+                        }
+                        let _ = write.flush().await;
+                    }
+                });
+            }
+        });
+        Self {
+            socket: socket.to_path_buf(),
+            requests,
+            task,
+        }
+    }
+
+    /// 已收到的方法请求数（用于断言「本地失败、未触达服务」）。
+    fn request_count(&self, method: &str) -> usize {
+        self.requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|request| request["method"] == json!(method))
+            .count()
+    }
+
+    /// 已发出的 `windows.op` 请求的目标标识（未发出为空）。
+    fn windows_op_targets(&self) -> Vec<Value> {
+        self.requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|request| request["method"] == json!("windows.op"))
+            .map(|request| request["params"]["target"].clone())
+            .collect()
+    }
+}
+
+impl Drop for ScriptedDaemon {
+    fn drop(&mut self) {
+        self.task.abort();
+        let _ = std::fs::remove_file(&self.socket);
+    }
+}
+
+/// 目标解析与命令面同源：多命中报歧义（匹配数 + 候选）、零命中列可见窗口、
+/// 显式 `window_id` 失配不落回模糊条件，且失败路径一次窗口写操作都不发出。
+#[tokio::test]
+async fn mcp_target_resolution_rejects_ambiguous_and_never_falls_back() {
+    let sandbox = tempfile::tempdir().expect("mcp sandbox");
+    for dir in ["home", "config/agent-shell", "state", "run"] {
+        std::fs::create_dir_all(sandbox.path().join(dir)).expect("sandbox dir");
+    }
+    let bins = tokio::task::spawn_blocking(build_binaries)
+        .await
+        .expect("join build");
+    let socket = sandbox.path().join("run/scripted.sock");
+    let daemon = ScriptedDaemon::start(
+        &socket,
+        vec![
+            json!({"native_id": "w1", "title": "Terminal — zsh", "app_id": "kitty", "pid": 10}),
+            json!({"native_id": "w2", "title": "Terminal — ssh", "app_id": "kitty", "pid": 11}),
+            json!({"native_id": "w3", "title": "Files", "app_id": "nautilus", "pid": 12}),
+        ],
+    )
+    .await;
+    let mut mcp = Mcp::start(&bins.mcp, sandbox.path(), Some(&socket)).await;
+    let id = mcp
+        .send(
+            "initialize",
+            json!({
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "clientInfo": {"name": "acceptance", "version": "1"},
+            }),
+        )
+        .await;
+    mcp.response(id).await;
+    mcp.send_notification("notifications/initialized").await;
+
+    // 空选择条件：参数非法，本地失败（不触达服务，不发 windows.list）。
+    let result = mcp.call_tool("focus_window", json!({})).await;
+    let text = error_text(&result);
+    assert!(
+        text.contains("focus_window requires one of window_id/app_id/title/pid"),
+        "missing selectors must be an invalid-params error: {text}"
+    );
+    assert_eq!(
+        daemon.request_count("windows.list"),
+        0,
+        "invalid params must fail before any RPC"
+    );
+
+    // 多命中：同一 app_id 的两扇窗口 → 歧义错误，带匹配数与候选。
+    let result = mcp
+        .call_tool("focus_window", json!({"app_id": "kitty"}))
+        .await;
+    let text = error_text(&result);
+    assert!(
+        text.contains("2 windows match app_id=\"kitty\"") && text.contains("disambiguate with id:"),
+        "multiple matches must be an ambiguity error: {text}"
+    );
+    assert!(
+        text.contains("[w1] Terminal — zsh") && text.contains("[w2] Terminal — ssh"),
+        "ambiguity must list the matching candidates: {text}"
+    );
+
+    // 零命中：错误可读，列出可见窗口。
+    let result = mcp
+        .call_tool("focus_window", json!({"app_id": "nope"}))
+        .await;
+    let text = error_text(&result);
+    assert!(
+        text.contains("window not found: app_id=\"nope\"") && text.contains("[w3] Files"),
+        "a miss must name the selector and the visible windows: {text}"
+    );
+
+    // 显式标识失配：同一次调用还带了能命中的 app_id，也不得落回模糊匹配。
+    let result = mcp
+        .call_tool(
+            "focus_window",
+            json!({"window_id": "w-missing", "app_id": "kitty", "pid": 10}),
+        )
+        .await;
+    let text = error_text(&result);
+    assert!(
+        text.contains("window not found: window_id=\"w-missing\""),
+        "an explicit window_id miss must not fall back to fuzzy selectors: {text}"
+    );
+    assert!(
+        daemon.windows_op_targets().is_empty(),
+        "no window write may be issued by a failed resolution: {:?}",
+        daemon.windows_op_targets()
+    );
+
+    // 唯一命中：照常下发 windows.op，目标即解析结果。
+    let result = mcp
+        .call_tool("focus_window", json!({"window_id": "w3"}))
+        .await;
+    assert!(
+        result.get("isError") != Some(&json!(true)),
+        "unique window_id must focus: {result}"
+    );
+    assert_eq!(
+        result
+            .get("structuredContent")
+            .and_then(|value| value.get("target")),
+        Some(&json!("w3")),
+        "windows.op must carry the resolved native_id: {result}"
+    );
+    assert_eq!(daemon.windows_op_targets(), vec![json!("w3")]);
 }
