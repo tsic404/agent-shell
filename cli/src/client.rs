@@ -152,7 +152,11 @@ impl DaemonClient {
         let peer = stream
             .peer_cred()
             .map_err(|e| format!("cannot read peer credentials of {}: {e}", path.display()))?;
-        verify_peer_uid(path, peer.uid(), current_uid())?;
+        agent_shell_rpc::endpoint::verify_peer_uid(
+            path,
+            peer.uid(),
+            agent_shell_rpc::endpoint::current_uid(),
+        )?;
         let (read, write) = stream.into_split();
         Ok(Self {
             child: None,
@@ -428,29 +432,6 @@ fn is_transport_error(msg: &str) -> bool {
         || is_closed_early(msg)
 }
 
-/// 本进程 uid（`SO_PEERCRED` 比对基准）。
-fn current_uid() -> u32 {
-    // SAFETY: getuid 无参数、无副作用、不会失败（始终返回调用进程的真实 uid）。
-    unsafe { libc::getuid() }
-}
-
-/// 端点对端 uid 校验：只接受同 uid 的 daemon。
-///
-/// daemon 侧已用 socket 权限 0600 挡住「别人连我」；这里是反向的一半——显式端点
-/// 路径可落在共享目录，别人先绑定同名 socket 就能收到本 CLI 发出的命令负载。
-/// 路径本身不可信，对端进程凭据才是。
-fn verify_peer_uid(path: &Path, peer_uid: u32, our_uid: u32) -> Result<(), String> {
-    if peer_uid == our_uid {
-        return Ok(());
-    }
-    Err(format!(
-        "refusing to use daemon socket {}: peer runs as uid {peer_uid}, not ours ({our_uid}) — \
-         the path may be a socket planted by another user; keep endpoints under a \
-         user-private directory such as $XDG_RUNTIME_DIR",
-        path.display()
-    ))
-}
-
 /// 定位 daemon 二进制（委托 agent-shell-rpc::daemon_bin）。
 ///
 /// workspace target 目录用 `CARGO_MANIFEST_DIR` 拼绝对路径，不依赖 CWD。
@@ -659,22 +640,6 @@ fn a11y_query_params(role: Option<&str>, name: Option<&str>, all: bool) -> Value
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// 直连端点校验对端 uid：不同 uid 一律拒绝，并在报错里点名两个 uid 与路径。
-    #[test]
-    fn verify_peer_uid_rejects_foreign_process() {
-        let path = std::path::Path::new("/tmp/agent-shell.sock");
-        assert!(verify_peer_uid(path, 1000, 1000).is_ok());
-        let err = verify_peer_uid(path, 0, 1000).expect_err("foreign uid must be refused");
-        assert!(
-            err.contains("uid 0") && err.contains("1000") && err.contains("/tmp/agent-shell.sock"),
-            "error must name both uids and the path: {err}"
-        );
-        assert!(
-            err.contains("$XDG_RUNTIME_DIR"),
-            "error must point at a user-private location: {err}"
-        );
-    }
 
     /// 端点不可达时给的补救命令必须可执行：带 `--lock-path`（默认会话锁可能被
     /// 常驻 daemon 持有，照旧提示 `--socket` 会立刻撞 `daemon already running`）。

@@ -7,6 +7,12 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+/// 显式套接字端点的共用判定（空白归零、对端 uid 校验）。
+pub mod endpoint;
+
+/// 窗口目标解析的共用语义（多命中报错、标识等价、候选渲染）。
+pub mod window_target;
+
 /// 输入按键模型（CLI 与 daemon 共用，§22.2 协议载荷）。
 ///
 /// CLI 侧解析组合键语法（快速失败），daemon 侧执行注入；双方以本模块
