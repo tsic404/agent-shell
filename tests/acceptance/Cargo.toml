@@ -100,6 +100,10 @@ name = "TC-tech-08"
 path = "TC-tech-08.rs"
 
 [[test]]
+name = "TC-tech-09"
+path = "TC-tech-09.rs"
+
+[[test]]
 name = "TC-doctor-01"
 path = "TC-doctor-01.rs"
 
