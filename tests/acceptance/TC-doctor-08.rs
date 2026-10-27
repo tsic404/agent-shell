@@ -155,10 +155,10 @@ async fn component_slot_matrix_matches_execution_paths() {
     // 懒启动槽在首次订阅后建立：订阅成功即该能力被激活，不静默失败。
     filled.call_ok(method::EVENTS_SUBSCRIBE, None).await;
 
-    // GNOME 会话独有的 Shell 扩展槽：显式状态，不静默省略。
-    std::env::set_var("XDG_CURRENT_DESKTOP", "GNOME");
+    // GNOME 会话独有的 Shell 扩展槽：显式状态，不静默省略（此时夹具目录尚未
+    // 安装扩展，只断言槽存在且带明确状态；安装后的真值断言见下方 AC-110 段）。
+    let _desktop = EnvGuard::set("XDG_CURRENT_DESKTOP", "GNOME");
     let value = filled.call_ok(method::DOCTOR, None).await;
-    std::env::remove_var("XDG_CURRENT_DESKTOP");
     let report: DoctorResult = serde_json::from_value(value).expect("DoctorResult");
     let extension = report
         .lines
@@ -169,4 +169,155 @@ async fn component_slot_matrix_matches_execution_paths() {
         ["✓", "⚠", "✗"].iter().any(|p| extension.starts_with(p)),
         "extension slot must carry an explicit status: {extension}"
     );
+
+    // 扩展的版本白名单边界（AC-110：GNOME 组合的合成器槽必须装配成功）。
+    // metadata.json 的 shell-version 是 GNOME 的装载白名单，不在列即拒绝加载——
+    // 槽随之变空、窗口命令报 1002。两侧都要可判定，且版本不符的提示本身保留。
+    let versions = embedded_shell_versions();
+    let running = running_shell_major().map(|m| m.to_string());
+    assert!(
+        versions.iter().any(|v| v == SUPPORTED_SHELL_MAJOR),
+        "shell-version {versions:?} must cover the supported GNOME {SUPPORTED_SHELL_MAJOR}"
+    );
+    if let Some(running) = running.as_deref() {
+        assert!(
+            versions
+                .iter()
+                .any(|v| v.split('.').next() == Some(running)),
+            "shell-version {versions:?} does not cover the running GNOME Shell {running}"
+        );
+    }
+
+    // 生产装载判据（install 落盘 + status 提示）：覆盖的版本可加载且不报 mismatch；
+    // 白名单之外的版本仍如实报 mismatch（提示保留，不静默成功）。
+    let data = tempfile::tempdir().expect("extension data home");
+    let _data_home = EnvGuard::set("XDG_DATA_HOME", data.path());
+    let _shell = EnvGuard::set("GNOME_SHELL_VERSION", format!("{SUPPORTED_SHELL_MAJOR}.1"));
+    filled.call_ok(method::EXTENSION_INSTALL, None).await;
+    let status = extension_status(&mut filled).await;
+    assert!(
+        status.installed,
+        "GNOME {SUPPORTED_SHELL_MAJOR} must load the installed extension: {status:?}"
+    );
+    assert!(
+        !status
+            .note
+            .as_deref()
+            .unwrap_or_default()
+            .contains("shell-version mismatch"),
+        "a covered shell version must not report mismatch: {:?}",
+        status.note
+    );
+
+    // AC-110 的就绪判据：安装生效后医生行必须读安装真值，不得再报「未安装」
+    // （就绪能力不返回后端不可用）。⚠ installed but not enabled 与 ✓ 都接受——
+    // 取决于 dconf 真值，两者都证明槽读的是安装结果而非空装配。
+    //
+    // 执行路径（windows.list 不返回 1002）要真实 GNOME 扩展通道才有判定面：夹具
+    // 合成器是 KDE 假合成器，扩展通道不在本夹具可达范围；该面由 extension.js 的
+    // 分派用例（四条授权分支）与真机验收覆盖。
+    let value = filled.call_ok(method::DOCTOR, None).await;
+    let report: DoctorResult = serde_json::from_value(value).expect("DoctorResult");
+    let extension = report
+        .lines
+        .iter()
+        .find(|line| !line.starts_with(' ') && line.contains("Shell 扩展"))
+        .expect("GNOME session must render the extension slot");
+    assert!(
+        !extension.contains("not installed"),
+        "installed extension must not be reported as missing: {extension}"
+    );
+    assert!(
+        extension.starts_with('⚠') || extension.starts_with('✓'),
+        "extension slot must report the installed state: {extension}"
+    );
+
+    let undeclared = format!("{}.1", highest_shell_major(&versions) + 1);
+    let _undeclared = EnvGuard::set("GNOME_SHELL_VERSION", &undeclared);
+    let status = extension_status(&mut filled).await;
+    assert!(
+        !status.installed,
+        "an undeclared shell major must not be reported loadable: {status:?}"
+    );
+    assert!(
+        status
+            .note
+            .as_deref()
+            .unwrap_or_default()
+            .contains("shell-version mismatch"),
+        "version mismatch hint must be kept for undeclared majors: {:?}",
+        status.note
+    );
+}
+
+/// 环境变量守卫：Drop 时恢复原值——断言 panic 时同样生效，不把指向已删除
+/// tempdir 的值留在进程环境里。
+struct EnvGuard {
+    key: &'static str,
+    previous: Option<std::ffi::OsString>,
+}
+
+impl EnvGuard {
+    fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+        let previous = std::env::var_os(key);
+        std::env::set_var(key, value);
+        Self { key, previous }
+    }
+}
+
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        match &self.previous {
+            Some(value) => std::env::set_var(self.key, value),
+            None => std::env::remove_var(self.key),
+        }
+    }
+}
+
+/// 当前受支持的最大 GNOME Shell 主版本：与 metadata.json 的 shell-version 同步上移。
+const SUPPORTED_SHELL_MAJOR: &str = "51";
+
+/// 内嵌 metadata.json 的 shell-version 白名单（安装与打包的唯一来源）。
+fn embedded_shell_versions() -> Vec<String> {
+    let meta: serde_json::Value =
+        serde_json::from_str(agent_shell_compositor_mutter::EXTENSION_METADATA)
+            .expect("extension metadata must be valid JSON");
+    meta["shell-version"]
+        .as_array()
+        .expect("shell-version array")
+        .iter()
+        .filter_map(|v| v.as_str().map(str::to_string))
+        .collect()
+}
+
+/// 白名单里的最高主版本（边界外的判据取它加一）。
+fn highest_shell_major(versions: &[String]) -> u32 {
+    versions
+        .iter()
+        .filter_map(|v| v.split('.').next()?.parse::<u32>().ok())
+        .max()
+        .expect("shell-version must name at least one major")
+}
+
+/// 本机安装的 GNOME Shell 主版本（与生产装载判据同源命令）；非 GNOME 环境为 None。
+fn running_shell_major() -> Option<u32> {
+    let out = std::process::Command::new("gnome-shell")
+        .arg("--version")
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8(out.stdout).ok()?;
+    text.split_whitespace()
+        .next_back()?
+        .split('.')
+        .next()?
+        .parse()
+        .ok()
+}
+
+async fn extension_status(fixture: &mut Fixture) -> agent_shell_rpc::ExtensionStatus {
+    serde_json::from_value(fixture.call_ok(method::EXTENSION_STATUS, None).await)
+        .expect("ExtensionStatus")
 }

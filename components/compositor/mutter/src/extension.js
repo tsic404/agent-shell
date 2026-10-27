@@ -52,11 +52,13 @@ class AgentShellBridge {
         this._impl = null;
         this._nodeInfo = null;
         this._ifaceInfo = null;
-        this._vtable = null;
         this._regId = 0;        // register_object 句柄（对象路径）
         this._nameOwnerId = 0;  // bus_own_name 句柄（well-known 名称）
         this._signalIds = [];
         this._watchers = new Map();
+        this._closedWatch = new Map();  // MetaWindow → unmanaged 句柄
+        this._daemonWatcherId = 0;      // DAEMON_BUS_NAME 的 watch 句柄
+        this._daemonOwner = null;       // 当前持有者唯一名（sender 比对基准）
     }
 
     enable() {
@@ -79,37 +81,61 @@ class AgentShellBridge {
             GetMonitorLayout: () => this._monitorLayout(),
         };
 
-        // 自定义 vtable：method_call 先校验 sender 再按方法名分派。
+        // method_call 闭包：先校验 sender 再按方法名分派。
         // 不用 Gio.DBusExportedObject.wrapJSObject——其 method 不暴露 sender，
-        // 无法做调用方校验（安全要求）。
-        this._vtable = new Gio.DBusInterfaceVTable();
-        this._vtable.method_call = (connection, sender, objectPath, ifaceName,
-            methodName, parameters, invocation) => {
-            this._onMethodCall(sender, methodName, parameters, invocation);
-        };
+        // 无法做调用方校验（安全要求）。GNOME 51（GJS 1.90）起
+        // `Gio.DBusInterfaceVTable` 不能直接构造，只能用闭包形态注册。
         this._regId = Gio.DBus.session.register_object(
-            OBJECT_PATH, this._ifaceInfo, this._vtable);
+            OBJECT_PATH, this._ifaceInfo,
+            (connection, sender, objectPath, ifaceName, methodName, parameters, invocation) => {
+                this._onMethodCall(sender, methodName, parameters, invocation);
+            },
+            null, null);
 
         this._nameOwnerId = Gio.bus_own_name(Gio.BusType.SESSION, BUS_NAME,
             Gio.BusNameOwnerFlags.NONE, null, null, null);
 
+        // daemon 的 well-known 名持有者：
+        //  · enable 阶段同步取一次——此时不在方法分派内，不会与正在分派的消息互等；
+        //    少了这一步，watcher 回调落地前到达的首个调用会被判 Unauthorized，
+        //    daemon 首次 windows.list 就是 1002（AC-110「就绪能力不返回后端不可用」）。
+        //  · 之后由 NameOwnerChanged 维护（覆盖 daemon 在扩展之后启动）。
+        //  ⚠ method_call 内不得同步查询该连接：会与正在分派的这条消息互相等待。
+        this._daemonOwner = this._lookupDaemonOwner();
+        this._daemonWatcherId = Gio.bus_watch_name(Gio.BusType.SESSION,
+            DAEMON_BUS_NAME, Gio.BusNameWatcherFlags.NONE,
+            (_conn, _name, owner) => { this._daemonOwner = owner; },
+            () => { this._daemonOwner = null; });
+
         // 窗口事件 → D-Bus 信号（§8.1 三信号）。
         const display = global.display ?? global.compositor;
         if (display) {
-            this._signalIds.push(display.connect('window-created', (_d, mw) =>
-                this._onWindowCreated(mw)));
-            this._signalIds.push(display.connect('window-destroyed', (_d, mw) =>
-                this._emit('WindowClosed', new GLib.Variant('(u)', [mw.get_id() >>> 0]))));
+            this._signalIds.push(display.connect('window-created', (_d, mw) => {
+                this._watchWindowClosed(mw);
+                this._onWindowCreated(mw);
+            }));
             // notify::focus-window（属性通知信号）——notify-focus-window 不存在。
             this._signalIds.push(display.connect('notify::focus-window', () =>
                 this._emit('ActiveWindowChanged',
                     new GLib.Variant('(s)', [this._getActiveWindow()]))));
         }
+        // GNOME 51 起 MetaDisplay 不再提供 window-destroyed：逐窗订阅
+        // MetaWindow::unmanaged（关闭/销毁都经此），已存在窗口同样纳入。
+        for (const actor of global.get_window_actors())
+            this._watchWindowClosed(actor.meta_window);
     }
 
     disable() {
         for (const [, toId] of this._watchers) GLib.source_remove(toId);
         this._watchers.clear();
+        for (const [mw, id] of this._closedWatch) {
+            try {
+                mw.disconnect(id);
+            } catch (e) {
+                // 窗口已销毁，句柄随之失效。
+            }
+        }
+        this._closedWatch.clear();
         for (const id of this._signalIds)
             (global.display ?? global.compositor)?.disconnect(id);
         this._signalIds = [];
@@ -123,11 +149,26 @@ class AgentShellBridge {
             Gio.DBus.session.unregister_object(this._regId);
             this._regId = 0;
         }
+        if (this._daemonWatcherId > 0) {
+            Gio.bus_unwatch_name(this._daemonWatcherId);
+            this._daemonWatcherId = 0;
+            this._daemonOwner = null;
+        }
 
         this._impl = null;
         this._nodeInfo = null;
         this._ifaceInfo = null;
-        this._vtable = null;
+    }
+
+    // 把处理异常翻成 D-Bus 错误：JS 异常不是 GLib.Error，直接
+    // return_gerror 会二次抛出，invocation 永不回包（调用方只能等超时）。
+    _returnError(invocation, e) {
+        try {
+            invocation.return_gerror(e);
+        } catch (_notGlibError) {
+            invocation.return_dbus_error('org.freedesktop.DBus.Error.Failed',
+                String(e));
+        }
     }
 
     // 校验 sender 后按方法名分派（method_call 入口）。
@@ -147,7 +188,7 @@ class AgentShellBridge {
         try {
             args = parameters ? parameters.deepUnpack() : [];
         } catch (e) {
-            invocation.return_gerror(e);
+            this._returnError(invocation, e);
             return;
         }
         try {
@@ -158,7 +199,21 @@ class AgentShellBridge {
                 invocation.return_value(new GLib.Variant('()', []));
             }
         } catch (e) {
-            invocation.return_gerror(e);
+            this._returnError(invocation, e);
+        }
+    }
+
+    // 取 daemon 当前持有者（仅 enable 阶段调用；method_call 内调用会互等，见 enable）。
+    _lookupDaemonOwner() {
+        try {
+            const [owner] = Gio.DBus.session.call_sync(
+                'org.freedesktop.DBus', '/org/freedesktop/DBus',
+                'org.freedesktop.DBus', 'GetNameOwner',
+                new GLib.Variant('(s)', [DAEMON_BUS_NAME]), null,
+                Gio.DBusCallFlags.NONE, -1, null).deepUnpack();
+            return owner ?? null;
+        } catch (e) {
+            return null;  // daemon 尚未运行：由 watch 的 appeared 回调填充。
         }
     }
 
@@ -166,12 +221,7 @@ class AgentShellBridge {
     // 可调用。防止任意同 uid 进程经 org.gnome.Shell.AgentShell 绕过 daemon 的
     // caller 门禁（§8.1 安全——GNOME 47 禁用 Eval 的同类暴露面）。
     _isAuthorized(sender) {
-        try {
-            const owner = Gio.DBus.session.get_name_owner_sync(DAEMON_BUS_NAME);
-            return owner !== null && owner === sender;
-        } catch (e) {
-            return false;
-        }
+        return this._daemonOwner !== null && this._daemonOwner === sender;
     }
 
     _withWindow(id, fn) {
@@ -180,6 +230,22 @@ class AgentShellBridge {
         if (!actor) throw new GLib.Error(GLib.quark_from_string('agent-shell'),
             1, `window ${id} not found`);
         fn(actor.meta_window);
+    }
+
+    // 逐窗订阅 `unmanaged` → WindowClosed（GNOME 51 起 MetaDisplay 无
+    // window-destroyed；`unmanaged` 在 45+ 均可用）。
+    _watchWindowClosed(mw) {
+        if (this._closedWatch.has(mw)) return;
+        const id = mw.connect('unmanaged', () => {
+            this._closedWatch.delete(mw);
+            try {
+                this._emit('WindowClosed',
+                    new GLib.Variant('(u)', [mw.get_id() >>> 0]));
+            } catch (e) {
+                logError(e, 'agent-shell-bridge: WindowClosed emit failed');
+            }
+        });
+        this._closedWatch.set(mw, id);
     }
 
     _onWindowCreated(mw) {
@@ -204,7 +270,7 @@ class AgentShellBridge {
         return JSON.stringify({
             id: mw.get_id(), title: mw.get_title() || '',
             appId: mw.get_wm_class() || '', pid: mw.get_pid(),
-            minimized: mw.minimized, maximized: mw.maximized,
+            minimized: mw.minimized, maximized: mw.is_maximized(),
             fullscreen: mw.fullscreen,
             geometry: mw.get_frame_rect(),
             hasFocus: mw.has_focus()
