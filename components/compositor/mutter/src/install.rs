@@ -336,10 +336,11 @@ mod tests {
             .as_array()
             .expect("shell-version array");
         assert!(!versions.is_empty(), "shell-version must be non-empty");
-        // P0：验收主场景要求 GNOME 50 能加载——shell-version 必须覆盖 "50"。
+        // 白名单按 GNOME 大版本逐个列出：当前受支持的最大版本必须在内，
+        // 否则 shell 拒绝加载（验收主场景 GNOME 51）。
         assert!(
-            versions.iter().any(|v| v == "50"),
-            "shell-version must include GNOME 50"
+            versions.iter().any(|v| v == "51"),
+            "shell-version must include GNOME 51"
         );
     }
 

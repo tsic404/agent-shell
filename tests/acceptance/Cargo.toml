@@ -22,6 +22,7 @@ path = "src/lib.rs"
 agent-shell-a11y.workspace = true
 agent-shell-bluetooth.workspace = true
 agent-shell-capture = { path = "../../modules/capture", default-features = false }
+agent-shell-compositor-mutter.workspace = true
 agent-shell-core.workspace = true
 # 直连路径依赖 + 关默认特性：与 daemon / cli 的跨成员依赖同形，避免无 PipeWire
 # dev 头的机器（no-pipewire profile、arm64）被 portal-screencast 卡住编译。
