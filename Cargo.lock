@@ -27,6 +27,7 @@ dependencies = [
  "agent-shell-a11y",
  "agent-shell-bluetooth",
  "agent-shell-capture",
+ "agent-shell-compositor-mutter",
  "agent-shell-core",
  "agent-shell-daemon",
  "agent-shell-event",

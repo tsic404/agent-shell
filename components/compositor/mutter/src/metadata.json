@@ -2,7 +2,7 @@
   "uuid": "agent-shell-bridge@tsic.top",
   "name": "agent-shell-bridge",
   "description": "Expose window-management D-Bus interface (org.gnome.Shell.AgentShell) for agent-shell",
-  "shell-version": ["45", "46", "47", "48", "49", "50"],
+  "shell-version": ["45", "46", "47", "48", "49", "50", "51"],
   "version": 1,
   "url": "https://github.com/tsic404/agent-shell"
 }

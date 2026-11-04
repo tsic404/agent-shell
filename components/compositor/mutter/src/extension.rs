@@ -317,7 +317,7 @@ fn empty_focus_placeholder() -> agent_shell_core::types::WindowInfo {
 mod tests {
     use super::*;
     use std::ffi::OsString;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
 
     #[test]
     fn extension_js_registers_declared_interface() {
@@ -369,20 +369,22 @@ mod tests {
     }
 
     #[test]
-    fn extension_js_registers_with_method_call_vtable() {
-        // 审查🔴2：方法分派须经含 method_call 的 vtable（普通对象不是合法 vtable）。
-        assert!(EXTENSION_JS.contains("new Gio.DBusInterfaceVTable()"));
-        assert!(EXTENSION_JS.contains(".method_call = "));
+    fn extension_js_registers_method_call_closure() {
+        // 方法分派须经带 sender 的 method_call 闭包（wrapJSObject 不暴露 sender）；
+        // GNOME 51（GJS 1.90）起 `new Gio.DBusInterfaceVTable()` 不可构造。
         assert!(EXTENSION_JS.contains("register_object("));
+        assert!(EXTENSION_JS.contains("(connection, sender, objectPath, ifaceName,"));
+        assert!(!EXTENSION_JS.contains("new Gio.DBusInterfaceVTable()"));
     }
 
     #[test]
     fn extension_js_validates_sender() {
-        // 审查🔴6：well-known 名暴露窗口控制，method_call 须先校验 sender
-        // 确为 daemon（持有 org.agentshell.Daemon 名）。
+        // well-known 名暴露窗口控制，method_call 须先校验 sender 确为 daemon
+        // （持有 org.agentshell.Daemon 名）。持有者随 NameOwnerChanged 缓存——
+        // method_call 内不能对同一连接做同步查询（会与正在分派的消息互等）。
         assert!(EXTENSION_JS.contains("_isAuthorized(sender)"));
-        assert!(EXTENSION_JS.contains("get_name_owner_sync(DAEMON_BUS_NAME)"));
-        assert!(EXTENSION_JS.contains("owner !== null && owner === sender"));
+        assert!(EXTENSION_JS.contains("bus_watch_name(Gio.BusType.SESSION,"));
+        assert!(EXTENSION_JS.contains("this._daemonOwner === sender"));
         assert!(EXTENSION_JS.contains(".Error.Unauthorized"));
     }
 
@@ -656,6 +658,73 @@ exit 1
         {
             panic!("{message}");
         }
+    }
+
+    /// 方法分派与窗口接线的可执行判定（不依赖图形会话）：把 `tests/js` 的 mock
+    /// 与改写 import 后的 extension.js 落到临时目录，用 node 驱动 method_call
+    /// 闭包与窗口信号。九条判定见 harness.mjs 顶部：分派四分支（含「enable 同步
+    /// 取得 owner 时首调即返回载荷」这条启动窗口判据）、逐窗 `unmanaged` 接线
+    /// 三条、`is_maximized()` 载荷两条。node 缺失即失败——不静默跳过。
+    #[test]
+    fn extension_js_dispatch_branches_are_executable() {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/js");
+        let dir = prepare_dispatch_harness(&fixture);
+        let out = std::process::Command::new("node")
+            .arg(dir.join("harness.mjs"))
+            .current_dir(&dir)
+            .output();
+        let out = match out {
+            Ok(out) => out,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                let _ = std::fs::remove_dir_all(&dir);
+                panic!("node is required to run the extension dispatch harness");
+            }
+            Err(e) => panic!("failed to run node: {e}"),
+        };
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            out.status.success(),
+            "extension dispatch harness failed:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        assert!(
+            stdout.contains("PASS 9 checks"),
+            "harness must report every branch: {stdout}"
+        );
+    }
+
+    /// 把 mock 与改写 import 后的 extension.js 落到临时目录（Node ESM 只能按相对
+    /// 路径解析 mock；真实 `gi://` / `resource://` 命名空间在 Node 下不存在）。
+    fn prepare_dispatch_harness(src: &Path) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("agent-shell-ext-dispatch-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create dispatch harness dir");
+        for name in [
+            "harness.mjs",
+            "mock-extension.mjs",
+            "mock-gio.mjs",
+            "mock-glib.mjs",
+            "mock-meta.mjs",
+        ] {
+            std::fs::copy(src.join(name), dir.join(name))
+                .unwrap_or_else(|e| panic!("copy {name}: {e}"));
+        }
+        let js = EXTENSION_JS
+            .replace("from 'gi://GLib'", "from './mock-glib.mjs'")
+            .replace("from 'gi://Gio'", "from './mock-gio.mjs'")
+            .replace("from 'gi://Meta'", "from './mock-meta.mjs'")
+            .replace(
+                "from 'resource:///org/gnome/shell/extensions/extension.js'",
+                "from './mock-extension.mjs'",
+            );
+        assert!(
+            !js.contains("from 'gi://") && !js.contains("from 'resource:///"),
+            "extension.js import layout changed; update the dispatch harness"
+        );
+        std::fs::write(dir.join("extension_under_test.mjs"), js).expect("write extension copy");
+        dir
     }
 
     #[test]
