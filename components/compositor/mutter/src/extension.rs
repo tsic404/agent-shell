@@ -662,9 +662,10 @@ exit 1
 
     /// 方法分派与窗口接线的可执行判定（不依赖图形会话）：把 `tests/js` 的 mock
     /// 与改写 import 后的 extension.js 落到临时目录，用 node 驱动 method_call
-    /// 闭包与窗口信号。九条判定见 harness.mjs 顶部：分派四分支（含「enable 同步
+    /// 闭包与窗口信号。十三条判定见 harness.mjs 顶部：分派四分支（含「enable 同步
     /// 取得 owner 时首调即返回载荷」这条启动窗口判据）、逐窗 `unmanaged` 接线
-    /// 三条、`is_maximized()` 载荷两条。node 缺失即失败——不静默跳过。
+    /// 三条、`is_maximized()` 载荷两条、几何/工作区/类型/置顶四条。
+    /// node 缺失即失败——不静默跳过。
     #[test]
     fn extension_js_dispatch_branches_are_executable() {
         let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/js");
@@ -689,7 +690,7 @@ exit 1
             "extension dispatch harness failed:\nstdout:\n{stdout}\nstderr:\n{stderr}"
         );
         assert!(
-            stdout.contains("PASS 9 checks"),
+            stdout.contains("PASS 13 checks"),
             "harness must report every branch: {stdout}"
         );
     }

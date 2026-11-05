@@ -15,11 +15,16 @@
 //   7. 触发已接线窗口的 `unmanaged` → 对外发 WindowClosed，载荷带该窗口标识；
 //   8. 窗口 is_maximized() 为 true 时载荷 maximized === true；
 //   9. 窗口 is_maximized() 为 false 时载荷 maximized === false
-//      （读 `mw.maximized` 得 undefined，8/9 都会红）。
+//      （读 `mw.maximized` 得 undefined，8/9 都会红）；
+//  10. 几何取 frame 四边实值（Meta.Rectangle 直接序列化只得 `{}`）；
+//  11. 工作区为 0 基序号，sticky 窗口为 null（不伪造序号）；
+//  12. 窗口类型映射为契约枚举名（Dialog）；
+//  13. 置顶标志与 is_above() 一致。
 //
-// 退出码非 0 即测试失败；Rust 侧断言 stdout 含 "PASS 9 checks"。
+// 退出码非 0 即测试失败；Rust 侧断言 stdout 含 "PASS 13 checks"。
 
 import AgentShellExtension from './extension_under_test.mjs';
+import Meta from './mock-meta.mjs';
 import {emittedSignals, session, setSyncOwner, watched} from './mock-gio.mjs';
 
 const IFACE = 'org.gnome.Shell.AgentShell';
@@ -44,8 +49,23 @@ function assert(condition, message) {
         throw new Error(message);
 }
 
+/// Meta.Rectangle 替身：GJS 的 boxed struct 字段不在自有可枚举属性上，
+/// `JSON.stringify(rect)` 得到 `{}`——这正是几何退化为 0×0 的成因，替身必须同形。
+function boxedRect(x, y, width, height) {
+    const rect = {};
+    for (const [key, value] of Object.entries({x, y, width, height}))
+        Object.defineProperty(rect, key, {value, enumerable: false});
+    return rect;
+}
+
 /// MetaWindow 替身：connect 记录信号名，便于断言接线用的是哪个信号。
-function makeWindow(id, {maximized = false} = {}) {
+function makeWindow(id, {
+    maximized = false,
+    workspace = 3,
+    windowType = Meta.WindowType.NORMAL,
+    keepAbove = false,
+    frameRect = {x: 8, y: 16, width: 644, height: 492},
+} = {}) {
     const signals = [];
     const window = {
         signals,
@@ -56,7 +76,11 @@ function makeWindow(id, {maximized = false} = {}) {
         minimized: false,
         fullscreen: false,
         is_maximized: () => maximized,
-        get_frame_rect: () => ({x: 10, y: 20, width: 640, height: 480}),
+        get_frame_rect: () => boxedRect(frameRect.x, frameRect.y,
+            frameRect.width, frameRect.height),
+        get_workspace: () => workspace === null ? null : {index: () => workspace},
+        get_window_type: () => windowType,
+        is_above: () => keepAbove,
         has_focus: () => id === 42,
         connect(signal, callback) {
             const handle = ++handleSeq;
@@ -224,9 +248,51 @@ for (const maximized of [true, false]) {
     });
 }
 
+// ── 10–13：投影字段（几何/工作区/类型/置顶） ───────────────────────────────
+//
+// 10 的替身用 non-enumerable 字段模拟 GJS boxed struct：直接序列化
+// `Meta.Rectangle` 得 `{}`（几何 0×0 的真实成因），显式取四边才通过。
+
+check('载荷几何取实值（frame 四边，不是空对象）', () => {
+    installFakeShell([makeWindow(42)]);
+    boot(':1.7');
+    const window = assertWindowList(invoke(':1.7'), 'geometry');
+    assert(JSON.stringify(window.geometry) ===
+        JSON.stringify({x: 8, y: 16, width: 644, height: 492}),
+    `expected frame rect, got ${JSON.stringify(window.geometry)}`);
+});
+
+check('载荷工作区为 0 基序号；sticky 窗口为 null', () => {
+    installFakeShell([makeWindow(42, {workspace: 3})]);
+    boot(':1.7');
+    assert(assertWindowList(invoke(':1.7'), 'workspace').workspace === 3,
+        'workspace index must round-trip');
+
+    installFakeShell([makeWindow(42, {workspace: null})]);
+    boot(':1.7');
+    assert(assertWindowList(invoke(':1.7'), 'sticky').workspace === null,
+        'window without a workspace must report null, not a sentinel index');
+});
+
+check('载荷窗口类型为首字母大写枚举名', () => {
+    installFakeShell([makeWindow(42, {windowType: Meta.WindowType.DIALOG})]);
+    boot(':1.7');
+    assert(assertWindowList(invoke(':1.7'), 'windowType').windowType === 'Dialog',
+        'window type must map to the contract enum name');
+});
+
+check('载荷置顶标志与 is_above() 一致', () => {
+    for (const keepAbove of [true, false]) {
+        installFakeShell([makeWindow(42, {keepAbove})]);
+        boot(':1.7');
+        assert(assertWindowList(invoke(':1.7'), `keepAbove=${keepAbove}`).keepAbove === keepAbove,
+            `expected keepAbove=${keepAbove}`);
+    }
+});
+
 if (failures > 0) {
     console.error(`${failures} check(s) failed`);
     process.exit(1);
 }
-console.log('PASS 9 checks');
+console.log('PASS 13 checks');
 process.exit(0);

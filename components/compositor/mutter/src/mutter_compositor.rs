@@ -679,6 +679,7 @@ impl CompositorComponent for MutterCompositor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agent_shell_core::types::WindowType;
     use std::os::unix::net::UnixStream;
     use std::process::Stdio;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -782,6 +783,85 @@ mod tests {
             .await
             .expect("claim org.gnome.Shell");
         conn
+    }
+
+    /// mock `org.gnome.Shell.AgentShell`：ListWindows 原样返回固定载荷。
+    struct FakeAgentShell {
+        payload: String,
+    }
+
+    #[zbus::interface(name = "org.gnome.Shell.AgentShell")]
+    impl FakeAgentShell {
+        fn list_windows(&self) -> String {
+            self.payload.clone()
+        }
+        fn get_active_window(&self) -> String {
+            String::new()
+        }
+        fn focus_window(&self, _window_id: u32) {}
+        fn move_window(&self, _window_id: u32, _x: i32, _y: i32) {}
+        fn close_window(&self, _window_id: u32) {}
+        fn minimize_window(&self, _window_id: u32, _minimize: bool) {}
+        fn maximize_window(&self, _window_id: u32, _maximize: bool) {}
+    }
+
+    async fn spawn_fake_agent_shell(bus: &TestBus, payload: &str) -> zbus::Connection {
+        let conn = bus.connect().await;
+        conn.object_server()
+            .at(
+                "/org/gnome/Shell/AgentShell",
+                FakeAgentShell {
+                    payload: payload.to_string(),
+                },
+            )
+            .await
+            .expect("register org.gnome.Shell.AgentShell");
+        use zbus::names::WellKnownName;
+        let name = WellKnownName::try_from("org.gnome.Shell.AgentShell".to_string())
+            .expect("valid bus name");
+        conn.request_name(name)
+            .await
+            .expect("claim org.gnome.Shell.AgentShell");
+        conn
+    }
+
+    /// GNOME 51.1 Wayland 真机会话 `ListWindows` 的返回串（真窗口取值）。
+    ///
+    /// 采集自 gnome-text-editor 窗口：几何是 `get_frame_rect` 四边显式取值的
+    /// 结果；`workspace` 是 0 基序号；`windowType` 是契约枚举名。载荷形状即
+    /// 扩展与 daemon 之间的线格式。
+    const GNOME_LIST_WINDOWS_PAYLOAD: &str = r#"[{"id":52877633,"title":"New Document (Draft) - Text Editor","appId":"org.gnome.TextEditor","pid":619,"minimized":false,"maximized":false,"fullscreen":false,"geometry":{"x":290,"y":156,"width":700,"height":520},"workspace":0,"windowType":"Normal","keepAbove":false,"hasFocus":false}]"#;
+
+    /// Extension 载荷 → core `WindowInfo`：几何/工作区/类型不得退化为默认值。
+    #[tokio::test]
+    async fn extension_list_windows_projects_geometry_type_and_workspace() {
+        let bus = TestBus::start().await;
+        let _shell = spawn_fake_agent_shell(&bus, GNOME_LIST_WINDOWS_PAYLOAD).await;
+        let conn = bus.connect().await;
+        let windows = crate::extension::ExtensionRunner::new(conn)
+            .list_windows()
+            .await
+            .expect("extension payload parses over D-Bus");
+        assert_eq!(windows.len(), 1, "one window in the captured payload");
+        let window = &windows[0];
+        assert_eq!(window.id.native_id, "52877633");
+        assert_eq!(
+            window.geometry,
+            agent_shell_core::types::Rect {
+                x: 290,
+                y: 156,
+                width: 700,
+                height: 520,
+            }
+        );
+        // 载荷不带 frameGeometry 时按既有规则回落内容几何（同源）。
+        assert_eq!(window.frame_geometry, window.geometry);
+        assert_eq!(
+            window.workspace_id.as_ref().map(|w| w.native_id.as_str()),
+            Some("0")
+        );
+        assert_eq!(window.window_type, WindowType::Normal);
+        assert!(!window.keep_above);
     }
 
     /// 原始 Wayland 服务端线程：`UnixStream::pair()` 一侧交给 `Backend`，

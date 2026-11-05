@@ -26,15 +26,17 @@ trait Shell {
 /// Eval 返回的窗口 JSON 键 → core `WindowInfo` 归一化。
 pub(crate) mod parse {
     use agent_shell_core::types::{
-        DesktopEnvironment, Rect, WindowId, WindowInfo, WindowState, WindowType,
+        DesktopEnvironment, Rect, WindowId, WindowInfo, WindowState, WindowType, WorkspaceId,
     };
     use serde_json::Value;
 
     /// 把 Eval/Extension 返回的单窗 JSON 归一化为 core `WindowInfo`。
     ///
     /// GNOME 侧字段：`id`(number|string) / `title` / `appId` / `pid` /
-    /// `geometry{x,y,width,height}` / `frameGeometry`(可选) /
-    /// `hasFocus` / `minimized` / `maximized`。缺字段按默认值兜底。
+    /// `geometry{x,y,width,height}`（用户可见窗口边缘）/ `frameGeometry`(可选) /
+    /// `workspace`(0 基序号，null=全部工作区可见) / `windowType`（契约
+    /// 枚举名）/ `keepAbove` / `hasFocus` / `minimized` / `maximized`。
+    /// 缺字段按默认值兜底（旧版载荷无后三字段）。
     pub(crate) fn window(v: &Value, stacking_order: u32) -> Option<WindowInfo> {
         let id = match v.get("id") {
             Some(Value::Number(n)) => n.to_string(),
@@ -74,6 +76,14 @@ pub(crate) mod parse {
         } else {
             frame
         };
+        // 0 基工作区序号；null/缺字段 = 全部工作区可见或旧版载荷未携带。
+        let workspace_id = v
+            .get("workspace")
+            .and_then(Value::as_i64)
+            .map(|index| WorkspaceId {
+                native_id: index.to_string(),
+                de_type: DesktopEnvironment::GNOME,
+            });
         Some(WindowInfo {
             id: WindowId {
                 native_id: id,
@@ -93,14 +103,30 @@ pub(crate) mod parse {
             geometry: content,
             frame_geometry,
             states,
-            workspace_id: None,
+            workspace_id,
             monitor_id: None,
             stacking_order,
             desktop_file: None,
-            window_type: WindowType::Unknown,
+            window_type: window_type(v.get("windowType")),
             icon_geometry: None,
-            keep_above: false,
+            keep_above: v.get("keepAbove").and_then(Value::as_bool).unwrap_or(false),
         })
+    }
+
+    /// 契约枚举名 → core `WindowType`。未知/缺失一律 `Unknown`。
+    fn window_type(v: Option<&Value>) -> WindowType {
+        match v.and_then(Value::as_str) {
+            Some("Normal") => WindowType::Normal,
+            Some("Dialog") => WindowType::Dialog,
+            Some("Dock") => WindowType::Dock,
+            Some("Desktop") => WindowType::Desktop,
+            Some("DropdownMenu") => WindowType::DropdownMenu,
+            Some("Tooltip") => WindowType::Tooltip,
+            Some("Notification") => WindowType::Notification,
+            Some("Splash") => WindowType::Splash,
+            Some("Utility") => WindowType::Utility,
+            _ => WindowType::Unknown,
+        }
     }
 
     fn num(g: &Value, key: &str) -> i32 {
@@ -158,13 +184,30 @@ impl GnomeEvalBridge {
     }
 
     /// 窗口列表 JS（§8.1 设计文档原文）。
+    ///
+    /// `Meta.Rectangle` 是 boxed struct，直接 `JSON.stringify` 得到 `{}`
+    /// （几何退化为 0×0）——四边须显式取值。工作区/类型/置顶同理须显式读，
+    /// 不能留给 Rust 侧默认值。几何取 `get_frame_rect`（用户可见的窗口
+    /// 边缘）：Wayland CSD 的 buffer rect 含客户端阴影，不能当内容几何。
+    /// 类型表按 `MetaWindowType` 的稳定 ABI 编号；契约无对应取值的编号
+    /// 不上报臆造名。
     pub(crate) const LIST_WINDOWS_JS: &'static str = r#"JSON.stringify(global.get_window_actors().map(a => {
             let mw = a.meta_window;
+            let rect = f => { let g = f();
+                return { x: g.x, y: g.y, width: g.width, height: g.height }; };
+            let types = { 0: 'Normal', 1: 'Desktop', 2: 'Dock', 3: 'Dialog',
+                4: 'Dialog', 5: 'Utility', 6: 'DropdownMenu', 7: 'Utility',
+                8: 'Splash', 9: 'DropdownMenu', 10: 'DropdownMenu',
+                11: 'Tooltip', 12: 'Notification', 13: 'DropdownMenu' };
+            let ws = mw.get_workspace();
             return { id: mw.get_id(), title: mw.get_title() || '',
                      appId: mw.get_wm_class() || '', pid: mw.get_pid(),
                      minimized: mw.minimized, maximized: mw.maximized,
                      fullscreen: mw.fullscreen,
-                     geometry: mw.get_frame_rect(),
+                     geometry: rect(() => mw.get_frame_rect()),
+                     workspace: ws ? ws.index() : null,
+                     windowType: types[mw.get_window_type()] || 'Unknown',
+                     keepAbove: mw.is_above(),
                      hasFocus: mw.has_focus() };
         }))"#;
 
@@ -268,7 +311,7 @@ fn js_number(native_id: &str) -> Result<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_shell_core::types::{Rect, WindowState};
+    use agent_shell_core::types::{DesktopEnvironment, Rect, WindowState, WindowType, WorkspaceId};
     use serde_json::json;
 
     #[test]
@@ -332,6 +375,48 @@ mod tests {
     }
 
     #[test]
+    fn parses_workspace_window_type_and_keep_above() {
+        // GNOME 51 扩展载荷形状：工作区是 0 基序号，类型是同名字符串。
+        let w = json!({
+            "id": 1211664006u64, "title": "New Document", "appId": "org.gnome.TextEditor",
+            "pid": 1472, "workspace": 0, "windowType": "Dialog", "keepAbove": true,
+            "geometry": {"x": 120, "y": 90, "width": 900, "height": 600},
+            "frameGeometry": {"x": 120, "y": 60, "width": 900, "height": 630}
+        });
+        let info = parse::window(&w, 0).expect("payload parses");
+        assert_eq!(
+            info.workspace_id,
+            Some(WorkspaceId {
+                native_id: "0".into(),
+                de_type: DesktopEnvironment::GNOME,
+            })
+        );
+        assert_eq!(info.window_type, WindowType::Dialog);
+        assert!(info.keep_above);
+        assert_eq!(info.geometry.height, 600);
+        assert_eq!(info.frame_geometry.height, 630);
+    }
+
+    #[test]
+    fn sticky_window_has_no_workspace() {
+        // null = 全部工作区可见；不得伪造 0 号工作区。
+        let w = json!({"id": 5u64, "workspace": null, "windowType": "Normal"});
+        let info = parse::window(&w, 0).unwrap();
+        assert!(info.workspace_id.is_none());
+        assert_eq!(info.window_type, WindowType::Normal);
+        assert!(!info.keep_above);
+    }
+
+    #[test]
+    fn unknown_window_type_name_is_unknown() {
+        let w = json!({"id": 6u64, "windowType": "OverrideOther"});
+        assert_eq!(
+            parse::window(&w, 0).unwrap().window_type,
+            WindowType::Unknown
+        );
+    }
+
+    #[test]
     fn numeric_ids_only_reach_eval_js() {
         assert_eq!(js_number("12345").unwrap(), "12345");
         assert!(js_number("").is_err());
@@ -342,12 +427,24 @@ mod tests {
 
     #[test]
     fn list_windows_js_mentions_required_api_surface() {
-        // 守住 §8.4 操作面：actor 遍历 + frame_rect + has_focus。
-        for needle in ["get_window_actors", "get_frame_rect", "has_focus"] {
+        // 守住 §8.4 操作面：actor 遍历 + 矩形 + 工作区/类型/置顶 + has_focus。
+        for needle in [
+            "get_window_actors",
+            "get_frame_rect",
+            "get_workspace",
+            "get_window_type",
+            "is_above",
+            "has_focus",
+        ] {
             assert!(
                 GnomeEvalBridge::LIST_WINDOWS_JS.contains(needle),
                 "LIST_WINDOWS_JS missing `{needle}`"
             );
         }
+        // 回归守卫：矩形不得整对象序列化（boxed struct 会变成 `{}`），
+        // 工作区取序号而不是把 Meta.Workspace 塞进载荷。
+        assert!(GnomeEvalBridge::LIST_WINDOWS_JS.contains("rect(() => mw.get_frame_rect())"));
+        assert!(GnomeEvalBridge::LIST_WINDOWS_JS.contains("ws.index()"));
+        assert!(!GnomeEvalBridge::LIST_WINDOWS_JS.contains("geometry: mw.get_frame_rect()"));
     }
 }
