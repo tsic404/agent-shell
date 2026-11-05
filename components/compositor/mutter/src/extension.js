@@ -47,6 +47,30 @@ const DBusInterface = `
 // 返回字符串（JSON）的方法集合；其余方法无返回值（void）。
 const STRING_RETURN_METHODS = new Set(['ListWindows', 'GetActiveWindow', 'GetMonitorLayout']);
 
+// Meta.WindowType → 投影枚举名（core WindowType，首字母大写）。
+// 契约词表更窄：toolbar/combo 按语义就近归一（Utility/DropdownMenu）；
+// 拖放与覆盖层在契约里没有对应取值，不臆造名字，按 Unknown 上报。
+const WINDOW_TYPE_NAMES = new Map([
+    [Meta.WindowType.NORMAL, 'Normal'],
+    [Meta.WindowType.DESKTOP, 'Desktop'],
+    [Meta.WindowType.DOCK, 'Dock'],
+    [Meta.WindowType.DIALOG, 'Dialog'],
+    [Meta.WindowType.MODAL_DIALOG, 'Dialog'],
+    [Meta.WindowType.TOOLBAR, 'Utility'],
+    [Meta.WindowType.MENU, 'DropdownMenu'],
+    [Meta.WindowType.UTILITY, 'Utility'],
+    [Meta.WindowType.SPLASHSCREEN, 'Splash'],
+    [Meta.WindowType.DROPDOWN_MENU, 'DropdownMenu'],
+    [Meta.WindowType.POPUP_MENU, 'DropdownMenu'],
+    [Meta.WindowType.TOOLTIP, 'Tooltip'],
+    [Meta.WindowType.NOTIFICATION, 'Notification'],
+    [Meta.WindowType.COMBO, 'DropdownMenu'],
+]);
+
+// Meta.Rectangle 是 boxed struct：字段不在自有可枚举属性上，JSON.stringify
+// 只会得到 `{}`（几何因此退化为 0×0）。必须显式取四个字段再序列化。
+const rectJson = r => ({x: r.x, y: r.y, width: r.width, height: r.height});
+
 class AgentShellBridge {
     constructor() {
         this._impl = null;
@@ -267,12 +291,19 @@ class AgentShellBridge {
 
     _windowJson(a_or_mw) {
         let mw = a_or_mw.meta_window ?? a_or_mw;
+        // 工作区为空 = 全部工作区可见（sticky）；类型不在映射表内 = Unknown。
+        // 几何取 get_frame_rect（用户可见的窗口边缘）：Wayland CSD 的
+        // buffer rect 含客户端阴影，比可见窗口更大，不能当内容几何。
+        const ws = mw.get_workspace();
         return JSON.stringify({
             id: mw.get_id(), title: mw.get_title() || '',
             appId: mw.get_wm_class() || '', pid: mw.get_pid(),
             minimized: mw.minimized, maximized: mw.is_maximized(),
             fullscreen: mw.fullscreen,
-            geometry: mw.get_frame_rect(),
+            geometry: rectJson(mw.get_frame_rect()),
+            workspace: ws ? ws.index() : null,
+            windowType: WINDOW_TYPE_NAMES.get(mw.get_window_type()) ?? 'Unknown',
+            keepAbove: mw.is_above(),
             hasFocus: mw.has_focus()
         });
     }

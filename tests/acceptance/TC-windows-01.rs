@@ -9,7 +9,7 @@
 //! 注入的脚本化合成器（无图形 CI 下替代桌面协议通道），缓存与投影仍由 daemon
 //! 执行。本用例全部可在无显示服务器的环境中执行，无环境绑定部分。
 
-use acceptance::{window, FakeCompositor, Fixture};
+use acceptance::{window, FakeCompositor, Fixture, PrivateBus};
 use agent_shell_core::types::{
     DesktopEnvironment, MonitorId, WindowState, WindowType, WorkspaceId,
 };
@@ -115,4 +115,74 @@ async fn list_reports_complete_fields_and_an_empty_desktop_is_not_an_error() {
     let result = empty_fixture.call_ok(method::WINDOWS_LIST, None).await;
     assert_eq!(result["windows"], json!([]));
     assert_eq!(result["from_cache"], json!(false));
+}
+
+// ── GNOME 51 扩展载荷 → daemon 投影（真机线格式） ──────────────────────────
+
+/// GNOME 51.1 Wayland 真机会话 `ListWindows` 的返回串（单窗，取值来自真窗口）。
+///
+/// 采集自 gnome-text-editor：扩展把 `Meta.Rectangle` 四边显式取出后序列化；
+/// 工作区是 0 基序号，窗口类型是契约枚举名。本常量即真机线格式，
+/// 解析与投影都不得退化。
+const GNOME_LIST_WINDOWS_PAYLOAD: &str = r#"[{"id":52877633,"title":"New Document (Draft) - Text Editor","appId":"org.gnome.TextEditor","pid":619,"minimized":false,"maximized":false,"fullscreen":false,"geometry":{"x":290,"y":156,"width":700,"height":520},"workspace":0,"windowType":"Normal","keepAbove":false,"hasFocus":false}]"#;
+
+/// mock `org.gnome.Shell.AgentShell`：只实现被测的 ListWindows。
+struct GnomeExtensionShell {
+    payload: String,
+}
+
+#[zbus::interface(name = "org.gnome.Shell.AgentShell")]
+impl GnomeExtensionShell {
+    fn list_windows(&self) -> String {
+        self.payload.clone()
+    }
+    fn get_active_window(&self) -> String {
+        String::new()
+    }
+    fn focus_window(&self, _window_id: u32) {}
+    fn move_window(&self, _window_id: u32, _x: i32, _y: i32) {}
+    fn close_window(&self, _window_id: u32) {}
+    fn minimize_window(&self, _window_id: u32, _minimize: bool) {}
+    fn maximize_window(&self, _window_id: u32, _maximize: bool) {}
+}
+
+/// GNOME 通道端到端：扩展载荷经 ExtensionRunner 解析后，`windows.list`
+/// 条目携带真实几何/工作区/类型——0×0、Unknown、null 都是失败。
+#[tokio::test]
+async fn gnome_extension_payload_keeps_geometry_type_and_workspace_in_the_projection() {
+    let bus = PrivateBus::start();
+    let server = bus
+        .serve(
+            "/org/gnome/Shell/AgentShell",
+            GnomeExtensionShell {
+                payload: GNOME_LIST_WINDOWS_PAYLOAD.to_string(),
+            },
+        )
+        .await;
+    acceptance::bus::claim(&server, "org.gnome.Shell.AgentShell").await;
+
+    let conn = bus.connect().await;
+    let windows = agent_shell_compositor_mutter::ExtensionRunner::new(conn)
+        .list_windows()
+        .await
+        .expect("GNOME extension payload parses over D-Bus");
+    assert_eq!(windows.len(), 1, "captured payload carries one window");
+
+    let mut fixture = Fixture::start().await;
+    fixture.install_compositor(
+        &FakeCompositor::with_windows(windows),
+        DesktopEnvironment::GNOME,
+    );
+    let result = fixture.call_ok(method::WINDOWS_LIST, None).await;
+    let entry = &result["windows"][0];
+
+    // 逐字段等于真窗口取值：0×0 / Unknown / null 任何一个出现都判失败。
+    assert_eq!(entry["native_id"], json!("52877633"));
+    assert_eq!(entry["x"], json!(290));
+    assert_eq!(entry["y"], json!(156));
+    assert_eq!(entry["width"], json!(700));
+    assert_eq!(entry["height"], json!(520));
+    assert_eq!(entry["workspace"], json!("0"));
+    assert_eq!(entry["window_type"], json!("Normal"));
+    assert_eq!(entry["keep_above"], json!(false));
 }
