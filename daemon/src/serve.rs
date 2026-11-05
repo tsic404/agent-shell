@@ -441,6 +441,290 @@ mod tests {
         );
     }
 
+    /// 合成器夹具：`close_window` 进入后永不返回，模拟挂死的后端。
+    struct HungCloseCompositor {
+        entered: Arc<tokio::sync::Notify>,
+    }
+
+    fn hung_window() -> agent_shell_core::types::WindowInfo {
+        use agent_shell_core::types::{
+            DesktopEnvironment, Rect, WindowId, WindowInfo, WindowState, WindowType,
+        };
+        WindowInfo {
+            id: WindowId {
+                native_id: "w-1".into(),
+                de_type: DesktopEnvironment::GNOME,
+            },
+            title: "Hung".into(),
+            app_id: "hung".into(),
+            pid: 42,
+            geometry: Rect {
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 100,
+            },
+            frame_geometry: Rect {
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 100,
+            },
+            states: vec![WindowState::Normal],
+            workspace_id: None,
+            monitor_id: None,
+            stacking_order: 0,
+            desktop_file: None,
+            window_type: WindowType::Normal,
+            icon_geometry: None,
+            keep_above: false,
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl agent_shell_core::component::DesktopComponent for HungCloseCompositor {
+        fn name(&self) -> &'static str {
+            "hung-close"
+        }
+
+        fn component_type(&self) -> agent_shell_core::component::ComponentType {
+            agent_shell_core::component::ComponentType::Compositor
+        }
+
+        fn is_available(&self) -> bool {
+            true
+        }
+
+        async fn health(&self) -> agent_shell_core::component::ComponentHealth {
+            agent_shell_core::component::ComponentHealth::Healthy
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl agent_shell_core::component::CompositorComponent for HungCloseCompositor {
+        fn capabilities(&self) -> agent_shell_core::component::BackendCapabilities {
+            agent_shell_core::component::BackendCapabilities::default()
+        }
+
+        async fn list_windows(
+            &self,
+        ) -> agent_shell_core::error::Result<Vec<agent_shell_core::types::WindowInfo>> {
+            Ok(vec![hung_window()])
+        }
+
+        async fn get_active_window(
+            &self,
+        ) -> agent_shell_core::error::Result<Option<agent_shell_core::types::WindowInfo>> {
+            Ok(None)
+        }
+
+        async fn focus_window(
+            &self,
+            _id: &agent_shell_core::types::WindowId,
+        ) -> agent_shell_core::error::Result<()> {
+            Ok(())
+        }
+
+        async fn move_window(
+            &self,
+            _id: &agent_shell_core::types::WindowId,
+            _x: i32,
+            _y: i32,
+        ) -> agent_shell_core::error::Result<()> {
+            Ok(())
+        }
+
+        async fn resize_window(
+            &self,
+            _id: &agent_shell_core::types::WindowId,
+            _w: i32,
+            _h: i32,
+        ) -> agent_shell_core::error::Result<()> {
+            Ok(())
+        }
+
+        async fn minimize_window(
+            &self,
+            _id: &agent_shell_core::types::WindowId,
+        ) -> agent_shell_core::error::Result<()> {
+            Ok(())
+        }
+
+        async fn unminimize_window(
+            &self,
+            _id: &agent_shell_core::types::WindowId,
+        ) -> agent_shell_core::error::Result<()> {
+            Ok(())
+        }
+
+        async fn maximize_window(
+            &self,
+            _id: &agent_shell_core::types::WindowId,
+        ) -> agent_shell_core::error::Result<()> {
+            Ok(())
+        }
+
+        async fn close_window(
+            &self,
+            _id: &agent_shell_core::types::WindowId,
+        ) -> agent_shell_core::error::Result<()> {
+            self.entered.notify_one();
+            std::future::pending().await
+        }
+
+        async fn set_window_geometry(
+            &self,
+            _id: &agent_shell_core::types::WindowId,
+            _geo: agent_shell_core::types::Rect,
+        ) -> agent_shell_core::error::Result<()> {
+            Ok(())
+        }
+
+        async fn get_window_info(
+            &self,
+            _id: &agent_shell_core::types::WindowId,
+        ) -> agent_shell_core::error::Result<agent_shell_core::types::WindowInfo> {
+            Ok(hung_window())
+        }
+
+        async fn list_workspaces(
+            &self,
+        ) -> agent_shell_core::error::Result<Vec<agent_shell_core::types::WorkspaceInfo>> {
+            Ok(Vec::new())
+        }
+
+        async fn activate_workspace(
+            &self,
+            _id: &agent_shell_core::types::WorkspaceId,
+        ) -> agent_shell_core::error::Result<()> {
+            Ok(())
+        }
+
+        async fn move_window_to_workspace(
+            &self,
+            _wid: &agent_shell_core::types::WindowId,
+            _ws: &agent_shell_core::types::WorkspaceId,
+        ) -> agent_shell_core::error::Result<()> {
+            Ok(())
+        }
+
+        async fn list_monitors(
+            &self,
+        ) -> agent_shell_core::error::Result<Vec<agent_shell_core::types::MonitorInfo>> {
+            Ok(Vec::new())
+        }
+
+        async fn subscribe(
+            &self,
+        ) -> agent_shell_core::error::Result<Box<dyn agent_shell_core::event::EventStream>>
+        {
+            Err(agent_shell_core::error::AgentShellError::NotImplemented(
+                "fixture has no event stream".into(),
+            ))
+        }
+    }
+
+    /// 挂死的窗口操作不得扣住 daemon 的请求串行化槽位：并发的后续请求必须在
+    /// 同一实例上拿到响应，而不是一起挂死。
+    #[tokio::test]
+    async fn hung_window_op_does_not_block_later_requests() {
+        let (mut daemon, _sandbox) = TestDaemon::start(Duration::from_secs(1)).await.into_parts();
+        daemon.window_op_budget = Duration::from_millis(50);
+        let entered = Arc::new(tokio::sync::Notify::new());
+        daemon.install_acceptance_compositor(
+            Arc::new(HungCloseCompositor {
+                entered: Arc::clone(&entered),
+            }),
+            agent_shell_core::types::DesktopEnvironment::GNOME,
+            event::EventSource::MutterExtension,
+        );
+        let daemon = Arc::new(Mutex::new(daemon));
+
+        // 连接 A：close 进入后端后挂住，直到预算耗尽才返回错误。
+        let (a_server, a_client) = tokio::io::duplex(4096);
+        let (a_reader, a_writer) = tokio::io::split(a_server);
+        let a_daemon = Arc::clone(&daemon);
+        let a_task = tokio::spawn(async move {
+            serve_stream(
+                &a_daemon,
+                a_reader,
+                Arc::new(Mutex::new(a_writer)),
+                None,
+                None,
+                false,
+            )
+            .await;
+        });
+        let mut a_client = BufReader::new(a_client);
+        let close_req = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"windows.op\",\
+                         \"params\":{\"op\":\"close\",\"target\":\"w-1\"}}\n";
+        a_client
+            .get_mut()
+            .write_all(close_req.as_bytes())
+            .await
+            .expect("write close request");
+        tokio::time::timeout(Duration::from_secs(2), entered.notified())
+            .await
+            .expect("close must reach the backend");
+
+        // 连接 B：A 仍占用串行化槽位时发起，必须在预算耗尽后拿到响应。
+        let (b_server, b_client) = tokio::io::duplex(4096);
+        let (b_reader, b_writer) = tokio::io::split(b_server);
+        let b_daemon = Arc::clone(&daemon);
+        let b_task = tokio::spawn(async move {
+            serve_stream(
+                &b_daemon,
+                b_reader,
+                Arc::new(Mutex::new(b_writer)),
+                None,
+                None,
+                false,
+            )
+            .await;
+        });
+        let mut b_client = BufReader::new(b_client);
+        b_client
+            .get_mut()
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"windows.list\"}\n")
+            .await
+            .expect("write list request");
+        let mut line = String::new();
+        tokio::time::timeout(Duration::from_secs(2), b_client.read_line(&mut line))
+            .await
+            .expect("a later request must not be blocked by the hung window op")
+            .expect("read list response");
+        let list_resp: serde_json::Value =
+            serde_json::from_str(line.trim()).expect("list response json");
+        assert!(
+            list_resp.get("error").is_none(),
+            "later request must succeed: {list_resp}"
+        );
+        assert_eq!(
+            list_resp["result"]["windows"][0]["native_id"].as_str(),
+            Some("w-1")
+        );
+
+        // A 的 close 在预算耗尽后以错误响应返回，而不是继续挂住。
+        let mut line = String::new();
+        tokio::time::timeout(Duration::from_secs(2), a_client.read_line(&mut line))
+            .await
+            .expect("close must return within the budget")
+            .expect("read close response");
+        let close_resp: serde_json::Value =
+            serde_json::from_str(line.trim()).expect("close response json");
+        assert_eq!(close_resp["error"]["code"].as_i64(), Some(1005));
+        assert!(
+            close_resp["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("did not complete"),
+            "timeout message must be user-facing: {close_resp}"
+        );
+
+        a_task.abort();
+        b_task.abort();
+    }
+
     #[tokio::test]
     async fn bind_creates_owner_only_socket() {
         let dir = tempfile::tempdir().expect("tempdir");

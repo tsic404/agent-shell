@@ -82,6 +82,10 @@ pub enum MutterError {
     /// 版本探测失败（ShellVersion 缺失或格式不识别）。
     #[error("gnome version probe failed: {0}")]
     Version(String),
+
+    /// 会话总线调用在预算内没有应答（对端挂死，调用方不得无限等待）。
+    #[error("shell extension call timed out: {0}")]
+    Timeout(String),
 }
 
 impl From<MutterError> for AgentShellError {
@@ -99,6 +103,9 @@ impl From<MutterError> for AgentShellError {
             }
             MutterError::Version(msg) => {
                 AgentShellError::BackendUnavailable(format!("gnome version: {msg}"))
+            }
+            MutterError::Timeout(msg) => {
+                AgentShellError::Timeout(format!("gnome extension: {msg}"))
             }
         }
     }
@@ -138,6 +145,13 @@ mod tests {
     fn version_error_maps_to_backend_unavailable() {
         let e = AgentShellError::from(MutterError::Version("no ShellVersion".into()));
         assert!(matches!(e, AgentShellError::BackendUnavailable(_)));
+    }
+
+    #[test]
+    fn timeout_error_maps_to_core_timeout() {
+        let e = AgentShellError::from(MutterError::Timeout("CloseWindow did not answer".into()));
+        assert!(matches!(e, AgentShellError::Timeout(_)));
+        assert!(e.to_string().contains("CloseWindow"));
     }
 
     #[test]
