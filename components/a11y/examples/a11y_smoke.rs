@@ -109,10 +109,42 @@ async fn run_probe(pid: &u32) -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(read_back, "round-trip-123", "set_text/get_text mismatch");
 
     // 7. click（Action 接口路径）
-    component.actions().click(&targets[0]).await?;
+    component
+        .actions()
+        .click(&targets[0], &ActionOnlyPointer)
+        .await?;
     println!("click via Action interface: ok");
 
     Ok(())
+}
+
+/// 冒烟只走 Action 接口路径：坐标降级需要真实输入链，不在此例装配。
+struct ActionOnlyPointer;
+
+#[async_trait::async_trait]
+impl agent_shell_a11y::PointerInput for ActionOnlyPointer {
+    async fn mouse_move(
+        &self,
+        _x: i32,
+        _y: i32,
+    ) -> Result<(), agent_shell_core::error::AgentShellError> {
+        Err(
+            agent_shell_core::error::AgentShellError::BackendUnavailable(
+                "smoke: coordinate fallback has no pointer channel".into(),
+            ),
+        )
+    }
+
+    async fn mouse_click(
+        &self,
+        _button: agent_shell_core::types::MouseButton,
+    ) -> Result<(), agent_shell_core::error::AgentShellError> {
+        Err(
+            agent_shell_core::error::AgentShellError::BackendUnavailable(
+                "smoke: coordinate fallback has no pointer channel".into(),
+            ),
+        )
+    }
 }
 
 fn assert_element_wired(el: &ElementNode) {

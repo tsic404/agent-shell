@@ -2800,15 +2800,15 @@ impl SemanticLocator {
 
 pub struct ElementActions {
     bridge: AtspiBridge,
-    input: std::sync::Arc<dyn PointerInput>,
 }
 
 impl ElementActions {
     pub fn new(bridge: AtspiBridge) -> Self { ... }
-    pub fn with_input(mut self, input: std::sync::Arc<dyn PointerInput>) -> Self { ... }
     pub fn bridge(&self) -> &AtspiBridge { ... }
-    /// 点击元素：优先 AT-SPI Action 接口，降级坐标点击
-    pub async fn click(&self, element: &ElementNode) -> Result<()> {
+    /// 点击元素：优先 AT-SPI Action 接口，降级坐标点击（指针通道由调用方注入）
+    pub async fn click(&self, element: &ElementNode, pointer: &dyn PointerInput) -> Result<()> {
+        // 降级原因：无 Action 接口 / 有接口但 DoAction 返 false——文案分开成句
+        let mut cause = FallbackCause::NoActionInterface;
         if self.has_action_interface(element).await {
             let p = self
                 .bridge
@@ -2837,16 +2837,17 @@ impl ElementActions {
                     path = %element.path,
                     "DoAction returned false; falling back to coordinate click"
                 );
+                cause = FallbackCause::ActionRefused;
             }
         }
-        // 降级：中心坐标 → 移动 + 左键点击
+        // 降级：中心坐标 → 移动 + 左键点击；空包围盒不可点击（不得落到 0,0）
         let rect = self
             .bridge
             .get_extents(&element.bus_name, &element.path)
             .await?;
-        let (cx, cy) = ElementNode::center_of(rect);
-        self.input.mouse_move(cx, cy).await?;
-        self.input.mouse_click(MouseButton::Left).await
+        let (cx, cy) = click_point(rect, &element.path, cause)?;
+        pointer.mouse_move(cx, cy).await?;
+        pointer.mouse_click(MouseButton::Left).await
     }
 
     /// 聚焦元素：AT-SPI Component.GrabFocus 优先，失败降级 Action.DoAction(0)

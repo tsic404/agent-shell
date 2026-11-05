@@ -8,7 +8,7 @@
 //! TTY / 无 at-spi2 时为 None（§3.1 装配矩阵最后一列）。KDE/DDE/GNOME/
 //! Hyprland/Sway/X11Generic 各 backend 共用本公共组件。
 
-use crate::action::ElementActions;
+use crate::action::{ElementActions, PointerInput};
 use crate::atspi_bridge::AtspiBridge;
 use crate::semantic_locator::SemanticLocator;
 use crate::tree::ElementNode;
@@ -164,8 +164,8 @@ impl A11yOps for AtSpiComponent {
         self.locator().locate_by_path(bus, path).await
     }
 
-    async fn click(&self, element: &ElementNode) -> Result<()> {
+    async fn click(&self, element: &ElementNode, pointer: &dyn PointerInput) -> Result<()> {
         self.prepare_tree().await?;
-        self.actions().click(element).await
+        self.actions().click(element, pointer).await
     }
 }

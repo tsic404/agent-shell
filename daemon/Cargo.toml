@@ -39,6 +39,7 @@ dirs = "5"
 libc.workspace = true
 zbus.workspace = true
 uuid = { workspace = true }
+async-trait.workspace = true
 
 [features]
 default = ["portal-screencast"]

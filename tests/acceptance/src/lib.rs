@@ -13,6 +13,7 @@
 
 pub mod a11y;
 pub mod apparatus;
+pub mod atspi_tree;
 pub mod bus;
 pub mod compositor;
 pub mod events;
@@ -21,6 +22,7 @@ pub mod journey;
 pub mod portal;
 
 pub use a11y::{element, FakeA11y};
+pub use atspi_tree::{serve_application, serve_registry, MockAction, NodeSpec};
 pub use bus::PrivateBus;
 pub use compositor::{window, workspace, FakeCompositor, FakeDesktop};
 pub use events::RecordingRawSource;

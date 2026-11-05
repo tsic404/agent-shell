@@ -192,11 +192,71 @@ fn mouse_button(b: &str) -> Result<MouseButton, (RpcErrorCode, String)> {
 }
 
 /// `AgentShellError` → RPC 错误码：后端不可用/权限不足独立成码，其余归 BackendError。
-fn map_input_err(e: AgentShellError) -> (RpcErrorCode, String) {
+///
+/// 输入面的所有通道（`input.send` 与 a11y 坐标降级）共用同一映射：同一会话
+/// 里同一类底层失败必须得到同一个码，不能按入口分别判定（C-103）。
+pub(crate) fn map_input_err(e: AgentShellError) -> (RpcErrorCode, String) {
     match e {
         AgentShellError::BackendUnavailable(msg) => (RpcErrorCode::BackendUnavailable, msg),
         AgentShellError::Permission(msg) => (RpcErrorCode::Denied, msg),
         other => (RpcErrorCode::BackendError, other.to_string()),
+    }
+}
+
+// ───────────────────── 无障碍坐标降级通道 ─────────────────────
+
+/// 无障碍元素动作的坐标降级通道：把会话输入链投影为 a11y 的
+/// [`PointerInput`]（§14.4「以 trait 依赖而非硬编码实例」）。
+///
+/// 两种结局必须可分辨（C-074）：链已装配时注入走与 `input.send` 相同的降级
+/// 语义；链缺失时以「指针后端不可用 + 装配根因」失败。元素自身没有可用几何
+/// 是另一种原因，由 a11y 组件报出，不在此处冒充。
+pub(crate) enum PointerChannel<'a> {
+    /// 会话已装配输入链（libei → ydotool → uinput → XTest → xdotool）。
+    Assembled(&'a agent_shell_input::InputComponentHandle),
+    /// 本会话没有可用输入后端；携带装配根因（`Daemon::input_error`）供文案透出。
+    Unavailable(Option<&'a str>),
+}
+
+impl PointerChannel<'_> {
+    /// 链缺失时的错误：有具体根因（如 portal 缺 ConnectToEIS）时透出，
+    /// 纯 TTY/空链（无根因）给通用文案。
+    fn unavailable_error(reason: Option<&str>) -> AgentShellError {
+        match reason {
+            Some(reason) => AgentShellError::BackendUnavailable(format!(
+                "pointer input backend unavailable in this session ({reason})"
+            )),
+            None => AgentShellError::BackendUnavailable(
+                "pointer input backend unavailable in this session \
+                 (no injection backend assembled)"
+                    .into(),
+            ),
+        }
+    }
+}
+
+/// 本会话的坐标降级通道：链在用取装配结果，否则携带装配根因。
+pub(crate) fn pointer_channel(daemon: &crate::state::Daemon) -> PointerChannel<'_> {
+    match daemon.input.as_ref() {
+        Some(handle) => PointerChannel::Assembled(handle),
+        None => PointerChannel::Unavailable(daemon.input_error.as_deref()),
+    }
+}
+
+#[async_trait::async_trait]
+impl agent_shell_a11y::PointerInput for PointerChannel<'_> {
+    async fn mouse_move(&self, x: i32, y: i32) -> Result<(), AgentShellError> {
+        match self {
+            Self::Assembled(handle) => handle.dispatcher().mouse_move(x, y).await,
+            Self::Unavailable(reason) => Err(Self::unavailable_error(*reason)),
+        }
+    }
+
+    async fn mouse_click(&self, button: MouseButton) -> Result<(), AgentShellError> {
+        match self {
+            Self::Assembled(handle) => handle.dispatcher().mouse_click(button).await,
+            Self::Unavailable(reason) => Err(Self::unavailable_error(*reason)),
+        }
     }
 }
 

@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use acceptance::{element, Fixture};
-use agent_shell_a11y::{A11yOps, ElementNode};
+use agent_shell_a11y::{A11yOps, ElementNode, PointerInput};
 use agent_shell_core::error::{AgentShellError, Result as A11yResult};
 use agent_shell_core::types::SemanticTarget;
 use agent_shell_rpc::{method, RpcErrorCode};
@@ -53,7 +53,7 @@ impl A11yOps for ClickFails {
         }
     }
 
-    async fn click(&self, _element: &ElementNode) -> A11yResult<()> {
+    async fn click(&self, _element: &ElementNode, _pointer: &dyn PointerInput) -> A11yResult<()> {
         Err(AgentShellError::DBus(
             "Action.DoAction failed (fixture): element exposes no default action".into(),
         ))
