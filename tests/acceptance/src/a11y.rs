@@ -5,7 +5,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use agent_shell_a11y::{A11yOps, AtspiRole, AtspiState, ElementNode};
+use agent_shell_a11y::{A11yOps, AtspiRole, AtspiState, ElementNode, PointerInput};
 use agent_shell_core::error::{AgentShellError, Result};
 use agent_shell_core::types::SemanticTarget;
 use async_trait::async_trait;
@@ -121,7 +121,7 @@ impl A11yOps for FakeA11y {
         }
     }
 
-    async fn click(&self, element: &ElementNode) -> Result<()> {
+    async fn click(&self, element: &ElementNode, _pointer: &dyn PointerInput) -> Result<()> {
         if !self.available {
             return Err(AgentShellError::BackendUnavailable(
                 "AT-SPI bus unreachable (fixture)".into(),

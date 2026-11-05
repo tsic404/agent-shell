@@ -347,3 +347,7 @@ path = "TC-toolchain-05.rs"
 [[test]]
 name = "TC-mcp-01"
 path = "TC-mcp-01.rs"
+
+[[test]]
+name = "TC-uat-04"
+path = "TC-uat-04.rs"

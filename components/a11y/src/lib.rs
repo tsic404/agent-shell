@@ -27,8 +27,9 @@ pub trait A11yOps: Send + Sync {
     async fn locate(&self, target: &SemanticTarget) -> Result<Vec<ElementNode>>;
     /// 按 `(bus_name, path)` 二元组定位元素（`a11y.action`，§14.4）。
     async fn locate_by_path(&self, bus: Option<&str>, path: &str) -> Result<ElementNode>;
-    /// 触发元素主动作（`Action.DoAction(0)`，§14.4）。
-    async fn click(&self, element: &ElementNode) -> Result<()>;
+    /// 触发元素主动作（`Action.DoAction(0)`，§14.4）；元素无动作接口时经
+    /// `pointer` 降级为坐标点击——指针通道由调用方按会话装配结果给出。
+    async fn click(&self, element: &ElementNode, pointer: &dyn PointerInput) -> Result<()>;
 }
 
 pub use action::{ElementActions, PointerInput};

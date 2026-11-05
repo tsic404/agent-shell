@@ -830,6 +830,11 @@ async fn a11y_query(d: &Daemon, req: &Request) -> RpcResult {
 
 /// 触发元素主动作（§14.4 `ElementActions::click` → Action.DoAction(0)）。
 ///
+/// 元素无动作接口时按 C-074 降级为坐标点击：注入通道取自本会话的输入链
+/// （与 `input.send` 同一条降级链）；链缺失时返回后端不可用并透出装配根因，
+/// 不与「元素没有可用几何」混为一谈。注入期的权限类失败与 `input.send`
+/// 同码（1004），后端失败才是 1005。
+///
 /// `(bus, path)` 定位：`a11y.query` 结果携带 `bus_name` 与 `path`——对象
 /// 路径只在 bus_name 内唯一，故 `bus` 传入时按二元组精确匹配；`bus` 缺省
 /// 时按 path 匹配，歧义（多 bus 同 path）返回 NotFound 而非静默取第一个。
@@ -881,10 +886,12 @@ async fn a11y_action(d: &Daemon, req: &Request) -> RpcResult {
             AgentShellError::BackendUnavailable(msg) => (RpcErrorCode::BackendUnavailable, msg),
             other => (RpcErrorCode::BackendError, other.to_string()),
         })?;
-    component.click(&node).await.map_err(|e| match e {
-        AgentShellError::BackendUnavailable(msg) => (RpcErrorCode::BackendUnavailable, msg),
-        other => (RpcErrorCode::BackendError, other.to_string()),
-    })?;
+    component
+        .click(&node, &crate::input::pointer_channel(d))
+        .await
+        // 与 `input.send` 同一映射：降级注入真正触达输入链后，权限类失败
+        // （libei/portal 授权被拒）是最常见的真实原因，必须报 1004 而非 1005。
+        .map_err(crate::input::map_input_err)?;
     Ok(json!({ "ok": true }))
 }
 
@@ -3009,7 +3016,11 @@ mod tests {
             })
         }
 
-        async fn click(&self, element: &ElementNode) -> agent_shell_core::error::Result<()> {
+        async fn click(
+            &self,
+            element: &ElementNode,
+            _pointer: &dyn agent_shell_a11y::PointerInput,
+        ) -> agent_shell_core::error::Result<()> {
             self.clicked
                 .lock()
                 .push((element.bus_name.clone(), element.path.clone()));
