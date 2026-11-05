@@ -197,8 +197,14 @@ impl CaptureDispatcher {
     /// 窗口直捕（X11-only；portal 无法定位 native window id）。
     /// 连接经 `OnceCell` 惰性建立并复用。
     ///
+    /// 会话类型先于后端可用性判定：Wayland 会话没有 X11 窗口标识语义，任何
+    /// 窗口标识都归为「无效窗口标识」，且不建 X11 连接（C-060 拒绝 X11 兜底）。
+    ///
     /// 无 `DISPLAY`（无 X server 可达）返回 `BackendUnavailable`。
     pub async fn capture_window(&self, window: u32) -> Result<Frame> {
+        if let Some(e) = window_capture_gate(window, self.wayland_session) {
+            return Err(e);
+        }
         if !self.x11_present {
             return Err(AgentShellError::BackendUnavailable(
                 "x11 capture unavailable: no X server reachable".into(),
@@ -902,6 +908,21 @@ fn is_wayland_session_with(
     wayland_display.is_some() || wayland_socket.is_some()
 }
 
+/// 窗口直捕的会话门控（纯函数，可单测）。
+///
+/// 窗口截图仅 X11 支持（C-062）：Wayland 会话的窗口标识没有 X11 语义，任何
+/// 标识（含 `windows list` 给出的十进制 native id）都归为「无效窗口标识」。
+/// 门控先于 X11 可用性判定求值——Wayland 下不得建立 X11 连接（C-060）。
+fn window_capture_gate(window: u32, wayland_session: bool) -> Option<AgentShellError> {
+    if !wayland_session {
+        return None;
+    }
+    Some(AgentShellError::NotSupported(format!(
+        "invalid window id {window}: window capture is X11-only; this Wayland session \
+         has no X11 window ids"
+    )))
+}
+
 /// 校验 portal Screenshot 落盘产物是否可用（纯函数，可单测）：非 PNG（如
 /// xdg-desktop-portal-dde 委托 KWin 落盘的 JPEG）、损坏或全黑（与
 /// [`is_png_black_or_invalid`] 同口径）一律判不可用并清理临时文件，返回
@@ -1127,6 +1148,22 @@ mod tests {
             Some(OsStr::new("wayland-0")),
             Some(OsStr::new("12"))
         ));
+    }
+
+    /// 窗口直捕会话门控：Wayland 下任何（含十进制）窗口标识都归为「无效窗口标识」，
+    /// 且不进入 X11 可用性判定；原生 X11 会话不受影响。
+    #[test]
+    fn window_capture_gate_rejects_ids_in_wayland_sessions() {
+        assert!(window_capture_gate(1211664006, false).is_none());
+        match window_capture_gate(1211664006, true) {
+            Some(AgentShellError::NotSupported(msg)) => {
+                assert!(msg.contains("invalid window id 1211664006"), "{msg}");
+                assert!(msg.contains("X11-only"), "{msg}");
+                assert!(msg.contains("Wayland"), "{msg}");
+                assert!(!msg.contains("x11 capture unavailable"), "{msg}");
+            }
+            other => panic!("expected NotSupported invalid-window-id, got {other:?}"),
+        }
     }
 
     /// 预算封顶行为：快速 future 原样通过；慢 future 被中止并归一到 `Timeout`
