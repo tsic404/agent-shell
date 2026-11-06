@@ -51,6 +51,13 @@ impl FakeCompositor {
         this
     }
 
+    /// 带初始工作区的桌面。
+    pub fn with_workspaces(workspaces: Vec<WorkspaceInfo>) -> Self {
+        let this = Self::default();
+        this.state.lock().expect("fake state").workspaces = workspaces;
+        this
+    }
+
     /// 共享状态句柄（测试读写窗口与调用记录）。
     pub fn state(&self) -> Arc<Mutex<FakeDesktop>> {
         Arc::clone(&self.state)
