@@ -21,6 +21,9 @@ trait AgentShell {
     /// 全部窗口 JSON 数组字符串。
     fn list_windows(&self) -> zbus::Result<String>;
 
+    /// 全部工作区 JSON 数组字符串。
+    fn list_workspaces(&self) -> zbus::Result<String>;
+
     /// 当前活动窗口 JSON（空串=无焦点窗口）。
     fn get_active_window(&self) -> zbus::Result<String>;
 
@@ -122,6 +125,24 @@ impl ExtensionRunner {
             .iter()
             .enumerate()
             .filter_map(|(i, w)| parse::window(w, i as u32))
+            .collect())
+    }
+
+    /// 列出全部工作区（扩展 `ListWorkspaces` 载荷）。
+    pub async fn list_workspaces(&self) -> Result<Vec<agent_shell_core::types::WorkspaceInfo>> {
+        let raw = self
+            .proxy()
+            .await?
+            .list_workspaces()
+            .await
+            .map_err(Self::proxy_err)?;
+        let v: Value = serde_json::from_str(&raw)
+            .map_err(|e| MutterError::Extension(format!("ListWorkspaces invalid JSON: {e}")))?;
+        Ok(v.as_array()
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+            .filter_map(parse::workspace)
             .collect())
     }
 
@@ -331,6 +352,7 @@ mod tests {
         // issue 验收 XML 的全部 method + signal 必须齐备——缺一个即验收失败。
         for needle in [
             "ListWindows",
+            "ListWorkspaces",
             "GetActiveWindow",
             "FocusWindow",
             "MoveWindow",
@@ -662,10 +684,10 @@ exit 1
 
     /// 方法分派与窗口接线的可执行判定（不依赖图形会话）：把 `tests/js` 的 mock
     /// 与改写 import 后的 extension.js 落到临时目录，用 node 驱动 method_call
-    /// 闭包与窗口信号。十三条判定见 harness.mjs 顶部：分派四分支（含「enable 同步
+    /// 闭包与窗口信号。十五条判定见 harness.mjs 顶部：分派四分支（含「enable 同步
     /// 取得 owner 时首调即返回载荷」这条启动窗口判据）、逐窗 `unmanaged` 接线
-    /// 三条、`is_maximized()` 载荷两条、几何/工作区/类型/置顶四条。
-    /// node 缺失即失败——不静默跳过。
+    /// 三条、`is_maximized()` 载荷两条、几何/工作区/类型/置顶四条、工作区枚举
+    /// 两条（字段齐全 + 单工作区边界）。node 缺失即失败——不静默跳过。
     #[test]
     fn extension_js_dispatch_branches_are_executable() {
         let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/js");
@@ -690,7 +712,7 @@ exit 1
             "extension dispatch harness failed:\nstdout:\n{stdout}\nstderr:\n{stderr}"
         );
         assert!(
-            stdout.contains("PASS 13 checks"),
+            stdout.contains("PASS 15 checks"),
             "harness must report every branch: {stdout}"
         );
     }
