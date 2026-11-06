@@ -96,7 +96,9 @@ class AgentShellBridge {
             GetActiveWindow: () => this._getActiveWindow(),
             FocusWindow: id => this._withWindow(id, mw => mw.activate(global.get_current_time())),
             MoveWindow: (id, x, y) => this._withWindow(id, mw => mw.move_frame(true, x, y)),
-            CloseWindow: id => this._withWindow(id, mw => mw.delete()),
+            // meta_window_delete 的 timestamp 是必填参数：缺参会在 GIR 类型检查
+            // 处抛出，关闭从未发生且 invocation 无应答（调用方只能等超时）。
+            CloseWindow: id => this._withWindow(id, mw => mw.delete(global.get_current_time())),
             MinimizeWindow: (id, minimize) =>
                 this._withWindow(id, mw => { mw.minimized = !!minimize; }),
             MaximizeWindow: (id, maximize) => this._withWindow(id, mw =>
@@ -184,14 +186,18 @@ class AgentShellBridge {
         this._ifaceInfo = null;
     }
 
-    // 把处理异常翻成 D-Bus 错误：JS 异常不是 GLib.Error，直接
-    // return_gerror 会二次抛出，invocation 永不回包（调用方只能等超时）。
+    // 把处理异常翻成 D-Bus 错误。invocation 在 GJS 里是 one-shot：第一次
+    // return_* 占位，之后调用只会是 no-op，所以按类型一次选对，不做
+    // 「先试 A 失败再试 B」的兜底。回包自身抛错只记日志，不逃出 method_call。
     _returnError(invocation, e) {
         try {
-            invocation.return_gerror(e);
-        } catch (_notGlibError) {
-            invocation.return_dbus_error('org.freedesktop.DBus.Error.Failed',
-                String(e));
+            if (e instanceof GLib.Error)
+                invocation.return_gerror(e);
+            else
+                invocation.return_dbus_error('org.freedesktop.DBus.Error.Failed',
+                    e?.message ?? String(e));
+        } catch (replyError) {
+            logError(replyError, 'agent-shell-bridge: error reply failed');
         }
     }
 
@@ -215,15 +221,23 @@ class AgentShellBridge {
             this._returnError(invocation, e);
             return;
         }
+        let result;
         try {
-            const result = fn(...args);
+            result = fn(...args);
+        } catch (e) {
+            this._returnError(invocation, e);
+            return;
+        }
+        // 回包失败不再走错误回包：invocation 可能已进入返回态，二次回包只会
+        // 抛出 already returned 并丢掉这次应答。
+        try {
             if (STRING_RETURN_METHODS.has(methodName)) {
                 invocation.return_value(new GLib.Variant('(s)', [result]));
             } else {
                 invocation.return_value(new GLib.Variant('()', []));
             }
         } catch (e) {
-            this._returnError(invocation, e);
+            logError(e, 'agent-shell-bridge: method reply failed');
         }
     }
 
