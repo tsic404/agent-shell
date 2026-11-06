@@ -27,6 +27,7 @@ trait Shell {
 pub(crate) mod parse {
     use agent_shell_core::types::{
         DesktopEnvironment, Rect, WindowId, WindowInfo, WindowState, WindowType, WorkspaceId,
+        WorkspaceInfo,
     };
     use serde_json::Value;
 
@@ -129,6 +130,40 @@ pub(crate) mod parse {
         }
     }
 
+    /// 把 Eval/Extension 返回的工作区 JSON 归一化为 core `WorkspaceInfo`。
+    ///
+    /// GNOME 侧字段：`id`(number|string，0 基原生序号) / `name` / `number`
+    /// （从 1 开始）/ `isActive`。缺 `id` 的条目直接丢弃（无法定位）；
+    /// 缺 `number` 时按原生序号补 1 基序号，避免契约字段退化为 0。
+    pub(crate) fn workspace(v: &Value) -> Option<WorkspaceInfo> {
+        let id = match v.get("id") {
+            Some(Value::Number(n)) => n.to_string(),
+            Some(Value::String(s)) => s.clone(),
+            _ => return None,
+        };
+        let number = v
+            .get("number")
+            .and_then(Value::as_u64)
+            .map(|n| n as u32)
+            .or_else(|| id.parse::<u32>().ok().map(|i| i + 1))
+            .unwrap_or(0);
+        Some(WorkspaceInfo {
+            id: WorkspaceId {
+                native_id: id,
+                de_type: DesktopEnvironment::GNOME,
+            },
+            name: v
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            number,
+            is_active: v.get("isActive").and_then(Value::as_bool).unwrap_or(false),
+            monitor_ids: Vec::new(),
+            window_ids: Vec::new(),
+        })
+    }
+
     fn num(g: &Value, key: &str) -> i32 {
         g.get(key).and_then(Value::as_i64).unwrap_or(0) as i32
     }
@@ -220,6 +255,30 @@ impl GnomeEvalBridge {
             .enumerate()
             .filter_map(|(i, w)| parse::window(w, i as u32))
             .collect())
+    }
+
+    /// 工作区列表 JS：`Meta.Workspace` 只有序号（没有名称接口），读
+    /// `Meta.WorkspaceManager` 的原生序号集合并按序号合成名称；`isActive`
+    /// 取活动工作区序号而不是对象身份（GJS 包装对象不保证引用相等）。
+    pub(crate) const LIST_WORKSPACES_JS: &'static str = r#"JSON.stringify((() => {
+            let wm = global.workspace_manager;
+            let active = wm.get_active_workspace_index();
+            let out = [];
+            for (let i = 0; i < wm.get_n_workspaces(); i++) {
+                let ws = wm.get_workspace_by_index(i);
+                if (!ws) continue;
+                let index = ws.index();
+                out.push({ id: index, name: 'Workspace ' + (index + 1),
+                           number: index + 1, isActive: index === active });
+            }
+            return out;
+        })())"#;
+
+    /// 列出全部工作区（0 基原生序号 + 1 基展示序号 + 名称 + 活动态）。
+    pub async fn list_workspaces(&self) -> Result<Vec<agent_shell_core::types::WorkspaceInfo>> {
+        let result = self.eval_js(Self::LIST_WORKSPACES_JS).await?;
+        let arr = result.as_array().cloned().unwrap_or_default();
+        Ok(arr.iter().filter_map(parse::workspace).collect())
     }
 
     /// 当前活动窗口（hasFocus 位筛选；桌面无焦点时 None）。
@@ -414,6 +473,56 @@ mod tests {
             parse::window(&w, 0).unwrap().window_type,
             WindowType::Unknown
         );
+    }
+
+    #[test]
+    fn parses_workspace_payload() {
+        // GNOME 扩展载荷：id 是 0 基原生序号，number 从 1 开始，isActive 由
+        // 活动工作区序号判定。
+        let ws = json!({"id": 1u64, "name": "Workspace 2", "number": 2u64, "isActive": true});
+        let info = parse::workspace(&ws).expect("workspace parses");
+        assert_eq!(
+            info.id,
+            WorkspaceId {
+                native_id: "1".into(),
+                de_type: DesktopEnvironment::GNOME,
+            }
+        );
+        assert_eq!(info.name, "Workspace 2");
+        assert_eq!(info.number, 2);
+        assert!(info.is_active);
+        assert!(info.monitor_ids.is_empty());
+        assert!(info.window_ids.is_empty());
+    }
+
+    #[test]
+    fn workspace_number_falls_back_to_native_index() {
+        // 缺 number 时按 0 基序号补 1 基展示序号，不得退化为 0。
+        let ws = json!({"id": 3u64, "name": "Workspace 4"});
+        assert_eq!(parse::workspace(&ws).unwrap().number, 4);
+    }
+
+    #[test]
+    fn workspace_without_id_is_dropped() {
+        assert!(parse::workspace(&json!({"name": "orphan"})).is_none());
+    }
+
+    #[test]
+    fn list_workspaces_js_mentions_required_api_surface() {
+        // 工作区枚举走 Meta.WorkspaceManager；序号取原生 index()，活动态按
+        // 活动工作区序号（对象身份在 GJS 包装下不保证相等）。
+        for needle in [
+            "global.workspace_manager",
+            "get_n_workspaces",
+            "get_workspace_by_index",
+            "get_active_workspace_index",
+            "ws.index()",
+        ] {
+            assert!(
+                GnomeEvalBridge::LIST_WORKSPACES_JS.contains(needle),
+                "LIST_WORKSPACES_JS missing `{needle}`"
+            );
+        }
     }
 
     #[test]

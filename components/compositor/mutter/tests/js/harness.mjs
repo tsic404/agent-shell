@@ -19,9 +19,11 @@
 //  10. 几何取 frame 四边实值（Meta.Rectangle 直接序列化只得 `{}`）；
 //  11. 工作区为 0 基序号，sticky 窗口为 null（不伪造序号）；
 //  12. 窗口类型映射为契约枚举名（Dialog）；
-//  13. 置顶标志与 is_above() 一致。
+//  13. 置顶标志与 is_above() 一致；
+//  14. ListWorkspaces 载荷：0 基原生标识 / 1 基序号 / 合成名称 / 活动标志；
+//  15. 仅一个工作区时返回单元素列表（C-044 边界）。
 //
-// 退出码非 0 即测试失败；Rust 侧断言 stdout 含 "PASS 13 checks"。
+// 退出码非 0 即测试失败；Rust 侧断言 stdout 含 "PASS 15 checks"。
 
 import AgentShellExtension from './extension_under_test.mjs';
 import Meta from './mock-meta.mjs';
@@ -96,11 +98,21 @@ function makeWindow(id, {
     return window;
 }
 
-/// 安装假 shell（窗口集合 + 可触发的 display 信号），返回 display 处理器表。
-function installFakeShell(windows) {
+/// 安装假 shell（窗口集合 + 工作区集合 + 可触发的 display 信号），
+/// 返回 display 处理器表。
+function installFakeShell(windows, {workspaces = [0], activeIndex = 0} = {}) {
     const displayHandlers = new Map();
     globalThis.global = {
         get_window_actors: () => windows.map(window => ({meta_window: window})),
+        // Meta.WorkspaceManager 替身：工作区对象只暴露 index()（GJS 侧真实
+        // 接口没有名称）；活动态走序号而不是对象身份。
+        workspace_manager: {
+            get_n_workspaces: () => workspaces.length,
+            get_workspace_by_index: i => i < workspaces.length
+                ? {index: () => workspaces[i]}
+                : null,
+            get_active_workspace_index: () => activeIndex,
+        },
         display: {
             connect(signal, callback) {
                 displayHandlers.set(signal, callback);
@@ -139,11 +151,11 @@ function invocation() {
     return {record, target};
 }
 
-function invoke(sender) {
+function invoke(sender, method = 'ListWindows', parameters = null) {
     const {record, target} = invocation();
     const methodCall = session.methodCall(PATH);
     assert(typeof methodCall === 'function', 'method_call closure must be registered');
-    methodCall(null, sender, PATH, IFACE, 'ListWindows', null, target);
+    methodCall(null, sender, PATH, IFACE, method, parameters, target);
     return record;
 }
 
@@ -290,9 +302,38 @@ check('载荷置顶标志与 is_above() 一致', () => {
     }
 });
 
+// ── 14–15：工作区枚举（workspaces list 接线） ───────────────────────────────
+//
+// GNOME 原生工作区没有名称接口；载荷必须给出 0 基原生标识（与窗口
+// workspace 同一标识空间）、1 基展示序号、合成名称与被标记为活动的唯一项。
+
+check('ListWorkspaces 返回 0 基标识 / 1 基序号 / 名称 / 活动标志', () => {
+    installFakeShell([makeWindow(42)], {workspaces: [0, 1, 2], activeIndex: 1});
+    boot(':1.7');
+    const record = invoke(':1.7', 'ListWorkspaces');
+    assert(!record.dbusError, `ListWorkspaces must not be rejected: ${JSON.stringify(record)}`);
+    const list = payloadOf(record);
+    assert(Array.isArray(list), 'ListWorkspaces must return a JSON array');
+    assert(JSON.stringify(list) === JSON.stringify([
+        {id: 0, name: 'Workspace 1', number: 1, isActive: false},
+        {id: 1, name: 'Workspace 2', number: 2, isActive: true},
+        {id: 2, name: 'Workspace 3', number: 3, isActive: false},
+    ]), `unexpected workspace payload: ${JSON.stringify(list)}`);
+});
+
+check('仅一个工作区时 ListWorkspaces 返回单元素列表', () => {
+    installFakeShell([makeWindow(42)], {workspaces: [0], activeIndex: 0});
+    boot(':1.7');
+    const list = payloadOf(invoke(':1.7', 'ListWorkspaces'));
+    assert(list.length === 1, `expected one workspace, got ${list.length}`);
+    assert(list[0].id === 0, `native id must be 0-based: ${list[0].id}`);
+    assert(list[0].number === 1, `number must be 1-based: ${list[0].number}`);
+    assert(list[0].isActive === true, 'the single workspace must be active');
+});
+
 if (failures > 0) {
     console.error(`${failures} check(s) failed`);
     process.exit(1);
 }
-console.log('PASS 13 checks');
+console.log('PASS 15 checks');
 process.exit(0);

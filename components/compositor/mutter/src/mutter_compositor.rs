@@ -438,13 +438,14 @@ impl DesktopComponent for MutterCompositor {
 
 #[async_trait]
 impl CompositorComponent for MutterCompositor {
-    /// 能力矩阵如实上报（§8.4）：GNOME 无 move/resize/workspace/
-    /// 原生事件流。monitor_layout=true 仅代表可读布局（GetCurrentState）。
+    /// 能力矩阵如实上报（§8.4）：GNOME 无 move/resize/工作区切换/
+    /// 原生事件流；工作区列表只读可枚举。monitor_layout=true 仅代表
+    /// 可读布局（GetCurrentState）。
     fn capabilities(&self) -> agent_shell_core::component::BackendCapabilities {
         agent_shell_core::component::BackendCapabilities {
             // focus/close/minimize/maximize 经 Eval/Extension 可用。
             window_management: true,
-            // GNOME 工作区语义不在 Eval/Extension 方法集内。
+            // 工作区切换/移窗仍无接口——列表只读能力不声明为「管理」。
             workspace_management: false,
             monitor_layout: true,
             // Extension 三信号存在，但归一化依赖 extension.js 部署且
@@ -565,13 +566,17 @@ impl CompositorComponent for MutterCompositor {
             })
     }
 
-    /// 工作区列表：**受限**——GNOME 工作区语义不在 Eval/Extension 方法集。
+    /// 工作区列表：按当前路径分派。GNOME 工作区以 0 基序号为原生标识
+    /// （与窗口 `workspace` 字段同一标识空间），`number` 为从 1 开始的
+    /// 展示序号；名称由 GNOME 侧按序号合成（Meta.Workspace 无名称接口）。
+    /// 单一工作区同样是单元素列表。
     async fn list_workspaces(
         &self,
     ) -> agent_shell_core::error::Result<Vec<agent_shell_core::types::WorkspaceInfo>> {
-        Err(agent_shell_core::error::AgentShellError::NotImplemented(
-            "mutter: workspace enumeration not supported on GNOME".into(),
-        ))
+        match &self.path {
+            GnomePath::Eval(e) => Ok(e.list_workspaces().await?),
+            GnomePath::Extension(x) => Ok(x.list_workspaces().await?),
+        }
     }
 
     async fn activate_workspace(

@@ -1774,7 +1774,7 @@ pub struct MutterCompositor {
 | 能力 | 值 | 说明 |
 |------|-----|------|
 | window_management | true | focus/close/minimize/maximize 经 Eval/Extension 可用 |
-| workspace_management | false | GNOME 工作区语义不在 Eval/Extension 方法集内 |
+| workspace_management | false | 工作区列表只读可枚举；切换/移窗无接口 |
 | monitor_layout | true | 仅可读布局（GetCurrentState） |
 | window_events / workspace_events | false | Extension 三信号存在但归一化依赖 extension.js 部署，语义未定前不声明 |
 | native_input / native_capture | false | portal RemoteDesktop / ScreenCast 走输入与 capture 组件 |
@@ -1783,7 +1783,7 @@ pub struct MutterCompositor {
 `move_window` 已实现（Extension 路径 `ext.move_window(&id.native_id, x, y)`；
 Eval 路径返回 `NotImplemented("mutter: window move unavailable on Eval path")`），
 但能力矩阵不声明 move，仅供显式调用方使用。`resize_window` 恒 `NotImplemented`
-（GNOME 无协议，portal-only）。resize / workspace / 原生事件流仍无——GNOME 是**最受限的后端**，
+（GNOME 无协议，portal-only）。resize / 工作区切换 / 原生事件流仍无——GNOME 是**最受限的后端**，
 事件流通过 AT-SPI 补充。
 
 **Eval 路径**（GNOME <47）：

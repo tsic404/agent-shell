@@ -7,10 +7,11 @@
 //! 判定面是真实 `workspaces.list`：夹具合成器提供工作区集，daemon 投影为拍平
 //! 条目；无工作区时返回空集合（零退出语义 = RPC 成功）。
 
-use acceptance::{workspace, FakeCompositor, Fixture};
+use acceptance::{workspace, FakeCompositor, Fixture, PrivateBus};
+use agent_shell_compositor_mutter::ExtensionRunner;
 use agent_shell_core::types::DesktopEnvironment;
 use agent_shell_rpc::{method, RpcErrorCode};
-use serde_json::Value;
+use serde_json::{json, Value};
 
 fn workspaces(value: Value) -> Vec<Value> {
     value
@@ -74,4 +75,106 @@ async fn workspace_list_projects_fields_and_handles_single_workspace() {
         "missing compositor must be explicit: {}",
         error.message
     );
+}
+
+// ── GNOME 通道：扩展载荷 → daemon 投影（真机线格式） ──────────────────────
+//
+// 扩展的 `ListWorkspaces` 返回 JSON 数组：id 是 0 基原生序号（与窗口
+// `workspace` 字段同一标识空间），number 从 1 开始，名称由扩展合成
+// （Meta.Workspace 没有名称接口）。Rust 解析与 daemon 投影都不得退化为
+// 缺字段/0 基序号。
+
+/// GNOME 51.1 Wayland 真机会话 `ListWorkspaces` 的返回串（两工作区，第 1 个当前）。
+const GNOME_LIST_WORKSPACES_PAYLOAD: &str = r#"[{"id":0,"name":"Workspace 1","number":1,"isActive":true},{"id":1,"name":"Workspace 2","number":2,"isActive":false}]"#;
+
+/// mock `org.gnome.Shell.AgentShell`：只实现被测的 ListWorkspaces。
+struct GnomeExtensionWorkspaces {
+    payload: String,
+}
+
+#[zbus::interface(name = "org.gnome.Shell.AgentShell")]
+impl GnomeExtensionWorkspaces {
+    fn list_workspaces(&self) -> String {
+        self.payload.clone()
+    }
+}
+
+/// GNOME 通道端到端：扩展载荷经 `ExtensionRunner` 解析后，`workspaces.list`
+/// 条目字段齐全（原生标识 / 名称 / 1 基序号 / 活动态）。
+#[tokio::test]
+async fn gnome_extension_payload_projects_complete_workspace_entries() {
+    let bus = PrivateBus::start();
+    let server = bus
+        .serve(
+            "/org/gnome/Shell/AgentShell",
+            GnomeExtensionWorkspaces {
+                payload: GNOME_LIST_WORKSPACES_PAYLOAD.to_string(),
+            },
+        )
+        .await;
+    acceptance::bus::claim(&server, "org.gnome.Shell.AgentShell").await;
+
+    let conn = bus.connect().await;
+    let parsed = ExtensionRunner::new(conn)
+        .list_workspaces()
+        .await
+        .expect("GNOME extension workspace payload parses over D-Bus");
+    assert_eq!(parsed.len(), 2, "captured payload carries two workspaces");
+    assert_eq!(parsed[0].id.native_id, "0");
+    assert_eq!(parsed[0].id.de_type, DesktopEnvironment::GNOME);
+    assert_eq!(parsed[0].name, "Workspace 1");
+    assert_eq!(parsed[0].number, 1);
+    assert!(parsed[0].is_active);
+    assert_eq!(parsed[1].id.native_id, "1");
+    assert_eq!(parsed[1].number, 2);
+    assert!(!parsed[1].is_active);
+
+    let mut fixture = Fixture::start().await;
+    fixture.install_compositor(
+        &FakeCompositor::with_workspaces(parsed),
+        DesktopEnvironment::GNOME,
+    );
+    let items = workspaces(fixture.call_ok(method::WORKSPACES_LIST, None).await);
+    assert_eq!(
+        items,
+        vec![
+            json!({"id": "0", "name": "Workspace 1", "number": 1, "is_active": true}),
+            json!({"id": "1", "name": "Workspace 2", "number": 2, "is_active": false}),
+        ],
+        "GNOME workspaces must project complete entries"
+    );
+}
+
+/// C-044 边界：仅一个工作区时 GNOME 通道返回单元素列表，且该项标为当前。
+#[tokio::test]
+async fn gnome_single_workspace_is_a_single_element_list() {
+    let bus = PrivateBus::start();
+    let server = bus
+        .serve(
+            "/org/gnome/Shell/AgentShell",
+            GnomeExtensionWorkspaces {
+                payload: r#"[{"id":0,"name":"Workspace 1","number":1,"isActive":true}]"#
+                    .to_string(),
+            },
+        )
+        .await;
+    acceptance::bus::claim(&server, "org.gnome.Shell.AgentShell").await;
+
+    let conn = bus.connect().await;
+    let parsed = ExtensionRunner::new(conn)
+        .list_workspaces()
+        .await
+        .expect("single-workspace payload parses");
+    assert_eq!(parsed.len(), 1);
+
+    let mut fixture = Fixture::start().await;
+    fixture.install_compositor(
+        &FakeCompositor::with_workspaces(parsed),
+        DesktopEnvironment::GNOME,
+    );
+    let items = workspaces(fixture.call_ok(method::WORKSPACES_LIST, None).await);
+    assert_eq!(items.len(), 1, "single workspace must stay a list");
+    assert_eq!(items[0]["id"], json!("0"));
+    assert_eq!(items[0]["number"], json!(1));
+    assert_eq!(items[0]["is_active"], json!(true));
 }
