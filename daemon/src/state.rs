@@ -251,6 +251,9 @@ fn window_resolver(
 /// 缓存条目有效期。T3b（EventHub 归一化）落地后由事件失效替代。
 const CACHE_TTL: Duration = Duration::from_secs(2);
 
+/// 窗口写操作预算：单条命令默认上限，后端挂死时按超时失败而非扣住串行化槽位。
+const WINDOW_OP_BUDGET: Duration = agent_shell_core::fallback::DEFAULT_COMMAND_TIMEOUT;
+
 /// daemon 会话状态。
 pub struct Daemon {
     compositor: Option<std::sync::Arc<CompositorBackend>>,
@@ -300,6 +303,8 @@ pub struct Daemon {
     pub ring: EventRing,
     /// 待 serve_connection 取走的订阅句柄（转发任务消费）。
     pub subscriptions: Vec<event::EventSubscription>,
+    /// 窗口写操作预算（默认取单命令上限；测试可缩短以覆盖超时分支）。
+    pub window_op_budget: Duration,
     /// 事件归一化管线是否已启动（首次 `events subscribe` 时惰性装配；
     /// compositor 原始事件队列仅可消费一次，二次订阅不重复取流）。
     event_pipeline_started: bool,
@@ -449,6 +454,7 @@ impl Daemon {
             hub: EventHub::new(),
             ring: EventRing::default(),
             subscriptions: Vec::new(),
+            window_op_budget: WINDOW_OP_BUDGET,
             event_pipeline_started: false,
         }
     }
@@ -566,7 +572,37 @@ impl Daemon {
     }
 
     /// 窗口写操作（写操作直通持久化连接，不经缓存）。
+    ///
+    /// 整个操作受单命令预算约束：后端挂死时按超时失败，不把 daemon 的请求
+    /// 串行化槽位一起扣住。
     pub async fn window_op(
+        &self,
+        native_id: &str,
+        op: agent_shell_rpc::WindowOpKind,
+        x: i32,
+        y: i32,
+        w: i32,
+        h: i32,
+    ) -> Result<(), (agent_shell_rpc::RpcErrorCode, String)> {
+        match tokio::time::timeout(
+            self.window_op_budget,
+            self.window_op_inner(native_id, op, x, y, w, h),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => Err((
+                agent_shell_rpc::RpcErrorCode::BackendError,
+                format!(
+                    "window operation {op:?} did not complete within {:?}: \
+                     the compositor backend is not responding",
+                    self.window_op_budget
+                ),
+            )),
+        }
+    }
+
+    async fn window_op_inner(
         &self,
         native_id: &str,
         op: agent_shell_rpc::WindowOpKind,
@@ -1093,6 +1129,7 @@ mod tests {
             hub: EventHub::new(),
             ring: EventRing::default(),
             subscriptions: Vec::new(),
+            window_op_budget: WINDOW_OP_BUDGET,
             event_pipeline_started: false,
         }
     }

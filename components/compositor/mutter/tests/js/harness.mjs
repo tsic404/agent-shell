@@ -21,9 +21,16 @@
 //  12. 窗口类型映射为契约枚举名（Dialog）；
 //  13. 置顶标志与 is_above() 一致。
 //
-// 退出码非 0 即测试失败；Rust 侧断言 stdout 含 "PASS 13 checks"。
+//   CloseWindow 应答（关闭真正生效的判据）：
+//  14. CloseWindow 把 shell 时间戳传给 mw.delete（缺参即抛，关闭不会发生）；
+//  15. 非 GLib.Error 抛出时只回一次 D-Bus 错误（one-shot 下兜底重试会被静默丢弃）；
+//  16. GLib.Error 抛出时走 return_gerror，不混入 dbus_error；
+//  17. 回包自身抛错只记日志，不逃出 method_call。
+//
+// 退出码非 0 即测试失败；Rust 侧断言 stdout 含 "PASS 17 checks"。
 
 import AgentShellExtension from './extension_under_test.mjs';
+import GLib from './mock-glib.mjs';
 import Meta from './mock-meta.mjs';
 import {emittedSignals, session, setSyncOwner, watched} from './mock-gio.mjs';
 
@@ -65,10 +72,13 @@ function makeWindow(id, {
     windowType = Meta.WindowType.NORMAL,
     keepAbove = false,
     frameRect = {x: 8, y: 16, width: 644, height: 492},
+    deleteThrows = null,
 } = {}) {
     const signals = [];
+    const deleteCalls = [];
     const window = {
         signals,
+        deleteCalls,
         get_id: () => id,
         get_title: () => `window-${id}`,
         get_wm_class: () => 'harness-app',
@@ -82,6 +92,15 @@ function makeWindow(id, {
         get_window_type: () => windowType,
         is_above: () => keepAbove,
         has_focus: () => id === 42,
+        // Meta-51 的 delete 需 guint32 timestamp：缺参在 GIR 类型检查处抛，
+        // 与真机「关闭不发生且 invocation 不应答」的触发条件同形。
+        delete(timestamp) {
+            deleteCalls.push(timestamp);
+            if (timestamp === undefined)
+                throw new TypeError('method Meta.Window.delete: At least 1 argument required');
+            if (deleteThrows)
+                throw deleteThrows;
+        },
         connect(signal, callback) {
             const handle = ++handleSeq;
             signals.push({handle, signal, callback});
@@ -123,28 +142,55 @@ function boot(syncOwner) {
     return extension;
 }
 
-function invocation() {
+/// GJS 1.90 给 invocation 的 return_* 装了 one-shot 包装：首次调用先占位再执行，
+/// 其后任何调用都是 no-op（只 logError，不抛）。mock 必须同形——否则「先试 A
+/// 失败再试 B」的兜底会被误判成可用，而真机上第二次必定无声丢弃。
+function invocation(overrides = {}) {
     const record = {};
+    const settled = () => {
+        if (record.settled) {
+            record.duplicates = (record.duplicates ?? 0) + 1;
+            return false;
+        }
+        record.settled = true;
+        return true;
+    };
     const target = {
         return_value: (variant) => {
-            record.value = variant;
+            if (settled())
+                record.value = variant;
         },
         return_gerror: (error) => {
+            if (!settled())
+                return;
+            // 先占位后做 GI 类型检查：非 GLib.Error 在此抛出，调用方已无可回包。
+            if (!(error instanceof GLib.Error))
+                throw new TypeError('return_gerror expects a GLib.Error');
             record.error = error;
         },
         return_dbus_error: (name, message) => {
-            record.dbusError = {name, message};
+            if (settled())
+                record.dbusError = {name, message};
         },
+        ...overrides,
     };
     return {record, target};
 }
 
-function invoke(sender) {
-    const {record, target} = invocation();
+function callMethod(sender, methodName, parameters, target) {
     const methodCall = session.methodCall(PATH);
     assert(typeof methodCall === 'function', 'method_call closure must be registered');
-    methodCall(null, sender, PATH, IFACE, 'ListWindows', null, target);
+    methodCall(null, sender, PATH, IFACE, methodName, parameters, target);
+}
+
+function invokeMethod(sender, methodName, parameters = null, overrides = {}) {
+    const {record, target} = invocation(overrides);
+    callMethod(sender, methodName, parameters, target);
     return record;
+}
+
+function invoke(sender) {
+    return invokeMethod(sender, 'ListWindows');
 }
 
 function payloadOf(record) {
@@ -290,9 +336,68 @@ check('载荷置顶标志与 is_above() 一致', () => {
     }
 });
 
+// ── 14–17：CloseWindow 应答（关闭真正生效的判据） ─────────────────────────
+
+check('CloseWindow 把 shell 时间戳传给 mw.delete', () => {
+    const window = makeWindow(42);
+    installFakeShell([window]);
+    boot(':1.7');
+    const record = invokeMethod(':1.7', 'CloseWindow', new GLib.Variant('(u)', [42]));
+    assert(!record.error && !record.dbusError,
+        `close must not be rejected: ${JSON.stringify(record)}`);
+    assert(window.deleteCalls.length === 1,
+        `delete must be called exactly once, got ${window.deleteCalls.length}`);
+    assert(window.deleteCalls[0] === 0,
+        `delete must receive global.get_current_time() (0 in the harness), ` +
+        `got ${window.deleteCalls[0]}`);
+});
+
+check('非 GLib.Error 抛出时只回一次 D-Bus 错误（无兜底重试）', () => {
+    const window = makeWindow(42, {deleteThrows: new TypeError('delete refused')});
+    installFakeShell([window]);
+    boot(':1.7');
+    const record = invokeMethod(':1.7', 'CloseWindow', new GLib.Variant('(u)', [42]));
+    assert(record.dbusError &&
+        record.dbusError.name === 'org.freedesktop.DBus.Error.Failed',
+    `expected a D-Bus error reply, got ${JSON.stringify(record)}`);
+    assert(!record.value, 'a failed handler must not reply with a value');
+    // invocation 是 one-shot：先试 return_gerror 再兜底在真机上只会被静默丢弃，
+    // 判据必须钉住「只尝试过一次回包」。
+    assert(record.duplicates === undefined,
+        `exactly one reply may be attempted, got ${record.duplicates} duplicate(s)`);
+});
+
+check('GLib.Error 抛出时走 return_gerror（不混入 dbus_error）', () => {
+    // 目标窗口不在列表里 → `_withWindow` 抛 GLib.Error（真机同形路径）。
+    installFakeShell([makeWindow(43)]);
+    boot(':1.7');
+    const record = invokeMethod(':1.7', 'CloseWindow', new GLib.Variant('(u)', [42]));
+    assert(record.error instanceof GLib.Error,
+        `expected the return_gerror path, got ${JSON.stringify(record)}`);
+    assert(!record.dbusError,
+        'a GLib.Error must not be re-routed to return_dbus_error');
+    assert(record.duplicates === undefined,
+        `exactly one reply may be attempted, got ${record.duplicates} duplicate(s)`);
+});
+
+check('错误回包自身抛错时只记日志、不逃出 method_call', () => {
+    const window = makeWindow(42, {deleteThrows: new TypeError('delete refused')});
+    installFakeShell([window]);
+    boot(':1.7');
+    const replyThrows = () => {
+        throw new TypeError('invalid error name');
+    };
+    // 回包抛错若逃出 method_call，GJS 只会在主循环记一条异常，调用方无应答。
+    const record = invokeMethod(':1.7', 'CloseWindow', new GLib.Variant('(u)', [42]), {
+        return_dbus_error: replyThrows,
+    });
+    assert(!record.value && !record.dbusError && !record.error,
+        `a throwing reply must not be retried: ${JSON.stringify(record)}`);
+});
+
 if (failures > 0) {
     console.error(`${failures} check(s) failed`);
     process.exit(1);
 }
-console.log('PASS 13 checks');
+console.log('PASS 17 checks');
 process.exit(0);

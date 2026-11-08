@@ -5,6 +5,10 @@
 //! extension.js 由本 crate 内嵌交付（单一事实来源）。信号语义见 §8.1：
 //! WindowOpened / WindowClosed / ActiveWindowChanged，info 为单窗 JSON。
 
+use std::future::Future;
+use std::time::Duration;
+
+use agent_shell_core::fallback::DBUS_CALL_TIMEOUT;
 use serde_json::Value;
 use zbus::{Connection, MessageStream};
 
@@ -73,6 +77,23 @@ impl ExtensionRunner {
         ))
     }
 
+    /// 在预算内等待一次代理调用：对端挂死时返回超时错误，不无限等待。
+    async fn bounded<T, E>(
+        timeout: Duration,
+        what: &'static str,
+        call: impl Future<Output = std::result::Result<T, E>>,
+    ) -> Result<T>
+    where
+        E: std::fmt::Display,
+    {
+        match tokio::time::timeout(timeout, call).await {
+            Ok(result) => result.map_err(Self::proxy_err),
+            Err(_) => Err(MutterError::Timeout(format!(
+                "{what} did not answer within {timeout:?}"
+            ))),
+        }
+    }
+
     /// 探测：introspect 总线名是否在位（只读、无副作用）。
     ///
     /// 用 introspect 而非真实方法调用——探测不应触发窗口枚举这类
@@ -86,12 +107,13 @@ impl ExtensionRunner {
             .build()
             .await
             .map_err(Self::proxy_err)?;
-        match node.introspect().await {
-            Ok(xml) if xml.contains(AGENTSHELL_IFACE) => Ok(()),
-            Ok(_) => Err(MutterError::Extension(format!(
+        let xml = Self::bounded(DBUS_CALL_TIMEOUT, "Introspect", node.introspect()).await?;
+        if xml.contains(AGENTSHELL_IFACE) {
+            Ok(())
+        } else {
+            Err(MutterError::Extension(format!(
                 "{AGENTSHELL_PATH} present but {AGENTSHELL_IFACE} not advertised"
-            ))),
-            Err(e) => Err(Self::proxy_err(e)),
+            )))
         }
     }
 
@@ -104,12 +126,8 @@ impl ExtensionRunner {
     }
 
     async fn list_json(&self, what: &'static str) -> Result<Value> {
-        let raw = self
-            .proxy()
-            .await?
-            .list_windows()
-            .await
-            .map_err(Self::proxy_err)?;
+        let proxy = self.proxy().await?;
+        let raw = Self::bounded(DBUS_CALL_TIMEOUT, "ListWindows", proxy.list_windows()).await?;
         serde_json::from_str(&raw)
             .map_err(|e| MutterError::Extension(format!("{what} returned invalid JSON: {e}")))
     }
@@ -127,12 +145,13 @@ impl ExtensionRunner {
 
     /// 当前活动窗口（空串返回 None）。
     pub async fn get_active_window(&self) -> Result<Option<agent_shell_core::types::WindowInfo>> {
-        let raw = self
-            .proxy()
-            .await?
-            .get_active_window()
-            .await
-            .map_err(Self::proxy_err)?;
+        let proxy = self.proxy().await?;
+        let raw = Self::bounded(
+            DBUS_CALL_TIMEOUT,
+            "GetActiveWindow",
+            proxy.get_active_window(),
+        )
+        .await?;
         if raw.is_empty() {
             return Ok(None);
         }
@@ -144,43 +163,43 @@ impl ExtensionRunner {
     }
 
     pub async fn focus_window(&self, native_id: &str) -> Result<()> {
-        self.proxy()
-            .await?
-            .focus_window(parse_u32(native_id)?)
-            .await
-            .map_err(Self::proxy_err)
+        let id = parse_u32(native_id)?;
+        let proxy = self.proxy().await?;
+        Self::bounded(DBUS_CALL_TIMEOUT, "FocusWindow", proxy.focus_window(id)).await
     }
 
     pub async fn close_window(&self, native_id: &str) -> Result<()> {
-        self.proxy()
-            .await?
-            .close_window(parse_u32(native_id)?)
-            .await
-            .map_err(Self::proxy_err)
+        let id = parse_u32(native_id)?;
+        let proxy = self.proxy().await?;
+        Self::bounded(DBUS_CALL_TIMEOUT, "CloseWindow", proxy.close_window(id)).await
     }
 
     pub async fn minimize_window(&self, native_id: &str, minimize: bool) -> Result<()> {
-        self.proxy()
-            .await?
-            .minimize_window(parse_u32(native_id)?, minimize)
-            .await
-            .map_err(Self::proxy_err)
+        let id = parse_u32(native_id)?;
+        let proxy = self.proxy().await?;
+        Self::bounded(
+            DBUS_CALL_TIMEOUT,
+            "MinimizeWindow",
+            proxy.minimize_window(id, minimize),
+        )
+        .await
     }
 
     pub async fn move_window(&self, native_id: &str, x: i32, y: i32) -> Result<()> {
-        self.proxy()
-            .await?
-            .move_window(parse_u32(native_id)?, x, y)
-            .await
-            .map_err(Self::proxy_err)
+        let id = parse_u32(native_id)?;
+        let proxy = self.proxy().await?;
+        Self::bounded(DBUS_CALL_TIMEOUT, "MoveWindow", proxy.move_window(id, x, y)).await
     }
 
     pub async fn maximize_window(&self, native_id: &str, maximize: bool) -> Result<()> {
-        self.proxy()
-            .await?
-            .maximize_window(parse_u32(native_id)?, maximize)
-            .await
-            .map_err(Self::proxy_err)
+        let id = parse_u32(native_id)?;
+        let proxy = self.proxy().await?;
+        Self::bounded(
+            DBUS_CALL_TIMEOUT,
+            "MaximizeWindow",
+            proxy.maximize_window(id, maximize),
+        )
+        .await
     }
 
     /// 订阅三个信号（`WindowOpened` / `WindowClosed` /
@@ -318,6 +337,25 @@ mod tests {
     use super::*;
     use std::ffi::OsString;
     use std::path::{Path, PathBuf};
+
+    /// 挂死的对端不得让调用无限等待：预算耗尽即返回可读的超时错误。
+    #[tokio::test]
+    async fn bounded_call_times_out_instead_of_hanging() {
+        let started = std::time::Instant::now();
+        let err = ExtensionRunner::bounded(
+            Duration::from_millis(20),
+            "CloseWindow",
+            std::future::pending::<std::result::Result<(), MutterError>>(),
+        )
+        .await
+        .expect_err("a call that never answers must time out");
+        assert!(matches!(err, MutterError::Timeout(_)), "got {err:?}");
+        assert!(err.to_string().contains("CloseWindow"), "got {err}");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "timeout must fire on the budget instead of hanging"
+        );
+    }
 
     #[test]
     fn extension_js_registers_declared_interface() {
@@ -662,9 +700,9 @@ exit 1
 
     /// 方法分派与窗口接线的可执行判定（不依赖图形会话）：把 `tests/js` 的 mock
     /// 与改写 import 后的 extension.js 落到临时目录，用 node 驱动 method_call
-    /// 闭包与窗口信号。十三条判定见 harness.mjs 顶部：分派四分支（含「enable 同步
+    /// 闭包与窗口信号。十七条判定见 harness.mjs 顶部：分派四分支（含「enable 同步
     /// 取得 owner 时首调即返回载荷」这条启动窗口判据）、逐窗 `unmanaged` 接线
-    /// 三条、`is_maximized()` 载荷两条、几何/工作区/类型/置顶四条。
+    /// 三条、`is_maximized()` 载荷两条、几何/工作区/类型/置顶四条、关闭应答四条。
     /// node 缺失即失败——不静默跳过。
     #[test]
     fn extension_js_dispatch_branches_are_executable() {
@@ -690,7 +728,7 @@ exit 1
             "extension dispatch harness failed:\nstdout:\n{stdout}\nstderr:\n{stderr}"
         );
         assert!(
-            stdout.contains("PASS 13 checks"),
+            stdout.contains("PASS 17 checks"),
             "harness must report every branch: {stdout}"
         );
     }
