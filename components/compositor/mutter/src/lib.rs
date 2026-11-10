@@ -5,7 +5,8 @@
 //! GNOME <47）与 Extension（[`extension`]，47+ 推荐）；路径选择按版本探测、初始
 //! 路径失败自动回退另一路径（§8.4）。显示器走 [`display_config`] 的
 //! `Mutter.DisplayConfig`；截图/输入不在本组件，按设计走 portal。能力如实上报：
-//! GNOME 是最受限后端——无 move/resize/workspace/原生事件流。
+//! GNOME 是最受限后端——无 move/resize/工作区切换/原生事件流（工作区列表
+//! 只读可枚举）。
 
 pub mod display_config;
 pub mod error;

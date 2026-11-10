@@ -21,6 +21,7 @@ const DBusInterface = `
 <node>
   <interface name="org.gnome.Shell.AgentShell">
     <method name="ListWindows"><arg type="s" direction="out"/></method>
+    <method name="ListWorkspaces"><arg type="s" direction="out"/></method>
     <method name="GetActiveWindow"><arg type="s" direction="out"/></method>
     <method name="FocusWindow"><arg type="u" name="window_id" direction="in"/></method>
     <method name="MoveWindow">
@@ -45,7 +46,7 @@ const DBusInterface = `
 </node>`;
 
 // 返回字符串（JSON）的方法集合；其余方法无返回值（void）。
-const STRING_RETURN_METHODS = new Set(['ListWindows', 'GetActiveWindow', 'GetMonitorLayout']);
+const STRING_RETURN_METHODS = new Set(['ListWindows', 'ListWorkspaces', 'GetActiveWindow', 'GetMonitorLayout']);
 
 // Meta.WindowType → 投影枚举名（core WindowType，首字母大写）。
 // 契约词表更窄：toolbar/combo 按语义就近归一（Utility/DropdownMenu）；
@@ -93,6 +94,7 @@ class AgentShellBridge {
         // 方法名 → 函数；返回值由 method_call 按签名打包成 D-Bus out 参数。
         this._impl = {
             ListWindows: () => this._listWindows(),
+            ListWorkspaces: () => this._listWorkspaces(),
             GetActiveWindow: () => this._getActiveWindow(),
             FocusWindow: id => this._withWindow(id, mw => mw.activate(global.get_current_time())),
             MoveWindow: (id, x, y) => this._withWindow(id, mw => mw.move_frame(true, x, y)),
@@ -325,6 +327,28 @@ class AgentShellBridge {
     _listWindows() {
         return JSON.stringify(global.get_window_actors().map(a =>
             JSON.parse(this._windowJson(a))));
+    }
+
+    // 工作区列表：原生标识 = 0 基序号（与窗口载荷的 workspace 同一标识空间），
+    // number = 从 1 开始的展示序号。Meta.Workspace 没有名称接口，名称按序号
+    // 合成（与无名桌面的既有兜底形态一致），不把空串当名称上报。
+    _listWorkspaces() {
+        const wm = global.workspace_manager;
+        const activeIndex = wm.get_active_workspace_index();
+        const out = [];
+        for (let i = 0; i < wm.get_n_workspaces(); i++) {
+            const ws = wm.get_workspace_by_index(i);
+            if (!ws)
+                continue;
+            const index = ws.index();
+            out.push({
+                id: index,
+                name: `Workspace ${index + 1}`,
+                number: index + 1,
+                isActive: index === activeIndex,
+            });
+        }
+        return JSON.stringify(out);
     }
 
     _getActiveWindow() {

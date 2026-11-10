@@ -438,13 +438,14 @@ impl DesktopComponent for MutterCompositor {
 
 #[async_trait]
 impl CompositorComponent for MutterCompositor {
-    /// 能力矩阵如实上报（§8.4）：GNOME 无 move/resize/workspace/
-    /// 原生事件流。monitor_layout=true 仅代表可读布局（GetCurrentState）。
+    /// 能力矩阵如实上报（§8.4）：GNOME 无 move/resize/工作区切换/
+    /// 原生事件流；工作区列表只读可枚举。monitor_layout=true 仅代表
+    /// 可读布局（GetCurrentState）。
     fn capabilities(&self) -> agent_shell_core::component::BackendCapabilities {
         agent_shell_core::component::BackendCapabilities {
             // focus/close/minimize/maximize 经 Eval/Extension 可用。
             window_management: true,
-            // GNOME 工作区语义不在 Eval/Extension 方法集内。
+            // 工作区切换/移窗仍无接口——列表只读能力不声明为「管理」。
             workspace_management: false,
             monitor_layout: true,
             // Extension 三信号存在，但归一化依赖 extension.js 部署且
@@ -565,13 +566,17 @@ impl CompositorComponent for MutterCompositor {
             })
     }
 
-    /// 工作区列表：**受限**——GNOME 工作区语义不在 Eval/Extension 方法集。
+    /// 工作区列表：按当前路径分派。GNOME 工作区以 0 基序号为原生标识
+    /// （与窗口 `workspace` 字段同一标识空间），`number` 为从 1 开始的
+    /// 展示序号；名称由 GNOME 侧按序号合成（Meta.Workspace 无名称接口）。
+    /// 单一工作区同样是单元素列表。
     async fn list_workspaces(
         &self,
     ) -> agent_shell_core::error::Result<Vec<agent_shell_core::types::WorkspaceInfo>> {
-        Err(agent_shell_core::error::AgentShellError::NotImplemented(
-            "mutter: workspace enumeration not supported on GNOME".into(),
-        ))
+        match &self.path {
+            GnomePath::Eval(e) => Ok(e.list_workspaces().await?),
+            GnomePath::Extension(x) => Ok(x.list_workspaces().await?),
+        }
     }
 
     async fn activate_workspace(
@@ -754,27 +759,47 @@ mod tests {
         line.trim_end_matches('\n').to_string()
     }
 
-    /// mock `org.gnome.Shell.Eval`：任何脚本都返回 `(true, "null")`——
-    /// `null` 是合法 JSON，`eval_js` 解析通过即 `probe()` 成功。
-    #[derive(Clone, Copy)]
-    struct FakeShell;
+    /// mock `org.gnome.Shell.Eval`：工作区脚本按真实 shell 的编码层回包
+    /// （`JSON.stringify(eval(code))`，脚本自身 stringify 后即为带引号的
+    /// JSON 字符串）；其余脚本返回 `(true, "null")`——`null` 是合法 JSON，
+    /// `eval_js` 解析通过即 `probe()` 成功。
+    struct FakeShell {
+        version: String,
+    }
 
     #[zbus::interface(name = "org.gnome.Shell")]
     impl FakeShell {
-        fn eval(&self, _script: String) -> (bool, String) {
-            (true, "null".to_string())
+        fn eval(&self, script: String) -> (bool, String) {
+            if script.contains("workspace_manager") {
+                (
+                    true,
+                    serde_json::to_string(GNOME_LIST_WORKSPACES_PAYLOAD)
+                        .expect("encode shell Eval result"),
+                )
+            } else {
+                (true, "null".to_string())
+            }
         }
 
         #[zbus(property)]
         fn shell_version(&self) -> String {
-            "45.2".to_string()
+            self.version.clone()
         }
     }
 
     async fn spawn_fake_shell(bus: &TestBus) -> zbus::Connection {
+        spawn_fake_shell_version(bus, "45.2").await
+    }
+
+    async fn spawn_fake_shell_version(bus: &TestBus, version: &str) -> zbus::Connection {
         let conn = bus.connect().await;
         conn.object_server()
-            .at("/org/gnome/Shell", FakeShell)
+            .at(
+                "/org/gnome/Shell",
+                FakeShell {
+                    version: version.to_string(),
+                },
+            )
             .await
             .expect("register org.gnome.Shell");
         use zbus::names::WellKnownName;
@@ -794,6 +819,9 @@ mod tests {
     impl FakeAgentShell {
         fn list_windows(&self) -> String {
             self.payload.clone()
+        }
+        fn list_workspaces(&self) -> String {
+            GNOME_LIST_WORKSPACES_PAYLOAD.to_string()
         }
         fn get_active_window(&self) -> String {
             String::new()
@@ -832,6 +860,9 @@ mod tests {
     /// 扩展与 daemon 之间的线格式。
     const GNOME_LIST_WINDOWS_PAYLOAD: &str = r#"[{"id":52877633,"title":"New Document (Draft) - Text Editor","appId":"org.gnome.TextEditor","pid":619,"minimized":false,"maximized":false,"fullscreen":false,"geometry":{"x":290,"y":156,"width":700,"height":520},"workspace":0,"windowType":"Normal","keepAbove":false,"hasFocus":false}]"#;
 
+    /// GNOME 51.1 真机会话 `ListWorkspaces` 的返回串（两工作区，第 1 个当前）。
+    const GNOME_LIST_WORKSPACES_PAYLOAD: &str = r#"[{"id":0,"name":"Workspace 1","number":1,"isActive":true},{"id":1,"name":"Workspace 2","number":2,"isActive":false}]"#;
+
     /// Extension 载荷 → core `WindowInfo`：几何/工作区/类型不得退化为默认值。
     #[tokio::test]
     async fn extension_list_windows_projects_geometry_type_and_workspace() {
@@ -862,6 +893,66 @@ mod tests {
         );
         assert_eq!(window.window_type, WindowType::Normal);
         assert!(!window.keep_above);
+    }
+
+    /// GNOME <47：工作区列表按 Eval 分派并解析；切换仍如实报未实现，
+    /// 能力矩阵不声明 workspace_management。
+    #[tokio::test]
+    async fn eval_list_workspaces_dispatches_and_keeps_switch_unimplemented() {
+        use agent_shell_core::types::{DesktopEnvironment, WorkspaceId};
+
+        let bus = TestBus::start().await;
+        let _shell = spawn_fake_shell(&bus).await;
+        let comp = build(&bus, None).await;
+        assert_eq!(comp.path_kind(), GnomePathKind::Eval);
+
+        let spaces = comp
+            .list_workspaces()
+            .await
+            .expect("eval workspace listing parses");
+        assert_eq!(spaces.len(), 2, "captured payload carries two workspaces");
+        assert_eq!(spaces[0].id.native_id, "0");
+        assert_eq!(spaces[0].id.de_type, DesktopEnvironment::GNOME);
+        assert_eq!(spaces[0].name, "Workspace 1");
+        assert_eq!(spaces[0].number, 1);
+        assert!(spaces[0].is_active);
+        assert_eq!(spaces[1].number, 2);
+        assert!(!spaces[1].is_active);
+
+        let err = comp
+            .activate_workspace(&WorkspaceId {
+                native_id: "1".into(),
+                de_type: DesktopEnvironment::GNOME,
+            })
+            .await
+            .expect_err("GNOME workspace switching must stay unimplemented");
+        assert!(matches!(
+            err,
+            agent_shell_core::error::AgentShellError::NotImplemented(_)
+        ));
+        assert!(!comp.capabilities().workspace_management);
+    }
+
+    /// GNOME 47+：工作区列表按 Extension 分派并解析（与 Eval 同一投影形态）。
+    #[tokio::test]
+    async fn extension_list_workspaces_dispatches_and_parses() {
+        let bus = TestBus::start().await;
+        let _shell = spawn_fake_shell_version(&bus, "51.1").await;
+        let _agent = spawn_fake_agent_shell(&bus, GNOME_LIST_WINDOWS_PAYLOAD).await;
+        let comp = build(&bus, None).await;
+        assert_eq!(comp.path_kind(), GnomePathKind::Extension);
+
+        let spaces = comp
+            .list_workspaces()
+            .await
+            .expect("extension workspace listing parses");
+        assert_eq!(spaces.len(), 2, "captured payload carries two workspaces");
+        assert_eq!(spaces[0].id.native_id, "0");
+        assert_eq!(spaces[0].name, "Workspace 1");
+        assert_eq!(spaces[0].number, 1);
+        assert!(spaces[0].is_active);
+        assert_eq!(spaces[1].number, 2);
+        assert!(!spaces[1].is_active);
     }
 
     /// 原始 Wayland 服务端线程：`UnixStream::pair()` 一侧交给 `Backend`，

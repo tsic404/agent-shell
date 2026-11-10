@@ -27,6 +27,7 @@ trait Shell {
 pub(crate) mod parse {
     use agent_shell_core::types::{
         DesktopEnvironment, Rect, WindowId, WindowInfo, WindowState, WindowType, WorkspaceId,
+        WorkspaceInfo,
     };
     use serde_json::Value;
 
@@ -129,6 +130,34 @@ pub(crate) mod parse {
         }
     }
 
+    /// 把 Eval/Extension 返回的工作区 JSON 归一化为 core `WorkspaceInfo`。
+    ///
+    /// GNOME 侧字段：`id`(number|string，0 基原生序号) / `name` / `number`
+    /// （从 1 开始）/ `isActive`。四字段任一缺失或类型不符即丢弃该条目：
+    /// 契约判据是「字段齐全 + 取值正确」，补默认值只会把缺字段伪装成齐全。
+    pub(crate) fn workspace(v: &Value) -> Option<WorkspaceInfo> {
+        let id = match v.get("id") {
+            Some(Value::Number(n)) => n.to_string(),
+            Some(Value::String(s)) => s.clone(),
+            _ => return None,
+        };
+        let number = u32::try_from(v.get("number").and_then(Value::as_u64)?).ok()?;
+        if number == 0 {
+            return None;
+        }
+        Some(WorkspaceInfo {
+            id: WorkspaceId {
+                native_id: id,
+                de_type: DesktopEnvironment::GNOME,
+            },
+            name: v.get("name").and_then(Value::as_str)?.to_string(),
+            number,
+            is_active: v.get("isActive").and_then(Value::as_bool)?,
+            monitor_ids: Vec::new(),
+            window_ids: Vec::new(),
+        })
+    }
+
     fn num(g: &Value, key: &str) -> i32 {
         g.get(key).and_then(Value::as_i64).unwrap_or(0) as i32
     }
@@ -220,6 +249,50 @@ impl GnomeEvalBridge {
             .enumerate()
             .filter_map(|(i, w)| parse::window(w, i as u32))
             .collect())
+    }
+
+    /// 工作区列表 JS：`Meta.Workspace` 只有序号（没有名称接口），读
+    /// `Meta.WorkspaceManager` 的原生序号集合并按序号合成名称；`isActive`
+    /// 取活动工作区序号而不是对象身份（GJS 包装对象不保证引用相等）。
+    pub(crate) const LIST_WORKSPACES_JS: &'static str = r#"JSON.stringify((() => {
+            let wm = global.workspace_manager;
+            let active = wm.get_active_workspace_index();
+            let out = [];
+            for (let i = 0; i < wm.get_n_workspaces(); i++) {
+                let ws = wm.get_workspace_by_index(i);
+                if (!ws) continue;
+                let index = ws.index();
+                out.push({ id: index, name: 'Workspace ' + (index + 1),
+                           number: index + 1, isActive: index === active });
+            }
+            return out;
+        })())"#;
+
+    /// 列出全部工作区（0 基原生序号 + 1 基展示序号 + 名称 + 活动态）。
+    ///
+    /// gnome-shell 的 `Eval` 是 `returnValue = JSON.stringify(eval(code))`
+    /// （`shellDBus.js`）：脚本自身 `JSON.stringify` 后，线上 `result` 是带引号
+    /// 的 JSON 字符串，`eval_js` 单次解析得到 `Value::String`。解开这层只在
+    /// 本方法——`eval_js` 保持单次解析，避免打断依赖字符串判定的 `focus_window`。
+    /// 回退跳与 Extension 跳必须保持同一语义（C-034 ⑤），不得在真机上退化为空集。
+    pub async fn list_workspaces(&self) -> Result<Vec<agent_shell_core::types::WorkspaceInfo>> {
+        let value = self.eval_js(Self::LIST_WORKSPACES_JS).await?;
+        let value = match value {
+            Value::String(inner) => serde_json::from_str(&inner)
+                .map_err(|e| MutterError::Eval(format!("workspaces payload: {e}")))?,
+            other => other,
+        };
+        let arr = value
+            .as_array()
+            .ok_or_else(|| MutterError::Eval("workspaces payload is not a JSON array".into()))?;
+        let workspaces: Vec<_> = arr.iter().filter_map(parse::workspace).collect();
+        // 有载荷却一条都解析不出来 = 字段全不合约，不能静默成空集（C-151）。
+        if !arr.is_empty() && workspaces.is_empty() {
+            return Err(MutterError::Eval(
+                "workspaces payload dropped every incomplete entry".into(),
+            ));
+        }
+        Ok(workspaces)
     }
 
     /// 当前活动窗口（hasFocus 位筛选；桌面无焦点时 None）。
@@ -414,6 +487,59 @@ mod tests {
             parse::window(&w, 0).unwrap().window_type,
             WindowType::Unknown
         );
+    }
+
+    #[test]
+    fn parses_workspace_payload() {
+        // GNOME 扩展载荷：id 是 0 基原生序号，number 从 1 开始，isActive 由
+        // 活动工作区序号判定。
+        let ws = json!({"id": 1u64, "name": "Workspace 2", "number": 2u64, "isActive": true});
+        let info = parse::workspace(&ws).expect("workspace parses");
+        assert_eq!(
+            info.id,
+            WorkspaceId {
+                native_id: "1".into(),
+                de_type: DesktopEnvironment::GNOME,
+            }
+        );
+        assert_eq!(info.name, "Workspace 2");
+        assert_eq!(info.number, 2);
+        assert!(info.is_active);
+        assert!(info.monitor_ids.is_empty());
+        assert!(info.window_ids.is_empty());
+    }
+
+    #[test]
+    fn workspace_without_number_is_dropped() {
+        // number 缺失/非数字 = 条目不完整；补 0 会把 1 基序号伪造成契约外取值。
+        assert!(parse::workspace(&json!({"id": 3u64, "name": "Workspace 4"})).is_none());
+        assert!(
+            parse::workspace(&json!({"id": 3u64, "name": "Workspace 4", "number": "4"})).is_none()
+        );
+        // 显式 0 同样违反「从 1 开始的序号」，不能当有效取值透传。
+        assert!(parse::workspace(
+            &json!({"id": 3u64, "name": "Workspace 4", "number": 0u64, "isActive": false})
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn workspace_without_name_is_dropped() {
+        // 名称缺失不得补空串：AC-20 的判据是字段齐全且取值正确。
+        assert!(parse::workspace(&json!({"id": 0u64, "number": 1u64, "isActive": true})).is_none());
+    }
+
+    #[test]
+    fn workspace_without_active_flag_is_dropped() {
+        // isActive 缺失不得补 false：当前工作区会被误报为非当前。
+        assert!(
+            parse::workspace(&json!({"id": 0u64, "name": "Workspace 1", "number": 1u64})).is_none()
+        );
+    }
+
+    #[test]
+    fn workspace_without_id_is_dropped() {
+        assert!(parse::workspace(&json!({"name": "orphan"})).is_none());
     }
 
     #[test]

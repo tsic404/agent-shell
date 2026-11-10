@@ -27,7 +27,11 @@
 //  16. GLib.Error 抛出时走 return_gerror，不混入 dbus_error；
 //  17. 回包自身抛错只记日志，不逃出 method_call。
 //
-// 退出码非 0 即测试失败；Rust 侧断言 stdout 含 "PASS 17 checks"。
+//   工作区枚举（workspaces list 接线）：
+//  18. ListWorkspaces 载荷：0 基原生标识 / 1 基序号 / 合成名称 / 活动标志；
+//  19. 仅一个工作区时返回单元素列表（C-044 边界）。
+//
+// 退出码非 0 即测试失败；Rust 侧断言 stdout 含 "PASS 19 checks"。
 
 import AgentShellExtension from './extension_under_test.mjs';
 import GLib from './mock-glib.mjs';
@@ -115,11 +119,21 @@ function makeWindow(id, {
     return window;
 }
 
-/// 安装假 shell（窗口集合 + 可触发的 display 信号），返回 display 处理器表。
-function installFakeShell(windows) {
+/// 安装假 shell（窗口集合 + 工作区集合 + 可触发的 display 信号），
+/// 返回 display 处理器表。
+function installFakeShell(windows, {workspaces = [0], activeIndex = 0} = {}) {
     const displayHandlers = new Map();
     globalThis.global = {
         get_window_actors: () => windows.map(window => ({meta_window: window})),
+        // Meta.WorkspaceManager 替身：工作区对象只暴露 index()（GJS 侧真实
+        // 接口没有名称）；活动态走序号而不是对象身份。
+        workspace_manager: {
+            get_n_workspaces: () => workspaces.length,
+            get_workspace_by_index: i => i < workspaces.length
+                ? {index: () => workspaces[i]}
+                : null,
+            get_active_workspace_index: () => activeIndex,
+        },
         display: {
             connect(signal, callback) {
                 displayHandlers.set(signal, callback);
@@ -395,9 +409,38 @@ check('错误回包自身抛错时只记日志、不逃出 method_call', () => {
         `a throwing reply must not be retried: ${JSON.stringify(record)}`);
 });
 
+// ── 18–19：工作区枚举（workspaces list 接线） ───────────────────────────────
+//
+// GNOME 原生工作区没有名称接口；载荷必须给出 0 基原生标识（与窗口
+// workspace 同一标识空间）、1 基展示序号、合成名称与被标记为活动的唯一项。
+
+check('ListWorkspaces 返回 0 基标识 / 1 基序号 / 名称 / 活动标志', () => {
+    installFakeShell([makeWindow(42)], {workspaces: [0, 1, 2], activeIndex: 1});
+    boot(':1.7');
+    const record = invokeMethod(':1.7', 'ListWorkspaces');
+    assert(!record.dbusError, `ListWorkspaces must not be rejected: ${JSON.stringify(record)}`);
+    const list = payloadOf(record);
+    assert(Array.isArray(list), 'ListWorkspaces must return a JSON array');
+    assert(JSON.stringify(list) === JSON.stringify([
+        {id: 0, name: 'Workspace 1', number: 1, isActive: false},
+        {id: 1, name: 'Workspace 2', number: 2, isActive: true},
+        {id: 2, name: 'Workspace 3', number: 3, isActive: false},
+    ]), `unexpected workspace payload: ${JSON.stringify(list)}`);
+});
+
+check('仅一个工作区时 ListWorkspaces 返回单元素列表', () => {
+    installFakeShell([makeWindow(42)], {workspaces: [0], activeIndex: 0});
+    boot(':1.7');
+    const list = payloadOf(invokeMethod(':1.7', 'ListWorkspaces'));
+    assert(list.length === 1, `expected one workspace, got ${list.length}`);
+    assert(list[0].id === 0, `native id must be 0-based: ${list[0].id}`);
+    assert(list[0].number === 1, `number must be 1-based: ${list[0].number}`);
+    assert(list[0].isActive === true, 'the single workspace must be active');
+});
+
 if (failures > 0) {
     console.error(`${failures} check(s) failed`);
     process.exit(1);
 }
-console.log('PASS 17 checks');
+console.log('PASS 19 checks');
 process.exit(0);

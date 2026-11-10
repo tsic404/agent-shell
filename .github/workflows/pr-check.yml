@@ -110,7 +110,10 @@ jobs:
   # （capture 走 Screenshot/X11 降级链，§20.2）。x86_64 的 no-pipewire profile 只
   # 验证特性开关，不覆盖 aarch64 目标；本 job 交叉编译 aarch64 验证该路径不回归。
   check-arm64:
-    runs-on: ubuntu-latest
+    # 固定 24.04（noble）：ubuntu-latest 随镜像滚动，主归档与
+    # ports.ubuntu.com 的包版本可能错配，apt 因降级拒绝安装 arm64 依赖，
+    # 导致门禁在构建前失败。交叉编译基线需要稳定发行版，不跟 latest 漂。
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
 
