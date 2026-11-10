@@ -241,14 +241,24 @@ impl GnomeEvalBridge {
         }))"#;
 
     /// 列出全部窗口。
+    ///
+    /// gnome-shell 的 `Eval` 再包一层 `JSON.stringify`，脚本自身 stringify
+    /// 后线上是带引号的 JSON 字符串（见 [`decode_list_payload`]）。解开这层
+    /// 后按载荷顺序编号；空数组是「没有窗口」，不是解析失败（C-042）。
     pub async fn list_windows(&self) -> Result<Vec<agent_shell_core::types::WindowInfo>> {
-        let result = self.eval_js(Self::LIST_WINDOWS_JS).await?;
-        let arr = result.as_array().cloned().unwrap_or_default();
-        Ok(arr
+        let entries = decode_list_payload(self.eval_js(Self::LIST_WINDOWS_JS).await?, "windows")?;
+        let windows: Vec<_> = entries
             .iter()
             .enumerate()
             .filter_map(|(i, w)| parse::window(w, i as u32))
-            .collect())
+            .collect();
+        // 有载荷却一条都投影不出 = 逐条缺原生标识，不能静默成空集（C-151）。
+        if !entries.is_empty() && windows.is_empty() {
+            return Err(MutterError::Eval(
+                "windows payload dropped every incomplete entry".into(),
+            ));
+        }
+        Ok(windows)
     }
 
     /// 工作区列表 JS：`Meta.Workspace` 只有序号（没有名称接口），读
@@ -273,21 +283,15 @@ impl GnomeEvalBridge {
     /// gnome-shell 的 `Eval` 是 `returnValue = JSON.stringify(eval(code))`
     /// （`shellDBus.js`）：脚本自身 `JSON.stringify` 后，线上 `result` 是带引号
     /// 的 JSON 字符串，`eval_js` 单次解析得到 `Value::String`。解开这层只在
-    /// 本方法——`eval_js` 保持单次解析，避免打断依赖字符串判定的 `focus_window`。
-    /// 回退跳与 Extension 跳必须保持同一语义（C-034 ⑤），不得在真机上退化为空集。
+    /// 列表消费点（见 [`decode_list_payload`]）——`eval_js` 保持单次解析，避免打断
+    /// 依赖字符串判定的 `focus_window`。回退跳与 Extension 跳必须保持同一语义
+    /// （C-034 ⑤），不得在真机上退化为空集。
     pub async fn list_workspaces(&self) -> Result<Vec<agent_shell_core::types::WorkspaceInfo>> {
-        let value = self.eval_js(Self::LIST_WORKSPACES_JS).await?;
-        let value = match value {
-            Value::String(inner) => serde_json::from_str(&inner)
-                .map_err(|e| MutterError::Eval(format!("workspaces payload: {e}")))?,
-            other => other,
-        };
-        let arr = value
-            .as_array()
-            .ok_or_else(|| MutterError::Eval("workspaces payload is not a JSON array".into()))?;
-        let workspaces: Vec<_> = arr.iter().filter_map(parse::workspace).collect();
+        let entries =
+            decode_list_payload(self.eval_js(Self::LIST_WORKSPACES_JS).await?, "workspaces")?;
+        let workspaces: Vec<_> = entries.iter().filter_map(parse::workspace).collect();
         // 有载荷却一条都解析不出来 = 字段全不合约，不能静默成空集（C-151）。
-        if !arr.is_empty() && workspaces.is_empty() {
+        if !entries.is_empty() && workspaces.is_empty() {
             return Err(MutterError::Eval(
                 "workspaces payload dropped every incomplete entry".into(),
             ));
@@ -297,13 +301,16 @@ impl GnomeEvalBridge {
 
     /// 当前活动窗口（hasFocus 位筛选；桌面无焦点时 None）。
     pub async fn get_active_window(&self) -> Result<Option<agent_shell_core::types::WindowInfo>> {
-        let result = self.eval_js(Self::LIST_WINDOWS_JS).await?;
-        Ok(result
-            .as_array()
-            .into_iter()
-            .flatten()
+        let entries = decode_list_payload(self.eval_js(Self::LIST_WINDOWS_JS).await?, "windows")?;
+        let Some(focused) = entries
+            .iter()
             .find(|w| w.get("hasFocus").and_then(Value::as_bool).unwrap_or(false))
-            .and_then(|w| parse::window(w, 0)))
+        else {
+            return Ok(None);
+        };
+        parse::window(focused, 0)
+            .map(Some)
+            .ok_or_else(|| MutterError::Eval("active window payload missing window id".into()))
     }
 
     /// 聚焦窗口（meta_window.activate()）。窗口不存在返回错误。
@@ -364,6 +371,26 @@ impl GnomeEvalBridge {
         ))
         .await?;
         Ok(())
+    }
+}
+
+/// 解开 gnome-shell `Eval` 回包的字符串层，取出脚本返回的 JSON 数组。
+///
+/// `js/ui/shellDBus.js` 的 `Eval` 是 `returnValue = JSON.stringify(eval(code))`：
+/// 脚本自身 `JSON.stringify` 后，线上 `result` 是带引号的 JSON 字符串，`eval_js`
+/// 单次解析停在 `Value::String`。解开只作用于列表载荷——`eval_js` 保持单次解析，
+/// `focus_window` 依赖字符串判定的判据不被改写。非数组明确失败（C-151）。
+fn decode_list_payload(value: Value, what: &str) -> Result<Vec<Value>> {
+    let value = match value {
+        Value::String(inner) => serde_json::from_str(&inner)
+            .map_err(|e| MutterError::Eval(format!("{what} payload: {e}")))?,
+        other => other,
+    };
+    match value {
+        Value::Array(items) => Ok(items),
+        _ => Err(MutterError::Eval(format!(
+            "{what} payload is not a JSON array"
+        ))),
     }
 }
 
@@ -540,6 +567,46 @@ mod tests {
     #[test]
     fn workspace_without_id_is_dropped() {
         assert!(parse::workspace(&json!({"name": "orphan"})).is_none());
+    }
+
+    /// Eval 回包的壳编码层：脚本自身 stringify 后，线上是带引号的 JSON 字符串，
+    /// 列表解析必须解开这层；已解码的数组与空数组同语义。
+    #[test]
+    fn decode_list_payload_unwraps_shell_encoding() {
+        let encoded = Value::String(r#"[{"id":1},{"id":2}]"#.into());
+        let decoded = decode_list_payload(encoded, "windows").expect("shell-encoded list decodes");
+        assert_eq!(decoded.len(), 2, "解开一层后保留全部条目");
+
+        let bare = json!([{"id": 1}]);
+        assert_eq!(
+            decode_list_payload(bare, "windows")
+                .expect("already-decoded list passes through")
+                .len(),
+            1
+        );
+        assert!(decode_list_payload(json!([]), "windows")
+            .expect("empty desktop is a valid empty list")
+            .is_empty());
+    }
+
+    /// 非数组与非 JSON 一律明确失败，不得退化成空集（C-151）。
+    #[test]
+    fn decode_list_payload_rejects_non_arrays() {
+        for bad in [
+            Value::String("42".into()),
+            Value::String("not-json".into()),
+            json!(42),
+            json!({"id": 1}),
+            Value::Null,
+        ] {
+            assert!(
+                matches!(
+                    decode_list_payload(bad.clone(), "windows"),
+                    Err(MutterError::Eval(_))
+                ),
+                "accepted {bad}"
+            );
+        }
     }
 
     #[test]
