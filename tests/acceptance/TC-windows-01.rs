@@ -10,8 +10,9 @@
 //! 执行。本用例全部可在无显示服务器的环境中执行，无环境绑定部分。
 
 use acceptance::{window, FakeCompositor, Fixture, PrivateBus};
+use agent_shell_compositor_mutter::{parse_shell_version, GnomeEvalBridge, MutterError};
 use agent_shell_core::types::{
-    DesktopEnvironment, MonitorId, WindowState, WindowType, WorkspaceId,
+    DesktopEnvironment, MonitorId, Rect, WindowState, WindowType, WorkspaceId,
 };
 use agent_shell_rpc::method;
 use serde_json::{json, Value};
@@ -185,4 +186,232 @@ async fn gnome_extension_payload_keeps_geometry_type_and_workspace_in_the_projec
     assert_eq!(entry["workspace"], json!("0"));
     assert_eq!(entry["window_type"], json!("Normal"));
     assert_eq!(entry["keep_above"], json!(false));
+}
+
+// ── GNOME <47：Eval 回退跳的壳编码层 → 解析 → daemon 投影 ────────────────────
+//
+// `org.gnome.Shell.Eval` 的实现是 `returnValue = JSON.stringify(eval(code))`：
+// 脚本自身 `JSON.stringify` 后，线上 `result` 是带引号的 JSON 字符串。mock 必须
+// 复刻这层编码，只回裸数组会让「生产只拿到 Value::String」的缺陷继续隐藏。
+
+/// 复刻 gnome-shell `Eval` 的编码层：脚本返回值是 JSON 文本时，协议回包是这段
+/// 文本的 JSON 字符串字面量（`JSON.stringify(eval(code))`）。
+fn shell_eval_result(json_text: &str) -> String {
+    serde_json::to_string(json_text).expect("encode shell Eval result")
+}
+
+/// mock `org.gnome.Shell` 根接口：原样返回 `(success, payload)`。
+struct GnomeShellEval {
+    success: bool,
+    payload: String,
+}
+
+#[zbus::interface(name = "org.gnome.Shell")]
+impl GnomeShellEval {
+    fn eval(&self, _script: String) -> (bool, String) {
+        (self.success, self.payload.clone())
+    }
+}
+
+/// 在私有总线上起 Eval mock 并返回桥接；`_server` 必须与测试同寿命，
+/// 否则 mock 对象随连接一起销毁。
+async fn eval_bridge(
+    bus: &PrivateBus,
+    success: bool,
+    payload: &str,
+) -> (zbus::Connection, GnomeEvalBridge) {
+    let server = bus
+        .serve(
+            "/org/gnome/Shell",
+            GnomeShellEval {
+                success,
+                payload: payload.to_string(),
+            },
+        )
+        .await;
+    acceptance::bus::claim(&server, "org.gnome.Shell").await;
+    let conn = bus.connect().await;
+    (
+        server,
+        GnomeEvalBridge::new(conn, parse_shell_version("45.2").expect("GNOME 45")),
+    )
+}
+
+/// 两窗 Eval 载荷（脚本 `LIST_WINDOWS_JS` 的线上形状：字段与真机一致，
+/// 不含 frameGeometry）。
+const GNOME_EVAL_LIST_WINDOWS_PAYLOAD: &str = r#"[{"id":52877633,"title":"New Document (Draft) - Text Editor","appId":"org.gnome.TextEditor","pid":619,"minimized":false,"maximized":false,"fullscreen":false,"geometry":{"x":290,"y":156,"width":700,"height":520},"workspace":0,"windowType":"Normal","keepAbove":false,"hasFocus":true},{"id":42,"title":"Terminal","appId":"org.gnome.Console","pid":1337,"minimized":true,"maximized":false,"fullscreen":false,"geometry":{"x":0,"y":0,"width":1024,"height":768},"workspace":1,"windowType":"Dialog","keepAbove":true,"hasFocus":false}]"#;
+
+/// GNOME <47 Eval 跳：双层编码的真实回包经解析后字段齐全、序号按载荷顺序；
+/// daemon `windows.list` 投影与扩展跳同形。
+#[tokio::test]
+async fn gnome_eval_window_payload_projects_fields_and_stacking_order() {
+    let bus = PrivateBus::start();
+    let (_server, bridge) = eval_bridge(
+        &bus,
+        true,
+        &shell_eval_result(GNOME_EVAL_LIST_WINDOWS_PAYLOAD),
+    )
+    .await;
+
+    let windows = bridge
+        .list_windows()
+        .await
+        .expect("double-encoded Eval payload parses over D-Bus");
+    assert_eq!(windows.len(), 2, "双层编码的载荷不得退化成空列表");
+
+    let first = &windows[0];
+    assert_eq!(first.id.native_id, "52877633");
+    assert_eq!(first.id.de_type, DesktopEnvironment::GNOME);
+    assert_eq!(first.title, "New Document (Draft) - Text Editor");
+    assert_eq!(first.app_id, "org.gnome.TextEditor");
+    assert_eq!(first.pid, 619);
+    assert_eq!(
+        first.geometry,
+        Rect {
+            x: 290,
+            y: 156,
+            width: 700,
+            height: 520,
+        }
+    );
+    // 载荷不带 frameGeometry：按既有规则回落内容几何（与扩展跳同口径）。
+    assert_eq!(first.frame_geometry, first.geometry);
+    assert_eq!(
+        first.workspace_id.as_ref().map(|w| w.native_id.as_str()),
+        Some("0")
+    );
+    assert_eq!(first.window_type, WindowType::Normal);
+    assert_eq!(first.stacking_order, 0);
+    assert!(!first.keep_above);
+
+    let second = &windows[1];
+    assert_eq!(second.id.native_id, "42");
+    assert_eq!(
+        second.workspace_id.as_ref().map(|w| w.native_id.as_str()),
+        Some("1")
+    );
+    assert_eq!(second.window_type, WindowType::Dialog);
+    assert_eq!(second.stacking_order, 1);
+    assert!(second.keep_above);
+    assert_eq!(second.states, vec![WindowState::Minimized]);
+
+    // 活动窗口走同一载荷：hasFocus 位命中第一条。
+    let active = bridge
+        .get_active_window()
+        .await
+        .expect("active window decodes the same payload")
+        .expect("the first window carries hasFocus");
+    assert_eq!(active.id.native_id, "52877633");
+
+    // daemon 方法投影：windows.list 条目字段与序号。
+    let mut fixture = Fixture::start().await;
+    fixture.install_compositor(
+        &FakeCompositor::with_windows(windows),
+        DesktopEnvironment::GNOME,
+    );
+    let result = fixture.call_ok(method::WINDOWS_LIST, None).await;
+    let entries = result["windows"].as_array().expect("windows array");
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries[0]["native_id"], json!("52877633"));
+    assert_eq!(
+        entries[0]["title"],
+        json!("New Document (Draft) - Text Editor")
+    );
+    assert_eq!(entries[0]["app_id"], json!("org.gnome.TextEditor"));
+    assert_eq!(entries[0]["pid"], json!(619));
+    assert_eq!(entries[0]["x"], json!(290));
+    assert_eq!(entries[0]["y"], json!(156));
+    assert_eq!(entries[0]["width"], json!(700));
+    assert_eq!(entries[0]["height"], json!(520));
+    assert_eq!(entries[0]["workspace"], json!("0"));
+    assert_eq!(entries[0]["stacking_order"], json!(0));
+    assert_eq!(entries[0]["states"], json!(["Normal"]));
+    assert_eq!(entries[0]["window_type"], json!("Normal"));
+    assert_eq!(entries[0]["keep_above"], json!(false));
+    assert_eq!(entries[1]["native_id"], json!("42"));
+    assert_eq!(entries[1]["workspace"], json!("1"));
+    assert_eq!(entries[1]["stacking_order"], json!(1));
+    assert_eq!(entries[1]["states"], json!(["Minimized"]));
+    assert_eq!(entries[1]["window_type"], json!("Dialog"));
+    assert_eq!(entries[1]["keep_above"], json!(true));
+}
+
+/// C-042：零窗口桌面返回空列表（零退出语义），不是解析失败——与「条目全被
+/// 丢弃」区分，后者必须报错。
+#[tokio::test]
+async fn gnome_eval_empty_window_list_is_an_empty_list() {
+    let bus = PrivateBus::start();
+    let (_server, bridge) = eval_bridge(&bus, true, &shell_eval_result("[]")).await;
+
+    let windows = bridge
+        .list_windows()
+        .await
+        .expect("empty desktop is a valid empty list");
+    assert!(windows.is_empty());
+    let active = bridge
+        .get_active_window()
+        .await
+        .expect("empty desktop has no active window");
+    assert!(active.is_none());
+}
+
+/// 非数组 / 全部条目被丢弃 / 内层非 JSON / 壳侧失败都必须明确报错，
+/// 不得静默成空集（C-151）。
+#[tokio::test]
+async fn gnome_eval_window_payload_failures_are_explicit_errors() {
+    // 非数组：协议层是合法 JSON 字符串，内层不是数组。
+    let not_array = PrivateBus::start();
+    let (_server, bridge) = eval_bridge(&not_array, true, &shell_eval_result("42")).await;
+    let err = bridge
+        .list_windows()
+        .await
+        .expect_err("non-array payload must be an error");
+    assert!(matches!(err, MutterError::Eval(_)), "got {err:?}");
+
+    // 字段缺失：数组里每条都缺原生标识 → 全部丢弃 → 明确失败。
+    let all_dropped = PrivateBus::start();
+    let (_server, bridge) = eval_bridge(
+        &all_dropped,
+        true,
+        &shell_eval_result(r#"[{"title":"no id"}]"#),
+    )
+    .await;
+    let err = bridge
+        .list_windows()
+        .await
+        .expect_err("all-incomplete payload must be an error");
+    assert!(matches!(err, MutterError::Eval(_)), "got {err:?}");
+
+    // 焦点条目缺原生标识：hasFocus 已命中却无法投影，必须报错——不得静默
+    // 退化成「没有活动窗口」（`list_windows` 丢弃该条目的语义不适用于这里）。
+    let focused_without_id = PrivateBus::start();
+    let (_server, bridge) = eval_bridge(
+        &focused_without_id,
+        true,
+        &shell_eval_result(r#"[{"title":"no id","hasFocus":true}]"#),
+    )
+    .await;
+    let err = bridge
+        .get_active_window()
+        .await
+        .expect_err("focused entry without a native id must be an error");
+    assert!(matches!(err, MutterError::Eval(_)), "got {err:?}");
+
+    // 内层不是 JSON（脚本返回非 JSON 文本）。
+    let mangled = PrivateBus::start();
+    let (_server, bridge) = eval_bridge(&mangled, true, &shell_eval_result("not-json")).await;
+    let err = bridge
+        .list_windows()
+        .await
+        .expect_err("inner non-JSON must be an error");
+    assert!(matches!(err, MutterError::Eval(_)), "got {err:?}");
+
+    // 壳侧失败（Eval 被禁用 / 脚本抛错）：success=false 必须报错。
+    let shell_failed = PrivateBus::start();
+    let (_server, bridge) = eval_bridge(&shell_failed, false, "").await;
+    let err = bridge
+        .list_windows()
+        .await
+        .expect_err("shell-side failure must be an error");
+    assert!(matches!(err, MutterError::Eval(_)), "got {err:?}");
 }
