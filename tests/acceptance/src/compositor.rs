@@ -33,15 +33,34 @@ pub struct FakeDesktop {
 }
 
 /// 可克隆的合成器句柄：注入 daemon 后测试仍可读写同一份状态。
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct FakeCompositor {
     state: Arc<Mutex<FakeDesktop>>,
+    name: &'static str,
+}
+
+impl Default for FakeCompositor {
+    fn default() -> Self {
+        Self {
+            state: Arc::default(),
+            name: "fake-desktop",
+        }
+    }
 }
 
 impl FakeCompositor {
     /// 空桌面。
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// 以指定后端名构造：夹具代持真实后端（KWin/Mutter 等）的身份，供
+    /// 「报告值来自装配真值」的用例区分不同会话。
+    pub fn named(name: &'static str) -> Self {
+        Self {
+            name,
+            ..Self::default()
+        }
     }
 
     /// 带初始窗口的桌面。
@@ -137,7 +156,7 @@ pub fn workspace(native_id: &str, name: &str, number: u32, is_active: bool) -> W
 #[async_trait]
 impl DesktopComponent for FakeCompositor {
     fn name(&self) -> &'static str {
-        "fake-desktop"
+        self.name
     }
 
     fn component_type(&self) -> ComponentType {

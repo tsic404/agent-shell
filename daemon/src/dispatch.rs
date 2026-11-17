@@ -314,11 +314,11 @@ async fn doctor(d: &mut Daemon) -> RpcResult {
     // 2. 合成器通道（daemon 持久化连接的真实状态）。
     match d.compositor_health() {
         Ok(_) => {
-            lines.push(format!("✓ 合成器         : {}", d.compositor_name()));
+            lines.push(format!("✓ 合成器         : {}", d.compositor_report()));
             let comp_lines = compositor_doctor_lines(d).await;
             lines.extend(comp_lines);
         }
-        Err(()) => lines.push("✗ 合成器         : unavailable in this session".into()),
+        Err(()) => lines.push(format!("✗ 合成器         : {}", d.compositor_report())),
     }
     // 3. AT-SPI 存活性（分级探测：session bus → a11y bus → Registry）。
     lines.push(crate::a11y::atspi_line().await);
@@ -538,6 +538,7 @@ async fn info(d: &Daemon) -> RpcResult {
     ];
     let r = InfoResult {
         detection,
+        backend: Some(d.compositor_report().to_string()),
         capabilities,
     };
     Ok(serde_json::to_value(r).expect("InfoResult serializable"))
@@ -2340,6 +2341,9 @@ mod tests {
         let resp = dispatch(&mut d, &req(method::INFO, None)).await;
         let v = resp.result.expect("ok");
         let r: InfoResult = serde_json::from_value(v).expect("InfoResult");
+
+        // 后端身份与健康报告共用装配真值；无合成器时两者同为「本会话不可用」。
+        assert_eq!(r.backend.as_deref(), Some(d.compositor_report()));
 
         // 能力位表固定 9 行且名称顺序稳定（不得硬编码）。
         let names: Vec<&str> = r.capabilities.iter().map(|(n, _)| n.as_str()).collect();

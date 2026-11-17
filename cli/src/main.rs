@@ -144,31 +144,26 @@ fn render_doctor(out: OutputFormat, report: &agent_shell_rpc::DoctorResult) -> S
     }
 }
 
-/// `info` 报告的 backend 展示值。table 与 JSON 双格式共享同一常量，
-/// 保证两种输出信息等价（agent 自动化从 JSON 即可获知后端身份）。
-const INFO_BACKEND: &str = "kwin-compositor (via daemon)";
-
 /// `info` 输出渲染：JSON 走结构化序列化（含 backend），table 走检测摘要 + 能力位表。
 fn render_info(out: OutputFormat, r: &agent_shell_rpc::InfoResult) -> String {
     match out {
-        OutputFormat::Json => {
-            let mut v = serde_json::to_value(r).expect("InfoResult serializable");
-            v.as_object_mut()
-                .expect("InfoResult serializes as object")
-                .insert("backend".to_owned(), Value::String(INFO_BACKEND.to_owned()));
-            serde_json::to_string_pretty(&v).expect("info json serializable")
-        }
+        OutputFormat::Json => serde_json::to_string_pretty(r).expect("InfoResult serializable"),
         OutputFormat::Table => {
             let mut s = String::new();
             s.push_str(&r.detection);
             s.push_str("\nbackend           : ");
-            s.push_str(INFO_BACKEND);
+            s.push_str(backend_display(&r.backend));
             for (name, status) in &r.capabilities {
                 s.push_str(&format!("\n{name:<24} {}", render_capability(status)));
             }
             s
         }
     }
+}
+
+/// 旧 daemon 未带结构化后端字段：CLI 只标明未上报，不推断具体后端。
+fn backend_display(backend: &Option<String>) -> &str {
+    backend.as_deref().unwrap_or("not reported by daemon")
 }
 
 /// 能力三态 → 终端标记。`Lazy`：首次订阅才建立，非永久不可用
@@ -1381,9 +1376,11 @@ mod tests {
 
     #[test]
     fn render_info_json_is_structured_and_keeps_capabilities() {
-        // info --output-format json 应输出结构化对象，供 agent 自动化解析。
+        // info --output-format json 应输出结构化对象，供 agent 自动化解析；
+        // backend 与 daemon 上报值逐字一致，CLI 不得改写或替换成任何常量。
         let r = InfoResult {
             detection: "KDE (wayland)".into(),
+            backend: Some("mutter-compositor".into()),
             capabilities: vec![
                 ("window_management".into(), CapabilityStatus::Enabled),
                 ("native_capture".into(), CapabilityStatus::Lazy),
@@ -1391,7 +1388,7 @@ mod tests {
         };
         let v: Value = serde_json::from_str(&render_info(OutputFormat::Json, &r))
             .expect("render_info json must parse");
-        assert_eq!(v["backend"], "kwin-compositor (via daemon)");
+        assert_eq!(v["backend"], r.backend.as_deref().unwrap_or_default());
         assert_eq!(v["detection"], "KDE (wayland)");
         assert_eq!(v["capabilities"][0][0], "window_management");
         assert_eq!(v["capabilities"][0][1], "enabled");
@@ -1400,15 +1397,35 @@ mod tests {
 
     #[test]
     fn render_info_table_preserves_detection_and_markers() {
-        // table 模式行为保持不变：检测摘要 + backend 行 + 能力位表标记。
+        // table 模式的 backend 行同样来自 daemon 上报值：输出与 daemon 报告的
+        // 合成器一致，而非另一个写死的后端名。
         let r = InfoResult {
             detection: "KDE (wayland)".into(),
+            backend: Some("mutter-compositor".into()),
             capabilities: vec![("window_management".into(), CapabilityStatus::Enabled)],
         };
         let out = render_info(OutputFormat::Table, &r);
-        assert!(out.starts_with("KDE (wayland)\nbackend           : kwin-compositor (via daemon)"));
+        assert!(out.starts_with(&format!(
+            "KDE (wayland)\nbackend           : {}",
+            r.backend.as_deref().unwrap_or_default()
+        )));
         assert!(out.contains("window_management"));
         assert!(out.contains("✓"));
+    }
+
+    #[test]
+    fn render_info_marks_missing_backend_without_naming_one() {
+        // 旧 daemon 无结构化后端字段：两种格式都只标明「未上报」，不得回填后端名。
+        let r = InfoResult {
+            detection: "legacy daemon".into(),
+            backend: None,
+            capabilities: Vec::new(),
+        };
+        let table = render_info(OutputFormat::Table, &r);
+        assert!(table.contains("backend           : not reported by daemon"));
+        let json: Value = serde_json::from_str(&render_info(OutputFormat::Json, &r))
+            .expect("render_info json must parse");
+        assert!(json["backend"].is_null());
     }
 
     #[test]

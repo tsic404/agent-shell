@@ -46,6 +46,9 @@ enum CompositorBackend {
     Acceptance(AcceptanceCompositor),
 }
 
+/// 合成器空槽的对外报告值（doctor 行与 `info` 后端字段共用同一措辞）。
+const SESSION_UNAVAILABLE: &str = "unavailable in this session";
+
 /// 原始事件源装配结果（区分「就绪 / 无原生流 / 失败」三态）。
 enum RawSourceOutcome {
     /// 原始事件源就绪（KWin 事件脚本启动成功且接收端已取到）。
@@ -68,13 +71,14 @@ impl CompositorBackend {
     }
 
     /// doctor 报告用的后端展示名（KWin 保留历史值，DDE/Mutter 委托 trait 方法）。
+    /// 验收夹具代持真实后端身份：名字取自注入组件，两套夹具才能落到不同后端名。
     fn name(&self) -> &'static str {
         match self {
             Self::Kwin(_) => "kwin-compositor",
             Self::Dde(c) => c.name(),
             Self::Mutter(c) => c.name(),
             #[cfg(debug_assertions)]
-            Self::Acceptance(_) => "acceptance-compositor",
+            Self::Acceptance(c) => c.component.name(),
         }
     }
 
@@ -720,12 +724,15 @@ impl Daemon {
             .unwrap_or(&[])
     }
 
-    /// doctor 报告用的合成器后端名。
-    pub fn compositor_name(&self) -> &'static str {
+    /// 合成器通道的对外报告值（doctor 合成器行与 `info` 后端字段共用）。
+    ///
+    /// 两处读同一函数：就绪时是后端身份，空槽时是本会话不可用——报告值不靠
+    /// 调用方各自拼字符串维持一致。
+    pub fn compositor_report(&self) -> &'static str {
         self.compositor
             .as_ref()
             .map(|c| c.name())
-            .unwrap_or("unavailable")
+            .unwrap_or(SESSION_UNAVAILABLE)
     }
 
     /// 窗口缓存是否新鲜（TTL 内）。`daemon.status` 据此决定是否报告缓存条目数。
@@ -1135,12 +1142,12 @@ mod tests {
     }
 
     #[test]
-    fn compositor_name_reports_unavailable_without_backend() {
+    fn compositor_report_reports_unavailable_without_backend() {
         // 名称委托的 Dde 路径由 dde crate 的 name() 契约覆盖。此处固化 None
         // 路径（doctor 兜底展示名）。
         let sandbox = Sandbox::new();
         let d = bare_daemon(&sandbox);
-        assert_eq!(d.compositor_name(), "unavailable");
+        assert_eq!(d.compositor_report(), "unavailable in this session");
     }
 
     #[test]

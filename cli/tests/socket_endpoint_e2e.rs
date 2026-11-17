@@ -190,14 +190,33 @@ fn info_over_socket(path: &Path) -> Result<String, String> {
     Ok(line)
 }
 
-/// `info --output-format json` 的输出必须是 daemon 结构化回执（含 backend 字段）。
-fn assert_info_json(stdout: &str) {
+/// `info --output-format json` 的输出必须是 daemon 结构化回执：backend 与同一
+/// daemon 的 doctor 合成器行逐字一致，CLI 不得自带后端名。
+fn assert_info_json(daemon: &SocketDaemon, stdout: &str) {
     let v: serde_json::Value =
         serde_json::from_str(stdout).expect("info --output-format json must be JSON");
     let backend = v["backend"].as_str().unwrap_or_default();
+    let doctor =
+        rpc_result_over_socket(&daemon.socket, "doctor.run", "null").expect("raw doctor.run");
+    let row = doctor["lines"]
+        .as_array()
+        .expect("doctor lines")
+        .iter()
+        .filter_map(|line| line.as_str())
+        .find(|line| !line.starts_with(' ') && line.contains("合成器"))
+        .expect("doctor compositor row");
+    let expected = row
+        .split_once(':')
+        .unwrap_or_else(|| panic!("compositor row keeps `<label>: <value>`: {row}"))
+        .1
+        .trim();
+    assert_eq!(
+        backend, expected,
+        "info backend must equal the daemon-reported compositor (stdout: {stdout})"
+    );
     assert!(
-        backend.contains("via daemon"),
-        "info must come from daemon assembly, got backend={backend:?} (stdout: {stdout})"
+        !backend.is_empty(),
+        "info must report the daemon compositor, got empty backend"
     );
 }
 
@@ -235,7 +254,7 @@ fn cli_uses_socket_endpoint_while_session_lock_is_held() {
         out.status.success(),
         "info over --socket must exit 0 (stderr: {stderr})"
     );
-    assert_info_json(&stdout);
+    assert_info_json(&daemon, &stdout);
     assert!(
         elapsed < CLI_DEADLINE,
         "CLI must not wait on the held lock; took {elapsed:?}"
@@ -262,7 +281,7 @@ fn cli_honours_agent_shell_socket_env() {
         out.status.success(),
         "AGENT_SHELL_SOCKET must select the endpoint (stderr: {stderr})"
     );
-    assert_info_json(&stdout);
+    assert_info_json(&daemon, &stdout);
 }
 
 /// 端点不可达时明确报错，不得静默退回 spawn（用户点了具体端点）。
@@ -314,7 +333,7 @@ fn socket_endpoint_serves_concurrent_connections() {
         out.status.success(),
         "second connection must be served while a stream connection is open (stderr: {stderr})"
     );
-    assert_info_json(&stdout);
+    assert_info_json(&daemon, &stdout);
     assert!(
         elapsed < CLI_DEADLINE,
         "second connection blocked: {elapsed:?}"
