@@ -13,6 +13,10 @@ use acceptance::portal::serve_screenshot_portal;
 use acceptance::{sample_png, Fixture, PortalBehaviour, PrivateBus, ScreenshotMock};
 use agent_shell_rpc::{method, DoctorResult, RpcErrorCode};
 use serde_json::json;
+use std::time::{Duration, Instant};
+
+/// C-154 单条命令默认预算。
+const COMMAND_BUDGET: Duration = Duration::from_secs(5);
 
 fn params(output: &std::path::Path) -> serde_json::Value {
     json!({"window": null, "area": null, "output_path": output.display().to_string()})
@@ -108,4 +112,80 @@ async fn capture_chain_selects_session_path_and_fails_loudly_without_backend() {
         error.message
     );
     assert!(!output.exists());
+
+    // 5) KDE 授权弹窗无人应答：doctor 的非交互探测与截图都必须受固定预算封顶，
+    //    返回可读失败而不是挂住；随后的只读 RPC 仍能应答（连续调用不被拖死）。
+    mock.set_behaviour(PortalBehaviour::Hang);
+    mock.set_interactive_behaviour(PortalBehaviour::Hang);
+    let mut hanging = Fixture::start_with_env(&[
+        ("DBUS_SESSION_BUS_ADDRESS", bus.address().to_string()),
+        ("WAYLAND_DISPLAY", "wayland-acceptance".to_string()),
+    ])
+    .await;
+
+    let started = Instant::now();
+    let response = tokio::time::timeout(COMMAND_BUDGET, hanging.call(method::DOCTOR, None))
+        .await
+        .expect("doctor must return within the 5s command budget when the portal dialog hangs");
+    assert!(
+        started.elapsed() < COMMAND_BUDGET,
+        "doctor exceeded the command budget: {:?}",
+        started.elapsed()
+    );
+    let report: DoctorResult =
+        serde_json::from_value(response.result.expect("doctor returns a bounded report"))
+            .expect("DoctorResult");
+    let row = report
+        .lines
+        .iter()
+        .find(|line| !line.starts_with(' ') && line.contains("截图捕获"))
+        .expect("capture row");
+    assert!(
+        row.starts_with("⚠") || row.starts_with("✗"),
+        "a timed-out portal probe must be reported as degraded: {row}"
+    );
+    assert_eq!(
+        report.healthy,
+        !report.lines.iter().any(|line| line.starts_with('✗')),
+        "healthy must mirror the absence of unavailable rows"
+    );
+
+    hanging
+        .call_ok(method::INFO, None)
+        .await
+        .get("backend")
+        .expect("doctor must release the daemon after a timed-out portal probe");
+
+    let output = out_dir.path().join("hanging.png");
+    let started = Instant::now();
+    let response = tokio::time::timeout(
+        COMMAND_BUDGET,
+        hanging.call(method::SCREENSHOT_CAPTURE, Some(params(&output))),
+    )
+    .await
+    .expect("screenshot must fail within the 5s command budget when the portal dialog hangs");
+    assert!(
+        started.elapsed() < COMMAND_BUDGET,
+        "screenshot exceeded the command budget: {:?}",
+        started.elapsed()
+    );
+    let error = response
+        .error
+        .expect("a hung portal must produce a structured capture failure");
+    assert_eq!(error.code, RpcErrorCode::Denied as i32);
+    assert!(
+        error.message.contains("Wayland") && error.message.contains("refusing"),
+        "timeout must be reported as a readable Wayland capture denial: {}",
+        error.message
+    );
+    assert!(
+        !output.exists(),
+        "failed capture must not leave an artifact"
+    );
+
+    hanging
+        .call_ok(method::INFO, None)
+        .await
+        .get("backend")
+        .expect("the same daemon must still answer info after a timed-out capture");
 }
