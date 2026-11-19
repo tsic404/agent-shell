@@ -25,6 +25,8 @@ pub enum PortalBehaviour {
     Success,
     /// 返回非零响应码（1 = 用户取消 / 2 = 其它），客户端归一到权限错误。
     Cancel,
+    /// 方法调用永不返回（模拟 KDE 截图授权弹窗无人应答）。
+    Hang,
 }
 
 /// portal Screenshot mock：返回指定 PNG 字节与响应码。
@@ -120,6 +122,10 @@ impl ScreenshotMock {
         let code: u32 = match behaviour {
             PortalBehaviour::Success => 0,
             PortalBehaviour::Cancel => 1,
+            PortalBehaviour::Hang => {
+                tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+                return Err(zbus::fdo::Error::Failed("portal hang released".into()));
+            }
         };
         let mut results: HashMap<String, OwnedValue> = HashMap::new();
         if behaviour == PortalBehaviour::Success {

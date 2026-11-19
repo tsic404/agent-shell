@@ -47,20 +47,21 @@ pub trait TokenStore: Send + Sync {
 /// 组件名（doctor 报告用）。
 pub const COMPONENT_NAME: &str = "capture";
 
-/// portal 授权探测预算：portal 段（ScreenCast Start 弹窗等待 + Screenshot 交互
-/// 超时）单独封顶 6s，为 x11 兜底与进程启动/RPC 往返留余量。
+/// portal 段预算：ScreenCast 弹窗等待 + Screenshot 调用/响应整体封顶 3s。
 ///
-/// 无授权时弹窗无人应答会吃满 15s（`SCREENCAST_TIMEOUT` + 交互超时）；QA 以 8s
-/// 为命令超时上限，故 portal 段封顶 6s、端到端由 [`CAPTURE_END_TO_END_BUDGET`]
-/// 封顶 7s——保证无授权时 8s 内必出结果（x11 帧）或快速失败。
-pub const PORTAL_PROBE_BUDGET: std::time::Duration = std::time::Duration::from_secs(6);
+/// C-154 的单条命令默认预算是 5s；portal 必须留出进程启动、RPC 往返与
+/// x11 兜底的余量。KDE 的截图授权弹窗会让 `Screenshot` 方法调用本身无限
+/// 阻塞（不是只等 `Response` 信号），因此预算必须覆盖方法调用，而不能只
+/// 包住信号等待。
+pub const PORTAL_PROBE_BUDGET: std::time::Duration = std::time::Duration::from_secs(3);
 
-/// 端到端捕获截止：portal 探测 + x11 兜底整体封顶 7s，低于 QA
-/// 验收 `timeout 8` 上限（留 1s 余量给进程启动与 RPC 往返）。
-///
-/// 单独约束 portal 段（[`PORTAL_PROBE_BUDGET`]）不足以防 x11 兜底自身阻塞；
-/// 此截止把「portal 探测 + x11 抓帧」作为整体兜底，超时即快速失败。
-pub const CAPTURE_END_TO_END_BUDGET: std::time::Duration = std::time::Duration::from_secs(7);
+/// 端到端捕获截止：portal 段 + x11 兜底整体封顶 4s，低于 C-154 的 5s
+/// 命令预算，给进程启动与 RPC 往返留 1s。
+pub const CAPTURE_END_TO_END_BUDGET: std::time::Duration = std::time::Duration::from_secs(4);
+
+/// 健康体检的非交互探测截止：与端到端捕获同一上限，保证 doctor 不被任何
+/// 单个后端拖住，后续 RPC 也不会因 daemon 状态锁被占而排队。
+pub const CAPTURE_DOCTOR_BUDGET: std::time::Duration = std::time::Duration::from_secs(4);
 
 /// 捕获结果：帧或已落盘的 PNG 路径。
 #[derive(Clone, Debug)]
@@ -248,7 +249,7 @@ impl CaptureDispatcher {
     /// 弹窗授权，`interactive=false` 无 token 则直接降级 Screenshot/X11。交互路径
     /// 端到端受 [`CAPTURE_END_TO_END_BUDGET`] 封顶、portal 段受 [`PORTAL_PROBE_BUDGET`]
     /// 截断，随后降级 x11（原生 X11 会话）或快速失败（Wayland/无 x11）——
-    /// 全程保证 8s 内出结果。
+    /// 全程保证 5s 命令预算内出结果。
     pub async fn capture(&self, target: CaptureTarget, interactive: bool) -> Result<CapturedFrame> {
         self.capture_impl(target, interactive, false).await
     }
@@ -280,16 +281,11 @@ impl CaptureDispatcher {
         interactive: bool,
         require_pixels: bool,
     ) -> Result<CapturedFrame> {
-        if interactive {
-            capture_with_budget(
-                CAPTURE_END_TO_END_BUDGET,
-                self.capture_portal_then_fallback(target, true, require_pixels),
-            )
-            .await
-        } else {
-            self.capture_portal_then_fallback(target, false, require_pixels)
-                .await
-        }
+        capture_with_budget(
+            CAPTURE_END_TO_END_BUDGET,
+            self.capture_portal_then_fallback(target, interactive, require_pixels),
+        )
+        .await
     }
 
     /// portal 段（受 [`PORTAL_PROBE_BUDGET`] 子预算）→ 失败/超时降级 x11 或快速失败。
@@ -303,15 +299,11 @@ impl CaptureDispatcher {
         interactive: bool,
         require_pixels: bool,
     ) -> Result<CapturedFrame> {
-        let portal = if interactive {
-            capture_with_budget(
-                PORTAL_PROBE_BUDGET,
-                self.capture_portal(target, true, require_pixels),
-            )
-            .await
-        } else {
-            self.capture_portal(target, false, require_pixels).await
-        };
+        let portal = capture_with_budget(
+            PORTAL_PROBE_BUDGET,
+            self.capture_portal(target, interactive, require_pixels),
+        )
+        .await;
         match portal {
             Ok(frame) => Ok(frame),
             Err(e) => {
@@ -416,13 +408,21 @@ impl CaptureDispatcher {
         if !self.screenshot.available().await {
             return None;
         }
-        let path = match self.screenshot.capture(false).await {
-            Ok(p) => p,
-            Err(e) => {
-                tracing::debug!("silent portal Screenshot unavailable: {e}");
-                return None;
-            }
-        };
+        let path =
+            match tokio::time::timeout(PORTAL_PROBE_BUDGET, self.screenshot.capture(false)).await {
+                Ok(Ok(p)) => p,
+                Ok(Err(e)) => {
+                    tracing::debug!("silent portal Screenshot unavailable: {e}");
+                    return None;
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        "silent portal Screenshot exceeded {}s; treating portal as unavailable",
+                        PORTAL_PROBE_BUDGET.as_secs()
+                    );
+                    return None;
+                }
+            };
         let path = validated_screenshot_frame(path)?;
         if !require_pixels {
             return Some(CapturedFrame::Png(path));
@@ -533,6 +533,20 @@ impl CaptureDispatcher {
     ///
     /// 返回 `None` 表示无任何后端可非交互建立，并将 `active` 清空。
     pub async fn probe(&self) -> Option<ActiveBackend> {
+        match tokio::time::timeout(CAPTURE_DOCTOR_BUDGET, self.probe_inner()).await {
+            Ok(active) => active,
+            Err(_) => {
+                tracing::warn!(
+                    "capture doctor probe exceeded {}s; reporting no active backend",
+                    CAPTURE_DOCTOR_BUDGET.as_secs()
+                );
+                self.set_active(None);
+                None
+            }
+        }
+    }
+
+    async fn probe_inner(&self) -> Option<ActiveBackend> {
         // L1: 静默 portal Screenshot（无对话框）——与 [`Self::capture_portal`]
         // 的降级顺序一致，doctor 报的「选中后端」才是 `screenshot -f` 实际会走的
         // 那一个。探测只判可用性、不留产物：门户落盘的全屏截图（可能含敏感画面）
@@ -1074,19 +1088,19 @@ mod tests {
         assert!(store.get_restore_token().is_none());
     }
 
-    /// portal 探测预算 = 6s、端到端截止 = 7s：两者都必须小于 QA 验收的 8s
-    /// 上限与旧行为叠加的 2×SCREENSHOT_TIMEOUT + SCREENCAST_TIMEOUT（≈27.8s）
-    /// 及旧的 15s 交互预算——锚定「无 portal 授权 8s 内降级 x11 或快速失败」。
+    /// portal 探测预算 = 3s、端到端截止 = 4s：两者都必须小于 C-154 的 5s
+    /// 单条命令默认预算，并为进程启动与 RPC 往返留余量；也远小于旧行为叠加的
+    /// 2×SCREENSHOT_TIMEOUT + SCREENCAST_TIMEOUT（≈27.8s）与旧的 15s 交互预算。
     /// `SCREENCAST_TIMEOUT` 仅在 `portal-screencast` 下
     /// 存在，故整测随 feature 排除。
     #[cfg(feature = "portal-screencast")]
     #[test]
     fn capture_budgets_leave_margin_for_x11_fallback() {
-        assert_eq!(PORTAL_PROBE_BUDGET, std::time::Duration::from_secs(6));
-        assert_eq!(CAPTURE_END_TO_END_BUDGET, std::time::Duration::from_secs(7));
+        assert_eq!(PORTAL_PROBE_BUDGET, std::time::Duration::from_secs(3));
+        assert_eq!(CAPTURE_END_TO_END_BUDGET, std::time::Duration::from_secs(4));
         assert!(
-            CAPTURE_END_TO_END_BUDGET < std::time::Duration::from_secs(8),
-            "end-to-end deadline must stay under the QA 8s timeout (leave margin)"
+            CAPTURE_END_TO_END_BUDGET < std::time::Duration::from_secs(5),
+            "end-to-end deadline must stay under the 5s command budget"
         );
         assert!(
             PORTAL_PROBE_BUDGET < CAPTURE_END_TO_END_BUDGET,

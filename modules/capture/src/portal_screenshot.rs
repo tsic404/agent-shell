@@ -2,8 +2,8 @@
 //!
 //! `org.freedesktop.portal.Screenshot.Screenshot` 返回 Request 对象；
 //! 必须等 `Response` 信号取回结果字典中的 `uri`，再解析为本地路径。
-//! 超时/重试按 §19.3：非交互 screenshot 8s / 最多 2 次；交互（弹授权窗）
-//! 5s / 单次——授权场景无需 8s、不重试（超时后二次弹窗无意义，§13.1）。
+//! 超时/重试：非交互 screenshot 3s / 最多 2 次；交互（弹授权窗）3s / 单次
+//! ——授权场景必须留在 5s 命令预算内、不重试（超时后二次弹窗无意义）。
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -16,11 +16,14 @@ use crate::portal_common::{
     uri_to_path, wait_for_response, PORTAL_RETRY_BACKOFF, PORTAL_SERVICE,
 };
 
-/// screenshot 通道默认超时（§19.3；非交互 doctor/probe 路径）。
-pub const SCREENSHOT_TIMEOUT: Duration = Duration::from_secs(8);
+/// screenshot 通道默认超时（非交互 doctor/probe 路径）。
+///
+/// 必须低于 C-154 的 5s 命令预算；方法调用本身也受此值约束，因为 KDE 的
+/// 授权弹窗会让 `Screenshot` 调用直接等待用户输入。
+pub const SCREENSHOT_TIMEOUT: Duration = Duration::from_secs(3);
 /// screenshot 交互（弹授权窗）超时：授权场景用户要么尽快点击、要么不在场，
-/// 无需按 portal 延迟口径等满 8s——更短超时让无人值守/自动化快速失败（§13.1）。
-pub const SCREENSHOT_TIMEOUT_INTERACTIVE: Duration = Duration::from_secs(5);
+/// 更短超时让无人值守/自动化快速失败。
+pub const SCREENSHOT_TIMEOUT_INTERACTIVE: Duration = Duration::from_secs(3);
 /// screenshot 通道最大尝试次数（§19.3；含首次，共 2 次尝试）。
 pub const SCREENSHOT_MAX_ATTEMPTS: u32 = 2;
 
@@ -151,24 +154,37 @@ impl ScreenshotPortal {
             // 方法调用：AccessDenied 归一到 Permission（用户拒绝/无活跃会话），
             // 与 Timeout 同为语义明确错误，不重试；其余瞬态错误（GetSession
             // 就绪竞态）短退避后进入下一尝试。
-            let returned: zvariant::OwnedObjectPath = match proxy.call("Screenshot", &body).await {
-                Ok(p) => p,
-                Err(e) => {
-                    let e = dbus_error(format!("Screenshot call: {e}"));
-                    if matches!(
-                        e,
-                        AgentShellError::Permission(_) | AgentShellError::Timeout(_)
-                    ) {
+            // KDE 的授权弹窗会让方法调用本身停住（不是先返回 Request 再等
+            // Response 信号），所以超时必须覆盖 `proxy.call`；否则后续
+            // `drain_response_with_timeout` 根本没有机会开始计时。
+            let returned: zvariant::OwnedObjectPath =
+                match tokio::time::timeout(timeout, proxy.call("Screenshot", &body)).await {
+                    Ok(Ok(p)) => p,
+                    Ok(Err(e)) => {
+                        let e = dbus_error(format!("Screenshot call: {e}"));
+                        if matches!(
+                            e,
+                            AgentShellError::Permission(_) | AgentShellError::Timeout(_)
+                        ) {
+                            return Err(e);
+                        }
+                        tracing::warn!(attempt, "portal Screenshot call failed: {e}");
+                        last_err = Some(e);
+                        if attempt + 1 < attempts {
+                            tokio::time::sleep(PORTAL_RETRY_BACKOFF).await;
+                        }
+                        continue;
+                    }
+                    Err(_) => {
+                        let e = AgentShellError::Timeout(format!(
+                            "portal Screenshot method did not return within {}s \
+                         (authorization dialog may be waiting for input)",
+                            timeout.as_secs()
+                        ));
+                        tracing::warn!(attempt, "{e}");
                         return Err(e);
                     }
-                    tracing::warn!(attempt, "portal Screenshot call failed: {e}");
-                    last_err = Some(e);
-                    if attempt + 1 < attempts {
-                        tokio::time::sleep(PORTAL_RETRY_BACKOFF).await;
-                    }
-                    continue;
-                }
-            };
+                };
 
             // portal 若未按 handle_token 规范返回预算路径（非常规实现），回退
             // 到调用后订阅的旧路径——该路径有竞态，但仅非常规后端才会触发。
@@ -240,15 +256,15 @@ mod tests {
         assert_eq!(second, screenshot_token(pid, 1));
     }
 
-    /// 交互与非交互的超时/重试口径分离：交互走更短超时（授权场景无需 8s）、
-    /// 单次尝试（超时/取消后重试只会二次弹窗）；非交互保留 §19.3 默认。
+    /// 交互与非交互的尝试次数分离：交互单次（超时/取消后重试只会二次弹窗）；
+    /// 非交互保留默认重试。两者超时都必须低于 5s 命令预算。
     #[test]
     fn screenshot_timeout_and_attempts_split_by_interactive() {
         assert_eq!(screenshot_timeout(false), SCREENSHOT_TIMEOUT);
         assert_eq!(screenshot_timeout(true), SCREENSHOT_TIMEOUT_INTERACTIVE);
         assert_eq!(screenshot_attempts(false), SCREENSHOT_MAX_ATTEMPTS);
         assert_eq!(screenshot_attempts(true), 1);
-        // 交互超时必须短于非交互超时——这是「授权场景无需 8s」的锚定。
-        assert!(SCREENSHOT_TIMEOUT_INTERACTIVE < SCREENSHOT_TIMEOUT);
+        assert!(SCREENSHOT_TIMEOUT < Duration::from_secs(5));
+        assert!(SCREENSHOT_TIMEOUT_INTERACTIVE < Duration::from_secs(5));
     }
 }

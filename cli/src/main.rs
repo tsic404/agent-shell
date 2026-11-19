@@ -86,6 +86,7 @@ async fn dispatch_command(
 ) -> CmdResult {
     prevalidate_command(&command)?;
     let mut c = DaemonClient::connect_with_retries(retry, socket.as_deref()).await?;
+    c.set_call_timeout(command_call_timeout(&command));
     match command {
         Command::Doctor => doctor(out, &mut c).await,
         Command::Info => info(out, &mut c).await,
@@ -117,6 +118,23 @@ async fn dispatch_command(
         Command::Job(cmd) => job_cmd(&mut c, cmd).await,
         Command::Pkg(cmd) => pkg_cmd(&mut c, cmd).await,
         Command::Sysctl(cmd) => sysctl_cmd(&mut c, cmd).await,
+    }
+}
+
+/// C-154 的单命令预算：默认 5s；rootd 特权链路（含 pkg/job 的作业链）按
+/// C-144 的分层超时显式放宽，避免把合法的长操作误报为无响应。等待类
+/// 命令的 15s 是其轮询循环预算，单次 `windows.list` 仍须在 5s 内返回。
+fn command_call_timeout(command: &Command) -> std::time::Duration {
+    match command {
+        Command::Log(_) => LOG_QUERY_TIMEOUT,
+        Command::Service(_)
+        | Command::Fs(_)
+        | Command::Hostname(_)
+        | Command::Job(_)
+        | Command::Kill { .. }
+        | Command::Pkg(_)
+        | Command::Sysctl(_) => ROOTD_COMMAND_TIMEOUT,
+        _ => client::DEFAULT_COMMAND_TIMEOUT,
     }
 }
 
@@ -1013,6 +1031,10 @@ fn pkg_failed_job_line(v: &Value) -> String {
 /// 进程自身卡死的罕见情况，不会抢在 daemon 的超时错误之前误报。
 const LOG_QUERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(91);
 
+/// rootd 特权链路调用预算：严格大于 daemon→rootd 的 90s method timeout，
+/// 让内层错误先返回（C-144）；普通命令仍用 5s 默认预算。
+const ROOTD_COMMAND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(91);
+
 /// `log` 查询 CLI 侧超时后的用户可读错误信息。
 fn log_query_timeout_error() -> String {
     format!(
@@ -1329,12 +1351,12 @@ fn sysctl_rpc_error(e: CallError) -> CmdResult {
 #[cfg(test)]
 mod tests {
     use super::{
-        a11y_query_exit_code, brightness_rpc_error, dispatch, is_auth_required, job_status_outcome,
-        log_query_timeout_error, parse_log_filter, pkg_failed_job_line, process_rootd_error,
-        render_capability, render_doctor, render_extension_status, render_info,
-        security_audit_params, security_request, socket_endpoint, sysctl_rpc_error,
-        sysctl_set_accepted_line, validate_area, wait_for_job_impl, JobStatusSource,
-        LOG_QUERY_TIMEOUT,
+        a11y_query_exit_code, brightness_rpc_error, command_call_timeout, dispatch,
+        is_auth_required, job_status_outcome, log_query_timeout_error, parse_log_filter,
+        pkg_failed_job_line, process_rootd_error, render_capability, render_doctor,
+        render_extension_status, render_info, security_audit_params, security_request,
+        socket_endpoint, sysctl_rpc_error, sysctl_set_accepted_line, validate_area,
+        wait_for_job_impl, JobStatusSource, LOG_QUERY_TIMEOUT,
     };
     use crate::client::CallError;
     use crate::{CapabilityStatus, OutputFormat, RpcErrorCode};
@@ -1954,6 +1976,52 @@ mod tests {
         assert!(
             err.contains("area coordinates must be non-negative"),
             "{err}"
+        );
+    }
+
+    /// C-154：桌面命令走 5s 默认预算；rootd 长链路保留 C-144 的分层超时。
+    #[test]
+    fn command_budget_keeps_compositor_calls_at_five_seconds() {
+        assert_eq!(
+            command_call_timeout(&crate::cli::Command::Info),
+            Duration::from_secs(5)
+        );
+        assert_eq!(
+            command_call_timeout(&crate::cli::Command::Doctor),
+            Duration::from_secs(5)
+        );
+        assert_eq!(
+            command_call_timeout(&crate::cli::Command::Log(crate::cli::LogCommand {
+                filter: "{}".into(),
+            })),
+            Duration::from_secs(91)
+        );
+        assert_eq!(
+            command_call_timeout(&crate::cli::Command::Service(
+                crate::cli::ServiceCommand::Restart {
+                    unit: "sshd".into()
+                }
+            )),
+            Duration::from_secs(91)
+        );
+        assert_eq!(
+            command_call_timeout(&crate::cli::Command::Pkg(crate::cli::PkgCommand::Refresh {
+                wait: false
+            })),
+            Duration::from_secs(91)
+        );
+        assert_eq!(
+            command_call_timeout(&crate::cli::Command::Pkg(crate::cli::PkgCommand::Install {
+                packages: vec!["vim".into()],
+                wait: true,
+            })),
+            Duration::from_secs(91)
+        );
+        assert_eq!(
+            command_call_timeout(&crate::cli::Command::Job(crate::cli::JobCommand::Status {
+                job_id: "job-1".into(),
+            })),
+            Duration::from_secs(91)
         );
     }
 }

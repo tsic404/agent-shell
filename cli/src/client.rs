@@ -51,6 +51,10 @@ const CLOSED_EARLY: &str = "daemon closed connection before responding";
 /// 恢复（§19 短退避）。
 const RETRY_BACKOFF_MS: u64 = 150;
 
+/// C-154：单条命令默认超时 5 秒。等待类命令另有 15s 预算，由命令实现
+/// 自行轮询；超出该预算的 rootd 长操作显式覆盖。
+pub const DEFAULT_COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// daemon stderr 尾部保留上限（字节）。排空任务只保留最近输出、超出丢弃
 /// 最旧字节，防止长时间会话（`events subscribe` / RUST_LOG=debug）缓冲
 /// 无限增长；64KB 足以容纳锁竞争/启动失败的末行诊断。
@@ -108,6 +112,8 @@ pub struct DaemonClient {
     retries: u32,
     /// 显式端点（`--socket`/`AGENT_SHELL_SOCKET`）；None = spawn 瞬态 daemon。
     socket: Option<PathBuf>,
+    /// 单次 RPC 预算（C-154）；命令可在建连后按类别覆盖。
+    call_timeout: Duration,
 }
 
 impl Drop for DaemonClient {
@@ -166,6 +172,7 @@ impl DaemonClient {
             next_id: 1,
             retries,
             socket: Some(path.to_path_buf()),
+            call_timeout: DEFAULT_COMMAND_TIMEOUT,
         })
     }
 
@@ -191,6 +198,7 @@ impl DaemonClient {
             next_id: 1,
             retries,
             socket: None,
+            call_timeout: DEFAULT_COMMAND_TIMEOUT,
         })
     }
 
@@ -261,21 +269,37 @@ impl DaemonClient {
     /// 「产品无响应」。仅传输层「提前关闭」触发重试；RPC 错误（有 code）
     /// 与参数错误不重试。
     pub async fn call_rpc(&mut self, method: &str, params: Value) -> Result<Value, CallError> {
+        let timeout = self.call_timeout;
         let mut attempt: u32 = 0;
         loop {
-            match self.call_rpc_once(method, params.clone()).await {
-                Ok(v) => return Ok(v),
-                Err(CallError::Other(msg))
+            match tokio::time::timeout(timeout, self.call_rpc_once(method, params.clone())).await {
+                // 超时后不再重试：请求可能仍在 daemon 内执行，重发会放大副作用。
+                Err(_) => {
+                    return Err(CallError::Other(format!(
+                        "daemon call `{method}` timed out after {}s (no response; \
+                         command budget exhausted)",
+                        timeout.as_secs()
+                    )))
+                }
+                Ok(Ok(v)) => return Ok(v),
+                Ok(Err(CallError::Other(msg)))
                     if is_transport_error(&msg) && attempt < self.retries =>
                 {
                     attempt += 1;
                     tokio::time::sleep(Duration::from_millis(RETRY_BACKOFF_MS)).await;
-                    *self =
-                        Self::connect_with_retries(self.retries, self.socket.as_deref()).await?;
+                    let retries = self.retries;
+                    let socket = self.socket.clone();
+                    *self = Self::connect_with_retries(retries, socket.as_deref()).await?;
+                    self.call_timeout = timeout;
                 }
-                Err(e) => return Err(e),
+                Ok(Err(e)) => return Err(e),
             }
         }
+    }
+
+    /// 覆盖本命令的单次 RPC 预算。仅命令分派层按 C-154 的类别设置。
+    pub fn set_call_timeout(&mut self, timeout: Duration) {
+        self.call_timeout = timeout;
     }
 
     /// 单次请求往返（不重试）。响应与 `events.notify` 通知共享行流，通知无
@@ -674,6 +698,7 @@ mod tests {
             next_id: 1,
             retries: 0,
             socket: None,
+            call_timeout: DEFAULT_COMMAND_TIMEOUT,
         }
     }
 
@@ -815,5 +840,30 @@ mod tests {
             .subscribe(None)
             .await
             .expect("clean stream end must be Ok");
+    }
+
+    /// C-154：daemon 不回应时，CLI 必须在 5s 预算内返回可读错误，而不是
+    /// 等待外部 `timeout` 杀死进程。
+    #[tokio::test]
+    async fn call_rpc_times_out_with_readable_error() {
+        let mut client = spawn_script("sleep 60");
+        let started = std::time::Instant::now();
+        let err = tokio::time::timeout(
+            DEFAULT_COMMAND_TIMEOUT + Duration::from_secs(1),
+            client.call_rpc(method::DOCTOR, Value::Null),
+        )
+        .await
+        .expect("call_rpc must enforce the 5s default budget")
+        .expect_err("an unresponsive daemon must fail");
+        assert!(
+            started.elapsed() < DEFAULT_COMMAND_TIMEOUT + Duration::from_secs(1),
+            "call_rpc exceeded the configured budget: {:?}",
+            started.elapsed()
+        );
+        let message = err.to_string();
+        assert!(
+            message.contains("doctor") && message.contains("timed out after 5s"),
+            "timeout must be readable and name the command: {message}"
+        );
     }
 }
