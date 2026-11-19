@@ -584,6 +584,11 @@ impl<'de> Deserialize<'de> for CapabilityStatus {
 pub struct InfoResult {
     /// DE 检测摘要（core detect_report 渲染）。
     pub detection: String,
+    /// 会话合成器后端身份（daemon 装配真值，与健康体检的合成器行同源）。
+    ///
+    /// 缺省留给旧版本 daemon：`None` 是「未上报」，不得解释成某个具体后端。
+    #[serde(default)]
+    pub backend: Option<String>,
     /// 能力位表：name → 状态。
     pub capabilities: Vec<(String, CapabilityStatus)>,
 }
@@ -1136,6 +1141,28 @@ mod tests {
                 status
             );
         }
+    }
+
+    /// 旧 daemon 不带 `backend` 字段：新客户端按 `None` 解析为「未上报」，
+    /// 不推断任何具体后端；新线格式原样保留后端身份。
+    #[test]
+    fn info_result_defaults_missing_backend_and_roundtrips_reported_backend() {
+        let legacy = json!({
+            "detection": "legacy daemon",
+            "capabilities": [["window_management", true]],
+        });
+        let r: InfoResult = serde_json::from_value(legacy).expect("legacy InfoResult");
+        assert_eq!(r.backend, None);
+
+        let r = InfoResult {
+            detection: "KDE (wayland)".into(),
+            backend: Some("kwin-compositor".into()),
+            capabilities: Vec::new(),
+        };
+        let v = serde_json::to_value(&r).expect("InfoResult serializable");
+        assert_eq!(v["backend"], "kwin-compositor");
+        let roundtrip: InfoResult = serde_json::from_value(v).expect("InfoResult roundtrip");
+        assert_eq!(roundtrip, r);
     }
 
     /// extension.* 结果结构往返稳定：CLI 从 daemon JSON 反序列化，

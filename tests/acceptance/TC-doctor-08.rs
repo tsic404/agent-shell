@@ -20,6 +20,10 @@ fn info(value: serde_json::Value) -> InfoResult {
     serde_json::from_value(value).expect("InfoResult")
 }
 
+fn doctor_of(value: serde_json::Value) -> DoctorResult {
+    serde_json::from_value(value).expect("DoctorResult")
+}
+
 fn capability<'a>(info: &'a InfoResult, name: &str) -> &'a agent_shell_rpc::CapabilityStatus {
     info.capabilities
         .iter()
@@ -28,11 +32,41 @@ fn capability<'a>(info: &'a InfoResult, name: &str) -> &'a agent_shell_rpc::Capa
         .unwrap_or_else(|| panic!("missing capability row {name}"))
 }
 
+/// doctor 的合成器顶层行（非子行）。
+fn compositor_row(report: &DoctorResult) -> &str {
+    report
+        .lines
+        .iter()
+        .find(|line| !line.starts_with(' ') && line.contains("合成器"))
+        .expect("compositor row")
+}
+
+/// 合成器行的状态值：`<前缀> 合成器 : <值>` 冒号后的部分。
+fn row_value(row: &str) -> &str {
+    row.split_once(':')
+        .unwrap_or_else(|| panic!("compositor row must keep the `<label>: <value>` shape: {row}"))
+        .1
+        .trim()
+}
+
+/// info 的后端字段必须与 doctor 合成器行同值：两种报告读同一份 daemon 装配真值。
+fn assert_info_backend_tracks_doctor(info: &serde_json::Value, report: &DoctorResult) {
+    let backend = info["backend"]
+        .as_str()
+        .expect("info must report the daemon compositor backend");
+    assert_eq!(
+        backend,
+        row_value(compositor_row(report)),
+        "info backend must equal the doctor compositor row value"
+    );
+}
+
 #[tokio::test]
 async fn component_slot_matrix_matches_execution_paths() {
     // TTY：窗口/工作区/捕获/输入/无障碍全部结构性不可用；执行路径同判。
     let mut tty = Fixture::start().await;
-    let caps = info(tty.call_ok(method::INFO, None).await);
+    let info_value = tty.call_ok(method::INFO, None).await;
+    let caps = info(info_value.clone());
     for name in [
         "window_management",
         "workspace_management",
@@ -72,7 +106,7 @@ async fn component_slot_matrix_matches_execution_paths() {
     assert_eq!(error.code, RpcErrorCode::BackendUnavailable as i32);
 
     let value = tty.call_ok(method::DOCTOR, None).await;
-    let report: DoctorResult = serde_json::from_value(value).expect("DoctorResult");
+    let report = doctor_of(value);
     let compositor = report
         .lines
         .iter()
@@ -82,6 +116,8 @@ async fn component_slot_matrix_matches_execution_paths() {
         compositor.starts_with("✗") && compositor.contains("unavailable in this session"),
         "structural capability absence must be explicit: {compositor}"
     );
+    // 后端身份与合成器行同源：TTY 无合成器槽，两处一致报告本会话不可用。
+    assert_info_backend_tracks_doctor(&info_value, &report);
     assert!(
         report.lines.iter().all(|line| !line.contains("Shell 扩展")),
         "non-GNOME sessions must not render the GNOME extension slot"
@@ -94,7 +130,7 @@ async fn component_slot_matrix_matches_execution_paths() {
     let _portal = serve_screenshot_portal(&bus, mock).await;
     let mut filled =
         Fixture::start_with_env(&[("DBUS_SESSION_BUS_ADDRESS", bus.address().to_string())]).await;
-    let compositor = FakeCompositor::new();
+    let compositor = FakeCompositor::named("kwin-compositor");
     filled.install_compositor(&compositor, DesktopEnvironment::KDE);
     filled
         .set_input_chain(
@@ -155,11 +191,28 @@ async fn component_slot_matrix_matches_execution_paths() {
     // 懒启动槽在首次订阅后建立：订阅成功即该能力被激活，不静默失败。
     filled.call_ok(method::EVENTS_SUBSCRIBE, None).await;
 
+    // 环境信息的后端字段取自 daemon 装配真值（KDE 组合：夹具代持 KWin 身份）：
+    // 与 doctor 合成器行同值，常量实现会在这里与装配脱钩。
+    let report = doctor_of(filled.call_ok(method::DOCTOR, None).await);
+    let info_value = filled.call_ok(method::INFO, None).await;
+    assert_info_backend_tracks_doctor(&info_value, &report);
+
     // GNOME 会话独有的 Shell 扩展槽：显式状态，不静默省略（此时夹具目录尚未
     // 安装扩展，只断言槽存在且带明确状态；安装后的真值断言见下方 AC-110 段）。
     let _desktop = EnvGuard::set("XDG_CURRENT_DESKTOP", "GNOME");
+
+    // GNOME 组合：换上代持 Mutter 身份的合成器。若后端字段仍是 CLI 侧常量，
+    // KWin 名不可能同时匹配两个夹具——两组合的一致断言即是对常量的反证。
+    filled.install_compositor(
+        &FakeCompositor::named("mutter-compositor"),
+        DesktopEnvironment::GNOME,
+    );
+    let report = doctor_of(filled.call_ok(method::DOCTOR, None).await);
+    let info_value = filled.call_ok(method::INFO, None).await;
+    assert_info_backend_tracks_doctor(&info_value, &report);
+
     let value = filled.call_ok(method::DOCTOR, None).await;
-    let report: DoctorResult = serde_json::from_value(value).expect("DoctorResult");
+    let report = doctor_of(value);
     let extension = report
         .lines
         .iter()
@@ -217,7 +270,7 @@ async fn component_slot_matrix_matches_execution_paths() {
     // 合成器是 KDE 假合成器，扩展通道不在本夹具可达范围；该面由 extension.js 的
     // 分派用例（四条授权分支）与真机验收覆盖。
     let value = filled.call_ok(method::DOCTOR, None).await;
-    let report: DoctorResult = serde_json::from_value(value).expect("DoctorResult");
+    let report = doctor_of(value);
     let extension = report
         .lines
         .iter()
