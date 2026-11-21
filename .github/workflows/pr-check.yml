@@ -67,6 +67,16 @@ jobs:
         run: |
           cargo build -p agent-shell-daemon --bin agent-shell-daemon
           cargo test --all-targets
+          # 默认特性回归：ScreenCast 子预算超时后仍须走到交互 Screenshot。
+          # 该目标要求 portal-screencast（默认测试构建不启用 acceptance 该特性）。
+          cargo test -p agent-shell-acceptance --features portal-screencast \
+            --test TC-capture-01-screencast
+          # 订阅注册（AddMatch）被延迟时，ScreenCast 仍须在子预算内释放资源。
+          cargo test -p agent-shell-acceptance --features portal-test-hooks \
+            --test TC-capture-01-screencast-subscribe
+          # 显式关闭、worker 退出与 Drop 补发共享同一个 200ms 清理截止。
+          cargo test -p agent-shell-acceptance --features portal-test-hooks \
+            --test TC-capture-01-screencast-cleanup
 
       - name: Test (Rust, X11 backend fixture)
         if: matrix.profile == 'default'
