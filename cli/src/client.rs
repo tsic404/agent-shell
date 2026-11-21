@@ -51,9 +51,31 @@ const CLOSED_EARLY: &str = "daemon closed connection before responding";
 /// 恢复（§19 短退避）。
 const RETRY_BACKOFF_MS: u64 = 150;
 
+/// 默认入口探测随包常驻端点的连接上限。端点不可达/无监听时在这段时间内
+/// 回退瞬态，不把常驻端点故障拖成命令超时。
+const RESIDENT_CONNECT_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// 连上之后的应答判定上限：一次 `daemon.ping` 往返。只连上不算可用——
+/// 监听方不读不应答时，业务请求会被拖到整条命令预算耗尽。
+const RESIDENT_PROBE_TIMEOUT: Duration = Duration::from_millis(500);
+
 /// C-154：单条命令默认超时 5 秒。等待类命令另有 15s 预算，由命令实现
 /// 自行轮询；超出该预算的 rootd 长操作显式覆盖。
 pub const DEFAULT_COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// 接入端点的结果：不可达可回退瞬态；对端凭据不可接受必须报错。
+enum SocketConnectError {
+    Unreachable(String),
+    Rejected(String),
+}
+
+impl SocketConnectError {
+    fn into_message(self) -> String {
+        match self {
+            Self::Unreachable(message) | Self::Rejected(message) => message,
+        }
+    }
+}
 
 /// daemon stderr 尾部保留上限（字节）。排空任务只保留最近输出、超出丢弃
 /// 最旧字节，防止长时间会话（`events subscribe` / RUST_LOG=debug）缓冲
@@ -134,7 +156,70 @@ impl DaemonClient {
     pub async fn connect_with_retries(retries: u32, socket: Option<&Path>) -> Result<Self, String> {
         match socket {
             Some(path) => Self::connect_socket(path, retries).await,
-            None => Self::connect_spawned(retries).await,
+            None => Self::connect_default(retries).await,
+        }
+    }
+
+    /// 默认入口：随包常驻端点可应答时复用它；不可达/不应答时派生瞬态服务
+    /// （C-101 / ADR-017）。对端凭据不可接受是硬错误，不回退——回退会把命令
+    /// 负载交给冒充端点的人。
+    ///
+    /// 「可应答」是一次短超时的 `daemon.ping` 往返，不是「连得上」：同 uid
+    /// 的监听方可能接受连接却从不读写。ping 在 daemon 侧不取状态锁，长命令
+    /// 占锁期间仍立即应答，因此正常繁忙不会被误判为不可用。
+    async fn connect_default(retries: u32) -> Result<Self, String> {
+        if let Some(path) = agent_shell_rpc::endpoint::resident_socket_path() {
+            match tokio::time::timeout(
+                RESIDENT_CONNECT_TIMEOUT,
+                Self::connect_socket_checked(&path, retries),
+            )
+            .await
+            {
+                Ok(Ok(mut client)) => {
+                    if client.probe(RESIDENT_PROBE_TIMEOUT).await.is_ok() {
+                        return Ok(client);
+                    }
+                }
+                Ok(Err(SocketConnectError::Rejected(message))) => return Err(message),
+                Ok(Err(SocketConnectError::Unreachable(_))) | Err(_) => {}
+            }
+        }
+        Self::connect_spawned(retries).await
+    }
+
+    /// 常驻端点的可应答判定：一次短超时、无副作用的 `daemon.ping` 往返。
+    ///
+    /// 只核对响应 id，不解读内容——任何匹配 id 的响应（包括旧版 daemon 对
+    /// 未知方法回的 MethodNotFound）都证明对端在读在写。
+    async fn probe(&mut self, timeout: Duration) -> Result<(), String> {
+        let id = self.next_id;
+        self.next_id += 1;
+        let request = Request::without_params(id, method::DAEMON_PING);
+        self.stdin
+            .write_all(request.to_line().as_bytes())
+            .await
+            .map_err(|e| format!("daemon probe write: {e}"))?;
+        self.stdin
+            .flush()
+            .await
+            .map_err(|e| format!("daemon probe flush: {e}"))?;
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let mut line = String::new();
+            let n = tokio::time::timeout_at(deadline, self.reader.read_line(&mut line))
+                .await
+                .map_err(|_| "daemon probe: no response within the readiness budget".to_string())?
+                .map_err(|e| format!("daemon probe read: {e}"))?;
+            if n == 0 {
+                return Err("daemon probe: connection closed before responding".into());
+            }
+            if line.trim().is_empty() {
+                continue;
+            }
+            let response = Response::from_line(&line).map_err(|e| format!("daemon probe: {e}"))?;
+            if response.id == id {
+                return Ok(());
+            }
         }
     }
 
@@ -144,8 +229,14 @@ impl DaemonClient {
     /// 连上后校验对端 uid：路径落在共享目录（`/tmp` 等）时可被同机他人抢占，
     /// 不校验就把整条命令的负载（含 `secret set` 的值）发给对方进程。
     async fn connect_socket(path: &Path, retries: u32) -> Result<Self, String> {
+        Self::connect_socket_checked(path, retries)
+            .await
+            .map_err(SocketConnectError::into_message)
+    }
+
+    async fn connect_socket_checked(path: &Path, retries: u32) -> Result<Self, SocketConnectError> {
         let stream = tokio::net::UnixStream::connect(path).await.map_err(|e| {
-            format!(
+            SocketConnectError::Unreachable(format!(
                 "cannot connect to daemon socket {}: {e} (start the daemon with \
                  `agent-shell-daemon --socket {} --lock-path $XDG_RUNTIME_DIR/agent-shell-qa.lock` \
                  — or `--no-lock` — since the default session lock may be held by a resident \
@@ -153,16 +244,20 @@ impl DaemonClient {
                  --socket/AGENT_SHELL_SOCKET to auto-spawn a transient daemon)",
                 path.display(),
                 path.display()
-            )
+            ))
         })?;
-        let peer = stream
-            .peer_cred()
-            .map_err(|e| format!("cannot read peer credentials of {}: {e}", path.display()))?;
+        let peer = stream.peer_cred().map_err(|e| {
+            SocketConnectError::Rejected(format!(
+                "cannot read peer credentials of {}: {e}",
+                path.display()
+            ))
+        })?;
         agent_shell_rpc::endpoint::verify_peer_uid(
             path,
             peer.uid(),
             agent_shell_rpc::endpoint::current_uid(),
-        )?;
+        )
+        .map_err(SocketConnectError::Rejected)?;
         let (read, write) = stream.into_split();
         Ok(Self {
             child: None,

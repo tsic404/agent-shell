@@ -117,10 +117,16 @@ struct SocketDaemon {
 
 impl SocketDaemon {
     fn start(dir: &Path) -> Self {
+        Self::start_with_state_dir(dir, None)
+    }
+
+    /// 带独立状态目录启动：审计日志落 `state_dir/agent-shell/audit.jsonl`，
+    /// 用例可以按住那把文件锁观察真实争用。
+    fn start_with_state_dir(dir: &Path, state_dir: Option<&Path>) -> Self {
         let socket = dir.join("agent-shell.sock");
         let lock = dir.join("agent-shell.lock");
-        let child = Command::new(daemon_binary())
-            .arg("--socket")
+        let mut cmd = Command::new(daemon_binary());
+        cmd.arg("--socket")
             .arg(&socket)
             .arg("--lock-path")
             .arg(&lock)
@@ -132,7 +138,11 @@ impl SocketDaemon {
             .env_remove("DISPLAY")
             .env_remove("DBUS_SESSION_BUS_ADDRESS")
             .env_remove("XDG_CURRENT_DESKTOP")
-            .env("XDG_SESSION_TYPE", "tty")
+            .env("XDG_SESSION_TYPE", "tty");
+        if let Some(state_dir) = state_dir {
+            cmd.env("XDG_STATE_HOME", state_dir);
+        }
+        let child = cmd
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -145,6 +155,12 @@ impl SocketDaemon {
         };
         daemon.wait_until_serving();
         daemon
+    }
+
+    /// 本 daemon 的审计锚点路径（`XDG_STATE_HOME` 已指向独立目录时有效）。
+    /// 记录实际写在锚点旁的进程分段里，锚点本身可能不存在。
+    fn audit_path(state_dir: &Path) -> PathBuf {
+        state_dir.join("agent-shell").join("audit.jsonl")
     }
 
     /// socket 文件先于 daemon 装配出现，就绪判定必须走真实 RPC 往返。
@@ -303,6 +319,226 @@ fn cli_reports_unreachable_endpoint_without_falling_back() {
         stderr.contains("cannot connect to daemon socket")
             && stderr.contains(&missing.display().to_string()),
         "error must name the unreachable endpoint: {stderr}"
+    );
+}
+
+/// 未指定端点：运行时目录里的随包常驻端点可应答时，入口直接接入它，不派生
+/// 第二个服务实例（AC-121 / ADR-017）。判定面用常驻实例的进程内状态：回执带
+/// 着预先写入的 IME 引擎名，新派生的瞬态实例不可能答出它。
+#[test]
+fn cli_default_entry_uses_resident_endpoint_without_spawning_second_instance() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut daemon = SocketDaemon::start(dir.path());
+    rpc_result_over_socket(
+        &daemon.socket,
+        "ime.engine.set",
+        r#"{"engine":"resident-marker"}"#,
+    )
+    .expect("seed resident-only state");
+    let before = std::fs::metadata(&daemon.socket).expect("socket metadata");
+
+    let started = Instant::now();
+    let out = Command::new(cli_binary())
+        .env("XDG_RUNTIME_DIR", dir.path())
+        .env_remove("AGENT_SHELL_SOCKET")
+        .env_remove("AGENT_SHELL_LOCK")
+        .args(["daemon", "status"])
+        .output()
+        .expect("run agent-shell daemon status");
+    let elapsed = started.elapsed();
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "default entry must reach the resident endpoint (stderr: {stderr})"
+    );
+    let status: Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("daemon status is not JSON ({e}): {stdout}"));
+    assert_eq!(
+        status["ime_engine"],
+        Value::String("resident-marker".into()),
+        "reply must come from the resident instance, not a freshly spawned one: {stdout}"
+    );
+    assert!(
+        elapsed < CLI_DEADLINE,
+        "default entry must not wait on a transient instance: {elapsed:?}"
+    );
+    let after = std::fs::metadata(&daemon.socket).expect("socket metadata after call");
+    use std::os::unix::fs::MetadataExt;
+    assert_eq!(
+        (before.dev(), before.ino()),
+        (after.dev(), after.ino()),
+        "resident endpoint must not be rebound by a second instance"
+    );
+    assert!(
+        daemon.child.try_wait().expect("try_wait").is_none(),
+        "resident instance must still be running"
+    );
+}
+
+/// 审计文件被另一个写者持锁时，常驻端点仍须被判定为可应答、默认入口不得
+/// 派生瞬态实例。
+///
+/// 审计落在 `daemon.ping` 的应答路径上。锁等待若无上限，另一实例（哪怕只是
+/// 正常读 `security.audit` 的查询）短暂持锁就会让常驻实例错过 CLI 的 500 ms
+/// 探测窗口，被误判为不可应答——默认入口因此漂移成「每次派生新实例」。
+#[test]
+fn default_entry_reuses_resident_endpoint_while_audit_lock_is_held() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let state = dir.path().join("state");
+    std::fs::create_dir_all(&state).expect("state dir");
+    let daemon = SocketDaemon::start_with_state_dir(dir.path(), Some(&state));
+    rpc_result_over_socket(
+        &daemon.socket,
+        "ime.engine.set",
+        r#"{"engine":"resident-marker"}"#,
+    )
+    .expect("seed resident-only state");
+    let audit = SocketDaemon::audit_path(&state);
+    // 记录写在 daemon 自己的进程分段里，锚点文件不再由 daemon 创建：这里显式
+    // 建一把空的主日志当锁对象，模拟旧版本遗留的同名文件被外部写者独占。
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&audit)
+        .expect("create audit anchor");
+
+    // 另一个进程持排他锁：`flock(1)` 阻塞到用例放行为止。
+    let mut holder = Command::new("flock")
+        .arg("-x")
+        .arg(&audit)
+        .arg("sh")
+        .arg("-c")
+        .arg("read _line")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn flock holder");
+    // 给 flock 一点时间真正拿到锁。
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(
+        holder.try_wait().expect("try_wait holder").is_none(),
+        "flock holder must still be holding"
+    );
+
+    let started = Instant::now();
+    let out = Command::new(cli_binary())
+        .env("XDG_RUNTIME_DIR", dir.path())
+        .env_remove("AGENT_SHELL_SOCKET")
+        .env_remove("AGENT_SHELL_LOCK")
+        .args(["daemon", "status"])
+        .output()
+        .expect("run agent-shell daemon status");
+    let elapsed = started.elapsed();
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "default entry must answer while the audit lock is held (stderr: {stderr})"
+    );
+    let status: Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("daemon status is not JSON ({e}): {stdout}"));
+    assert_eq!(
+        status["ime_engine"],
+        Value::String("resident-marker".into()),
+        "reply must come from the resident instance, not a freshly spawned one: {stdout}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "audit lock wait must stay inside the probe budget: {elapsed:?}"
+    );
+
+    // 放锁后该条审计仍要可查：不丢记录（C-107）。
+    drop(holder.stdin.take());
+    let _ = holder.wait();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut raw = String::new();
+    while Instant::now() < deadline {
+        raw = audit_text(&audit);
+        if raw.contains("daemon.ping") {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        raw.contains("daemon.ping"),
+        "queued audit record must land after the lock is released: {raw}"
+    );
+    for line in raw.lines().filter(|line| !line.trim().is_empty()) {
+        serde_json::from_str::<Value>(line)
+            .unwrap_or_else(|e| panic!("unparsable audit line {line:?}: {e}"));
+    }
+}
+
+/// 某个审计锚点对应的全部可读记录（主日志 + 各进程分段）拼接文本。
+fn audit_text(anchor: &Path) -> String {
+    let mut text = String::new();
+    for file in agent_shell_core::audit::audit_files(anchor) {
+        text.push_str(&std::fs::read_to_string(file).unwrap_or_default());
+    }
+    text
+}
+
+/// 同 uid 监听但不应答的常驻端点：默认入口必须判为不可应答并派生瞬态。
+/// 只「连得上」就复用，会把业务请求发给一个从不读写的进程，命令被拖到
+/// 整条预算耗尽（ADR-017 的「可应答时接入」）。
+#[test]
+fn default_entry_falls_back_when_resident_listener_never_answers() {
+    let _ = daemon_binary(); // 瞬态回退需要真实的 daemon 二进制
+    let dir = tempfile::tempdir().expect("tempdir");
+    let socket = dir.path().join("agent-shell.sock");
+    let listener =
+        std::os::unix::net::UnixListener::bind(&socket).expect("bind silent resident endpoint");
+    let (accepted_tx, accepted_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let silent = std::thread::spawn(move || {
+        if let Ok((stream, _)) = listener.accept() {
+            accepted_tx.send(()).ok();
+            // 接住连接但既不读也不写，直到用例放行。
+            let _ = release_rx.recv_timeout(Duration::from_secs(10));
+            drop(stream);
+        }
+    });
+
+    let started = Instant::now();
+    let out = Command::new(cli_binary())
+        .env("XDG_RUNTIME_DIR", dir.path())
+        .env_remove("AGENT_SHELL_SOCKET")
+        .env_remove("AGENT_SHELL_LOCK")
+        .env_remove("WAYLAND_DISPLAY")
+        .env_remove("DISPLAY")
+        .env_remove("DBUS_SESSION_BUS_ADDRESS")
+        .env_remove("XDG_CURRENT_DESKTOP")
+        .env("XDG_SESSION_TYPE", "tty")
+        .args(["daemon", "status"])
+        .output()
+        .expect("run agent-shell daemon status");
+    let elapsed = started.elapsed();
+    accepted_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("default entry must probe the resident endpoint before falling back");
+    release_tx.send(()).ok();
+    silent.join().expect("silent listener thread");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "silent resident listener must fall back to a transient daemon (stderr: {stderr})"
+    );
+    assert!(
+        elapsed < CLI_DEADLINE,
+        "readiness probe must be bounded: {elapsed:?}"
+    );
+    let status: Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("daemon status is not JSON ({e}): {stdout}"));
+    assert_eq!(
+        status["running"],
+        Value::Bool(true),
+        "reply must come from the transient daemon: {stdout}"
     );
 }
 

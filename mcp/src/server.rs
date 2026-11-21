@@ -1,8 +1,9 @@
 //! MCP server 实现——18 tools registered via rmcp ServerHandler。
 //!
 //! 工具调用经 stdio JSON-RPC 转发到 agent-shell daemon。连接选择与命令面同一条
-//! 规则（§22.2 激活策略）：`AGENT_SHELL_SOCKET` 给出显式端点时直连常驻实例，
-//! 否则派生瞬态 daemon；每个 MCP 进程同时只保持一条连接，复用于每次工具调用。
+//! 规则（§22.2 激活策略）：`AGENT_SHELL_SOCKET` 给出显式端点时直连该实例；
+//! 未指定时优先接入随包常驻端点，不可应答再派生瞬态 daemon（ADR-017）；每个
+//! MCP 进程同时只保持一条连接，复用于每次工具调用。
 
 use std::borrow::Cow;
 use std::collections::VecDeque;
@@ -10,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use agent_shell_rpc::RpcErrorCode;
+use agent_shell_rpc::{method, RpcErrorCode};
 use rmcp::model::{
     CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, ListToolsResult,
     PaginatedRequestParams, ServerCapabilities, ServerInfo, Tool,
@@ -29,6 +30,14 @@ use tracing::{error, info};
 ///
 /// 连接也受同一上限约束——调用方持着连接锁，端点卡住时不得让后续调用整体无响应。
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// 默认入口探测随包常驻端点的连接上限：不可达/无监听即回退瞬态，不把端点
+/// 故障拖成一次工具调用的 10 秒超时。
+const RESIDENT_CONNECT_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// 连上之后的应答判定上限：一次 `daemon.ping` 往返。监听方可能接受连接
+/// 却从不读写，只连上不能算可用。
+const RESIDENT_PROBE_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// 派生形态保留的 daemon stderr 上限（字节）。进程在应答前退出时，尾部输出
 /// 就是根因（如单实例锁竞争的 `daemon already running`），不得丢弃。
@@ -94,26 +103,77 @@ impl DaemonConnection {
     async fn connect() -> Result<Self, CallError> {
         match socket_endpoint() {
             Some(path) => Self::connect_socket(&path).await,
-            None => Self::connect_spawned().await,
+            None => Self::connect_default().await,
+        }
+    }
+
+    /// 默认入口：随包常驻端点可应答时复用它，否则派生瞬态（ADR-017）。
+    /// 对端凭据不可接受必须报错，不回退——否则会把工具负载交给冒充端点的人。
+    ///
+    /// 「可应答」是一次短超时的 `daemon.ping` 往返：同 uid 的监听方可能接受
+    /// 连接却从不读写，只连上会把业务请求拖到整条调用预算耗尽。ping 在
+    /// daemon 侧不取状态锁，长命令占锁期间仍立即应答。
+    async fn connect_default() -> Result<Self, CallError> {
+        let resident = agent_shell_rpc::endpoint::resident_socket_path();
+        Self::connect_default_at(resident.as_deref()).await
+    }
+
+    /// [`Self::connect_default`] 的显式路径形态（测试可注入端点）。
+    async fn connect_default_at(resident: Option<&Path>) -> Result<Self, CallError> {
+        if let Some(path) = resident {
+            match Self::connect_socket_with_timeout(path, RESIDENT_CONNECT_TIMEOUT).await {
+                Ok(mut conn) => {
+                    if conn.probe(RESIDENT_PROBE_TIMEOUT).await {
+                        return Ok(conn);
+                    }
+                }
+                Err(error)
+                    if error
+                        .render()
+                        .contains(agent_shell_rpc::endpoint::PEER_REJECT_PREFIX) =>
+                {
+                    return Err(error);
+                }
+                Err(_) => {}
+            }
+        }
+        Self::connect_spawned().await
+    }
+
+    /// 常驻端点的可应答判定：一次短超时、无副作用的 `daemon.ping` 往返。
+    ///
+    /// 只要求「有匹配请求的应答」：旧版 daemon 对未知方法回的 MethodNotFound
+    /// 同样是应答，不得因此判为不可用。
+    async fn probe(&mut self, timeout: Duration) -> bool {
+        match tokio::time::timeout(timeout, self.call(method::DAEMON_PING, Value::Null)).await {
+            Ok(Ok(_)) | Ok(Err(CallError::Rpc { .. })) => true,
+            Ok(Err(_)) | Err(_) => false,
         }
     }
 
     /// 直连显式端点。连不上不回退派生：端点由操作方指定，回退会把「常驻实例
     /// 没起来」伪装成一次成功的临时实例调用。
     async fn connect_socket(path: &Path) -> Result<Self, CallError> {
+        Self::connect_socket_with_timeout(path, RESPONSE_TIMEOUT).await
+    }
+
+    async fn connect_socket_with_timeout(
+        path: &Path,
+        timeout: Duration,
+    ) -> Result<Self, CallError> {
         let unavailable =
             |detail: String| CallError::transport(RpcErrorCode::DaemonUnavailable, detail);
         // tokio 的 connect 是「非阻塞 connect + 等可写」：backlog 满或端点进程被
         // SIGSTOP 时永不就绪。调用方持着连接锁，不设上限就会让此后每次 tools/call
         // 整体无响应且没有错误行——上限与应答死线同值，超时按 1001 显式失败。
-        let stream = tokio::time::timeout(RESPONSE_TIMEOUT, UnixStream::connect(path))
+        let stream = tokio::time::timeout(timeout, UnixStream::connect(path))
             .await
             .map_err(|_| {
                 unavailable(format!(
                     "cannot connect to daemon socket {} within {}s (AGENT_SHELL_SOCKET names \
                      the resident endpoint; drop it to auto-spawn a transient daemon)",
                     path.display(),
-                    RESPONSE_TIMEOUT.as_secs()
+                    timeout.as_secs_f32()
                 ))
             })?
             .map_err(|e| {
@@ -125,7 +185,8 @@ impl DaemonConnection {
             })?;
         let peer = stream.peer_cred().map_err(|e| {
             unavailable(format!(
-                "cannot read peer credentials of {}: {e}",
+                "{} {}: cannot read peer credentials: {e}",
+                agent_shell_rpc::endpoint::PEER_REJECT_PREFIX,
                 path.display()
             ))
         })?;
@@ -1644,5 +1705,127 @@ mod tests {
                 "{args} carries a selector"
             );
         }
+    }
+
+    fn probe_dir(tag: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("agent-shell-mcp-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create probe temp dir");
+        dir
+    }
+
+    /// 同 uid、接受连接但从不读写的端点：可应答判定必须在有界时间内失败。
+    #[tokio::test]
+    async fn probe_fails_for_silent_listener() {
+        let dir = probe_dir("silent");
+        let socket = dir.join("agent-shell.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).expect("bind endpoint");
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let silent = std::thread::spawn(move || {
+            if let Ok((stream, _)) = listener.accept() {
+                let _ = release_rx.recv_timeout(Duration::from_secs(10));
+                drop(stream);
+            }
+        });
+
+        let mut conn =
+            DaemonConnection::connect_socket_with_timeout(&socket, Duration::from_secs(1))
+                .await
+                .expect("connect to silent listener");
+        let started = std::time::Instant::now();
+        assert!(
+            !conn.probe(Duration::from_millis(200)).await,
+            "silent listener must not pass the readiness probe"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "readiness probe must be bounded: {:?}",
+            started.elapsed()
+        );
+        release_tx.send(()).ok();
+        silent.join().expect("silent listener thread");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 对端只要有匹配 id 的应答就判为可应答（含错误应答）。
+    #[tokio::test]
+    async fn probe_accepts_wellformed_response() {
+        use std::io::{BufRead, Write};
+
+        let dir = probe_dir("responsive");
+        let socket = dir.join("agent-shell.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).expect("bind endpoint");
+        let responder = std::thread::spawn(move || {
+            if let Ok((stream, _)) = listener.accept() {
+                let mut reader = std::io::BufReader::new(stream.try_clone().expect("clone stream"));
+                let mut line = String::new();
+                reader.read_line(&mut line).expect("read ping request");
+                let request: Value = serde_json::from_str(line.trim()).expect("ping request json");
+                let id = request["id"].as_u64().expect("ping request id");
+                let mut stream = stream;
+                writeln!(
+                    stream,
+                    "{{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{{}}}}"
+                )
+                .expect("write ping response");
+            }
+        });
+
+        let mut conn =
+            DaemonConnection::connect_socket_with_timeout(&socket, Duration::from_secs(1))
+                .await
+                .expect("connect to responsive listener");
+        assert!(
+            conn.probe(Duration::from_secs(1)).await,
+            "a matching response must pass the readiness probe"
+        );
+        responder.join().expect("responder thread");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 默认入口对静默端点的完整判定：探测失败后绝不把它当成 daemon。
+    #[tokio::test]
+    async fn default_entry_does_not_adopt_silent_listener() {
+        let dir = probe_dir("default");
+        let socket = dir.join("agent-shell.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).expect("bind endpoint");
+        let (accepted_tx, accepted_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let silent = std::thread::spawn(move || {
+            if let Ok((stream, _)) = listener.accept() {
+                accepted_tx.send(()).ok();
+                let _ = release_rx.recv_timeout(Duration::from_secs(10));
+                drop(stream);
+            }
+        });
+
+        let started = std::time::Instant::now();
+        let outcome = DaemonConnection::connect_default_at(Some(&socket)).await;
+        let elapsed = started.elapsed();
+        accepted_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("default entry must probe the silent endpoint");
+        release_tx.send(()).ok();
+        silent.join().expect("silent listener thread");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        match outcome {
+            Ok(conn) => assert!(
+                conn.endpoint.starts_with("spawned "),
+                "silent listener must not be adopted as the daemon: {}",
+                conn.endpoint
+            ),
+            // 无可用 daemon 二进制时派生阶段失败，同样不能说成「采用了端点」。
+            Err(error) => assert!(
+                !error.render().contains("agent-shell.sock"),
+                "unexpected failure unrelated to the fallback: {}",
+                error.render()
+            ),
+        }
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "probe plus fallback must be bounded: {elapsed:?}"
+        );
     }
 }

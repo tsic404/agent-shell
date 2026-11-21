@@ -190,7 +190,7 @@ async fn brightness_query_set_readback_and_policy_deny() {
     fixture
         .daemon_mut()
         .security
-        .config
+        .write_config()
         .permissions
         .deny
         .insert("brightness.set".into(), true);

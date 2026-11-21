@@ -371,6 +371,29 @@ impl AtspiBridge {
         })
     }
 
+    /// 直接按 `(bus_name, path)` 读取元素视图（不做全树遍历）。
+    ///
+    /// `a11y.action` 的调用方通常已从 `a11y.query` 拿到二元组；大型桌面上
+    /// 全树 DFS 是 O(节点数) 次 D-Bus 往返，可能把单条命令拖过 C-154 预算。
+    /// 路径无效/对象已销毁时返回错误，由调用方决定回退语义。
+    pub async fn element_node_at(&self, bus_name: &str, path: &str) -> Result<ElementNode> {
+        let states = self.get_state(bus_name, path).await?;
+        if states.contains(AtspiState::DEFUNCT) {
+            return Err(AgentShellError::WindowNotFound(format!(
+                "a11y path {path} (DEFUNCT)"
+            )));
+        }
+        let (role, name) =
+            tokio::try_join!(self.get_role(bus_name, path), self.get_name(bus_name, path))?;
+        Ok(ElementNode {
+            bus_name: bus_name.to_string(),
+            path: path.to_string(),
+            name,
+            role,
+            states,
+        })
+    }
+
     // ───────────────────── 树导航 ─────────────────────
 
     /// GetChildAtIndex(i) → 子引用。

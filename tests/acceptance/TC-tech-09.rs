@@ -2,7 +2,8 @@
 //!
 //! - 场景：按单元 ExecStart 拉起常驻服务；stdin 为空源；与未指定端点的客户端共存
 //! - 判据：运行时目录出现可应答端点；应答后进程存活；端点再次可应答；未指定端点
-//!   的客户端完成一次调用且不阻塞至 30s 锁窗口；该实例随后仍可应答
+//!   的客户端完成一次调用且不阻塞至 30s 锁窗口；该实例随后仍可应答；客户端
+//!   由常驻实例应答（回执带常驻实例的进程内状态），不产生第二个服务实例
 //! - 执行：`cargo test --no-default-features -p agent-shell-acceptance --test TC-tech-09`
 //!
 //! 用例不调用 `systemctl`，无 systemd 不构成跳过理由；判定面是真实二进制。
@@ -180,6 +181,11 @@ fn stderr_text(path: &Path) -> String {
 
 /// 一次 `daemon.status` 往返；连接或应答失败返回描述性错误。
 fn daemon_status(endpoint: &Path) -> Result<Value, String> {
+    daemon_rpc(endpoint, "daemon.status", Value::Null)
+}
+
+/// 一次原始 JSON-RPC 往返（端点确实是行分隔协议）。
+fn daemon_rpc(endpoint: &Path, method: &str, params: Value) -> Result<Value, String> {
     let stream = UnixStream::connect(endpoint)
         .map_err(|e| format!("connect {}: {e}", endpoint.display()))?;
     stream
@@ -188,10 +194,12 @@ fn daemon_status(endpoint: &Path) -> Result<Value, String> {
     stream
         .set_write_timeout(Some(RPC_TIMEOUT))
         .map_err(|e| format!("set write timeout: {e}"))?;
+    let request =
+        serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": method, "params": params});
     let mut reader = BufReader::new(stream);
     reader
         .get_mut()
-        .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"daemon.status\"}\n")
+        .write_all(format!("{request}\n").as_bytes())
         .map_err(|e| format!("write request: {e}"))?;
     let mut line = String::new();
     reader
@@ -272,6 +280,14 @@ fn unit_exec_start_serves_runtime_endpoint_and_keeps_default_client_unblocked() 
     daemon_status(&endpoint).expect("同一端点必须可再次应答");
 
     // (3) 未指定端点的客户端完成一次调用，且不阻塞至 30s 锁等待窗口上限。
+    //     先在常驻实例里留下进程内状态：只有常驻实例能答出它，派生瞬态服务的
+    //     回执不会带这个标记（AC-121：不产生第二个服务实例）。
+    daemon_rpc(
+        &endpoint,
+        "ime.engine.set",
+        serde_json::json!({"engine": "resident-marker"}),
+    )
+    .expect("seed resident-only state");
     let mut client = Command::new(&cli_bin);
     client.args(["daemon", "status"]);
     sandboxed(&mut client, runtime_dir);
@@ -294,6 +310,11 @@ fn unit_exec_start_serves_runtime_endpoint_and_keeps_default_client_unblocked() 
         status["running"],
         Value::Bool(true),
         "客户端未取得 daemon 应答；stdout:\n{stdout}"
+    );
+    assert_eq!(
+        status["ime_engine"],
+        Value::String("resident-marker".into()),
+        "未指定端点的入口必须由常驻实例应答（进程内状态只在常驻实例里）；stdout:\n{stdout}"
     );
 
     // (4) 上一步之后，常驻实例仍存活且仍可应答。

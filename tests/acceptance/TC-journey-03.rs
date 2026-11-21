@@ -35,7 +35,7 @@ impl HostState {
     }
 
     fn audit_text(&self) -> String {
-        read_text(&self.audit)
+        audit_text_at(&self.audit)
     }
 
     fn sessions_text(&self) -> String {
@@ -101,14 +101,16 @@ async fn run_round(tag: &str, extra: Option<&str>) -> Round {
 
     // 沙箱随 `fixture` 存活：产物清单在此处采齐。返回后再采只会读到已删除目录。
     let files = state_files(&state_dir);
-    for product in ["audit.jsonl", "sessions.json"] {
-        assert!(
-            files.iter().any(|file| file == product),
-            "本轮状态目录内必须留有产物 {product}：{files:?}"
-        );
-    }
+    assert!(
+        files.iter().any(|file| is_audit_segment(file)),
+        "本轮状态目录内必须留有本进程的审计分段：{files:?}"
+    );
+    assert!(
+        files.iter().any(|file| file == "sessions.json"),
+        "本轮状态目录内必须留有会话状态：{files:?}"
+    );
 
-    let audit = read_text(&state_dir.join("audit.jsonl"));
+    let audit = audit_text_at(&state_dir.join("audit.jsonl"));
     let sessions = read_text(&state_dir.join("sessions.json"));
 
     Round {
@@ -183,13 +185,15 @@ async fn journey_rounds_are_repeatable_and_leave_no_host_residue() {
         "同一旅程步两轮必须给出同一信息"
     );
     assert_eq!(
-        first.files, second.files,
+        normalize_segments(&first.files),
+        normalize_segments(&second.files),
         "两轮留在状态目录内的产物集合必须一致"
     );
     // 反证：控制轮与正常轮的唯一差别是状态目录内多了一个注入文件，集合因此必须
     // 不同——「两轮一致」若靠空集合成立，这里就会红。
     assert_ne!(
-        control.files, first.files,
+        normalize_segments(&control.files),
+        normalize_segments(&first.files),
         "状态目录内多一个产物时，产物集合比较必须给出不同结果"
     );
     assert!(
@@ -253,4 +257,41 @@ fn collect_files(root: &Path, dir: &Path, files: &mut Vec<String>) {
 /// 缺失即空文本：判据是「宿主侧不得出现本轮探针」，文件不存在同样满足。
 fn read_text(path: &Path) -> String {
     std::fs::read_to_string(path).unwrap_or_default()
+}
+
+/// 某个审计锚点对应的全部可读记录（旧主日志 + 各进程分段）拼接文本。
+fn audit_text_at(anchor: &Path) -> String {
+    let mut text = String::new();
+    for file in agent_shell_core::audit::audit_files(anchor) {
+        text.push_str(&read_text(&file));
+    }
+    text
+}
+
+/// 文件名是否为本进程的审计分段：`audit.jsonl.p<pid>-<32 位十六进制>`。
+fn is_audit_segment(name: &str) -> bool {
+    let Some(rest) = name.strip_prefix("audit.jsonl.p") else {
+        return false;
+    };
+    let Some((pid, token)) = rest.split_once('-') else {
+        return false;
+    };
+    !pid.is_empty()
+        && pid.bytes().all(|byte| byte.is_ascii_digit())
+        && token.len() == 32
+        && token.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+/// 产物清单的可比形态：审计分段名带 pid 与启动随机量，跨轮比较前归一。
+fn normalize_segments(files: &[String]) -> Vec<String> {
+    files
+        .iter()
+        .map(|file| {
+            if is_audit_segment(file) {
+                "<audit-segment>".to_string()
+            } else {
+                file.clone()
+            }
+        })
+        .collect()
 }

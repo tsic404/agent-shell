@@ -11,10 +11,13 @@
 //! 需要各自桌面会话，由真机验收覆盖；本用例断言可判定的槽矩阵与两路一致性。
 
 use acceptance::portal::serve_screenshot_portal;
-use acceptance::{sample_png, FakeCompositor, Fixture, PrivateBus, RecordingInput, ScreenshotMock};
+use acceptance::{
+    sample_png, FakeCompositor, Fixture, PrivateBus, RecordingInput, ScreenshotMock, SetupBehaviour,
+};
 use agent_shell_core::types::DesktopEnvironment;
 use agent_shell_rpc::{method, DoctorResult, InfoResult, RpcErrorCode};
 use serde_json::json;
+use std::time::{Duration, Instant};
 
 fn info(value: serde_json::Value) -> InfoResult {
     serde_json::from_value(value).expect("InfoResult")
@@ -300,6 +303,130 @@ async fn component_slot_matrix_matches_execution_paths() {
             .contains("shell-version mismatch"),
         "version mismatch hint must be kept for undeclared majors: {:?}",
         status.note
+    );
+
+    // ── AC-110 / C-034①：输入健康报告与命令执行路径对同一能力同判 ──
+    // libei 的会话是惰性建立的：portal 在场但 EIS 会话尚未建立时，命令路径
+    // 仍在等授权。体检不得报「选中即可用」——必须显示降级与根因。
+    let lazy_input = RecordingInput::new("libei")
+        .with_degraded("portal present but EIS session not yet established (lazy)")
+        .with_setup(SetupBehaviour::Hang);
+    filled
+        .set_input_chain(
+            DesktopEnvironment::GNOME,
+            vec![Box::new(lazy_input) as Box<dyn agent_shell_input::InputService>],
+        )
+        .await;
+    let report = doctor_of(filled.call_ok(method::DOCTOR, None).await);
+    let input_row = report
+        .lines
+        .iter()
+        .find(|line| !line.starts_with(' ') && line.contains("输入后端"))
+        .expect("input row");
+    assert!(
+        !input_row.starts_with('✓'),
+        "a not-yet-established input channel must not be reported ready: {input_row}"
+    );
+    assert!(
+        input_row.starts_with('⚠') && input_row.contains("EIS session not yet established"),
+        "degraded input row must carry the session-state reason: {input_row}"
+    );
+
+    // 同一会话、同一条链：建立过程挂起时 input.send 必须在命令预算内显式失败。
+    // 缩短预算（测试可注入，默认 4s < C-154 的 5s）以确定性覆盖超时分支。
+    filled.daemon_mut().input_budget = Duration::from_millis(50);
+    let started = Instant::now();
+    let hang = filled
+        .call_err(
+            method::INPUT_SEND,
+            Some(json!({"kind": "key", "payload": {"combo": "a"}})),
+        )
+        .await;
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "input.send must return within its budget instead of hanging: {:?}",
+        started.elapsed()
+    );
+    assert_eq!(
+        hang.code,
+        RpcErrorCode::BackendError as i32,
+        "budget exhaustion must be an explicit backend error: {hang:?}"
+    );
+    assert!(
+        hang.message.contains("did not complete within")
+            && hang.message.contains("portal RemoteDesktop/EIS"),
+        "timeout must name the establishment path: {}",
+        hang.message
+    );
+}
+
+/// AC-110 / C-024 / C-055：授权待确认时首选候选保留可恢复，而由降级候选
+/// 完成注入时成功回执与 doctor 选中名必须指向实际后端，不能继续标成首选。
+#[tokio::test]
+async fn pending_authorization_reports_the_backend_that_injected() {
+    let mut fixture = Fixture::start().await;
+    let libei = RecordingInput::new("libei").with_setup(SetupBehaviour::PendingThenReady);
+    let uinput = RecordingInput::new("uinput");
+    fixture
+        .set_input_chain(
+            DesktopEnvironment::GNOME,
+            vec![
+                Box::new(libei.clone()) as Box<dyn agent_shell_input::InputService>,
+                Box::new(uinput.clone()) as Box<dyn agent_shell_input::InputService>,
+            ],
+        )
+        .await;
+
+    let key = Some(json!({"kind": "key", "payload": {"combo": "a"}}));
+
+    // 第一条命令：libei 等授权返回 Pending，uinput 在剩余预算内完成注入。
+    let first = fixture.call_ok(method::INPUT_SEND, key.clone()).await;
+    assert_eq!(
+        first["backend"], "uinput",
+        "success receipt must name the backend that actually injected: {first}"
+    );
+    assert_eq!(uinput.calls().len(), 1);
+    assert!(libei.calls().is_empty(), "pending backend must not inject");
+    assert_eq!(
+        fixture.input_chain_names(),
+        vec!["libei", "uinput"],
+        "pending candidate must stay on the chain for recovery"
+    );
+
+    // doctor 同判：选中 uinput，同时说明 libei 仍待授权，不得报成就绪。
+    let report = doctor_of(fixture.call_ok(method::DOCTOR, None).await);
+    let input_row = report
+        .lines
+        .iter()
+        .find(|line| !line.starts_with(' ') && line.contains("输入后端"))
+        .expect("input row");
+    assert!(
+        input_row.contains("选中 uinput") && input_row.contains("libei 待授权确认"),
+        "doctor must name the actual backend and the recoverable candidate: {input_row}"
+    );
+    assert!(
+        !input_row.starts_with('✓'),
+        "a degraded chain must not be reported ready: {input_row}"
+    );
+
+    // 第二条命令：用户已确认授权，libei 接续该会话并完成注入。
+    let second = fixture.call_ok(method::INPUT_SEND, key).await;
+    assert_eq!(
+        second["backend"], "libei",
+        "the recovered candidate must serve the next command: {second}"
+    );
+    assert_eq!(libei.calls().len(), 1);
+    assert_eq!(uinput.calls().len(), 1, "fallback must not be reused");
+
+    let report = doctor_of(fixture.call_ok(method::DOCTOR, None).await);
+    let input_row = report
+        .lines
+        .iter()
+        .find(|line| !line.starts_with(' ') && line.contains("输入后端"))
+        .expect("input row");
+    assert!(
+        input_row.starts_with('✓') && input_row.contains("选中 libei"),
+        "after recovery the selected backend must be libei: {input_row}"
     );
 }
 

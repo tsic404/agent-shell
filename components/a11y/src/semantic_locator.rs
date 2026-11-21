@@ -27,6 +27,13 @@ pub trait TreeSource: Send + Sync {
     async fn window_as_element(&self, window: &WindowNode) -> Result<ElementNode>;
     /// 枚举节点的直接子元素。
     async fn children(&self, node: &ElementNode) -> Result<Vec<ElementNode>>;
+    /// 直接按 `(bus_name, path)` 读取元素（不做全树遍历）。
+    ///
+    /// `None` 表示依赖不支持直接读取（测试假实现），调用方回退到 DFS；
+    /// `Some(Err(..))` 表示直接读取失败，由调用方决定是否回退。
+    async fn element_at(&self, _bus: &str, _path: &str) -> Option<Result<ElementNode>> {
+        None
+    }
 }
 
 #[async_trait]
@@ -41,6 +48,15 @@ impl TreeSource for AtspiBridge {
 
     async fn children(&self, node: &ElementNode) -> Result<Vec<ElementNode>> {
         AtspiBridge::children(self, node).await
+    }
+
+    async fn element_at(&self, bus: &str, path: &str) -> Option<Result<ElementNode>> {
+        // 直接读取失败时回退 DFS，保持「对象不存在 → WindowNotFound」等既有
+        // 错误语义不变；成功路径（query 结果回传的二元组）则 O(1) 命中。
+        match AtspiBridge::element_node_at(self, bus, path).await {
+            Ok(node) => Some(Ok(node)),
+            Err(_) => None,
+        }
     }
 }
 
@@ -125,6 +141,13 @@ impl<B: TreeSource> SemanticLocator<B> {
     ///
     /// 找不到返回 [`AgentShellError::WindowNotFound`]。
     pub async fn locate_by_path(&self, bus: Option<&str>, path: &str) -> Result<ElementNode> {
+        // 调用方带着 `a11y.query` 返回的 bus 时直接读目标对象，避免为定位
+        // 一个已知路径遍历整棵桌面树（大树上会耗尽 C-154 命令预算）。
+        if let Some(bus) = bus {
+            if let Some(found) = self.bridge.element_at(bus, path).await {
+                return found;
+            }
+        }
         let mut matches: Vec<ElementNode> = Vec::new();
         for window in self.bridge.all_windows().await? {
             let root = self.bridge.window_as_element(&window).await?;
@@ -254,6 +277,8 @@ mod tests {
     use super::*;
     use crate::tree::{AtspiRole, AtspiState, WindowNode};
     use async_trait::async_trait;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
 
     fn element_on_bus(bus: &str, path: &str, role_name: &str, name: &str) -> ElementNode {
         ElementNode {
@@ -378,6 +403,64 @@ mod tests {
             vec!["/root/btn1", "/root/btn2"],
             "role filter must still apply: {found:?}"
         );
+    }
+
+    /// 直接读取型假源：统计全树入口调用次数。
+    struct DirectSource {
+        direct: ElementNode,
+        tree_calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl TreeSource for DirectSource {
+        async fn all_windows(&self) -> Result<Vec<WindowNode>> {
+            self.tree_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(vec![])
+        }
+
+        async fn window_as_element(&self, _window: &WindowNode) -> Result<ElementNode> {
+            Err(AgentShellError::NotImplemented("direct source".into()))
+        }
+
+        async fn children(&self, _node: &ElementNode) -> Result<Vec<ElementNode>> {
+            Ok(vec![])
+        }
+
+        async fn element_at(&self, bus: &str, path: &str) -> Option<Result<ElementNode>> {
+            (bus == self.direct.bus_name && path == self.direct.path)
+                .then(|| Ok(self.direct.clone()))
+        }
+    }
+
+    #[tokio::test]
+    async fn locate_by_path_with_bus_uses_direct_lookup_without_tree_walk() {
+        // AC-116 的 a11y 腿：query 结果自带 bus，动作定位不应为已知路径遍历整棵
+        // 桌面树（大树上会耗尽命令预算）。
+        let calls = Arc::new(AtomicUsize::new(0));
+        let target = element_at("/win/btn", "push button", "OK");
+        let locator = SemanticLocator::new(DirectSource {
+            direct: target,
+            tree_calls: Arc::clone(&calls),
+        });
+
+        let found = locator
+            .locate_by_path(Some(":1.0"), "/win/btn")
+            .await
+            .expect("direct lookup must resolve the target");
+        assert_eq!(found.path, "/win/btn");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "direct lookup must not enumerate the whole tree"
+        );
+
+        // 无 bus 时仍需遍历（跨 bus 同 path 的歧义只能靠 DFS 判定）。
+        let err = locator
+            .locate_by_path(None, "/win/btn")
+            .await
+            .expect_err("empty tree must not resolve without a bus");
+        assert!(matches!(err, AgentShellError::WindowNotFound(_)), "{err:?}");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

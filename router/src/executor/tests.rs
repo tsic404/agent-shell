@@ -841,12 +841,12 @@ async fn audit_stays_out_of_host_state_dir() {
         .await
         .expect("system.desktop_info must succeed");
 
-    let sandbox = std::fs::read_to_string(test_security.sandbox().audit_path()).unwrap_or_default();
+    let sandbox = test_security.sandbox().audit_text();
     assert!(
         sandbox.contains(&marker),
         "沙箱内应有本次判定的审计记录：{sandbox:?}"
     );
-    let host = std::fs::read_to_string(&host_audit).unwrap_or_default();
+    let host = crate::test_support::audit_text_at(&host_audit);
     assert!(
         !host.contains(&marker),
         "单测不得向宿主状态目录写审计记录：{}",

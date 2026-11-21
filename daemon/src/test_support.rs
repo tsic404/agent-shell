@@ -39,9 +39,14 @@ impl Sandbox {
         self.root.path().join("agent-shell")
     }
 
-    /// 审计日志替身（生产为 `state_dir()/audit.jsonl`）。
+    /// 审计锚点（生产为 `state_dir()/audit.jsonl`；实际记录在各进程分段里）。
     pub(crate) fn audit_path(&self) -> PathBuf {
         self.state_dir().join("audit.jsonl")
+    }
+
+    /// 沙箱内全部审计文件（旧主日志 + 各进程分段）的原始文本。
+    pub(crate) fn audit_text(&self) -> String {
+        audit_text_at(&self.audit_path())
     }
 
     /// 单测专用安全配置：默认配置 + 审计落沙箱。
@@ -58,6 +63,15 @@ impl Sandbox {
     pub(crate) fn portal_sessions(&self) -> Arc<PortalSessionManager> {
         Arc::new(PortalSessionManager::new(self.state_dir()))
     }
+}
+
+/// 某个审计锚点对应文件的原始文本拼接（测试断言用）。
+pub(crate) fn audit_text_at(anchor: &std::path::Path) -> String {
+    let mut text = String::new();
+    for file in agent_shell_core::audit::audit_files(anchor) {
+        text.push_str(&std::fs::read_to_string(file).unwrap_or_default());
+    }
+    text
 }
 
 /// 单测基座装配出的 daemon：与其状态目录沙箱同生死。

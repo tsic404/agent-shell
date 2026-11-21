@@ -9,13 +9,13 @@
 //!   ① 无动作接口的元素按几何降级为坐标点击——注入落在元素中心，动作成功；
 //!   ② 有动作接口的元素走主动作，不触发坐标注入（既有路径不变）；
 //!   ③ 元素没有可用几何时报「元素无法点击」类错误（BackendError），文案不得
-//!      归因到指针后端；
+//!   归因到指针后端；
 //!   ④ 元素有动作接口但 `DoAction` 返 false 且无可用几何时，文案按真实原因
-//!      成句，不得说成「没有动作接口」；
+//!   成句，不得说成「没有动作接口」；
 //!   ⑤ 会话没有指针后端时报 BackendUnavailable 并透出装配根因，与 ③ 分属
-//!      两种原因，且不产生任何注入；
+//!   两种原因，且不产生任何注入；
 //!   ⑥ 指针通道建立被拒（授权类失败）时报 Denied（1004），与 `input.send`
-//!      同码，不得落到 BackendError（1005）。
+//!   同码，不得落到 BackendError（1005）。
 //! - 执行：`cargo test -p agent-shell-acceptance --test TC-uat-04`
 //!
 //! 环境说明：真实 AT-SPI 树需要桌面应用注册到 a11y bus，CI 无法复现；夹具在
@@ -23,15 +23,20 @@
 //! Accessible/Component/Action 接口），被测组件仍是生产 `AtSpiComponent`，
 //! 请求走真实 `dispatch`，坐标注入走真实输入降级链（记录型后端）。
 
-use std::time::Duration;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use acceptance::bus::{claim, A11yStatus, A11Y_BUS_SERVICE, A11Y_STATUS_PATH};
 use acceptance::{
     serve_application, serve_registry, Fixture, NodeSpec, PrivateBus, RecordedOp, RecordingInput,
     SetupBehaviour,
 };
+use agent_shell_a11y::{A11yOps, ElementNode, PointerInput};
+use agent_shell_core::error::Result as A11yResult;
 use agent_shell_core::types::DesktopEnvironment;
+use agent_shell_core::types::SemanticTarget;
 use agent_shell_rpc::{method, RpcErrorCode};
+use async_trait::async_trait;
 use serde_json::{json, Value};
 
 /// 单次调用必须在时限内返回（挂起即验收失败）。
@@ -49,6 +54,24 @@ const GHOST_PATH: &str = "/org/example/App/Window/Ghost";
 const APPLY_PATH: &str = "/org/example/App/Window/Apply";
 /// 有 Action 接口但 `DoAction` 返 false、且包围盒为空的按钮：文案按真实原因成句。
 const REFUSE_PATH: &str = "/org/example/App/Window/Refuse";
+
+/// 动作链路永不返回的组件：覆盖 `a11y.action` 的命令预算封顶。
+struct HangingA11y;
+
+#[async_trait]
+impl A11yOps for HangingA11y {
+    async fn locate(&self, _target: &SemanticTarget) -> A11yResult<Vec<ElementNode>> {
+        Ok(Vec::new())
+    }
+
+    async fn locate_by_path(&self, _bus: Option<&str>, _path: &str) -> A11yResult<ElementNode> {
+        std::future::pending::<A11yResult<ElementNode>>().await
+    }
+
+    async fn click(&self, _element: &ElementNode, _pointer: &dyn PointerInput) -> A11yResult<()> {
+        unreachable!("locate_by_path never returns")
+    }
+}
 
 /// 元素树：窗口下挂四个按钮，覆盖 C-074 / C-103 的分支。
 const TREE: &[NodeSpec] = &[
@@ -374,5 +397,33 @@ async fn a11y_click_falls_back_to_coordinates_and_separates_failure_causes() {
         denied_input.calls().is_empty(),
         "a channel that never became ready must not inject anything: {:?}",
         denied_input.calls()
+    );
+
+    // ── ⑦ 动作链路挂起：a11y.action 受命令预算封顶，不得让 CLI 先超时 ──
+    // 组件换成永不返回的定位实现；预算缩短（默认 4s < C-154 的 5s）以确定性
+    // 覆盖超时分支。同一 `dispatch` 入口、同一错误映射。
+    fixture.daemon_mut().a11y = Some(Arc::new(HangingA11y));
+    fixture.daemon_mut().a11y_action_budget = Duration::from_millis(50);
+    let started = Instant::now();
+    let hung = error_within(
+        &mut fixture,
+        method::A11Y_ACTION,
+        Some(json!({ "path": COPY_PATH, "bus": copy_bus })),
+    )
+    .await;
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "a11y.action must return within its budget instead of hanging: {:?}",
+        started.elapsed()
+    );
+    assert_eq!(
+        hung.code,
+        RpcErrorCode::BackendError as i32,
+        "action budget exhaustion must be an explicit backend error: {hung:?}"
+    );
+    assert!(
+        hung.message.contains("did not complete within") && hung.message.contains("AT-SPI"),
+        "timeout must name the action path: {}",
+        hung.message
     );
 }

@@ -101,6 +101,11 @@ impl InputComponentHandle {
         self.dispatcher.active_backend_name()
     }
 
+    /// 授权待确认、仍可恢复的首选候选名（doctor 行补充说明用）。
+    pub fn recovering_backend_name(&self) -> Option<&'static str> {
+        self.dispatcher.recovering_backend_name()
+    }
+
     /// 统一注入入口。
     pub fn dispatcher(&self) -> &InputDispatcher {
         &self.dispatcher
@@ -127,17 +132,25 @@ impl DesktopComponent for InputComponentHandle {
     }
 
     async fn health(&self) -> ComponentHealth {
-        match self.dispatcher.active_backend_name() {
-            Some(name) => match self.dispatcher.active_health().await {
-                ComponentHealth::Healthy => ComponentHealth::Healthy,
-                ComponentHealth::Degraded(reason) => {
-                    ComponentHealth::Degraded(format!("{name}: {reason}"))
-                }
-                ComponentHealth::Unavailable => ComponentHealth::Degraded(format!(
-                    "{name}: selected but unavailable (stale probe?)"
-                )),
-            },
-            None => ComponentHealth::Unavailable,
+        let Some(name) = self.dispatcher.active_backend_name() else {
+            return ComponentHealth::Unavailable;
+        };
+        let active = match self.dispatcher.active_health().await {
+            ComponentHealth::Healthy => ComponentHealth::Healthy,
+            ComponentHealth::Degraded(reason) => {
+                ComponentHealth::Degraded(format!("{name}: {reason}"))
+            }
+            ComponentHealth::Unavailable => ComponentHealth::Degraded(format!(
+                "{name}: selected but unavailable (stale probe?)"
+            )),
+        };
+        // 首选候选仍待授权确认：能力本身可用（经实际注入后端），但链路是
+        // 降级态——不能报成完全就绪，也不能说成不可用。
+        match (active, self.dispatcher.recovering_backend_name()) {
+            (ComponentHealth::Healthy, Some(recovering)) if recovering != name => {
+                ComponentHealth::Degraded(format!("{recovering} 待授权确认，当前经 {name} 注入"))
+            }
+            (active, _) => active,
         }
     }
 }

@@ -25,6 +25,12 @@ use async_trait::async_trait;
 pub const INPUT_TIMEOUT: Duration = Duration::from_secs(1);
 /// input 注入重试次数（§19；首次 + 重试共 3 次尝试由后端命令层实现）。
 pub const INPUT_RETRIES: u32 = 3;
+/// 单次输入操作（建立通道 + 注入）预算。
+///
+/// C-154 的单命令预算是 5s；portal 会话建立（含授权确认）必须留在该预算内，
+/// 否则命令行只会看到「daemon 无响应」。这里给 RPC 往返与 daemon 命令级预算
+/// 留出余量，`click --at` 的 move+click 由 daemon 再把整条命令封顶。
+pub const INPUT_OPERATION_BUDGET: Duration = Duration::from_millis(3500);
 
 /// 单个输入注入后端的统一接口。
 #[async_trait]
@@ -129,6 +135,9 @@ impl Op<'_> {
 pub enum SetupFailure {
     /// 本会话该后端不具备本次操作需要的能力（能力缺口）。
     CapabilityGap(String),
+    /// 通道建立仍在进行（等待用户确认 portal 授权）：本次命令已超预算，
+    /// 但候选并未失效——不重试、不摘除，下一条命令可再次尝试。
+    Pending(AgentShellError),
     /// 通道建立失败（权限/瞬态/结构性不可用）。
     Unavailable(AgentShellError),
 }
@@ -143,18 +152,34 @@ impl std::fmt::Display for SetupFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             SetupFailure::CapabilityGap(m) => write!(f, "{m}"),
+            SetupFailure::Pending(e) => write!(f, "{e}"),
             SetupFailure::Unavailable(e) => write!(f, "{e}"),
         }
     }
 }
 
+/// 分发器的选中状态。
+///
+/// `active` 是**实际注入/选中的后端**——成功回执、doctor 选中名称与持久化
+/// 状态都以它为准；`recovering` 是**授权待确认、仍可恢复的首选候选**，只影响
+/// 下一条命令先试谁。二者必须分开：授权待确认后由降级候选完成注入时，若只
+/// 推进一个游标，就会把「经 uinput 成功」标成「libei」，让健康报告与执行
+/// 路径对同一能力给出相反结论（C-024 / C-034① / C-055）。
+#[derive(Default)]
+struct ActiveState {
+    /// 实际注入或当前选中的后端下标。
+    active: Option<usize>,
+    /// 建立期返回 Pending 的候选：不摘除，下一条命令优先重试。
+    recovering: Option<usize>,
+}
+
 /// 带降级链的输入分发器（§12.2）。
 ///
-/// `active` 用 `Mutex` 包裹：操作期降级会在注入失败时推进 active，doctor
+/// 选中状态用 `Mutex` 包裹：操作期降级会在注入失败时推进 active，doctor
 /// 与后续调用观察到的是降级后的真实选中后端。
 pub struct InputDispatcher {
     backends: Vec<Box<dyn InputService>>,
-    active: std::sync::Mutex<Option<usize>>,
+    state: std::sync::Mutex<ActiveState>,
     /// active 状态持久化文件；`None` = 不持久化（测试装配）。
     state_path: Option<PathBuf>,
     /// 首选后端（libei）探测失败的可诊断根因——仅「portal 在场但缺
@@ -164,6 +189,8 @@ pub struct InputDispatcher {
     /// 降级后端（uinput 直写）探测失败原因（如 /dev/uinput 不可写）；与
     /// `probe_failure` 一并并入整链空链时的可诊断错误。
     fallback_failure: Option<String>,
+    /// 单次操作预算（建立通道 + 注入）；测试可缩短以确定性覆盖超时分支。
+    op_budget: Duration,
 }
 
 /// 状态文件名（D9 状态持久化：`$XDG_RUNTIME_DIR/agent-shell/input-active.json`）。
@@ -439,10 +466,14 @@ impl InputDispatcher {
         );
         Ok(Self {
             backends,
-            active: std::sync::Mutex::new(active),
+            state: std::sync::Mutex::new(ActiveState {
+                active,
+                recovering: None,
+            }),
             state_path,
             probe_failure,
             fallback_failure,
+            op_budget: INPUT_OPERATION_BUDGET,
         })
     }
 
@@ -460,16 +491,28 @@ impl InputDispatcher {
         }
         Self {
             backends,
-            active: std::sync::Mutex::new(active),
+            state: std::sync::Mutex::new(ActiveState {
+                active,
+                recovering: None,
+            }),
             state_path: None,
             probe_failure: None,
             fallback_failure: None,
+            op_budget: INPUT_OPERATION_BUDGET,
         }
     }
 
     /// 当前激活的后端名（doctor：Healthy/Degraded 标明实际选中后端）。
     pub fn active_backend_name(&self) -> Option<&'static str> {
         self.current_active().map(|i| self.backends[i].name())
+    }
+
+    /// 授权待确认、仍可恢复的首选候选名（None = 无待恢复候选）。
+    ///
+    /// 只影响下一条命令先试谁；回执与 doctor 的「选中」仍取
+    /// [`Self::active_backend_name`]。
+    pub fn recovering_backend_name(&self) -> Option<&'static str> {
+        self.current_recovering().map(|i| self.backends[i].name())
     }
 
     /// 候选后端名列表（诊断/测试用，按降级链顺序）。
@@ -517,7 +560,53 @@ impl InputDispatcher {
 
     /// 读当前 active 下标（无锁竞争时直接取）。
     fn current_active(&self) -> Option<usize> {
-        *self.active.lock().unwrap_or_else(|p| p.into_inner())
+        self.state.lock().unwrap_or_else(|p| p.into_inner()).active
+    }
+
+    /// 读待恢复候选下标。
+    fn current_recovering(&self) -> Option<usize> {
+        self.state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .recovering
+    }
+
+    /// 候选不再是「待确认」（能力缺口/通道失败/已成功建立）时清除标记。
+    fn clear_recovering(&self, i: usize) {
+        let mut g = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        if g.recovering == Some(i) {
+            g.recovering = None;
+        }
+    }
+
+    /// 记录本次真正完成注入的后端。
+    ///
+    /// 只有「首选候选因授权待确认而不可用、改由 `i` 完成注入」时才推进对外
+    /// 选中状态并持久化：此时 `i` 就是用户实际得到服务的那一个，回执、
+    /// doctor 与重启读回都必须指向它，而首选候选降为待恢复项。
+    ///
+    /// 能力缺口跳过的候选不在此列——它对其它操作仍然可用，继续作为选中后端
+    /// （C-034⑤：回退链每一跳保持同一语义）。
+    fn note_injection(&self, i: usize, pending_from: Option<usize>) {
+        let mut g = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        let recovering = g.recovering;
+        if let Some(preferred) = pending_from {
+            if preferred != i {
+                g.recovering = Some(preferred);
+            }
+        }
+        // 授权晚确认的首选候选自己完成了注入：切回它并清除待恢复标记。
+        if recovering == Some(i) {
+            g.recovering = None;
+        }
+        // 实际注入后端成为对外选中后端（回执/doctor/持久化一致）。
+        let switched = g.active != Some(i) && (pending_from.is_some() || recovering == Some(i));
+        if switched {
+            g.active = Some(i);
+            if let Some(path) = self.state_path.as_deref() {
+                persist_active(path, self.backends[i].name());
+            }
+        }
     }
 
     /// 把失败后端从 active 摘除，active 前进到下一候选（末尾则 None）。
@@ -526,12 +615,15 @@ impl InputDispatcher {
     /// 更靠前的后端，此时保持现状。持久化在锁内完成：并发 demote 串行化，
     /// 避免旧写入的 rename 后完成覆盖新状态（lost update）。
     fn demote(&self, failed: usize) {
-        let mut g = self.active.lock().unwrap_or_else(|p| p.into_inner());
-        if *g != Some(failed) {
+        let mut g = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        if g.recovering == Some(failed) {
+            g.recovering = None;
+        }
+        if g.active != Some(failed) {
             return;
         }
         let next = (failed + 1 < self.backends.len()).then_some(failed + 1);
-        *g = next;
+        g.active = next;
         // 锁内持久化新的 active 后端；demote 到链尾（None）时清除状态文件，
         // 避免瞬态 daemon 重启后复活已摘除后端。
         if let Some(path) = self.state_path.as_deref() {
@@ -547,9 +639,31 @@ impl InputDispatcher {
     /// 通道就绪后注入一次，注入期错误直接返回，不降级重放（避免已注入部分事件
     /// 后回落造成的重复键击/点击/文本）。
     async fn dispatch(&self, op: Op<'_>) -> Result<()> {
-        let mut idx = self.current_active();
+        match tokio::time::timeout(self.op_budget, self.dispatch_inner(op)).await {
+            Ok(result) => result,
+            Err(_) => {
+                let backend = self.active_backend_name().unwrap_or("none");
+                Err(AgentShellError::Timeout(format!(
+                    "input: {} did not complete within {}ms on backend {backend} \
+                     (channel setup or injection exceeded the command budget)",
+                    op.capability(),
+                    self.op_budget.as_millis()
+                )))
+            }
+        }
+    }
+
+    /// [`Self::dispatch`] 本体：超时封顶在外层，内层按同一预算约束 retry。
+    async fn dispatch_inner(&self, op: Op<'_>) -> Result<()> {
+        let deadline = tokio::time::Instant::now() + self.op_budget;
+        // 待恢复候选优先：上一条命令等授权超时后用户可能已经确认弹窗，本次
+        // 应先接续该会话；它仍未就绪时再按链顺序降级。
+        let mut idx = self.current_recovering().or_else(|| self.current_active());
         let mut last_err = None;
         let mut unsupported = 0usize;
+        // 本次操作里因授权待确认而让位的首选候选：后续候选完成注入时，它才是
+        // 「待恢复」的那一个。
+        let mut pending_from: Option<usize> = None;
         // 通道建立期才确认的能力缺口（后端名, 原因）：不摘除候选，仅供最终
         // 能力缺口错误归因——「哪个候选为什么做不了这个操作」。
         let mut gaps: Vec<(&'static str, String)> = Vec::new();
@@ -566,7 +680,7 @@ impl InputDispatcher {
                 continue;
             }
             // 通道建立/能力校验失败发生在任何注入之前——可安全降级重放。
-            match self.ensure_ready_retrying(i, op).await {
+            match self.ensure_ready_retrying(i, op, deadline).await {
                 Ok(()) => {}
                 // 建立期确认的能力缺口：与 `supports` 声明的缺口同类处理——
                 // 只跳过本次操作，候选留在链上供其它操作使用。
@@ -576,7 +690,21 @@ impl InputDispatcher {
                         reason = %reason,
                         "input: backend confirmed capability gap at setup; trying next candidate"
                     );
+                    self.clear_recovering(i);
                     gaps.push((self.backends[i].name(), reason));
+                    idx = self.next_index(i);
+                    continue;
+                }
+                // 授权确认仍在等待：本次命令超预算，但不摘除候选——用户可能
+                // 随后确认弹窗，下一条命令应再次尝试该后端。
+                Err(SetupFailure::Pending(e)) => {
+                    tracing::warn!(
+                        backend = self.backends[i].name(),
+                        error = %e,
+                        "input: backend setup pending; keeping candidate"
+                    );
+                    pending_from.get_or_insert(i);
+                    last_err = Some(e);
                     idx = self.next_index(i);
                     continue;
                 }
@@ -597,13 +725,19 @@ impl InputDispatcher {
                 }
             }
             // 通道就绪：注入一次。注入期错误不再降级重放。
-            return match op {
+            let result = match op {
                 Op::Key(c) => backend.send_key(c).await,
                 Op::Text(t, d) => backend.type_text(t, d).await,
                 Op::Move(x, y) => backend.mouse_move(x, y).await,
                 Op::Click(b) => backend.mouse_click(b).await,
                 Op::Scroll(dx, dy) => backend.mouse_scroll(dx, dy).await,
             };
+            // 成功注入后才记录：授权待确认而让位的首选候选降为待恢复项，
+            // 实际注入后端成为对外选中后端（回执/doctor/持久化一致）。
+            if result.is_ok() {
+                self.note_injection(i, pending_from);
+            }
+            return result;
         }
         // 建立失败（通道级）优先透出原错误类型（Permission 等语义不丢）；
         // 只有「无候选可服务该操作」才是能力缺口错误。
@@ -619,18 +753,40 @@ impl InputDispatcher {
     /// 会话延迟建立」这类可恢复故障被永久摘除。授权类失败（`Permission`，含
     /// portal 弹窗未确认）与能力缺口都不重试——前者重试只会重复弹窗，后者重试
     /// 结论不变。
-    async fn ensure_ready_retrying(&self, i: usize, op: Op<'_>) -> Result<(), SetupFailure> {
+    async fn ensure_ready_retrying(
+        &self,
+        i: usize,
+        op: Op<'_>,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), SetupFailure> {
         let backend = self.backends[i].as_ref();
         let mut attempt = 0u32;
         loop {
-            match backend.ensure_ready(op).await {
+            let outcome = match tokio::time::timeout_at(deadline, backend.ensure_ready(op)).await {
+                Ok(outcome) => outcome,
+                Err(_) => {
+                    return Err(SetupFailure::Unavailable(AgentShellError::Timeout(
+                        format!(
+                            "input: backend {} did not establish its channel within {}ms",
+                            backend.name(),
+                            self.op_budget.as_millis()
+                        ),
+                    )))
+                }
+            };
+            match outcome {
                 Ok(()) => return Ok(()),
                 Err(SetupFailure::CapabilityGap(reason)) => {
                     return Err(SetupFailure::CapabilityGap(reason))
                 }
+                Err(SetupFailure::Pending(e)) => return Err(SetupFailure::Pending(e)),
                 Err(SetupFailure::Unavailable(e)) => {
                     attempt += 1;
                     if attempt >= INPUT_RETRIES || !is_transient_setup_failure(&e) {
+                        return Err(SetupFailure::Unavailable(e));
+                    }
+                    let backoff = Duration::from_millis(100 * u64::from(attempt));
+                    if tokio::time::Instant::now() + backoff >= deadline {
                         return Err(SetupFailure::Unavailable(e));
                     }
                     tracing::debug!(
@@ -639,7 +795,7 @@ impl InputDispatcher {
                         error = %e,
                         "input: transient setup failure; retrying"
                     );
-                    tokio::time::sleep(Duration::from_millis(100 * u64::from(attempt))).await;
+                    tokio::time::sleep(backoff).await;
                 }
             }
         }
@@ -724,10 +880,11 @@ impl InputDispatcher {
     pub(crate) fn test_empty(probe_failure: Option<String>) -> Self {
         InputDispatcher {
             backends: Vec::new(),
-            active: std::sync::Mutex::new(None),
+            state: std::sync::Mutex::new(ActiveState::default()),
             state_path: None,
             probe_failure,
             fallback_failure: None,
+            op_budget: INPUT_OPERATION_BUDGET,
         }
     }
 }
@@ -867,10 +1024,14 @@ mod tests {
         // 通过模块内私有字段构造——同 crate 测试可见。
         InputDispatcher {
             backends,
-            active: std::sync::Mutex::new(active),
+            state: std::sync::Mutex::new(ActiveState {
+                active,
+                recovering: None,
+            }),
             state_path: None,
             probe_failure: None,
             fallback_failure: None,
+            op_budget: INPUT_OPERATION_BUDGET,
         }
     }
 
@@ -900,10 +1061,11 @@ mod tests {
         // 两个原因（验收标准 2：/dev/uinput 不可用可诊断）。
         let d = InputDispatcher {
             backends: Vec::new(),
-            active: std::sync::Mutex::new(None),
+            state: std::sync::Mutex::new(ActiveState::default()),
             state_path: None,
             probe_failure: Some("portal backend does not support EIS".into()),
             fallback_failure: Some("/dev/uinput not writable: Permission denied".into()),
+            op_budget: INPUT_OPERATION_BUDGET,
         };
         let err = d.empty_chain_error(DesktopEnvironment::DDE).to_string();
         assert!(err.contains("portal backend does not support EIS"), "{err}");
@@ -1261,6 +1423,212 @@ mod tests {
         assert_eq!(d.active_backend_name(), Some("ok"));
     }
 
+    /// 永不返回的通道建立（复刻 portal 弹窗无人应答）：必须由操作预算截断。
+    struct HangingSetupBackend;
+
+    #[async_trait]
+    impl InputService for HangingSetupBackend {
+        fn name(&self) -> &'static str {
+            "hanging"
+        }
+        async fn is_available(&self) -> bool {
+            true
+        }
+        async fn ensure_ready(&self, _op: Op<'_>) -> Result<(), SetupFailure> {
+            std::future::pending::<Result<(), SetupFailure>>().await
+        }
+        async fn send_key(&self, _combo: &KeyCombo) -> Result<()> {
+            unreachable!("setup never completes")
+        }
+        async fn type_text(&self, _text: &str, _delay_ms: u32) -> Result<()> {
+            unreachable!("setup never completes")
+        }
+        async fn mouse_move(&self, _x: i32, _y: i32) -> Result<()> {
+            unreachable!("setup never completes")
+        }
+        async fn mouse_click(&self, _button: MouseButton) -> Result<()> {
+            unreachable!("setup never completes")
+        }
+        async fn mouse_scroll(&self, _dx: i32, _dy: i32) -> Result<()> {
+            unreachable!("setup never completes")
+        }
+    }
+
+    /// 授权等待中的通道建立（弹窗发出但用户尚未确认）。
+    struct PendingSetupBackend {
+        attempts: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl InputService for PendingSetupBackend {
+        fn name(&self) -> &'static str {
+            "pending"
+        }
+        async fn is_available(&self) -> bool {
+            true
+        }
+        async fn ensure_ready(&self, _op: Op<'_>) -> Result<(), SetupFailure> {
+            self.attempts.fetch_add(1, Ordering::SeqCst);
+            Err(SetupFailure::Pending(AgentShellError::Permission(
+                "portal RemoteDesktop Start 授权未确认".into(),
+            )))
+        }
+        async fn send_key(&self, _combo: &KeyCombo) -> Result<()> {
+            Ok(())
+        }
+        async fn type_text(&self, _text: &str, _delay_ms: u32) -> Result<()> {
+            Ok(())
+        }
+        async fn mouse_move(&self, _x: i32, _y: i32) -> Result<()> {
+            Ok(())
+        }
+        async fn mouse_click(&self, _button: MouseButton) -> Result<()> {
+            Ok(())
+        }
+        async fn mouse_scroll(&self, _dx: i32, _dy: i32) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn hanging_setup_is_cut_by_operation_budget() {
+        // C-154：单次调用不得把超时预算放大——建立过程不返回时，操作必须在
+        // 自己的预算内给出显式超时错误，而不是让 CLI 等到自身 5s 预算耗尽。
+        let mut d = dispatch_with(vec![Box::new(HangingSetupBackend)], Some(0));
+        d.op_budget = Duration::from_millis(50);
+        let started = std::time::Instant::now();
+        let err = d.send_key(&combo(true)).await.unwrap_err();
+        assert!(
+            matches!(&err, AgentShellError::Timeout(m) if m.contains("50ms")),
+            "got: {err:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "operation budget must cut the hanging setup: {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_setup_falls_through_and_reports_actual_backend() {
+        // 授权尚未确认与授权被拒是两种事实：Pending 不得摘除候选，但由后续
+        // 候选完成注入时，实际注入后端必须如实对外（回执/doctor/持久化）。
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let pending = PendingSetupBackend {
+            attempts: Arc::clone(&attempts),
+        };
+        let ok = FakeBackend::new("ok", 0);
+        let d = dispatch_with(vec![Box::new(pending), Box::new(ok)], Some(0));
+        d.send_key(&combo(true))
+            .await
+            .expect("falls through to a ready candidate");
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            d.active_backend_name(),
+            Some("ok"),
+            "the backend that actually injected must be reported"
+        );
+        assert_eq!(
+            d.recovering_backend_name(),
+            Some("pending"),
+            "the preferred candidate must stay recoverable"
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_fallback_persists_the_actual_backend() {
+        // C-055：降级后持久化的必须是真实注入后端；重启后的健康报告才不会
+        // 把「经 uinput 成功」读成 libei。
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state_path = dir.path().join("input-active.json");
+        let pending = PendingSetupBackend {
+            attempts: Arc::new(AtomicUsize::new(0)),
+        };
+        let ok = FakeBackend::new("ok", 0);
+        let mut d = dispatch_with(vec![Box::new(pending), Box::new(ok)], Some(0));
+        d.state_path = Some(state_path.clone());
+        d.send_key(&combo(true)).await.expect("falls through");
+        let persisted: PersistedActive =
+            serde_json::from_str(&std::fs::read_to_string(&state_path).expect("state file"))
+                .expect("persisted state");
+        assert_eq!(persisted.active, "ok");
+    }
+
+    /// 首次建立返回 Pending、之后返回就绪的候选（复刻用户晚些确认授权）。
+    struct RecoveringBackend {
+        pending_calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl InputService for RecoveringBackend {
+        fn name(&self) -> &'static str {
+            "libei"
+        }
+        async fn is_available(&self) -> bool {
+            true
+        }
+        async fn ensure_ready(&self, _op: Op<'_>) -> Result<(), SetupFailure> {
+            if self.pending_calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                return Err(SetupFailure::Pending(AgentShellError::Permission(
+                    "fixture authorization pending".into(),
+                )));
+            }
+            Ok(())
+        }
+        async fn send_key(&self, _combo: &KeyCombo) -> Result<()> {
+            Ok(())
+        }
+        async fn type_text(&self, _text: &str, _delay_ms: u32) -> Result<()> {
+            Ok(())
+        }
+        async fn mouse_move(&self, _x: i32, _y: i32) -> Result<()> {
+            Ok(())
+        }
+        async fn mouse_click(&self, _button: MouseButton) -> Result<()> {
+            Ok(())
+        }
+        async fn mouse_scroll(&self, _dx: i32, _dy: i32) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn late_authorization_restores_the_preferred_candidate() {
+        // 第一条命令等授权超时、经 uinput 成功；用户确认后第二条命令应回到
+        // libei，并把选中状态与恢复标记一起更新。
+        let recovering = RecoveringBackend {
+            pending_calls: Arc::new(AtomicUsize::new(0)),
+        };
+        let fallback = FakeBackend::new("uinput", 0);
+        let d = dispatch_with(vec![Box::new(recovering), Box::new(fallback)], Some(0));
+        d.send_key(&combo(true))
+            .await
+            .expect("first command falls back");
+        assert_eq!(d.active_backend_name(), Some("uinput"));
+        assert_eq!(d.recovering_backend_name(), Some("libei"));
+
+        d.send_key(&combo(true))
+            .await
+            .expect("second command resumes libei");
+        assert_eq!(d.active_backend_name(), Some("libei"));
+        assert_eq!(d.recovering_backend_name(), None);
+    }
+
+    #[tokio::test]
+    async fn pending_only_chain_returns_permission_and_keeps_candidate() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let pending = PendingSetupBackend {
+            attempts: Arc::clone(&attempts),
+        };
+        let d = dispatch_with(vec![Box::new(pending)], Some(0));
+        let err = d.send_key(&combo(true)).await.unwrap_err();
+        assert!(
+            matches!(err, AgentShellError::Permission(ref m) if m.contains("授权未确认")),
+            "got: {err:?}"
+        );
+        assert_eq!(d.active_backend_name(), Some("pending"));
+    }
+
     #[test]
     fn kwin_wayland_excludes_x11_injection_candidates() {
         // KWin Wayland 忽略 XWayland XTEST 注入（实测零效果且 rc=0）——
@@ -1279,6 +1647,10 @@ mod tests {
         // §19：input 注入超时 1s、重试 3 次。
         assert_eq!(INPUT_TIMEOUT, Duration::from_secs(1));
         assert_eq!(INPUT_RETRIES, 3);
+        assert!(
+            INPUT_OPERATION_BUDGET < agent_shell_core::fallback::DEFAULT_COMMAND_TIMEOUT,
+            "operation budget must stay below the C-154 command budget"
+        );
     }
 
     #[tokio::test]
@@ -1289,10 +1661,14 @@ mod tests {
         let ok = FakeBackend::new("ok", 0);
         let d = InputDispatcher {
             backends: vec![Box::new(failing), Box::new(ok)],
-            active: std::sync::Mutex::new(Some(0)),
+            state: std::sync::Mutex::new(ActiveState {
+                active: Some(0),
+                recovering: None,
+            }),
             state_path: Some(state_path.clone()),
             probe_failure: None,
             fallback_failure: None,
+            op_budget: INPUT_OPERATION_BUDGET,
         };
         d.send_key(&combo(true)).await.expect("falls back");
         assert_eq!(d.active_backend_name(), Some("ok"));
@@ -1342,10 +1718,14 @@ mod tests {
         let failing = SetupFailingBackend; // 唯一后端：demote 后链尾 → None
         let d = InputDispatcher {
             backends: vec![Box::new(failing)],
-            active: std::sync::Mutex::new(Some(0)),
+            state: std::sync::Mutex::new(ActiveState {
+                active: Some(0),
+                recovering: None,
+            }),
             state_path: Some(state_path.clone()),
             probe_failure: None,
             fallback_failure: None,
+            op_budget: INPUT_OPERATION_BUDGET,
         };
         let err = d.send_key(&combo(true)).await.unwrap_err();
         assert!(matches!(err, AgentShellError::BackendUnavailable(_)));
@@ -1372,10 +1752,16 @@ mod tests {
     /// 测试辅助：对已构造的 dispatcher 重新执行「选第一个可用」逻辑，
     /// 使 FakeBackend 的探测计数语义生效。
     async fn reselect(mut d: InputDispatcher) -> InputDispatcher {
-        *d.active.get_mut().expect("owned dispatcher uncontended") = None;
+        d.state
+            .get_mut()
+            .expect("owned dispatcher uncontended")
+            .active = None;
         for (i, b) in d.backends.iter().enumerate() {
             if b.is_available().await {
-                *d.active.get_mut().expect("owned dispatcher uncontended") = Some(i);
+                d.state
+                    .get_mut()
+                    .expect("owned dispatcher uncontended")
+                    .active = Some(i);
                 break;
             }
         }

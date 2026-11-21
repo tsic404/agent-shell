@@ -39,6 +39,7 @@ agent-shell-systemd.workspace = true
 async-trait.workspace = true
 futures.workspace = true
 libc.workspace = true
+reis = { version = "0.7", default-features = false }
 serde_json.workspace = true
 tempfile = "3"
 tokio.workspace = true
@@ -195,6 +196,14 @@ path = "TC-input-05.rs"
 [[test]]
 name = "TC-input-06"
 path = "TC-input-06.rs"
+
+[[test]]
+name = "TC-input-07"
+path = "TC-input-07.rs"
+
+[[test]]
+name = "TC-input-08"
+path = "TC-input-08.rs"
 
 [[test]]
 name = "TC-capture-01"

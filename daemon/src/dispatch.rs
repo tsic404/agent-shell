@@ -4,9 +4,9 @@
 //! 异步收集（合成器 doctor_lines + a11y 探测），CLI 只做渲染。
 
 use crate::state::Daemon;
-use agent_shell_core::component::SystemComponent;
+use agent_shell_core::component::{ComponentHealth, DesktopComponent, SystemComponent};
 use agent_shell_core::error::AgentShellError;
-use agent_shell_core::security::{Operation, PermissionDecision, PermissionLevel};
+use agent_shell_core::security::{Operation, PermissionDecision, PermissionLevel, SecurityManager};
 use agent_shell_core::types::{
     SemanticTarget, TitleMatchMode, TitleMatcher, WindowInfo, WorkspaceInfo,
 };
@@ -28,44 +28,10 @@ pub async fn dispatch(daemon: &mut Daemon, req: &Request) -> Response {
     // 额外权限边界。故 grant/revoke 提权原语以 `"*"` 为管理面边界：仅本地
     // 调用方（未注入 agent id 的 CLI/MCP）可授权/撤销；具名 agent 必须经
     // `"*"`。未知方法返回 None 交下方 match 报 MethodNotFound。
-    let management = security_operation_for(&req.method);
-    if management {
-        if let Some(reason) = check_management_permission(&daemon.caller_id) {
-            // 管理面 caller 门禁拒绝与普通权限拒绝同审计语义：deny 必须落痕
-            //（越权尝试此前零记录）。
-            if daemon.security.config.security.audit_log {
-                daemon
-                    .security
-                    .audit
-                    .log(&daemon.caller_id, &req.method, "deny", false);
-            }
-            return Response::err(req.id, RpcErrorCode::Denied, reason);
-        }
-    }
-    let gated_op = operation_for(&req.method, &req.params);
-    if let Some(op) = gated_op {
-        let caller = daemon.caller_id.clone();
-        match daemon.security.check_permission(&caller, &op) {
-            PermissionDecision::Allow => {}
-            PermissionDecision::Deny(reason) => {
-                return Response::err(req.id, RpcErrorCode::Denied, reason);
-            }
-            PermissionDecision::Confirm(mode) => {
-                // 未实现占位没有可授权的执行路径：确认语义不成立。「需确认」
-                // 会被读成「确认后可用」，而该操作连后端都没有——回执未实现
-                // 状态。占位接线后从 [`placeholder_service`] 摘除，本分支自然
-                // 回到 ConfirmationRequired。
-                if let Some(service) = placeholder_service(&req.method) {
-                    return Response::ok(req.id, not_implemented_payload(service));
-                }
-                return Response::err(
-                    req.id,
-                    RpcErrorCode::ConfirmationRequired,
-                    format!("{op} ({mode})"),
-                );
-            }
-        }
-    }
+    let gated_op = match gate(&daemon.security, &daemon.caller_id, req) {
+        Ok(op) => op,
+        Err(refusal) => return *refusal,
+    };
     let result = match req.method.as_str() {
         method::DOCTOR => doctor(daemon).await,
         method::INFO => info(daemon).await,
@@ -85,6 +51,7 @@ pub async fn dispatch(daemon: &mut Daemon, req: &Request) -> Response {
         method::EVENTS_REPLAY => events_replay(daemon, req).await,
         // ── daemon 管理（§22.2）──
         method::DAEMON_STATUS => daemon_status(daemon).await,
+        method::DAEMON_PING => Ok(daemon_ping_payload()),
         method::DAEMON_SESSIONS => daemon_sessions(daemon).await,
         // ── IME（§22.8 D7）──
         method::IME_ENGINE_LIST => ime_engine_list(daemon).await,
@@ -173,6 +140,7 @@ fn operation_levels() -> &'static [(&'static str, PermissionLevel)] {
         (method::EVENTS_UNSUBSCRIBE, L0),
         (method::EVENTS_REPLAY, L0),
         (method::DAEMON_STATUS, L0),
+        (method::DAEMON_PING, L0),
         (method::DAEMON_SESSIONS, L0),
         (method::IME_ENGINE_LIST, L0),
         (method::IME_ENGINE_SET, L1),
@@ -224,6 +192,70 @@ fn operation_levels() -> &'static [(&'static str, PermissionLevel)] {
         (method::SYSCTL_SET, L3),
     ];
     OPS
+}
+
+/// 每个远程方法入口的统一权限 gate（C-104 / C-105）：判定、错误形状与占位
+/// 回执只有这一份实现。
+///
+/// `Ok(Some(op))` = 放行且该方法受门禁覆盖，执行后须经
+/// [`SecurityManager::record_execution`] 追加执行结果；`Ok(None)` = 放行且
+/// 无登记操作；`Err(response)` = 已短路（管理面拒绝 / deny / 需确认 / 占位回执）。
+pub(crate) fn gate(
+    security: &SecurityManager,
+    caller_id: &str,
+    req: &Request,
+) -> Result<Option<Operation>, Box<Response>> {
+    if security_operation_for(&req.method) {
+        if let Some(reason) = check_management_permission(caller_id) {
+            // 管理面 caller 门禁拒绝与普通权限拒绝同审计语义：deny 必须落痕
+            //（越权尝试此前零记录）。
+            if security.read_config().security.audit_log {
+                security.audit.log(caller_id, &req.method, "deny", false);
+            }
+            return Err(Box::new(Response::err(
+                req.id,
+                RpcErrorCode::Denied,
+                reason,
+            )));
+        }
+    }
+    let Some(op) = operation_for(&req.method, &req.params) else {
+        return Ok(None);
+    };
+    match security.check_permission(caller_id, &op) {
+        PermissionDecision::Allow => Ok(Some(op)),
+        PermissionDecision::Deny(reason) => Err(Box::new(Response::err(
+            req.id,
+            RpcErrorCode::Denied,
+            reason,
+        ))),
+        PermissionDecision::Confirm(mode) => {
+            // 未实现占位没有可授权的执行路径：确认语义不成立。「需确认」
+            // 会被读成「确认后可用」，而该操作连后端都没有——回执未实现
+            // 状态。占位接线后从 [`placeholder_service`] 摘除，本分支自然
+            // 回到 ConfirmationRequired。
+            if let Some(service) = placeholder_service(&req.method) {
+                return Err(Box::new(Response::ok(
+                    req.id,
+                    not_implemented_payload(service),
+                )));
+            }
+            Err(Box::new(Response::err(
+                req.id,
+                RpcErrorCode::ConfirmationRequired,
+                format!("{op} ({mode})"),
+            )))
+        }
+    }
+}
+
+/// `daemon.ping` 的结果载荷：入口探测与完整分派读同一份定义，避免两条
+/// 应答路径的字段漂移。
+pub(crate) fn daemon_ping_payload() -> Value {
+    json!({
+        "service": "agent-shell-daemon",
+        "pid": std::process::id(),
+    })
 }
 
 /// `windows.op` 按 `params.op` 细分的操作名与级别（close=L2，其余写操作=L1）。
@@ -325,7 +357,7 @@ async fn doctor(d: &mut Daemon) -> RpcResult {
     // 4. capture 组件（三级降级链状态，§13）。
     lines.push(agent_shell_capture::doctor_line(d.capture.as_ref()).await);
     // 5. input 组件（libei → ydotool → uinput → XTest 降级链，§12）。
-    lines.push(input_doctor_line(d));
+    lines.push(input_doctor_line(d).await);
     // 6. GNOME 47+ 合成器唯一通道是 Shell Extension：缺安装机制即窗口
     //    语义整体缺失。仅 GNOME 会话渲染该行，缺失/未启用时给出可执行提示
     //    （其它 DE 无此扩展，不输出噪声）。
@@ -343,7 +375,11 @@ async fn doctor(d: &mut Daemon) -> RpcResult {
 ///
 /// 失败行携带 `Daemon::input_error` 装配短摘要（如 portal 缺 ConnectToEIS），
 /// 与 `input_send` 路径同源；无摘要时才回落通用「TTY 或无注入后端」。
-fn input_doctor_line(d: &Daemon) -> String {
+///
+/// 有装配结果时行前缀取组件健康而不是「有 active 即就绪」：libei 是惰性建
+/// 会话（portal RemoteDesktop 授权前 session 不存在），此时命令路径尚不可用，
+/// 就绪前缀会让健康报告与实际能力相反（AC-110 / C-034①）。
+async fn input_doctor_line(d: &Daemon) -> String {
     const LABEL: &str = "输入后端";
     match d.input.as_ref() {
         None => {
@@ -358,7 +394,23 @@ fn input_doctor_line(d: &Daemon) -> String {
             let name = handle
                 .backend_name()
                 .expect("detect guarantees an active backend");
-            format!("✓ {LABEL:<12}: {chain}（选中 {name}）")
+            match handle.health().await {
+                // 首选候选待授权、实际经降级候选注入：这是降级态，不是就绪，
+                // 也不是不可用——行内同时给出真实选中后端与待恢复候选。
+                ComponentHealth::Healthy => match handle.recovering_backend_name() {
+                    Some(recovering) if recovering != name => {
+                        format!("⚠ {LABEL:<12}: {chain}（选中 {name}；{recovering} 待授权确认）")
+                    }
+                    _ => format!("✓ {LABEL:<12}: {chain}（选中 {name}）"),
+                },
+                // 降级不是不可用（懒会话可建立），但绝不能再报就绪。
+                ComponentHealth::Degraded(reason) => {
+                    format!("⚠ {LABEL:<12}: {chain}（选中 {name}；{reason}）")
+                }
+                ComponentHealth::Unavailable => {
+                    format!("✗ {LABEL:<12}: {chain}（选中 {name}，但健康探测不可用）")
+                }
+            }
         }
     }
 }
@@ -711,7 +763,26 @@ async fn input_send(d: &mut Daemon, req: &Request) -> RpcResult {
             .unwrap_or("input unavailable in this session");
         (RpcErrorCode::BackendUnavailable, msg.to_string())
     })?;
-    crate::input::execute(input.dispatcher(), op).await?;
+    // C-154：整条命令（含 click --at 的 move+click）必须在默认调用预算内回包。
+    // 输入链的通道建立可能等 portal 授权弹窗；超过预算时给出可归因错误，而不是
+    // 让 CLI 先等到自己的 5s 超时、把原因折叠成「daemon 无响应」。
+    let budget = d.input_budget;
+    match tokio::time::timeout(budget, crate::input::execute(input.dispatcher(), op)).await {
+        Ok(result) => result?,
+        Err(_) => {
+            let backend = input.backend_name().unwrap_or("none");
+            return Err((
+                RpcErrorCode::BackendError,
+                format!(
+                    "input.send did not complete within {}ms on backend {backend}: the input \
+                     channel is still being established (portal RemoteDesktop/EIS authorization) \
+                     or the backend is not responding; run `agent-shell doctor` for the current \
+                     backend state",
+                    budget.as_millis()
+                ),
+            ));
+        }
+    }
     // 回传实际注入后端（降级链可能已在本调用内推进 active）：CLI 据此打印
     // "injected via …"，用户可分辨原生协议注入与降到 X11/uinput 的兜底注入。
     let backend = input.backend_name().unwrap_or("unknown");
@@ -875,12 +946,32 @@ async fn a11y_action(d: &Daemon, req: &Request) -> RpcResult {
             ))
         }
     };
+    // C-154：整条动作（定位遍历 + 主动作/坐标降级的输入链）必须在命令预算内
+    // 回包。AT-SPI 单次调用与输入链各自有固定超时，但没有整体上限时仍可能被
+    // 逐次放大到 CLI 的 5s 之外。
+    let budget = d.a11y_action_budget;
+    match tokio::time::timeout(budget, a11y_action_inner(d, bus.as_deref(), &path)).await {
+        Ok(result) => result,
+        Err(_) => Err((
+            RpcErrorCode::BackendError,
+            format!(
+                "a11y.action did not complete within {}ms: AT-SPI traversal, the element action, \
+                 or the coordinate fallback input channel is not responding; run `agent-shell \
+                 doctor` for the current backend state",
+                budget.as_millis()
+            ),
+        )),
+    }
+}
+
+/// [`a11y_action`] 本体的定位→动作链（超时封顶在外层）。
+async fn a11y_action_inner(d: &Daemon, bus: Option<&str>, path: &str) -> RpcResult {
     let component = d.a11y.as_ref().ok_or((
         RpcErrorCode::BackendUnavailable,
         "AT-SPI unavailable".to_string(),
     ))?;
     let node = component
-        .locate_by_path(bus.as_deref(), &path)
+        .locate_by_path(bus, path)
         .await
         .map_err(|e| match e {
             AgentShellError::WindowNotFound(msg) => (RpcErrorCode::NotFound, msg),
@@ -905,29 +996,32 @@ async fn a11y_action(d: &Daemon, req: &Request) -> RpcResult {
 /// 可选 `operation`：按操作名请求判定，结果放在 `check` 字段。判定走
 /// [`SecurityManager::decide`]（纯函数，不写审计）——查询本身无副作用。
 async fn security_status(d: &mut Daemon, req: &Request) -> RpcResult {
-    let cfg = &d.security.config;
-    let allow: serde_json::Map<_, _> = cfg
-        .permissions
-        .allow
-        .iter()
-        .map(|(agent, levels)| {
-            (
-                agent.clone(),
-                serde_json::Value::Array(
-                    levels
-                        .iter()
-                        .map(|l| serde_json::Value::from(l.as_str()))
-                        .collect(),
-                ),
-            )
+    // 策略快照读取只持这一把读锁，且不跨任何 await：判定查询一次构完。
+    let mut status = {
+        let cfg = d.security.read_config();
+        let allow: serde_json::Map<_, _> = cfg
+            .permissions
+            .allow
+            .iter()
+            .map(|(agent, levels)| {
+                (
+                    agent.clone(),
+                    serde_json::Value::Array(
+                        levels
+                            .iter()
+                            .map(|l| serde_json::Value::from(l.as_str()))
+                            .collect(),
+                    ),
+                )
+            })
+            .collect();
+        json!({
+            "default_confirm_level": cfg.security.default_confirm_level.as_str(),
+            "allow": allow,
+            "deny": cfg.permissions.deny,
+            "audit_path": d.security.audit.path(),
         })
-        .collect();
-    let mut status = json!({
-        "default_confirm_level": cfg.security.default_confirm_level.as_str(),
-        "allow": allow,
-        "deny": cfg.permissions.deny,
-        "audit_path": d.security.audit.path(),
-    });
+    };
     // 显式 null 与键缺失同义：MCP 投射层把「未提供」物化为 null，两者都返回策略真值。
     if let Some(raw) = req
         .params
@@ -1960,12 +2054,12 @@ mod tests {
 
         let _ = dispatch(&mut d, &req(method::EVENTS_UNSUBSCRIBE, None)).await;
 
-        let sandbox = std::fs::read_to_string(d.sandbox().audit_path()).unwrap_or_default();
+        let sandbox = d.sandbox().audit_text();
         assert!(
             sandbox.contains(PROBE_CALLER),
             "沙箱内应有本次判定的审计记录：{sandbox:?}"
         );
-        let host = std::fs::read_to_string(&host_audit).unwrap_or_default();
+        let host = crate::test_support::audit_text_at(&host_audit);
         assert!(
             !host.contains(PROBE_CALLER),
             "单测不得向宿主状态目录写审计记录：{}",
@@ -2575,7 +2669,7 @@ mod tests {
         d.input = None;
         d.input_error =
             Some("portal backend does not support EIS: RemoteDesktop.ConnectToEIS missing".into());
-        let line = input_doctor_line(&d);
+        let line = input_doctor_line(&d).await;
         assert!(line.starts_with("✗ 输入后端"), "got: {line}");
         assert!(line.contains("ConnectToEIS missing"), "got: {line}");
     }
@@ -2587,7 +2681,7 @@ mod tests {
         let mut d = test_daemon().await;
         d.input = None;
         d.input_error = None;
-        let line = input_doctor_line(&d);
+        let line = input_doctor_line(&d).await;
         assert!(line.contains("不可用（TTY 或无注入后端）"), "got: {line}");
     }
 
@@ -2612,11 +2706,7 @@ mod tests {
         // 触发 BackendUnavailable，不依赖宿主是否可达 portal/X11 后端。
         let mut d = test_daemon().await;
         // 隔离 ambient config：独立审计路径 + 默认权限（`"*"` 自动放行 L2）。
-        let audit_path = std::env::temp_dir().join(format!(
-            "agent-shell-dispatch-tsi2659-{}.jsonl",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_file(&audit_path);
+        let audit_path = d.sandbox().state_dir().join("audit-screenshot.jsonl");
         let mut cfg = AgentShellConfig::default();
         cfg.security.audit_log_path = Some(audit_path.to_string_lossy().into_owned());
         d.security = SecurityManager::with_config(cfg);
@@ -2644,7 +2734,6 @@ mod tests {
             allow_entries.iter().all(|e| !e.result),
             "backend-unavailable allow must have result=false: {entries:?}"
         );
-        let _ = std::fs::remove_file(&audit_path);
     }
 
     #[tokio::test]
@@ -2652,11 +2741,7 @@ mod tests {
         // `security.audit` 新增 `result` 过滤键——同一 allow 操作
         // 现在双记录（门禁 false + 执行结果），按执行态区分只读已执行/未执行。
         let mut d = test_daemon().await;
-        let audit_path = std::env::temp_dir().join(format!(
-            "agent-shell-dispatch-audit-result-{}.jsonl",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_file(&audit_path);
+        let audit_path = d.sandbox().state_dir().join("audit-result.jsonl");
         let mut cfg = AgentShellConfig::default();
         cfg.security.audit_log_path = Some(audit_path.to_string_lossy().into_owned());
         d.security = SecurityManager::with_config(cfg);
@@ -2690,7 +2775,6 @@ mod tests {
             "gate allow(false) + deny(false) both match result=false: {entries:?}"
         );
         assert!(entries.iter().all(|e| e["result"].as_bool() == Some(false)));
-        let _ = std::fs::remove_file(&audit_path);
     }
 
     #[tokio::test]
@@ -2744,7 +2828,7 @@ mod tests {
 
         // 黑名单优先于级别判定 → deny。
         d.security
-            .config
+            .write_config()
             .permissions
             .deny
             .insert("screenshot.*".into(), true);
@@ -2793,8 +2877,24 @@ mod tests {
         .expect_err("non-string operation");
         assert_eq!(err.0, RpcErrorCode::InvalidParams);
 
-        // 纯查询不产生审计记录。
-        let audit = std::fs::read_to_string(d.sandbox().audit_path()).unwrap_or_default();
+        // 纯查询不产生审计记录：查询前后条数不变，且不含被查操作名。
+        let before = d.security.audit.read_all().len();
+        let _ = security_status(
+            &mut d,
+            &req(
+                method::SECURITY_STATUS,
+                Some(json!({"operation": "windows.list"})),
+            ),
+        )
+        .await
+        .expect("status check");
+        let entries = d.security.audit.read_all();
+        assert_eq!(
+            entries.len(),
+            before,
+            "status check must not append audit entries"
+        );
+        let audit = serde_json::to_string(&entries).unwrap_or_default();
         assert!(
             !audit.contains("windows.list") && !audit.contains("mount.mount"),
             "status check must not write audit entries: {audit}"
@@ -3038,7 +3138,7 @@ mod tests {
         // L0 时必须确认——证明 A11Y_ACTION 已注册进 OPS 门禁表（阻塞项 2）。
         let mut d = test_daemon().await;
         d.security
-            .config
+            .write_config()
             .permissions
             .allow
             .insert("*".into(), vec![PermissionLevel::L0]);
@@ -3291,7 +3391,7 @@ mod tests {
     async fn deny_short_circuits_before_handler() {
         let mut d = test_daemon().await;
         d.security
-            .config
+            .write_config()
             .permissions
             .deny
             .insert("input.send".into(), true);
@@ -3331,7 +3431,7 @@ mod tests {
         d.rootd_connect = offline_rootd_connector();
         d.caller_id = "trusted".into();
         d.security
-            .config
+            .write_config()
             .permissions
             .allow
             .insert("trusted".into(), vec![PermissionLevel::L4]);
@@ -3360,7 +3460,7 @@ mod tests {
         d.rootd_connect = offline_rootd_connector();
         d.caller_id = "trusted".into();
         d.security
-            .config
+            .write_config()
             .permissions
             .allow
             .insert("trusted".into(), vec![PermissionLevel::L4]);
@@ -3397,7 +3497,7 @@ mod tests {
         let mut d = test_daemon().await;
         d.caller_id = "trusted".into();
         d.security
-            .config
+            .write_config()
             .permissions
             .allow
             .insert("trusted".into(), vec![PermissionLevel::L4]);
@@ -3417,7 +3517,7 @@ mod tests {
         let mut d = test_daemon().await;
         d.caller_id = "trusted".into();
         d.security
-            .config
+            .write_config()
             .permissions
             .allow
             .insert("trusted".into(), vec![PermissionLevel::L4]);
@@ -3441,7 +3541,7 @@ mod tests {
         let mut d = test_daemon().await;
         d.caller_id = "trusted".into();
         d.security
-            .config
+            .write_config()
             .permissions
             .allow
             .insert("trusted".into(), vec![PermissionLevel::L4]);
@@ -3466,7 +3566,7 @@ mod tests {
         // 不会触发确认，故该断言同时证明截图不再是 L0 只读映射）。
         let mut d = test_daemon().await;
         d.security
-            .config
+            .write_config()
             .permissions
             .allow
             .insert("*".into(), vec![PermissionLevel::L1]);
@@ -3483,7 +3583,7 @@ mod tests {
         // 仍返回确认态，证明 windows.restore 与 minimize 同级受管。
         let mut d = test_daemon().await;
         d.security
-            .config
+            .write_config()
             .permissions
             .allow
             .insert("*".into(), vec![PermissionLevel::L0]);
@@ -3516,20 +3616,21 @@ mod tests {
         .await;
         let err = resp.error.expect("error");
         assert_eq!(err.code, RpcErrorCode::Denied as i32);
-        assert!(!d.security.config.permissions.allow.contains_key("agent-x"));
+        assert!(!d
+            .security
+            .read_config()
+            .permissions
+            .allow
+            .contains_key("agent-x"));
     }
 
     #[tokio::test]
     async fn management_deny_is_audited() {
         // 具名 caller 越权调用 security.grant/revoke 被拒后，
-        // audit.jsonl 必须至少 1 行 deny（此前管理面拒绝完全无痕）。
+        // 审计必须至少 1 行 deny（此前管理面拒绝完全无痕）。
         let mut d = test_daemon().await;
         d.caller_id = "agent-x".into();
-        let audit_path = std::env::temp_dir().join(format!(
-            "agent-shell-dispatch-audit-{}.jsonl",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_file(&audit_path);
+        let audit_path = d.sandbox().state_dir().join("audit-management.jsonl");
         let mut cfg = AgentShellConfig::default();
         cfg.security.audit_log_path = Some(audit_path.to_string_lossy().into_owned());
         d.security = SecurityManager::with_config(cfg);
@@ -3546,9 +3647,8 @@ mod tests {
             );
         }
         let denies = d.security.audit.query("", "", "deny", None);
-        assert!(!denies.is_empty(), "audit.jsonl must record deny entries");
+        assert!(!denies.is_empty(), "audit must record deny entries");
         assert!(denies.iter().all(|e| e.agent_id == "agent-x" && !e.result));
-        let _ = std::fs::remove_file(&audit_path);
     }
 
     #[tokio::test]
@@ -3619,7 +3719,7 @@ mod tests {
         let mut d = test_daemon().await;
         d.caller_id = "trusted".into();
         d.security
-            .config
+            .write_config()
             .permissions
             .allow
             .insert("trusted".into(), vec![PermissionLevel::L4]);
@@ -3641,7 +3741,7 @@ mod tests {
         let mut d = test_daemon().await;
         d.caller_id = "trusted".into();
         d.security
-            .config
+            .write_config()
             .permissions
             .allow
             .insert("trusted".into(), vec![PermissionLevel::L4]);
@@ -3660,7 +3760,7 @@ mod tests {
         d.rootd_connect = offline_rootd_connector();
         d.caller_id = "trusted".into();
         d.security
-            .config
+            .write_config()
             .permissions
             .allow
             .insert("trusted".into(), vec![PermissionLevel::L4]);
@@ -3683,7 +3783,7 @@ mod tests {
         let mut d = test_daemon().await;
         d.caller_id = "trusted".into();
         d.security
-            .config
+            .write_config()
             .permissions
             .allow
             .insert("trusted".into(), vec![PermissionLevel::L4]);
@@ -3744,7 +3844,7 @@ mod tests {
         let mut d = test_daemon().await;
         d.caller_id = "trusted".into();
         d.security
-            .config
+            .write_config()
             .permissions
             .allow
             .insert("trusted".into(), vec![PermissionLevel::L4]);
@@ -3771,7 +3871,7 @@ mod tests {
         d.rootd_connect = offline_rootd_connector();
         d.caller_id = "trusted".into();
         d.security
-            .config
+            .write_config()
             .permissions
             .allow
             .insert("trusted".into(), vec![PermissionLevel::L4]);
@@ -3883,7 +3983,7 @@ mod tests {
         let mut d = test_daemon().await;
         d.caller_id = "trusted".into();
         d.security
-            .config
+            .write_config()
             .permissions
             .allow
             .insert("trusted".into(), vec![PermissionLevel::L4]);
@@ -3909,7 +4009,7 @@ mod tests {
         d.rootd_connect = offline_rootd_connector();
         d.caller_id = "trusted".into();
         d.security
-            .config
+            .write_config()
             .permissions
             .allow
             .insert("trusted".into(), vec![PermissionLevel::L4]);
