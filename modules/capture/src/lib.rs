@@ -28,6 +28,8 @@ use std::future::Future;
 
 pub use cache::CaptureCache;
 #[cfg(feature = "portal-screencast")]
+pub use portal_screencast::SCREENCAST_CLEANUP_BUDGET;
+#[cfg(feature = "portal-screencast")]
 pub use portal_screencast::{PersistMode, ScreenCastCapture, ScreenCastOptions, ScreenCastSession};
 pub use portal_screenshot::{ScreenshotPortal, SCREENSHOT_MAX_ATTEMPTS, SCREENSHOT_TIMEOUT};
 pub use types::{CaptureTarget, Frame, PixelFormat};
@@ -47,13 +49,30 @@ pub trait TokenStore: Send + Sync {
 /// 组件名（doctor 报告用）。
 pub const COMPONENT_NAME: &str = "capture";
 
-/// portal 段预算：ScreenCast 弹窗等待 + Screenshot 调用/响应整体封顶 3s。
+/// portal 段预算：静默 Screenshot + ScreenCast + 交互 Screenshot 整体封顶 3s。
 ///
 /// C-154 的单条命令默认预算是 5s；portal 必须留出进程启动、RPC 往返与
 /// x11 兜底的余量。KDE 的截图授权弹窗会让 `Screenshot` 方法调用本身无限
 /// 阻塞（不是只等 `Response` 信号），因此预算必须覆盖方法调用，而不能只
-/// 包住信号等待。
+/// 包住信号等待。段内第一级另有明显更短的
+/// [`PORTAL_SILENT_PROBE_BUDGET`]，避免第一级吃满整段、后续级永远轮不到。
 pub const PORTAL_PROBE_BUDGET: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// 第一级静默 portal Screenshot 的探测预算。
+///
+/// KDE 首次截图会在 `Screenshot` 调用上弹授权窗并阻塞方法返回；若这一级
+/// 与 [`PORTAL_PROBE_BUDGET`] 等长，它一超时就把整段预算耗尽，交互截图与
+/// X11 兜底都不会被发起。取段预算的三分之一，超时后仍留下两秒执行后续级。
+pub const PORTAL_SILENT_PROBE_BUDGET: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// ScreenCast 降级级的固定子预算：会话建立与取帧均受它约束。
+///
+/// 默认特性下这一级排在交互 Screenshot 之前；若沿用 `SCREENCAST_TIMEOUT`
+/// 的 10s，它会先吃满 portal 段，交互 Screenshot 永远轮不到。固定为 1s，
+/// 严格小于第一级超时后的剩余段预算（2s），保证超时后仍有预算发起交互截图。
+/// 其中末尾 `SCREENCAST_CLEANUP_BUDGET` 专门用于取消 Request 与关闭
+/// Session，清理不会挤占后续交互截图的时间。
+pub const PORTAL_SCREENCAST_PROBE_BUDGET: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// 端到端捕获截止：portal 段 + x11 兜底整体封顶 4s，低于 C-154 的 5s
 /// 命令预算，给进程启动与 RPC 往返留 1s。
@@ -301,7 +320,9 @@ impl CaptureDispatcher {
     ) -> Result<CapturedFrame> {
         let portal = capture_with_budget(
             PORTAL_PROBE_BUDGET,
-            self.capture_portal(target, interactive, require_pixels),
+            // portal 段的异步状态机随功能组合增长；装箱后不进入调用方的
+            // 栈上 future，避免小栈线程在构造阶段溢栈。
+            Box::pin(self.capture_portal(target, interactive, require_pixels)),
         )
         .await;
         match portal {
@@ -345,25 +366,46 @@ impl CaptureDispatcher {
         // L2: portal ScreenCast（流式，daemon 复用会话）。feature 关闭时编译期排除。
         #[cfg(feature = "portal-screencast")]
         {
-            if let Some(s) = self.ensure_screencast_session(_target, interactive).await {
-                match s.capture_frame().await {
-                    Ok(frame) => {
+            let started = tokio::time::Instant::now();
+            // 从子预算中先扣除固定清理时间：Start 超时后必须在预算内取消
+            // Request、关闭已创建的 Session，然后才轮到交互 Screenshot。
+            let work_budget =
+                PORTAL_SCREENCAST_PROBE_BUDGET.saturating_sub(SCREENCAST_CLEANUP_BUDGET);
+            let work_deadline = started + work_budget;
+            if let Some(session) = self
+                .ensure_screencast_session(_target, interactive, work_deadline)
+                .await
+            {
+                let frame_budget =
+                    work_deadline.saturating_duration_since(tokio::time::Instant::now());
+                let frame = tokio::time::timeout(frame_budget, session.capture_frame()).await;
+                match frame {
+                    Ok(Ok(frame)) => {
                         self.set_active(Some(ActiveBackend::ScreenCast));
                         return Ok(CapturedFrame::Pixels(frame));
                     }
-                    Err(e) => {
-                        tracing::warn!("screencast frame failed, degrade: {e}");
-                        // 会话失效即丢弃，下次重新走五步流程。
-                        *self.session.lock().await = None;
-                        self.set_active(None);
+                    Ok(Err(e)) => tracing::warn!("screencast frame failed, degrade: {e}"),
+                    Err(_) => {
+                        tracing::warn!(
+                            "screencast did not produce a frame within {}s; closing the session and \
+                             degrading",
+                            PORTAL_SCREENCAST_PROBE_BUDGET.as_secs()
+                        );
                     }
                 }
+                // 会话未产出可用帧：显式关闭与 worker 退出共享同一个清理
+                // 截止，Drop 不再二次计时，避免挤占交互截图预算。
+                let cleanup_deadline = tokio::time::Instant::now() + SCREENCAST_CLEANUP_BUDGET;
+                session.shutdown_until(cleanup_deadline).await;
+                *self.session.lock().await = None;
+                self.set_active(None);
             }
         }
 
         // L3: 交互 portal Screenshot（弹授权窗；`interactive=false` 时无免弹窗
         // 选项，不发起，避免静默路径反过来弹窗）。
         if interactive {
+            tracing::debug!("silent portal Screenshot unavailable; trying interactive Screenshot");
             match self.screenshot.capture(true).await {
                 Ok(path) => {
                     // 校验产物确为可解码的非黑 PNG：DDE 的 xdg-desktop-portal-dde
@@ -372,10 +414,10 @@ impl CaptureDispatcher {
                     // 触发 x11 兜底，daemon 按 PNG 解析报「not a PNG file」。
                     // 非 PNG / 损坏 / 全黑一律视为 portal 不可用，降级 x11
                     // （原生 X11 会话）或快速失败（Wayland / 无 x11）。
-                    match validated_screenshot_frame(path) {
-                        Some(p) => {
+                    match portal_screenshot_result(path, require_pixels) {
+                        Some(frame) => {
                             self.set_active(Some(ActiveBackend::ScreenshotPortal));
-                            return Ok(CapturedFrame::Png(p));
+                            return Ok(frame);
                         }
                         None => {
                             tracing::warn!(
@@ -405,11 +447,10 @@ impl CaptureDispatcher {
     /// KWin 落盘 JPEG）、损坏、全黑一律判不可用并清理临时文件；解码失败
     /// （合法 PNG 但布局异常）同样清理并返回 `None`，由调用方继续降级链。
     async fn screenshot_silent(&self, require_pixels: bool) -> Option<CapturedFrame> {
-        if !self.screenshot.available().await {
-            return None;
-        }
         let path =
-            match tokio::time::timeout(PORTAL_PROBE_BUDGET, self.screenshot.capture(false)).await {
+            match tokio::time::timeout(PORTAL_SILENT_PROBE_BUDGET, self.screenshot.capture(false))
+                .await
+            {
                 Ok(Ok(p)) => p,
                 Ok(Err(e)) => {
                     tracing::debug!("silent portal Screenshot unavailable: {e}");
@@ -418,26 +459,12 @@ impl CaptureDispatcher {
                 Err(_) => {
                     tracing::warn!(
                         "silent portal Screenshot exceeded {}s; treating portal as unavailable",
-                        PORTAL_PROBE_BUDGET.as_secs()
+                        PORTAL_SILENT_PROBE_BUDGET.as_secs()
                     );
                     return None;
                 }
             };
-        let path = validated_screenshot_frame(path)?;
-        if !require_pixels {
-            return Some(CapturedFrame::Png(path));
-        }
-        match decode_png_frame(&path) {
-            Ok(frame) => {
-                let _ = std::fs::remove_file(&path);
-                Some(CapturedFrame::Pixels(frame))
-            }
-            Err(e) => {
-                tracing::warn!("portal Screenshot PNG decode failed ({e}); degrading");
-                let _ = std::fs::remove_file(&path);
-                None
-            }
-        }
+        portal_screenshot_result(path, require_pixels)
     }
 
     /// X11 原生兜底（portal 不可用/超时/拒绝后）。
@@ -476,10 +503,15 @@ impl CaptureDispatcher {
     /// `interactive=false` 且无 `restore_token` 时直接返回 `None`（portal 无
     /// 免弹窗选项，建立会话会弹授权窗）；有 token 则尝试静默恢复。建立失败
     /// （token 过期 / portal 不可用）返回 `None`，由调用方降级。
+    ///
+    /// `deadline` 覆盖建立流程的全部等待（含会话槽位与订阅注册）；失败时
+    /// `start_with_deadline` 会在内置清理预算内取消 Request 并关闭已创建的
+    /// Session，再返回错误。
     async fn ensure_screencast_session(
         &self,
         target: CaptureTarget,
         interactive: bool,
+        deadline: tokio::time::Instant,
     ) -> Option<std::sync::Arc<ScreenCastCapture>> {
         if !self.screencast_ok {
             return None;
@@ -492,10 +524,19 @@ impl CaptureDispatcher {
         if !(interactive || has_token) {
             return None;
         }
-        let mut guard = self.session.lock().await;
+        let slot_budget = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let mut guard = match tokio::time::timeout(slot_budget, self.session.lock()).await {
+            Ok(guard) => guard,
+            Err(_) => {
+                tracing::debug!("ScreenCast session slot unavailable within the deadline");
+                return None;
+            }
+        };
         if guard.is_none() {
             let opts = self.build_screencast_options();
-            match ScreenCastCapture::start_with_options(self.conn.clone(), target, &opts).await {
+            match ScreenCastCapture::start_with_deadline(self.conn.clone(), target, &opts, deadline)
+                .await
+            {
                 Ok(session) => {
                     // Start 返回新 restore_token 时持久化（覆盖旧值，
                     // token 单次有效）。persist_mode 未授权则无 token。
@@ -564,21 +605,33 @@ impl CaptureDispatcher {
         // L2: ScreenCast 静默恢复（无 token 会弹窗，跳过）。feature 关闭时编译期排除。
         #[cfg(feature = "portal-screencast")]
         {
-            if let Some(s) = self
-                .ensure_screencast_session(CaptureTarget::Monitor, false)
+            let started = tokio::time::Instant::now();
+            let work_budget =
+                PORTAL_SCREENCAST_PROBE_BUDGET.saturating_sub(SCREENCAST_CLEANUP_BUDGET);
+            let work_deadline = started + work_budget;
+            if let Some(session) = self
+                .ensure_screencast_session(CaptureTarget::Monitor, false, work_deadline)
                 .await
             {
-                match s.capture_frame().await {
-                    Ok(_) => {
+                let frame_budget =
+                    work_deadline.saturating_duration_since(tokio::time::Instant::now());
+                match tokio::time::timeout(frame_budget, session.capture_frame()).await {
+                    Ok(Ok(_)) => {
                         self.set_active(Some(ActiveBackend::ScreenCast));
                         return Some(ActiveBackend::ScreenCast);
                     }
-                    Err(e) => {
+                    Ok(Err(e)) => {
                         tracing::debug!("screencast frame probe failed: {e}");
-                        *self.session.lock().await = None;
-                        self.set_active(None);
                     }
+                    Err(_) => tracing::debug!(
+                        "screencast probe frame timed out after {}ms",
+                        frame_budget.as_millis()
+                    ),
                 }
+                let cleanup_deadline = tokio::time::Instant::now() + SCREENCAST_CLEANUP_BUDGET;
+                session.shutdown_until(cleanup_deadline).await;
+                *self.session.lock().await = None;
+                self.set_active(None);
             }
         }
 
@@ -621,7 +674,8 @@ impl CaptureDispatcher {
     pub async fn shutdown(&self) {
         #[cfg(feature = "portal-screencast")]
         if let Some(s) = self.session.lock().await.take() {
-            let _ = s.close_session().await;
+            let deadline = tokio::time::Instant::now() + SCREENCAST_CLEANUP_BUDGET;
+            s.shutdown_until(deadline).await;
         }
     }
 }
@@ -950,6 +1004,32 @@ fn validated_screenshot_frame(path: std::path::PathBuf) -> Option<std::path::Pat
     }
 }
 
+/// 把 portal Screenshot 落盘产物转为捕获结果。
+///
+/// 两条成功路径（静默与交互）共用：`require_pixels` 时解码为像素帧并删除
+/// 门户落盘文件；否则直接返回 PNG 路径。非 PNG / 损坏 / 全黑或解码失败
+/// 一律返回 `None` 并清理门户文件，由调用方继续降级链。
+fn portal_screenshot_result(
+    path: std::path::PathBuf,
+    require_pixels: bool,
+) -> Option<CapturedFrame> {
+    let path = validated_screenshot_frame(path)?;
+    if !require_pixels {
+        return Some(CapturedFrame::Png(path));
+    }
+    match decode_png_frame(&path) {
+        Ok(frame) => {
+            let _ = std::fs::remove_file(&path);
+            Some(CapturedFrame::Pixels(frame))
+        }
+        Err(e) => {
+            tracing::warn!("portal Screenshot PNG decode failed ({e}); degrading");
+            let _ = std::fs::remove_file(&path);
+            None
+        }
+    }
+}
+
 /// 目标帧缓冲字节数（`width × 4 × height`，RGBA 展开后）。
 ///
 /// 溢出（伪造 IHDR 声明 u32::MAX 级宽高）或超 [`PNG_DECODE_MAX_BYTES`] 一律
@@ -1199,6 +1279,41 @@ mod tests {
         assert!(
             matches!(slow, Err(AgentShellError::Timeout(_))),
             "slow future must be aborted into Timeout: {slow:?}"
+        );
+    }
+
+    /// 第一级静默截图的预算必须明显小于包裹它的 portal 段预算：否则首次
+    /// 截图在 KDE 授权弹窗上耗满整段，交互截图与 X11 兜底永远轮不到。
+    #[test]
+    fn silent_probe_leaves_room_for_interactive_and_x11_fallback() {
+        assert_eq!(
+            PORTAL_SILENT_PROBE_BUDGET,
+            std::time::Duration::from_secs(1)
+        );
+        assert!(
+            PORTAL_SILENT_PROBE_BUDGET * 2 <= PORTAL_PROBE_BUDGET,
+            "the silent probe must leave at least two thirds of the portal segment"
+        );
+        assert_eq!(
+            PORTAL_SCREENCAST_PROBE_BUDGET,
+            std::time::Duration::from_secs(1)
+        );
+        assert!(
+            PORTAL_SILENT_PROBE_BUDGET + PORTAL_SCREENCAST_PROBE_BUDGET < PORTAL_PROBE_BUDGET,
+            "ScreenCast must time out before the portal segment, leaving budget for interactive capture"
+        );
+        #[cfg(feature = "portal-screencast")]
+        assert!(
+            SCREENCAST_CLEANUP_BUDGET < PORTAL_SCREENCAST_PROBE_BUDGET,
+            "session cleanup must fit inside the ScreenCast probe budget"
+        );
+        assert!(
+            PORTAL_PROBE_BUDGET < CAPTURE_END_TO_END_BUDGET,
+            "the portal segment must leave room for the x11 fallback"
+        );
+        assert!(
+            CAPTURE_END_TO_END_BUDGET < std::time::Duration::from_secs(5),
+            "end-to-end deadline must stay under the 5s command budget"
         );
     }
 

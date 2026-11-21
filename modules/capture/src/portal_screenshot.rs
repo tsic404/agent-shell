@@ -9,11 +9,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use agent_shell_core::error::{dbus_error, AgentShellError, Result};
+use ordered_stream::OrderedStreamExt as _;
 use zbus::zvariant::{self, ObjectPath};
 
 use crate::portal_common::{
-    drain_response_with_timeout, portal_proxy, prepare_response_stream, sender_part, string_field,
-    uri_to_path, wait_for_response, PORTAL_RETRY_BACKOFF, PORTAL_SERVICE,
+    close_portal_request, drain_response_with_timeout, portal_proxy, prepare_response_stream,
+    sender_part, string_field, uri_to_path, wait_for_response, PORTAL_RETRY_BACKOFF,
+    PORTAL_SERVICE,
 };
 
 /// screenshot 通道默认超时（非交互 doctor/probe 路径）。
@@ -26,6 +28,15 @@ pub const SCREENSHOT_TIMEOUT: Duration = Duration::from_secs(3);
 pub const SCREENSHOT_TIMEOUT_INTERACTIVE: Duration = Duration::from_secs(3);
 /// screenshot 通道最大尝试次数（§19.3；含首次，共 2 次尝试）。
 pub const SCREENSHOT_MAX_ATTEMPTS: u32 = 2;
+
+/// 被放弃的 Screenshot Request 的收尾窗口。
+///
+/// 静默探测在 1s 预算到期时丢弃整个 `capture()` future，portal 仍可能在此后
+/// 1–3 秒写出 PNG。守卫在这个窗口内等晚到的 `Response` 取 URI 并删源图；
+/// 它在独立任务里计时，不延长任何一级预算。
+const ABANDONED_REQUEST_GRACE: Duration = Duration::from_secs(3);
+/// 收尾任务里 `Request.Close` 的单次上限；与分级预算不叠加。
+const ABANDONED_REQUEST_CLOSE_BUDGET: Duration = Duration::from_millis(200);
 
 /// 交互与否对应的 Screenshot 超时（§13.1 全链预算 / §19.3）。
 pub fn screenshot_timeout(interactive: bool) -> Duration {
@@ -59,6 +70,123 @@ fn screenshot_token(pid: u32, seq: u64) -> String {
 fn next_token(counter: &AtomicU64, pid: u32) -> String {
     let n = counter.fetch_add(1, Ordering::SeqCst);
     screenshot_token(pid, n)
+}
+
+/// 单个 Screenshot Request 的生命周期守卫。
+///
+/// `capture()` 被外层探测预算整体丢弃时，本地 future 里的信号订阅与 Request
+/// 句柄一起消失；portal 未必随之中止，晚到的 `Response` 里仍带源图 URI。
+/// 守卫持有预订阅的流，在 Drop 时派生一个有界收尾任务：先发
+/// `org.freedesktop.portal.Request.Close`，再等晚到的成功 `Response`，
+/// 取到 URI 即删除源图。晚到的图只用于清理，不会回流成本次捕获结果。
+///
+/// 成功返回（调用方接管产物）或明确拒绝（无产物）时 [`Self::disarm`]；
+/// 重试与超时路径保持武装，每次尝试各自收尾。
+struct ScreenshotRequestGuard {
+    conn: zbus::Connection,
+    request_path: ObjectPath<'static>,
+    stream: Option<zbus::MessageStream>,
+    armed: bool,
+}
+
+impl ScreenshotRequestGuard {
+    fn new(
+        conn: zbus::Connection,
+        request_path: ObjectPath<'static>,
+        stream: zbus::MessageStream,
+    ) -> Self {
+        Self {
+            conn,
+            request_path,
+            stream: Some(stream),
+            armed: true,
+        }
+    }
+
+    fn stream_mut(&mut self) -> Option<&mut zbus::MessageStream> {
+        self.stream.as_mut()
+    }
+
+    /// 后端未按 handle_token 返回路径：改收尾目标为实际路径。
+    ///
+    /// 该路径在调用返回后才可知，预订阅流对不上任何 Response；收尾退化为
+    /// 有界 `Request.Close`。非常规后端才会走到这里。
+    fn retarget(&mut self, path: &str) {
+        match ObjectPath::try_from(path.to_owned()) {
+            Ok(path) => self.request_path = path,
+            Err(e) => tracing::warn!("Screenshot cleanup path {path}: {e}"),
+        }
+        self.stream = None;
+    }
+
+    /// 调用方已接管产物或确认无产物：不再收尾。
+    fn disarm(&mut self) {
+        self.armed = false;
+        self.stream = None;
+    }
+}
+
+impl Drop for ScreenshotRequestGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            tracing::debug!("no tokio runtime for portal Screenshot cleanup; skipping");
+            return;
+        };
+        let conn = self.conn.clone();
+        let request_path = self.request_path.clone();
+        let stream = self.stream.take();
+        handle.spawn(async move {
+            let _ = tokio::time::timeout(
+                ABANDONED_REQUEST_CLOSE_BUDGET,
+                close_portal_request(&conn, request_path.as_str()),
+            )
+            .await;
+            let Some(mut stream) = stream else {
+                return;
+            };
+            // Close 的等待期间流仍在缓冲：先 Close 再消费不会丢已到达的信号。
+            let deadline = tokio::time::Instant::now() + ABANDONED_REQUEST_GRACE;
+            loop {
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                if remaining.is_zero() {
+                    break;
+                }
+                let msg = match tokio::time::timeout(remaining, stream.next()).await {
+                    Ok(Some(Ok(msg))) => msg,
+                    Ok(Some(Err(e))) => {
+                        tracing::debug!("late portal Screenshot Response read failed: {e}");
+                        break;
+                    }
+                    Ok(None) | Err(_) => break,
+                };
+                let body = msg.body();
+                let parsed: std::result::Result<
+                    (u32, std::collections::HashMap<String, zvariant::OwnedValue>),
+                    _,
+                > = body.deserialize();
+                let Ok((code, results)) = parsed else {
+                    continue;
+                };
+                // Response 是请求终态：只可能有一条。
+                if code == 0 {
+                    if let Some(path) = string_field(&results, "uri").and_then(uri_to_path) {
+                        if let Err(e) = std::fs::remove_file(&path) {
+                            if e.kind() != std::io::ErrorKind::NotFound {
+                                tracing::warn!(
+                                    "late portal Screenshot cleanup failed {}: {e}",
+                                    path.display()
+                                );
+                            }
+                        }
+                    }
+                }
+                break;
+            }
+        });
+    }
 }
 
 /// portal Screenshot 组件：单帧 PNG 落盘路径获取。
@@ -131,7 +259,7 @@ impl ScreenshotPortal {
             // 先订阅再发请求（避免竞态）。流建立失败（瞬时 AddMatch 竞态）按
             // 可重试 attempt 失败处理，而非 `?` 整体中断——与下方 proxy.call
             // 瞬态分支同口径，保留 §19.3 的第二次尝试。
-            let mut stream = match prepare_response_stream(&self.conn, &request_path).await {
+            let stream = match prepare_response_stream(&self.conn, &request_path).await {
                 Ok(s) => s,
                 Err(e) => {
                     tracing::warn!(
@@ -145,6 +273,11 @@ impl ScreenshotPortal {
                     continue;
                 }
             };
+            // 从这里起 Request 已可能被 portal 接受：守卫持有预订阅流，任何
+            // 非成功/非拒绝的离开路径都由它在 Drop 里收尾（含外层 1s 预算
+            // 直接丢弃本 future 的情况）。
+            let mut request =
+                ScreenshotRequestGuard::new(self.conn.clone(), request_path.clone(), stream);
 
             let mut options = std::collections::HashMap::<&str, zvariant::Value>::new();
             options.insert("handle_token", zvariant::Value::from(token.as_str()));
@@ -189,18 +322,26 @@ impl ScreenshotPortal {
             // portal 若未按 handle_token 规范返回预算路径（非常规实现），回退
             // 到调用后订阅的旧路径——该路径有竞态，但仅非常规后端才会触发。
             let result = if returned.as_str() == request_path.as_str() {
-                drain_response_with_timeout(&mut stream, timeout, "Screenshot").await
+                match request.stream_mut() {
+                    Some(stream) => {
+                        drain_response_with_timeout(stream, timeout, "Screenshot").await
+                    }
+                    None => wait_for_response(&self.conn, &request_path, timeout).await,
+                }
             } else {
                 tracing::warn!(
                     "Screenshot path mismatch: expected {}, got {}",
                     request_path,
                     returned
                 );
+                request.retarget(returned.as_str());
                 wait_for_response(&self.conn, &returned, timeout).await
             };
 
             match result {
                 Ok((_, results)) => {
+                    // Response 是请求终态：不会再晚到第二条。
+                    request.disarm();
                     let uri = string_field(&results, "uri").ok_or_else(|| {
                         AgentShellError::Capture("portal Screenshot: no uri in response".into())
                     })?;
@@ -209,7 +350,11 @@ impl ScreenshotPortal {
                     });
                 }
                 // 用户拒绝/取消不重试——语义明确，重试只会再次弹窗。
-                Err(e @ AgentShellError::Permission(_)) => return Err(e),
+                Err(e @ AgentShellError::Permission(_)) => {
+                    // 明确拒绝/取消不产出文件，无需晚响应收尾。
+                    request.disarm();
+                    return Err(e);
+                }
                 Err(e) => {
                     tracing::warn!(attempt, "portal Screenshot attempt failed: {e}");
                     last_err = Some(e);
