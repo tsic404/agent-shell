@@ -11,7 +11,7 @@
 use std::path::Path;
 
 use acceptance::portal::serve_screenshot_portal;
-use acceptance::{sample_png, Fixture, PrivateBus, ScreenshotMock};
+use acceptance::{sample_png, Fixture, PortalBehaviour, PrivateBus, ScreenshotMock};
 use agent_shell_rpc::{method, RpcErrorCode};
 use serde_json::json;
 
@@ -30,6 +30,13 @@ fn area_params(output: &Path, area: [i32; 4]) -> serde_json::Value {
         "area": area,
         "output_path": output.display().to_string(),
     })
+}
+
+fn file_count(dir: &Path) -> usize {
+    std::fs::read_dir(dir)
+        .expect("read dir")
+        .filter_map(Result::ok)
+        .count()
 }
 
 /// 断言 PPM(P6) 的头部与逐像素内容。
@@ -125,4 +132,29 @@ async fn area_capture_crops_exact_region_and_rejects_invalid_area() {
         .await;
     assert_eq!(error.code, RpcErrorCode::InvalidParams as i32);
     assert_eq!(mock.calls(), calls_before);
+
+    // 静默 Screenshot 卡住超过探针预算、交互 Screenshot 随后成功：区域路径
+    // 必须消费交互 PNG 的像素并清理门户产物，而不是报「未解码为像素」。
+    mock.set_behaviour(PortalBehaviour::Hang);
+    mock.set_interactive_behaviour(PortalBehaviour::Success);
+    assert_eq!(
+        file_count(portal_dir.path()),
+        0,
+        "previous successful portal sources must already be cleaned up"
+    );
+    let interactive = out_dir.path().join("interactive-area.ppm");
+    let result = fixture
+        .call_ok(
+            method::SCREENSHOT_CAPTURE,
+            Some(area_params(&interactive, [1, 1, 2, 2])),
+        )
+        .await;
+    assert_eq!(result.get("width"), Some(&json!(2)));
+    assert_eq!(result.get("height"), Some(&json!(2)));
+    assert_ppm(&interactive, 2, 2, &[(1, 1), (2, 1), (1, 2), (2, 2)]);
+    assert_eq!(
+        file_count(portal_dir.path()),
+        0,
+        "interactive portal source must be removed after decoding"
+    );
 }
