@@ -61,6 +61,19 @@ pub struct ScreenCastOptions {
 /// ScreenCast 通道默认超时（§19.3）。
 pub const SCREENCAST_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// ScreenCast 子预算内为释放 portal 资源预留的固定清理时间。
+///
+/// 取消未完成的 `org.freedesktop.portal.Request` 与关闭已创建的
+/// `org.freedesktop.portal.Session` 各占一半。调用方须从 ScreenCast
+/// 探测预算中扣除它，保证超时清理不挤占后续交互截图。
+pub const SCREENCAST_CLEANUP_BUDGET: Duration = Duration::from_millis(200);
+
+/// 清理预算中等待 PipeWire worker 退出的上限。
+const SCREENCAST_WORKER_SHUTDOWN_BUDGET: Duration = Duration::from_millis(100);
+
+/// 清理预算中用于 Request.Close / Session.Close 的总额。
+const SCREENCAST_PORTAL_CLOSE_BUDGET: Duration = Duration::from_millis(100);
+
 /// 通过 ScreenCast portal 建立 PipeWire 流并持续取帧。
 ///
 /// 内部线程运行 PipeWire main loop；`capture_frame` 从共享槽位
@@ -68,8 +81,17 @@ pub const SCREENCAST_TIMEOUT: Duration = Duration::from_secs(10);
 pub struct ScreenCastCapture {
     conn: zbus::Connection,
     session_path: ObjectPath<'static>,
+    /// 是否已成功显式关闭 portal 会话；Drop 据此决定是否补发 Close。
+    closed: std::sync::atomic::AtomicBool,
     /// 关闭信号：Drop 时通知内部线程退出 main loop 并释放资源。
     shutdown: std::sync::mpsc::Sender<()>,
+    /// worker 退出通知；Drop 用它把同步 join 限制在清理预算内。
+    /// 用 Mutex 包裹使接收端满足 `Sync`（捕获器放入 `Arc` 共享）。
+    worker_done: std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+    /// 清理是否已由显式 shutdown 或 Drop 接管；避免 Drop 二次计时。
+    shutdown_handled: std::sync::atomic::AtomicBool,
+    /// worker 是否已在清理截止内退出；Drop 只在确认退出后同步 join。
+    worker_finished: std::sync::atomic::AtomicBool,
     /// 最新帧共享槽位（worker 写，capture_frame 读）。
     latest: std::sync::Arc<(std::sync::Mutex<Option<Frame>>, std::sync::Condvar)>,
     worker: Option<std::thread::JoinHandle<()>>,
@@ -108,7 +130,36 @@ impl ScreenCastCapture {
         let proxy = portal_proxy(&conn, "org.freedesktop.portal.ScreenCast")
             .await
             .map_err(|e| AgentShellError::DBus(format!("ScreenCast proxy: {e}")))?;
-        Self::start_via_proxy(&conn, &proxy, target, opts).await
+        Self::start_via_proxy(&conn, &proxy, target, opts, None).await
+    }
+
+    /// 在绝对截止前走完五步流程。
+    ///
+    /// `deadline` 覆盖全部建立等待，包括 Request 订阅注册（总线 AddMatch）与
+    /// 调用方已消耗的前置时间。截止到达后先取消未完成的 Request、再关闭已
+    /// 创建的 portal Session，之后才返回错误；调用方另需预留
+    /// [`SCREENCAST_CLEANUP_BUDGET`]。
+    pub async fn start_with_deadline(
+        conn: zbus::Connection,
+        target: CaptureTarget,
+        opts: &ScreenCastOptions,
+        deadline: tokio::time::Instant,
+    ) -> Result<ScreenCastSession> {
+        let proxy = match tokio::time::timeout(
+            deadline.saturating_duration_since(tokio::time::Instant::now()),
+            portal_proxy(&conn, "org.freedesktop.portal.ScreenCast"),
+        )
+        .await
+        {
+            Ok(Ok(proxy)) => proxy,
+            Ok(Err(e)) => return Err(AgentShellError::DBus(format!("ScreenCast proxy: {e}"))),
+            Err(_) => {
+                return Err(AgentShellError::Timeout(
+                    "portal ScreenCast proxy exceeded the ScreenCast deadline".into(),
+                ))
+            }
+        };
+        Self::start_via_proxy(&conn, &proxy, target, opts, Some(deadline)).await
     }
 
     async fn start_via_proxy(
@@ -116,6 +167,7 @@ impl ScreenCastCapture {
         proxy: &zbus::Proxy<'_>,
         target: CaptureTarget,
         opts: &ScreenCastOptions,
+        deadline: Option<tokio::time::Instant>,
     ) -> Result<ScreenCastSession> {
         let pid = std::process::id();
         // 每步使用不同的 handle_token——portal Request 路径由
@@ -127,13 +179,34 @@ impl ScreenCastCapture {
         let select_token = format!("agent_shell_sc_select_{pid}");
         let start_token = format!("agent_shell_sc_start_{pid}");
         let req_prefix = "/org/freedesktop/portal/desktop/request/";
+        // 每步等待上限：有总预算时取剩余时间，且不超过单步默认值。
+        let remaining = |deadline: Option<tokio::time::Instant>| match deadline {
+            Some(d) => d
+                .saturating_duration_since(tokio::time::Instant::now())
+                .min(SCREENCAST_TIMEOUT),
+            None => SCREENCAST_TIMEOUT,
+        };
+        let mut cleanup = PortalSessionCleanup::new(conn.clone());
 
         // 1. CreateSession：方法返回值是 **Request 对象路径**；
         //    真正的 session_handle 在其 Response 信号的
         //    results["session_handle"] 里（xdg-desktop-portal 规范）。
         let create_path = ObjectPath::try_from(format!("{req_prefix}{sender}/{create_token}"))
             .map_err(|e| AgentShellError::DBus(format!("create path: {e}")))?;
-        let mut create_stream = prepare_response_stream(conn, &create_path).await?;
+        let mut create_stream = match wait_within(
+            deadline,
+            "CreateSession subscription",
+            prepare_response_stream(conn, &create_path),
+        )
+        .await
+        {
+            Ok(stream) => stream,
+            Err(e) => {
+                cleanup.release(SCREENCAST_CLEANUP_BUDGET).await;
+                return Err(e);
+            }
+        };
+        cleanup.track_request(create_path.as_str().to_owned());
         let mut o = std::collections::HashMap::<&str, zvariant::Value>::new();
         o.insert("handle_token", zvariant::Value::from(create_token.as_str()));
         o.insert(
@@ -145,39 +218,100 @@ impl ScreenCastCapture {
         // 故不重试：瞬时失败由 capture 组件的三级降级链（ScreenCast → Screenshot
         // → X11）兜底，AccessDenied 经 dbus_error 归一到 Permission（不重试）。
         let create_body = (o,);
-        let create_request: zvariant::OwnedObjectPath = proxy
-            .call("CreateSession", &create_body)
-            .await
-            .map_err(|e| dbus_error(format!("CreateSession: {e}")))?;
+        let step = remaining(deadline);
+        let create_request: zvariant::OwnedObjectPath =
+            match tokio::time::timeout(step, proxy.call("CreateSession", &create_body)).await {
+                Ok(Ok(path)) => path,
+                Ok(Err(e)) => {
+                    let e = dbus_error(format!("CreateSession: {e}"));
+                    cleanup.release(SCREENCAST_CLEANUP_BUDGET).await;
+                    return Err(e);
+                }
+                Err(_) => {
+                    cleanup.release(SCREENCAST_CLEANUP_BUDGET).await;
+                    return Err(AgentShellError::Timeout(format!(
+                        "portal CreateSession method timed out after {}ms",
+                        step.as_millis()
+                    )));
+                }
+            };
+        if create_request.as_str() != create_path.as_str() {
+            cleanup.track_request(create_request.as_str().to_owned());
+        }
         // 注意：wait_for_response 在方法返回后才订阅 Response 信号，
         // 重新引入竞态——但此路径仅在后端不按规范返回路径时触发（非默认路径）。
         let (_, create_results) = if create_request.as_str() == create_path.as_str() {
-            drain_response_with_timeout(&mut create_stream, SCREENCAST_TIMEOUT, "CreateSession")
-                .await?
+            match drain_response_with_timeout(
+                &mut create_stream,
+                remaining(deadline),
+                "CreateSession",
+            )
+            .await
+            {
+                Ok(v) => v,
+                Err(e) => {
+                    cleanup.release(SCREENCAST_CLEANUP_BUDGET).await;
+                    return Err(e);
+                }
+            }
         } else {
             tracing::warn!(
                 "CreateSession path mismatch: expected {}, got {}",
                 create_path,
                 create_request
             );
-            wait_for_response(conn, &create_request, SCREENCAST_TIMEOUT).await?
+            match wait_within(
+                deadline,
+                "CreateSession response (path mismatch)",
+                wait_for_response(conn, &create_request, remaining(deadline)),
+            )
+            .await
+            {
+                Ok(v) => v,
+                Err(e) => {
+                    cleanup.release(SCREENCAST_CLEANUP_BUDGET).await;
+                    return Err(e);
+                }
+            }
         };
-        let session_handle = crate::portal_common::string_field(&create_results, "session_handle")
-            .ok_or_else(|| {
-                AgentShellError::Capture(
-                    "ScreenCast: no session_handle in CreateSession response".into(),
-                )
-            })?;
+        cleanup.clear_request();
+        let Some(session_handle) =
+            crate::portal_common::string_field(&create_results, "session_handle")
+        else {
+            cleanup.release(SCREENCAST_CLEANUP_BUDGET).await;
+            return Err(AgentShellError::Capture(
+                "ScreenCast: no session_handle in CreateSession response".into(),
+            ));
+        };
         let session_path: ObjectPath<'static> =
-            zvariant::ObjectPath::try_from(session_handle.to_owned())
-                .map_err(|e| AgentShellError::Capture(format!("bad session_handle: {e}")))?
-                .into_owned();
+            match zvariant::ObjectPath::try_from(session_handle.to_owned()) {
+                Ok(path) => path.into_owned(),
+                Err(e) => {
+                    cleanup.release(SCREENCAST_CLEANUP_BUDGET).await;
+                    return Err(AgentShellError::Capture(format!("bad session_handle: {e}")));
+                }
+            };
+        // CreateSession 成功即持有远端会话：此后任何失败/超时都必须 Close。
+        cleanup.track_session(session_path.clone());
 
         // 2. SelectSources：persist_mode + restore_token 在此传入
         //    （xdg-desktop-portal ScreenCast §SelectSources）。
         let select_path = ObjectPath::try_from(format!("{req_prefix}{sender}/{select_token}"))
             .map_err(|e| AgentShellError::DBus(format!("select path: {e}")))?;
-        let mut select_stream = prepare_response_stream(conn, &select_path).await?;
+        let mut select_stream = match wait_within(
+            deadline,
+            "SelectSources subscription",
+            prepare_response_stream(conn, &select_path),
+        )
+        .await
+        {
+            Ok(stream) => stream,
+            Err(e) => {
+                cleanup.release(SCREENCAST_CLEANUP_BUDGET).await;
+                return Err(e);
+            }
+        };
+        cleanup.track_request(select_path.as_str().to_owned());
         let mut o = std::collections::HashMap::<&str, zvariant::Value>::new();
         o.insert("handle_token", zvariant::Value::from(select_token.as_str()));
         o.insert("types", zvariant::Value::from(target.source_type_u32()));
@@ -188,16 +322,47 @@ impl ScreenCastCapture {
         if let Some(rt) = &opts.restore_token {
             o.insert("restore_token", zvariant::Value::from(rt.as_str()));
         }
-        let select_request: zvariant::OwnedObjectPath = proxy
-            .call::<_, (
+        let step = remaining(deadline);
+        let select_request: zvariant::OwnedObjectPath = match tokio::time::timeout(
+            step,
+            proxy.call::<_, (
                 &ObjectPath<'_>,
                 std::collections::HashMap<&str, zvariant::Value>,
-            ), zvariant::OwnedObjectPath>("SelectSources", &(&session_path, o))
-            .await
-            .map_err(|e| dbus_error(format!("SelectSources: {e}")))?;
+            ), zvariant::OwnedObjectPath>("SelectSources", &(&session_path, o)),
+        )
+        .await
+        {
+            Ok(Ok(path)) => path,
+            Ok(Err(e)) => {
+                let e = dbus_error(format!("SelectSources: {e}"));
+                cleanup.release(SCREENCAST_CLEANUP_BUDGET).await;
+                return Err(e);
+            }
+            Err(_) => {
+                cleanup.release(SCREENCAST_CLEANUP_BUDGET).await;
+                return Err(AgentShellError::Timeout(format!(
+                    "portal SelectSources method timed out after {}ms",
+                    step.as_millis()
+                )));
+            }
+        };
+        if select_request.as_str() != select_path.as_str() {
+            cleanup.track_request(select_request.as_str().to_owned());
+        }
         if select_request.as_str() == select_path.as_str() {
-            drain_response_with_timeout(&mut select_stream, SCREENCAST_TIMEOUT, "SelectSources")
-                .await?;
+            match drain_response_with_timeout(
+                &mut select_stream,
+                remaining(deadline),
+                "SelectSources",
+            )
+            .await
+            {
+                Ok(_) => {}
+                Err(e) => {
+                    cleanup.release(SCREENCAST_CLEANUP_BUDGET).await;
+                    return Err(e);
+                }
+            }
         } else {
             // 同 CreateSession 路径失配回退：wait_for_response 在方法返回后
             // 才订阅 Response 信号，重新引入竞态——但此路径仅在后端不按规范
@@ -207,26 +372,72 @@ impl ScreenCastCapture {
                 select_path,
                 select_request
             );
-            wait_for_response(conn, &select_request, SCREENCAST_TIMEOUT).await?;
+            match wait_within(
+                deadline,
+                "SelectSources response (path mismatch)",
+                wait_for_response(conn, &select_request, remaining(deadline)),
+            )
+            .await
+            {
+                Ok(_) => {}
+                Err(e) => {
+                    cleanup.release(SCREENCAST_CLEANUP_BUDGET).await;
+                    return Err(e);
+                }
+            }
         }
+        cleanup.clear_request();
 
         // 3. Start：触发用户确认弹窗（或静默恢复）；Response 携带 streams
         //    数组与可选的新 restore_token。
         let start_path = ObjectPath::try_from(format!("{req_prefix}{sender}/{start_token}"))
             .map_err(|e| AgentShellError::DBus(format!("start path: {e}")))?;
-        let mut start_stream = prepare_response_stream(conn, &start_path).await?;
+        let mut start_stream = match wait_within(
+            deadline,
+            "Start subscription",
+            prepare_response_stream(conn, &start_path),
+        )
+        .await
+        {
+            Ok(stream) => stream,
+            Err(e) => {
+                cleanup.release(SCREENCAST_CLEANUP_BUDGET).await;
+                return Err(e);
+            }
+        };
+        cleanup.track_request(start_path.as_str().to_owned());
         let mut o = std::collections::HashMap::<&str, zvariant::Value>::new();
         o.insert("handle_token", zvariant::Value::from(start_token.as_str()));
-        let start_request: zvariant::OwnedObjectPath = proxy
-            .call::<_, (
+        let step = remaining(deadline);
+        let start_request: zvariant::OwnedObjectPath = match tokio::time::timeout(
+            step,
+            proxy.call::<_, (
                 &ObjectPath<'_>,
                 &str,
                 std::collections::HashMap<&str, zvariant::Value>,
-            ), zvariant::OwnedObjectPath>("Start", &(&session_path, "", o))
-            .await
-            .map_err(|e| dbus_error(format!("Start: {e}")))?;
+            ), zvariant::OwnedObjectPath>("Start", &(&session_path, "", o)),
+        )
+        .await
+        {
+            Ok(Ok(path)) => path,
+            Ok(Err(e)) => {
+                let e = dbus_error(format!("Start: {e}"));
+                cleanup.release(SCREENCAST_CLEANUP_BUDGET).await;
+                return Err(e);
+            }
+            Err(_) => {
+                cleanup.release(SCREENCAST_CLEANUP_BUDGET).await;
+                return Err(AgentShellError::Timeout(format!(
+                    "portal Start method timed out after {}ms",
+                    step.as_millis()
+                )));
+            }
+        };
+        if start_request.as_str() != start_path.as_str() {
+            cleanup.track_request(start_request.as_str().to_owned());
+        }
         let (_, results) = if start_request.as_str() == start_path.as_str() {
-            match drain_response_with_timeout(&mut start_stream, SCREENCAST_TIMEOUT, "Start").await
+            match drain_response_with_timeout(&mut start_stream, remaining(deadline), "Start").await
             {
                 Ok(v) => v,
                 Err(e @ AgentShellError::Timeout(_)) => {
@@ -237,9 +448,13 @@ impl ScreenCastCapture {
                         "ScreenCast Start: portal Response never arrived (check PipeWire state and \
                          `journalctl --user -u plasma-xdg-desktop-portal-kde.service`): {e}"
                     );
+                    cleanup.release(SCREENCAST_CLEANUP_BUDGET).await;
                     return Err(e);
                 }
-                Err(e) => return Err(e),
+                Err(e) => {
+                    cleanup.release(SCREENCAST_CLEANUP_BUDGET).await;
+                    return Err(e);
+                }
             }
         } else {
             // 同 CreateSession 路径失配回退：wait_for_response 在方法返回后
@@ -250,26 +465,60 @@ impl ScreenCastCapture {
                 start_path,
                 start_request
             );
-            wait_for_response(conn, &start_request, SCREENCAST_TIMEOUT).await?
+            match wait_within(
+                deadline,
+                "Start response (path mismatch)",
+                wait_for_response(conn, &start_request, remaining(deadline)),
+            )
+            .await
+            {
+                Ok(v) => v,
+                Err(e) => {
+                    cleanup.release(SCREENCAST_CLEANUP_BUDGET).await;
+                    return Err(e);
+                }
+            }
         };
-        let node_id = extract_node_id(&results).ok_or_else(|| {
-            AgentShellError::Capture("ScreenCast: no stream node in response".into())
-        })?;
+        cleanup.clear_request();
+        let Some(node_id) = extract_node_id(&results) else {
+            cleanup.release(SCREENCAST_CLEANUP_BUDGET).await;
+            return Err(AgentShellError::Capture(
+                "ScreenCast: no stream node in response".into(),
+            ));
+        };
         // Start 响应可能携带新 restore_token（persist_mode 授权后）。
         let new_restore_token =
             crate::portal_common::string_field(&results, "restore_token").map(str::to_owned);
 
         // 4. OpenPipeWireRemote → fd
-        let fd: zbus::zvariant::OwnedFd = proxy
-            .call(
+        let step = remaining(deadline);
+        let fd: zbus::zvariant::OwnedFd = match tokio::time::timeout(
+            step,
+            proxy.call(
                 "OpenPipeWireRemote",
                 &(&session_path, HashMap::<&str, zvariant::Value>::new()),
-            )
-            .await
-            .map_err(|e| dbus_error(format!("OpenPipeWireRemote: {e}")))?;
+            ),
+        )
+        .await
+        {
+            Ok(Ok(fd)) => fd,
+            Ok(Err(e)) => {
+                let e = dbus_error(format!("OpenPipeWireRemote: {e}"));
+                cleanup.release(SCREENCAST_CLEANUP_BUDGET).await;
+                return Err(e);
+            }
+            Err(_) => {
+                cleanup.release(SCREENCAST_CLEANUP_BUDGET).await;
+                return Err(AgentShellError::Timeout(format!(
+                    "portal OpenPipeWireRemote timed out after {}ms",
+                    step.as_millis()
+                )));
+            }
+        };
 
         // 5. 启动 PipeWire 订阅线程
         let (shutdown_tx, shutdown_rx) = std::sync::mpsc::channel::<()>();
+        let (worker_done_tx, worker_done) = std::sync::mpsc::channel::<()>();
         let latest = std::sync::Arc::new((
             std::sync::Mutex::<Option<Frame>>::new(None),
             std::sync::Condvar::new(),
@@ -277,22 +526,38 @@ impl ScreenCastCapture {
         let latest_for_thread = std::sync::Arc::clone(&latest);
         // OwnedFd 是 RawFd 包装；跨线程交给 pw 前复制出 owned fd。
         use std::os::fd::AsFd as _;
-        let raw_fd = fd
-            .as_fd()
-            .try_clone_to_owned()
-            .map_err(|e| AgentShellError::Capture(format!("dup pipewire fd: {e}")))?;
-        let worker = std::thread::Builder::new()
+        let raw_fd = match fd.as_fd().try_clone_to_owned() {
+            Ok(fd) => fd,
+            Err(e) => {
+                cleanup.release(SCREENCAST_CLEANUP_BUDGET).await;
+                return Err(AgentShellError::Capture(format!("dup pipewire fd: {e}")));
+            }
+        };
+        let worker = match std::thread::Builder::new()
             .name("pw-screencast".into())
             .spawn(move || {
+                #[cfg(feature = "portal-test-hooks")]
+                crate::portal_common::test_hooks::apply_worker_start_delay();
                 run_pipewire_node(raw_fd, node_id, latest_for_thread, shutdown_rx);
-            })
-            .map_err(|e| AgentShellError::Other(Box::new(e)))?;
+                let _ = worker_done_tx.send(());
+            }) {
+            Ok(worker) => worker,
+            Err(e) => {
+                cleanup.release(SCREENCAST_CLEANUP_BUDGET).await;
+                return Err(AgentShellError::Other(Box::new(e)));
+            }
+        };
 
+        let session_path = cleanup.take_session();
         Ok(ScreenCastSession {
             capture: Self {
                 conn: conn.clone(),
                 session_path,
+                closed: std::sync::atomic::AtomicBool::new(false),
                 shutdown: shutdown_tx,
+                worker_done: std::sync::Mutex::new(Some(worker_done)),
+                shutdown_handled: std::sync::atomic::AtomicBool::new(false),
+                worker_finished: std::sync::atomic::AtomicBool::new(false),
                 latest,
                 worker: Some(worker),
             },
@@ -315,11 +580,12 @@ impl ScreenCastCapture {
     /// 取最新一帧（自上次调用以来的最新帧；尚无帧则阻塞等待至多一个超时周期）。
     pub async fn capture_frame(&self) -> Result<Frame> {
         let slot = std::sync::Arc::clone(&self.latest);
+        let wait = frame_wait_timeout();
         tokio::task::spawn_blocking(move || {
             let (lock, cvar) = &*slot;
             let guard = lock.lock().unwrap_or_else(|p| p.into_inner());
             let (mut guard, _timeout) = cvar
-                .wait_timeout_while(guard, SCREENCAST_TIMEOUT, |f| f.is_none())
+                .wait_timeout_while(guard, wait, |f| f.is_none())
                 .unwrap_or_else(|p| p.into_inner());
             guard
                 .take()
@@ -334,26 +600,256 @@ impl ScreenCastCapture {
         &self.session_path
     }
 
-    /// 关闭 portal session（Close 方法；幂等）。
+    /// 关闭 portal session（`org.freedesktop.portal.Session.Close`；幂等）。
     pub async fn close_session(&self) -> Result<()> {
-        let proxy = portal_proxy(&self.conn, "org.freedesktop.portal.ScreenCast")
-            .await
-            .map_err(|e| AgentShellError::DBus(format!("ScreenCast proxy: {e}")))?;
-        proxy
-            .call::<_, (&str,), ()>("Close", &(self.session_path.as_str(),))
-            .await
-            .map_err(|e| AgentShellError::DBus(format!("Close session: {e}")))?;
+        if self.closed.load(std::sync::atomic::Ordering::SeqCst) {
+            return Ok(());
+        }
+        close_portal_session(&self.conn, self.session_path.as_str()).await?;
+        self.closed.store(true, std::sync::atomic::Ordering::SeqCst);
         Ok(())
     }
+
+    /// 在绝对 `deadline` 前完成显式 Close 与 worker 退出。
+    ///
+    /// 两项清理并发进行并共享同一个截止；截止用尽即返回，由调用方降级。
+    /// 之后的 Drop 只做无阻塞收尾，不会再次等待或补发。
+    pub async fn shutdown_until(&self, deadline: tokio::time::Instant) {
+        use std::sync::atomic::Ordering;
+
+        if self.shutdown_handled.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let _ = self.shutdown.send(());
+
+        let wait_worker = async {
+            let receiver = self
+                .worker_done
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .take();
+            let Some(receiver) = receiver else {
+                return;
+            };
+            let budget = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if budget.is_zero() {
+                return;
+            }
+            let finished = tokio::time::timeout(
+                budget,
+                tokio::task::spawn_blocking(move || receiver.recv_timeout(budget).is_ok()),
+            )
+            .await;
+            if matches!(finished, Ok(Ok(true))) {
+                self.worker_finished.store(true, Ordering::SeqCst);
+            }
+        };
+
+        let close_portal = async {
+            if self.closed.load(Ordering::SeqCst) {
+                return;
+            }
+            let budget = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if budget.is_zero() {
+                return;
+            }
+            let closed = tokio::time::timeout(
+                budget,
+                close_portal_session(&self.conn, self.session_path.as_str()),
+            )
+            .await;
+            if matches!(closed, Ok(Ok(()))) {
+                self.closed.store(true, Ordering::SeqCst);
+            }
+        };
+
+        tokio::join!(wait_worker, close_portal);
+    }
+}
+
+fn frame_wait_timeout() -> Duration {
+    #[cfg(feature = "portal-test-hooks")]
+    if let Some(timeout) = crate::portal_common::test_hooks::frame_wait_timeout() {
+        return timeout;
+    }
+    SCREENCAST_TIMEOUT
 }
 
 impl Drop for ScreenCastCapture {
     fn drop(&mut self) {
-        let _ = self.shutdown.send(());
-        if let Some(worker) = self.worker.take() {
-            let _ = worker.join();
+        use std::sync::atomic::Ordering;
+
+        if !self.shutdown_handled.swap(true, Ordering::SeqCst) {
+            let _ = self.shutdown.send(());
+            let deadline = tokio::time::Instant::now() + SCREENCAST_CLEANUP_BUDGET;
+            if !self.closed.load(Ordering::SeqCst) {
+                spawn_portal_cleanup_until(
+                    self.conn.clone(),
+                    None,
+                    Some(self.session_path.clone()),
+                    deadline,
+                );
+            }
+            let receiver = self
+                .worker_done
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .take();
+            if let Some(receiver) = receiver {
+                let budget = deadline
+                    .saturating_duration_since(tokio::time::Instant::now())
+                    .min(SCREENCAST_WORKER_SHUTDOWN_BUDGET);
+                if receiver.recv_timeout(budget).is_ok() {
+                    self.worker_finished.store(true, Ordering::SeqCst);
+                }
+            }
+        }
+
+        if self.worker_finished.load(Ordering::SeqCst) {
+            if let Some(worker) = self.worker.take() {
+                let _ = worker.join();
+            }
         }
     }
+}
+
+/// 在绝对截止前等待一个建立步骤；无截止时退回单步默认超时。
+async fn wait_within<T>(
+    deadline: Option<tokio::time::Instant>,
+    label: &str,
+    fut: impl std::future::Future<Output = Result<T>>,
+) -> Result<T> {
+    let budget = match deadline {
+        Some(d) => d
+            .saturating_duration_since(tokio::time::Instant::now())
+            .min(SCREENCAST_TIMEOUT),
+        None => SCREENCAST_TIMEOUT,
+    };
+    tokio::time::timeout(budget, fut).await.map_err(|_| {
+        AgentShellError::Timeout(format!("portal {label} exceeded the ScreenCast deadline"))
+    })?
+}
+
+/// 从 CreateSession 成功起持有的 portal 资源清理守卫。
+///
+/// 记录已创建的会话与最后一个未完成的 Request。显式失败/超时路径调用
+/// [`Self::release`] 在固定预算内发出 `Request.Close` 与 `Session.Close`；
+/// 建立 future 被硬取消时由 Drop 在总线 executor 上补发一次有界清理。
+struct PortalSessionCleanup {
+    conn: zbus::Connection,
+    session_path: Option<ObjectPath<'static>>,
+    pending_request: Option<String>,
+}
+
+impl PortalSessionCleanup {
+    fn new(conn: zbus::Connection) -> Self {
+        Self {
+            conn,
+            session_path: None,
+            pending_request: None,
+        }
+    }
+
+    fn track_request(&mut self, path: String) {
+        self.pending_request = Some(path);
+    }
+
+    fn clear_request(&mut self) {
+        self.pending_request = None;
+    }
+
+    fn track_session(&mut self, path: ObjectPath<'static>) {
+        self.session_path = Some(path);
+    }
+
+    fn take_session(&mut self) -> ObjectPath<'static> {
+        self.session_path
+            .take()
+            .expect("session tracked after CreateSession")
+    }
+
+    /// 在 `budget` 内先取消未完成 Request、再关闭已创建的 Session。
+    async fn release(&mut self, budget: Duration) {
+        let step = budget.min(SCREENCAST_PORTAL_CLOSE_BUDGET) / 2;
+        if let Some(request) = self.pending_request.take() {
+            let _ = tokio::time::timeout(step, close_portal_request(&self.conn, &request)).await;
+        }
+        if let Some(session) = self.session_path.take() {
+            let _ = tokio::time::timeout(step, close_portal_session(&self.conn, session.as_str()))
+                .await;
+        }
+    }
+}
+
+impl Drop for PortalSessionCleanup {
+    fn drop(&mut self) {
+        let request = self.pending_request.take();
+        let session = self.session_path.take();
+        if request.is_none() && session.is_none() {
+            return;
+        }
+        spawn_portal_cleanup(self.conn.clone(), request, session);
+    }
+}
+
+/// 在当前 Tokio 运行时上补发一次有界清理；无运行时时放弃（进程退出场景）。
+fn spawn_portal_cleanup(
+    conn: zbus::Connection,
+    request: Option<String>,
+    session: Option<ObjectPath<'static>>,
+) {
+    let deadline = tokio::time::Instant::now() + SCREENCAST_CLEANUP_BUDGET;
+    spawn_portal_cleanup_until(conn, request, session, deadline);
+}
+
+/// 在同一个绝对截止前补发请求取消与会话关闭。
+fn spawn_portal_cleanup_until(
+    conn: zbus::Connection,
+    request: Option<String>,
+    session: Option<ObjectPath<'static>>,
+    deadline: tokio::time::Instant,
+) {
+    if request.is_none() && session.is_none() {
+        return;
+    }
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        tracing::debug!("no tokio runtime for ScreenCast portal cleanup; skipping");
+        return;
+    };
+    handle.spawn(async move {
+        if let Some(request) = request {
+            let budget = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if !budget.is_zero() {
+                let _ = tokio::time::timeout(budget, close_portal_request(&conn, &request)).await;
+            }
+        }
+        if let Some(session) = session {
+            let budget = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if !budget.is_zero() {
+                let _ = tokio::time::timeout(budget, close_portal_session(&conn, session.as_str()))
+                    .await;
+            }
+        }
+    });
+}
+
+/// 取消未完成的 portal Request（`org.freedesktop.portal.Request.Close`）。
+async fn close_portal_request(conn: &zbus::Connection, path: &str) -> Result<()> {
+    crate::portal_common::close_portal_request(conn, path).await
+}
+
+/// 关闭已创建的 portal 会话（`org.freedesktop.portal.Session.Close`）。
+async fn close_portal_session(conn: &zbus::Connection, path: &str) -> Result<()> {
+    conn.call_method(
+        Some(PORTAL_SERVICE),
+        path,
+        Some("org.freedesktop.portal.Session"),
+        "Close",
+        &(),
+    )
+    .await
+    .map_err(|e| AgentShellError::DBus(format!("Close session {path}: {e}")))?;
+    Ok(())
 }
 
 /// 从 Start 的 Response 结果字典提取第一个流的 node id。
@@ -597,5 +1093,14 @@ mod tests {
         tokens.sort();
         tokens.dedup();
         assert_eq!(tokens.len(), 3, "handle_token must be unique per step");
+    }
+
+    #[test]
+    fn cleanup_budget_covers_worker_shutdown_and_portal_close() {
+        // Drop 的同步 worker 等待与随后的 Request/Session Close 共用 200ms。
+        assert_eq!(
+            SCREENCAST_WORKER_SHUTDOWN_BUDGET + SCREENCAST_PORTAL_CLOSE_BUDGET,
+            SCREENCAST_CLEANUP_BUDGET
+        );
     }
 }

@@ -10,7 +10,7 @@
 use std::future::Future;
 use std::time::Duration;
 
-use agent_shell_core::error::AgentShellError;
+use agent_shell_core::error::{AgentShellError, Result};
 use ordered_stream::OrderedStreamExt as _;
 use zbus::zvariant::ObjectPath;
 
@@ -27,6 +27,23 @@ pub async fn portal_proxy<'a>(
     interface: &'a str,
 ) -> zbus::Result<zbus::Proxy<'a>> {
     zbus::Proxy::new(conn, PORTAL_SERVICE, PORTAL_PATH, interface).await
+}
+
+/// 取消未完成的 portal Request（`org.freedesktop.portal.Request.Close`）。
+///
+/// 调用方负责用 [`tokio::time::timeout`] 给该调用封顶：portal 无响应时
+/// Close 本身也可能挂住。对已结束的请求调用会返回错误，调用方可忽略。
+pub async fn close_portal_request(conn: &zbus::Connection, path: &str) -> Result<()> {
+    conn.call_method(
+        Some(PORTAL_SERVICE),
+        path,
+        Some("org.freedesktop.portal.Request"),
+        "Close",
+        &(),
+    )
+    .await
+    .map_err(|e| AgentShellError::DBus(format!("Close request {path}: {e}")))?;
+    Ok(())
 }
 
 /// 将 D-Bus unique name 编码为 portal Request 路径的 sender 段。
@@ -54,6 +71,8 @@ pub async fn prepare_response_stream(
     conn: &zbus::Connection,
     request_path: &ObjectPath<'_>,
 ) -> Result<zbus::MessageStream, AgentShellError> {
+    #[cfg(feature = "portal-test-hooks")]
+    test_hooks::apply(request_path).await;
     let rule = zbus::MatchRule::builder()
         .msg_type(zbus::message::Type::Signal)
         .interface("org.freedesktop.portal.Request")
@@ -66,6 +85,88 @@ pub async fn prepare_response_stream(
     zbus::MessageStream::for_match_rule(rule, conn, Some(4))
         .await
         .map_err(|e| AgentShellError::DBus(format!("signal stream: {e}")))
+}
+
+/// 验收夹具专用：在订阅注册（总线 AddMatch）前注入延迟。
+///
+/// 生产构建不编译本模块；仅 `portal-test-hooks` feature 开启时，
+/// [`prepare_response_stream`] 才读取该配置。用于证明建立截止覆盖
+/// `MessageStream::for_match_rule` 的等待，而不只是后续方法调用。
+#[cfg(feature = "portal-test-hooks")]
+pub mod test_hooks {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Mutex;
+    use std::time::Duration;
+
+    use zbus::zvariant::ObjectPath;
+
+    static DELAY_MS: AtomicU64 = AtomicU64::new(0);
+    static PATH_CONTAINS: Mutex<Option<String>> = Mutex::new(None);
+    static WORKER_START_DELAY_MS: Mutex<u64> = Mutex::new(0);
+    static FRAME_WAIT_TIMEOUT_MS: Mutex<Option<u64>> = Mutex::new(None);
+
+    /// 对包含 `path_contains` 的 Request 路径延迟 `delay` 后注册订阅。
+    pub fn set_subscribe_delay(path_contains: &str, delay: Duration) {
+        *PATH_CONTAINS.lock().expect("subscribe delay path") = Some(path_contains.to_owned());
+        DELAY_MS.store(delay.as_millis() as u64, Ordering::SeqCst);
+    }
+
+    /// 清除延迟；后续订阅立即注册。
+    pub fn clear_subscribe_delay() {
+        DELAY_MS.store(0, Ordering::SeqCst);
+        *PATH_CONTAINS.lock().expect("subscribe delay path") = None;
+    }
+
+    /// 延迟 PipeWire worker 启动，模拟清理截止内 worker 尚未退出。
+    pub fn set_worker_start_delay(delay: Duration) {
+        *WORKER_START_DELAY_MS.lock().expect("worker delay") = delay.as_millis() as u64;
+    }
+
+    /// 清除 worker 启动延迟。
+    pub fn clear_worker_start_delay() {
+        *WORKER_START_DELAY_MS.lock().expect("worker delay") = 0;
+    }
+
+    pub(crate) fn apply_worker_start_delay() {
+        let ms = *WORKER_START_DELAY_MS.lock().expect("worker delay");
+        if ms > 0 {
+            std::thread::sleep(Duration::from_millis(ms));
+        }
+    }
+
+    /// 覆盖 `capture_frame` 的无帧等待上限，避免回归用例遗留长阻塞任务。
+    pub fn set_frame_wait_timeout(timeout: Duration) {
+        *FRAME_WAIT_TIMEOUT_MS.lock().expect("frame wait timeout") =
+            Some(timeout.as_millis() as u64);
+    }
+
+    /// 恢复默认的无帧等待上限。
+    pub fn clear_frame_wait_timeout() {
+        *FRAME_WAIT_TIMEOUT_MS.lock().expect("frame wait timeout") = None;
+    }
+
+    pub(crate) fn frame_wait_timeout() -> Option<Duration> {
+        FRAME_WAIT_TIMEOUT_MS
+            .lock()
+            .expect("frame wait timeout")
+            .map(Duration::from_millis)
+    }
+
+    pub(crate) async fn apply(request_path: &ObjectPath<'_>) {
+        let ms = DELAY_MS.load(Ordering::SeqCst);
+        if ms == 0 {
+            return;
+        }
+        let matches = {
+            let guard = PATH_CONTAINS.lock().expect("subscribe delay path");
+            guard
+                .as_deref()
+                .is_none_or(|needle| request_path.as_str().contains(needle))
+        };
+        if matches {
+            tokio::time::sleep(Duration::from_millis(ms)).await;
+        }
+    }
 }
 
 /// 消费 [`prepare_response_stream`] 预订阅的流，等待 `Response` 信号。
@@ -115,6 +216,9 @@ pub async fn wait_for_response(
     request_path: &ObjectPath<'_>,
     timeout: Duration,
 ) -> Result<(u32, std::collections::HashMap<String, zvariant::OwnedValue>), AgentShellError> {
+    // 兼容路径同样要建立 proxy 并注册 Response 订阅；钩子用于复现慢总线。
+    #[cfg(feature = "portal-test-hooks")]
+    test_hooks::apply(request_path).await;
     // Request 对象路径以 sender unique name 为前缀，直接在其上监听 Response。
     let proxy = zbus::Proxy::new(
         conn,

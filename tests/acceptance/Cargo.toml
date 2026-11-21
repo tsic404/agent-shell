@@ -14,6 +14,13 @@ description = "agent-shell 验收用例的可执行形式：设计仓 03-accepta
 # 关闭发现、目标不得被声明为不参与测试腿）。
 autotests = true
 
+[features]
+# 默认特性回归（ScreenCast 级预算）需要真实编译 portal-screencast 分支；
+# 仅该测试目标启用，避免无 PipeWire 头的 no-pipewire / arm64 构建被拖住。
+portal-screencast = ["agent-shell-capture/portal-screencast"]
+# 验收夹具专用：延迟订阅注册，验证 ScreenCast 建立截止覆盖 AddMatch 等待。
+portal-test-hooks = ["portal-screencast", "agent-shell-capture/portal-test-hooks"]
+
 [lib]
 name = "acceptance"
 path = "src/lib.rs"
@@ -199,6 +206,25 @@ path = "TC-input-06.rs"
 [[test]]
 name = "TC-capture-01"
 path = "TC-capture-01.rs"
+
+[[test]]
+name = "TC-capture-01-screenshot-late"
+path = "TC-capture-01-screenshot-late.rs"
+
+[[test]]
+name = "TC-capture-01-screencast"
+path = "TC-capture-01-screencast.rs"
+required-features = ["portal-screencast"]
+
+[[test]]
+name = "TC-capture-01-screencast-subscribe"
+path = "TC-capture-01-screencast-subscribe.rs"
+required-features = ["portal-test-hooks"]
+
+[[test]]
+name = "TC-capture-01-screencast-cleanup"
+path = "TC-capture-01-screencast-cleanup.rs"
+required-features = ["portal-test-hooks"]
 
 [[test]]
 name = "TC-capture-02"

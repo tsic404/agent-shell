@@ -96,8 +96,41 @@ async fn fullscreen_capture_writes_nonempty_file_and_rejects_bad_path() {
         "missing params must not call portal"
     );
 
+    // 授权弹窗场景：第一级静默请求卡住（KDE 首次截图会弹授权窗），短超时后
+    // 必须仍有预算发起交互截图并落盘，而不是让整段 portal 预算被第一级吃满。
+    mock.set_behaviour(PortalBehaviour::Hang);
+    mock.set_interactive_behaviour(PortalBehaviour::Success);
+    let calls_before = mock.calls();
+    let interactive_before = mock.interactive_calls();
+    let authorized = out_dir.path().join("authorized.png");
+    let started = std::time::Instant::now();
+    fixture
+        .call_ok(
+            method::SCREENSHOT_CAPTURE,
+            Some(capture_params(&authorized)),
+        )
+        .await;
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "authorized capture must finish within the command budget: {:?}",
+        started.elapsed()
+    );
+    let written = std::fs::read(&authorized).expect("authorized capture output exists");
+    assert_eq!(written, png, "authorized capture must write the portal PNG");
+    assert_eq!(
+        mock.calls(),
+        calls_before + 2,
+        "a silent timeout must be followed by an interactive portal attempt"
+    );
+    assert_eq!(
+        mock.interactive_calls(),
+        interactive_before + 1,
+        "the fallback attempt must be the interactive Screenshot path"
+    );
+
     // portal 拒绝：非 Wayland 且无 X11 兜底 → 明确的后端不可用，不产出文件。
     mock.set_behaviour(PortalBehaviour::Cancel);
+    mock.set_interactive_behaviour(PortalBehaviour::Cancel);
     let denied_output = out_dir.path().join("denied.png");
     let error = fixture
         .call_err(

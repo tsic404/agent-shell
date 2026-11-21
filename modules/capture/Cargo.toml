@@ -28,6 +28,9 @@ default = ["portal-screencast"]
 # portal ScreenCast（PipeWire 流式）路径。关闭时 ScreenCast 分支编译期排除，
 # 无需 PipeWire dev 头（libpipewire-0.3.pc / spa 头）即可编译 capture 与 daemon。
 portal-screencast = ["dep:pipewire"]
+# 验收夹具专用：在订阅注册（总线 AddMatch）前注入延迟，验证建立截止覆盖它。
+# 生产构建不启用；接口只在 portal_common 的 test_hooks 模块暴露。
+portal-test-hooks = []
 
 [dev-dependencies]
 parking_lot.workspace = true
