@@ -233,10 +233,12 @@ fn render_doctor_lines(inputs: &DoctorInputs) -> Vec<String> {
         // X11 注入候选已被排除（KWin 忽略 XWayland XTEST），链退到 libei 起的
         // 通用降级链。
         lines.push(match &inputs.input {
-            InputRow::Authenticated => "✓ 输入注入   : fake_input authenticated ✓".to_string(),
-            InputRow::Bound => {
-                "✓ 输入注入   : fake_input bound（原生注入候选，首次注入时认证）".to_string()
-            }
+            InputRow::Authenticated => "✓ 输入注入   : fake_input authenticated ✓\
+                 （原生通道不可用时降级 libei/ydotool/uinput）"
+                .to_string(),
+            InputRow::Bound => "✓ 输入注入   : fake_input bound（原生注入候选，首次注入时认证；\
+                 原生通道不可用时降级 libei/ydotool/uinput）"
+                .to_string(),
             // 未绑定必须可归因（装配不变量：空槽给具体原因）：给出 KWin 的绑定
             // 失败原因与授权条目状态——「无 fake_input」本身不区分缺条目、
             // Exec 不匹配与 KWin 未放行，三者修复动作不同。
@@ -2980,6 +2982,51 @@ mod tests {
         assert!(no_protocol[0].contains("KWin 服务"));
         assert!(no_protocol[1].contains("D-Bus 桥接"));
         assert!(no_protocol[2].contains("事件脚本"));
+    }
+
+    /// 输入注入三态都必须说明降级去向：KDE Wayland 的候选顺序为原生注入、
+    /// libei、ydotool、uinput，原生通道已就绪或仅绑定未认证时，后续去向仍是
+    /// libei 起的通用链。
+    #[test]
+    fn doctor_input_rows_state_degradation_for_every_state() {
+        let inputs = |input: InputRow| DoctorInputs {
+            protocol: Some(ProtocolRow {
+                bound: 3,
+                detail: "window_mgmt v2, fake_input v5+, vd_mgmt bound".into(),
+            }),
+            kwin_version: "6.11.2".into(),
+            scripting: ScriptingProbe::Ok,
+            input,
+            event: EventRow::Loaded,
+        };
+
+        let authenticated = render_doctor_lines(&inputs(InputRow::Authenticated));
+        assert!(
+            authenticated[3].starts_with("✓ 输入注入")
+                && authenticated[3].contains("authenticated")
+                && authenticated[3].contains("降级 libei/ydotool/uinput"),
+            "authenticated native input must state its fallback chain: {}",
+            authenticated[3]
+        );
+
+        let bound = render_doctor_lines(&inputs(InputRow::Bound));
+        assert!(
+            bound[3].starts_with("✓ 输入注入")
+                && bound[3].contains("bound")
+                && bound[3].contains("降级 libei/ydotool/uinput"),
+            "bound-but-unauthenticated native input must state its fallback chain: {}",
+            bound[3]
+        );
+
+        let missing = render_doctor_lines(&inputs(InputRow::Missing {
+            reasons: vec!["无 fake_input（降级 libei/ydotool/uinput）".into()],
+        }));
+        assert!(
+            missing[3].contains("无 fake_input")
+                && missing[3].contains("降级 libei/ydotool/uinput"),
+            "missing native input must state its fallback chain: {}",
+            missing[3]
+        );
     }
 
     /// `rect_matches`：命中维度精确匹配，`None` 维度跳过——回读校验的
