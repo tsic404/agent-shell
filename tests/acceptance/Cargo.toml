@@ -221,6 +221,23 @@ name = "TC-capture-01-screenshot-late"
 path = "TC-capture-01-screenshot-late.rs"
 
 [[test]]
+name = "TC-capture-01-gnome-confirm"
+path = "TC-capture-01-gnome-confirm.rs"
+
+[[test]]
+name = "TC-capture-01-gnome-allow"
+path = "TC-capture-01-gnome-allow.rs"
+
+[[test]]
+name = "TC-capture-01-gnome-budget"
+path = "TC-capture-01-gnome-budget.rs"
+required-features = ["portal-test-hooks"]
+
+[[test]]
+name = "TC-capture-01-gnome-min-wait"
+path = "TC-capture-01-gnome-min-wait.rs"
+
+[[test]]
 name = "TC-capture-01-screencast"
 path = "TC-capture-01-screencast.rs"
 required-features = ["portal-screencast"]

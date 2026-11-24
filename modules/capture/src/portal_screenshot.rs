@@ -2,8 +2,9 @@
 //!
 //! `org.freedesktop.portal.Screenshot.Screenshot` 返回 Request 对象；
 //! 必须等 `Response` 信号取回结果字典中的 `uri`，再解析为本地路径。
-//! 超时/重试：非交互 screenshot 3s / 最多 2 次；交互（弹授权窗）3s / 单次
-//! ——授权场景必须留在 5s 命令预算内、不重试（超时后二次弹窗无意义）。
+//! 超时/重试：非交互 screenshot 3s / 最多 2 次；交互（弹授权窗）单次，方法
+//! 调用另有固定上限（超时后二次弹窗无意义），返回后的确认等待由调用方预算
+//! 承担——GNOME 的确认框会让方法调用本身阻塞到用户点击。
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -23,8 +24,10 @@ use crate::portal_common::{
 /// 必须低于 C-154 的 5s 命令预算；方法调用本身也受此值约束，因为 KDE 的
 /// 授权弹窗会让 `Screenshot` 调用直接等待用户输入。
 pub const SCREENSHOT_TIMEOUT: Duration = Duration::from_secs(3);
-/// screenshot 交互（弹授权窗）超时：授权场景用户要么尽快点击、要么不在场，
-/// 更短超时让无人值守/自动化快速失败。
+/// screenshot 交互（弹授权窗）的**方法调用**上限：GNOME/KDE 的确认框会让
+/// 这次调用本身阻塞到用户点击，固定上限保证无人值守时不会一直挂着；放弃
+/// 方法调用不等于放弃确认，返回后的等待另由 [`ScreenshotBudget::deadline`]
+/// 覆盖。
 pub const SCREENSHOT_TIMEOUT_INTERACTIVE: Duration = Duration::from_secs(3);
 /// screenshot 通道最大尝试次数（§19.3；含首次，共 2 次尝试）。
 pub const SCREENSHOT_MAX_ATTEMPTS: u32 = 2;
@@ -57,6 +60,45 @@ pub fn screenshot_attempts(interactive: bool) -> u32 {
     }
 }
 
+/// 一次 portal Screenshot 尝试的预算。
+///
+/// 方法调用与 Response 等待分开计时：KDE 的授权弹窗会让方法调用本身阻塞，
+/// 必须先以短预算判定并降级；GNOME 的确认对话框既可能阻塞方法调用、也可能
+/// 在方法返回后才等用户点击，两种情况都由 `deadline` 覆盖返回后的等待。
+/// 两者共用一个绝对截止，避免两级预算叠加把单次调用放大（C-154）。
+#[derive(Clone, Copy, Debug)]
+pub struct ScreenshotBudget {
+    /// 方法调用的单次上限。
+    pub call: Duration,
+    /// 方法调用与 Response 等的整体截止。
+    pub deadline: tokio::time::Instant,
+    /// 允许的尝试次数；等待用户确认的路径只允许一次。
+    pub attempts: u32,
+}
+
+impl ScreenshotBudget {
+    /// 常规预算：方法调用与 Response 各用通道默认超时。
+    pub fn standard(interactive: bool) -> Self {
+        let timeout = screenshot_timeout(interactive);
+        Self {
+            call: timeout,
+            deadline: tokio::time::Instant::now() + timeout,
+            attempts: screenshot_attempts(interactive),
+        }
+    }
+}
+
+/// 单次 portal Screenshot 的去向。
+#[derive(Debug)]
+pub enum ScreenshotAttempt {
+    /// 成功落盘。
+    Captured(std::path::PathBuf),
+    /// 门户已受理请求，但用户在预算内没有完成确认界面（如 GNOME 的截图确认框）。
+    AwaitingConfirmation(AgentShellError),
+    /// 后端不可用、被拒绝或方法调用失败。
+    Unavailable(AgentShellError),
+}
+
 /// 生成 Screenshot 的 `handle_token`（pid + 序列号）。
 fn screenshot_token(pid: u32, seq: u64) -> String {
     format!("agent_shell_screenshot_{pid}_{seq}")
@@ -81,7 +123,8 @@ fn next_token(counter: &AtomicU64, pid: u32) -> String {
 /// 取到 URI 即删除源图。晚到的图只用于清理，不会回流成本次捕获结果。
 ///
 /// 成功返回（调用方接管产物）或明确拒绝（无产物）时 [`Self::disarm`]；
-/// 重试与超时路径保持武装，每次尝试各自收尾。
+/// 确认超时保持武装，由守卫在 Drop 里收尾。重试路径也保持武装，每次尝试
+/// 各自收尾。
 struct ScreenshotRequestGuard {
     conn: zbus::Connection,
     request_path: ObjectPath<'static>,
@@ -189,6 +232,28 @@ impl Drop for ScreenshotRequestGuard {
     }
 }
 
+/// 把成功 Response 的结果字典转成捕获去向，并解除守卫的收尾职责。
+///
+/// Response 是请求终态，成功路径不会再晚到第二条：调用方接管产物，守卫
+/// 不再 `Request.Close`，也不删除门户落盘文件。
+fn finish_screenshot_response(
+    request: &mut ScreenshotRequestGuard,
+    results: &std::collections::HashMap<String, zvariant::OwnedValue>,
+) -> ScreenshotAttempt {
+    request.disarm();
+    let Some(uri) = string_field(results, "uri") else {
+        return ScreenshotAttempt::Unavailable(AgentShellError::Capture(
+            "portal Screenshot: no uri in response".into(),
+        ));
+    };
+    match uri_to_path(uri) {
+        Some(path) => ScreenshotAttempt::Captured(path),
+        None => ScreenshotAttempt::Unavailable(AgentShellError::Capture(format!(
+            "portal Screenshot: bad uri {uri:?}"
+        ))),
+    }
+}
+
 /// portal Screenshot 组件：单帧 PNG 落盘路径获取。
 pub struct ScreenshotPortal {
     conn: zbus::Connection,
@@ -234,11 +299,65 @@ impl ScreenshotPortal {
     /// `interactive: true` 时允许 portal 弹授权窗；false 时仅当已有
     /// 持久化授权（或后端免弹窗配置）才成功。
     pub async fn capture(&self, interactive: bool) -> Result<std::path::PathBuf> {
-        let proxy = portal_proxy(&self.conn, "org.freedesktop.portal.Screenshot")
+        match self
+            .capture_with_budget(interactive, ScreenshotBudget::standard(interactive))
             .await
-            .map_err(|e| AgentShellError::DBus(format!("Screenshot portal proxy: {e}")))?;
-        let sender = sender_part(&self.conn)
-            .ok_or_else(|| AgentShellError::DBus("no unique name on session bus".into()))?;
+        {
+            ScreenshotAttempt::Captured(path) => Ok(path),
+            ScreenshotAttempt::AwaitingConfirmation(e) | ScreenshotAttempt::Unavailable(e) => {
+                Err(e)
+            }
+        }
+    }
+
+    /// 在显式预算内截屏，区分「等待用户确认」与「后端不可用」。
+    ///
+    /// 等待确认的失败不能直接当作后端不可用去降级：门户界面已经弹出，
+    /// 再发起下一级只会叠加一个无人应答的界面。
+    pub async fn capture_with_budget(
+        &self,
+        interactive: bool,
+        budget: ScreenshotBudget,
+    ) -> ScreenshotAttempt {
+        // 整级绝对截止：proxy 建立、Response 订阅、方法调用与 Response 等待
+        // 共用 `budget.deadline`。任一段变慢都不能借用后续确认的预算，单次
+        // 方法调用另有 `budget.call` 固定上限（C-154）。
+        let level_budget = budget
+            .deadline
+            .saturating_duration_since(tokio::time::Instant::now());
+        let remaining = || {
+            budget
+                .deadline
+                .saturating_duration_since(tokio::time::Instant::now())
+        };
+
+        let proxy = match tokio::time::timeout(
+            remaining(),
+            portal_proxy(&self.conn, "org.freedesktop.portal.Screenshot"),
+        )
+        .await
+        {
+            Ok(Ok(proxy)) => proxy,
+            Ok(Err(e)) => {
+                return ScreenshotAttempt::Unavailable(AgentShellError::DBus(format!(
+                    "Screenshot portal proxy: {e}"
+                )))
+            }
+            Err(_) => {
+                return ScreenshotAttempt::Unavailable(AgentShellError::Timeout(format!(
+                    "portal Screenshot proxy did not answer within the {}ms level budget",
+                    level_budget.as_millis()
+                )))
+            }
+        };
+        let sender = match sender_part(&self.conn) {
+            Some(sender) => sender,
+            None => {
+                return ScreenshotAttempt::Unavailable(AgentShellError::DBus(
+                    "no unique name on session bus".into(),
+                ))
+            }
+        };
 
         // §19.3：非交互最多 2 次尝试；交互单次（超时/取消后重试只会二次弹窗）。
         // 每次生成新 token（pid 进程内不变，重试复用同一
@@ -247,30 +366,55 @@ impl ScreenshotPortal {
         // `interactive=false` 请求的即时取消（code=1）可能在订阅建立前就到达，
         // 被 `wait_for_response` 遗漏而误判为超时（debug 下订阅延迟
         // 放大该竞态）。
-        let timeout = screenshot_timeout(interactive);
-        let attempts = screenshot_attempts(interactive);
+        let timeout = budget.call;
+        let attempts = budget.attempts;
         let mut last_err = None;
         for attempt in 0..attempts {
             let token = next_token(&self.token_seq, std::process::id());
             let request_path = ObjectPath::try_from(format!(
                 "/org/freedesktop/portal/desktop/request/{sender}/{token}"
             ))
-            .map_err(|e| AgentShellError::DBus(format!("request path: {e}")))?;
+            .map_err(|e| AgentShellError::DBus(format!("request path: {e}")));
+            let request_path = match request_path {
+                Ok(path) => path,
+                Err(e) => return ScreenshotAttempt::Unavailable(e),
+            };
             // 先订阅再发请求（避免竞态）。流建立失败（瞬时 AddMatch 竞态）按
             // 可重试 attempt 失败处理，而非 `?` 整体中断——与下方 proxy.call
             // 瞬态分支同口径，保留 §19.3 的第二次尝试。
-            let stream = match prepare_response_stream(&self.conn, &request_path).await {
-                Ok(s) => s,
-                Err(e) => {
+            let setup_budget = remaining();
+            if setup_budget.is_zero() {
+                return ScreenshotAttempt::Unavailable(AgentShellError::Timeout(format!(
+                    "portal Screenshot level budget exhausted before attempt {}",
+                    attempt + 1
+                )));
+            }
+            let stream = match tokio::time::timeout(
+                setup_budget,
+                prepare_response_stream(&self.conn, &request_path),
+            )
+            .await
+            {
+                Ok(Ok(s)) => s,
+                Ok(Err(e)) => {
                     tracing::warn!(
                         attempt,
                         "portal Screenshot response stream setup failed: {e}"
                     );
                     last_err = Some(e);
                     if attempt + 1 < attempts {
-                        tokio::time::sleep(PORTAL_RETRY_BACKOFF).await;
+                        let backoff = PORTAL_RETRY_BACKOFF.min(remaining());
+                        if !backoff.is_zero() {
+                            tokio::time::sleep(backoff).await;
+                        }
                     }
                     continue;
+                }
+                Err(_) => {
+                    return ScreenshotAttempt::Unavailable(AgentShellError::Timeout(format!(
+                        "portal Screenshot response subscription exceeded the {}ms level budget",
+                        level_budget.as_millis()
+                    )))
                 }
             };
             // 从这里起 Request 已可能被 portal 接受：守卫持有预订阅流，任何
@@ -287,84 +431,115 @@ impl ScreenshotPortal {
             // 方法调用：AccessDenied 归一到 Permission（用户拒绝/无活跃会话），
             // 与 Timeout 同为语义明确错误，不重试；其余瞬态错误（GetSession
             // 就绪竞态）短退避后进入下一尝试。
-            // KDE 的授权弹窗会让方法调用本身停住（不是先返回 Request 再等
-            // Response 信号），所以超时必须覆盖 `proxy.call`；否则后续
-            // `drain_response_with_timeout` 根本没有机会开始计时。
-            let returned: zvariant::OwnedObjectPath =
-                match tokio::time::timeout(timeout, proxy.call("Screenshot", &body)).await {
-                    Ok(Ok(p)) => p,
+            let call_budget = timeout.min(remaining());
+            if call_budget.is_zero() {
+                return ScreenshotAttempt::Unavailable(AgentShellError::Timeout(format!(
+                    "portal Screenshot method call budget exhausted before attempt {}",
+                    attempt + 1
+                )));
+            }
+            let returned: Option<zvariant::OwnedObjectPath> =
+                match tokio::time::timeout(call_budget, proxy.call("Screenshot", &body)).await {
+                    Ok(Ok(p)) => Some(p),
                     Ok(Err(e)) => {
                         let e = dbus_error(format!("Screenshot call: {e}"));
                         if matches!(
                             e,
                             AgentShellError::Permission(_) | AgentShellError::Timeout(_)
                         ) {
-                            return Err(e);
+                            return ScreenshotAttempt::Unavailable(e);
                         }
                         tracing::warn!(attempt, "portal Screenshot call failed: {e}");
                         last_err = Some(e);
                         if attempt + 1 < attempts {
-                            tokio::time::sleep(PORTAL_RETRY_BACKOFF).await;
+                            let backoff = PORTAL_RETRY_BACKOFF.min(remaining());
+                            if !backoff.is_zero() {
+                                tokio::time::sleep(backoff).await;
+                            }
                         }
                         continue;
                     }
                     Err(_) => {
                         let e = AgentShellError::Timeout(format!(
-                            "portal Screenshot method did not return within {}s \
+                            "portal Screenshot method did not return within {}ms \
                          (authorization dialog may be waiting for input)",
-                            timeout.as_secs()
+                            call_budget.as_millis()
                         ));
                         tracing::warn!(attempt, "{e}");
-                        return Err(e);
+                        // 交互级：GNOME 的确认框在用户点击前一直阻塞方法调用，
+                        // 请求本身已经建立。固定上限只决定何时放弃这一次方法
+                        // 调用；不能连确认等待一起判死——否则 `--wait` 永远
+                        // 兑现不了。保留预订阅流，继续在同一条 Request 上等
+                        // Response（C-154：放宽的是返回后的等待）。
+                        if !interactive {
+                            return ScreenshotAttempt::Unavailable(e);
+                        }
+                        // 整级预算已在这段方法等待里耗尽（默认 3s 预算与 3s
+                        // 方法上限相等时必然如此）：请求已发出、门户仍在等
+                        // 确认，收场是「未确认」而不是「后端不可用」。守卫
+                        // 保持武装，由 Drop 做有界收尾。
+                        if remaining().is_zero() {
+                            return ScreenshotAttempt::AwaitingConfirmation(e);
+                        }
+                        None
                     }
                 };
 
+            // 方法调用已返回，或交互级已放弃方法而请求仍在：剩余预算属于
+            // 门户确认界面。GNOME 的 `interactive=false` 也弹确认框，且只在
+            // 用户点击后才发 Response。
+            let response_budget = remaining();
+
             // portal 若未按 handle_token 规范返回预算路径（非常规实现），回退
             // 到调用后订阅的旧路径——该路径有竞态，但仅非常规后端才会触发。
-            let result = if returned.as_str() == request_path.as_str() {
-                match request.stream_mut() {
-                    Some(stream) => {
-                        drain_response_with_timeout(stream, timeout, "Screenshot").await
-                    }
-                    None => wait_for_response(&self.conn, &request_path, timeout).await,
+            let result = match returned.as_ref() {
+                Some(returned) if returned.as_str() != request_path.as_str() => {
+                    tracing::warn!(
+                        "Screenshot path mismatch: expected {}, got {}",
+                        request_path,
+                        returned
+                    );
+                    request.retarget(returned.as_str());
+                    wait_for_response(&self.conn, returned, response_budget).await
                 }
-            } else {
-                tracing::warn!(
-                    "Screenshot path mismatch: expected {}, got {}",
-                    request_path,
-                    returned
-                );
-                request.retarget(returned.as_str());
-                wait_for_response(&self.conn, &returned, timeout).await
+                _ => match request.stream_mut() {
+                    Some(stream) => {
+                        drain_response_with_timeout(stream, response_budget, "Screenshot").await
+                    }
+                    None => wait_for_response(&self.conn, &request_path, response_budget).await,
+                },
             };
 
             match result {
                 Ok((_, results)) => {
-                    // Response 是请求终态：不会再晚到第二条。
-                    request.disarm();
-                    let uri = string_field(&results, "uri").ok_or_else(|| {
-                        AgentShellError::Capture("portal Screenshot: no uri in response".into())
-                    })?;
-                    return uri_to_path(uri).ok_or_else(|| {
-                        AgentShellError::Capture(format!("portal Screenshot: bad uri {uri:?}"))
-                    });
+                    return finish_screenshot_response(&mut request, &results);
                 }
                 // 用户拒绝/取消不重试——语义明确，重试只会再次弹窗。
                 Err(e @ AgentShellError::Permission(_)) => {
                     // 明确拒绝/取消不产出文件，无需晚响应收尾。
                     request.disarm();
-                    return Err(e);
+                    return ScreenshotAttempt::Unavailable(e);
+                }
+                // Request 已建立却等不到 Response：确认界面没人点击，不是
+                // 后端不可用。保留为独立去向，由调用方决定报错文案。
+                Err(e @ AgentShellError::Timeout(_)) => {
+                    return ScreenshotAttempt::AwaitingConfirmation(e);
                 }
                 Err(e) => {
                     tracing::warn!(attempt, "portal Screenshot attempt failed: {e}");
                     last_err = Some(e);
                     if attempt + 1 < attempts {
-                        tokio::time::sleep(Duration::from_millis(1500)).await;
+                        let backoff = Duration::from_millis(1500).min(remaining());
+                        if !backoff.is_zero() {
+                            tokio::time::sleep(backoff).await;
+                        }
                     }
                 }
             }
         }
-        Err(last_err.unwrap_or_else(|| AgentShellError::Capture("portal Screenshot failed".into())))
+        ScreenshotAttempt::Unavailable(
+            last_err.unwrap_or_else(|| AgentShellError::Capture("portal Screenshot failed".into())),
+        )
     }
 }
 

@@ -104,6 +104,7 @@ pub mod test_hooks {
     static PATH_CONTAINS: Mutex<Option<String>> = Mutex::new(None);
     static WORKER_START_DELAY_MS: Mutex<u64> = Mutex::new(0);
     static FRAME_WAIT_TIMEOUT_MS: Mutex<Option<u64>> = Mutex::new(None);
+    static SYNTHETIC_FRAME: Mutex<Option<crate::types::Frame>> = Mutex::new(None);
 
     /// 对包含 `path_contains` 的 Request 路径延迟 `delay` 后注册订阅。
     pub fn set_subscribe_delay(path_contains: &str, delay: Duration) {
@@ -150,6 +151,21 @@ pub mod test_hooks {
             .lock()
             .expect("frame wait timeout")
             .map(Duration::from_millis)
+    }
+
+    /// 用给定帧替代 PipeWire worker 的产出：验收环境没有真实屏幕流，
+    /// 暖会话回归仍需证明已建会话能直接出图。
+    pub fn set_synthetic_frame(frame: crate::types::Frame) {
+        *SYNTHETIC_FRAME.lock().expect("synthetic frame") = Some(frame);
+    }
+
+    /// 恢复真实 PipeWire 取帧。
+    pub fn clear_synthetic_frame() {
+        *SYNTHETIC_FRAME.lock().expect("synthetic frame") = None;
+    }
+
+    pub(crate) fn synthetic_frame() -> Option<crate::types::Frame> {
+        SYNTHETIC_FRAME.lock().expect("synthetic frame").clone()
     }
 
     pub(crate) async fn apply(request_path: &ObjectPath<'_>) {

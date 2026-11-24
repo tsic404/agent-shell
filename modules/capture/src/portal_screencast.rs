@@ -579,6 +579,10 @@ impl ScreenCastCapture {
 
     /// 取最新一帧（自上次调用以来的最新帧；尚无帧则阻塞等待至多一个超时周期）。
     pub async fn capture_frame(&self) -> Result<Frame> {
+        #[cfg(feature = "portal-test-hooks")]
+        if let Some(frame) = crate::portal_common::test_hooks::synthetic_frame() {
+            return Ok(frame);
+        }
         let slot = std::sync::Arc::clone(&self.latest);
         let wait = frame_wait_timeout();
         tokio::task::spawn_blocking(move || {

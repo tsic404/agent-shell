@@ -696,11 +696,17 @@ impl DaemonClient {
         window: Option<String>,
         area: Option<[i32; 4]>,
         output_path: &str,
+        wait_ms: u64,
     ) -> Result<agent_shell_rpc::CaptureResult, String> {
         let v = self
             .call(
                 method::SCREENSHOT_CAPTURE,
-                json!({ "window": window, "area": area, "output_path": output_path }),
+                json!({
+                    "window": window,
+                    "area": area,
+                    "output_path": output_path,
+                    "wait_ms": wait_ms,
+                }),
             )
             .await?;
         serde_json::from_value(v).map_err(|e| e.to_string())
