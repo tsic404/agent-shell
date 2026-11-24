@@ -118,6 +118,9 @@ pub mod method {
     // ── daemon 管理（§22.2）──
     /// daemon 状态查询。
     pub const DAEMON_STATUS: &str = "daemon.status";
+    /// 存活探测：不取 daemon 状态锁、无副作用，供默认入口判定端点是否可应答
+    /// （ADR-017）。一条长命令占着状态锁时仍必须立即应答。
+    pub const DAEMON_PING: &str = "daemon.ping";
     /// 查看 portal 会话。
     pub const DAEMON_SESSIONS: &str = "daemon.sessions";
     // ── IME（§22.8 D7）──

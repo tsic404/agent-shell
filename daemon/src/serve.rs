@@ -8,6 +8,7 @@
 use crate::dispatch;
 use crate::path_guard::describe_file_type;
 use crate::state::Daemon;
+use agent_shell_core::security::SecurityManager;
 use agent_shell_rpc::{Notification, Request, Response};
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -24,6 +25,9 @@ const IDLE_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 
 /// accept 报错后的退避：避免 EMFILE 等持续错误把监听循环打成忙等。
 const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(100);
+
+/// 退出前等待在途审计追加的上限：不让一次慢写拖住进程退出。
+const EXIT_AUDIT_FLUSH: Duration = Duration::from_millis(300);
 
 /// 监听模式的活动时钟：连入与每个请求都刷新，监听循环据此判定空闲退出。
 struct ActivityClock {
@@ -146,10 +150,12 @@ pub fn bind_socket(path: &Path) -> Result<BoundSocket, String> {
 
 /// stdio 形态：单连接，stdin EOF 或空闲超时退出。
 pub async fn serve_stdio(daemon: Daemon, idle_timeout: Duration) {
+    let gate = Gate::new(&daemon.security, &daemon.caller_id);
     let daemon = Arc::new(Mutex::new(daemon));
     let out = Arc::new(Mutex::new(tokio::io::stdout()));
     serve_stream(
         &daemon,
+        &gate,
         tokio::io::stdin(),
         out,
         Some(idle_timeout),
@@ -164,6 +170,7 @@ pub async fn serve_stdio(daemon: Daemon, idle_timeout: Duration) {
 
 /// 监听形态：每条连接一个任务，共享同一 daemon 状态；无请求且无连接达空闲超时退出。
 pub async fn serve_socket(bound: BoundSocket, daemon: Daemon, idle_timeout: Duration) {
+    let gate = Arc::new(Gate::new(&daemon.security, &daemon.caller_id));
     let daemon = Arc::new(Mutex::new(daemon));
     let activity = Arc::new(ActivityClock::new());
     let connections = Arc::new(AtomicUsize::new(0));
@@ -179,7 +186,13 @@ pub async fn serve_socket(bound: BoundSocket, daemon: Daemon, idle_timeout: Dura
             accepted = bound.listener.accept() => match accepted {
                 Ok((stream, _addr)) => {
                     activity.touch();
-                    spawn_connection(&daemon, stream, Arc::clone(&activity), Arc::clone(&connections));
+                    spawn_connection(
+                        &daemon,
+                        &gate,
+                        stream,
+                        Arc::clone(&activity),
+                        Arc::clone(&connections),
+                    );
                 }
                 Err(e) => {
                     tracing::warn!("accept failed: {e}");
@@ -222,16 +235,18 @@ impl Drop for ConnectionGuard {
 /// 单条 socket 连接：读半交给请求循环，写半共享给订阅转发任务。
 fn spawn_connection(
     daemon: &Arc<Mutex<Daemon>>,
+    gate: &Arc<Gate>,
     stream: UnixStream,
     activity: Arc<ActivityClock>,
     connections: Arc<AtomicUsize>,
 ) {
     let (reader, writer) = stream.into_split();
     let daemon = Arc::clone(daemon);
+    let gate = Arc::clone(gate);
     let out = Arc::new(Mutex::new(writer));
     tokio::spawn(async move {
         let _alive = ConnectionGuard::acquire(&connections);
-        serve_stream(&daemon, reader, out, None, Some(activity), false).await;
+        serve_stream(&daemon, &gate, reader, out, None, Some(activity), false).await;
     });
 }
 
@@ -256,6 +271,42 @@ fn exit_warn(transient: bool, msg: &str) {
     }
 }
 
+/// 连接级门禁句柄：与 `dispatch` 共用同一份策略真值，外加调用方身份。
+///
+/// 存活探测不取业务状态锁（长命令占锁时仍须应答），但探测本身是一条已登记的
+/// 远程方法：黑名单与确认覆盖对它同样生效。身份与策略在这里做成连接级句柄，
+/// 快路径才能在不等待状态锁的前提下调用同一个 [`dispatch::gate`]。
+/// `SecurityManager` 的克隆共享同一份配置（`Arc<RwLock<_>>`），`security.grant`
+/// / `revoke` 的变更因此对快路径立即可见；调用方身份由 `AGENT_SHELL_AGENT_ID`
+/// 在进程装配时注入、此后不变，连接建立时取快照与逐请求读取等价。
+#[derive(Clone)]
+pub(crate) struct Gate {
+    caller_id: String,
+    security: SecurityManager,
+}
+
+impl Gate {
+    pub(crate) fn new(security: &SecurityManager, caller_id: &str) -> Self {
+        Self {
+            caller_id: caller_id.to_string(),
+            security: security.clone(),
+        }
+    }
+
+    /// 探测应答：门禁 → 结果 → 执行结果审计，与完整分派同源。
+    fn answer_ping(&self, req: &Request) -> Response {
+        match dispatch::gate(&self.security, &self.caller_id, req) {
+            Ok(op) => {
+                if let Some(op) = op {
+                    self.security.record_execution(&self.caller_id, &op, true);
+                }
+                Response::ok(req.id, dispatch::daemon_ping_payload())
+            }
+            Err(refusal) => *refusal,
+        }
+    }
+}
+
 /// 请求服务循环：逐行读 → dispatch → 逐行写。连接 EOF 退出；`idle_timeout`
 /// 为 `Some` 时本连接空闲超时退出（stdio 形态，监听形态的空闲退出在监听循环）。
 ///
@@ -266,6 +317,7 @@ fn exit_warn(transient: bool, msg: &str) {
 /// 临近的日志必须非阻塞，见 [`exit_info`]。
 async fn serve_stream<R, W>(
     daemon: &Arc<Mutex<Daemon>>,
+    gate: &Gate,
     reader: R,
     out: Arc<Mutex<W>>,
     idle_timeout: Option<Duration>,
@@ -321,6 +373,19 @@ async fn serve_stream<R, W>(
                 continue;
             }
         };
+        // 存活探测不取状态锁：一条长命令（最多一整条命令预算）占着锁时，
+        // 默认入口的可应答判定仍必须得到回答，否则会被误判为不可应答而
+        // 另起瞬态实例（ADR-017）。免锁不等于免门禁：`daemon.ping` 是已
+        // 登记的远程方法，黑名单、确认覆盖与审计规则与 dispatch 同一份
+        // （C-104 / C-105 / C-107），由 [`Gate`] 承载。
+        if req.method == agent_shell_rpc::method::DAEMON_PING {
+            let resp = gate.answer_ping(&req);
+            if let Err(e) = write_line(&out, &resp.to_line()).await {
+                tracing::debug!("response write failed ({e}); closing connection");
+                break;
+            }
+            continue;
+        }
         // dispatch 与订阅取走必须在同一把状态锁内：多连接下若在两步之间让出，
         // 另一条连接的订阅句柄会被本连接转发到错误的 writer。
         let (resp, subs) = {
@@ -394,6 +459,13 @@ async fn shutdown(daemon: &Arc<Mutex<Daemon>>) {
     if let Some(capture) = daemon.capture.as_ref() {
         capture.shutdown().await;
     }
+    drop(daemon);
+    // 审计按进程独占分段同步追加：每次判定返回前记录已写进本进程的分段文件，
+    // 退出没有跨文件迁移或内存队列要交接（C-107）。这里只等仍在途的追加写完，
+    // 等待有墙钟上限，不把退出拖在慢盘上。
+    if !agent_shell_core::audit::flush_pending(EXIT_AUDIT_FLUSH) {
+        tracing::warn!("audit appends still in flight at exit; shutdown budget exhausted");
+    }
 }
 
 /// 写一行并 flush。返回写结果——调用方据此判定连接是否还在：对端消失后既不得
@@ -408,7 +480,403 @@ async fn write_line<W: AsyncWrite + Unpin>(out: &Mutex<W>, line: &str) -> std::i
 mod tests {
     use super::*;
     use crate::test_support::TestDaemon;
+    use agent_shell_core::security::ConfirmMode;
+    use agent_shell_rpc::{method, RpcErrorCode};
+    use serde_json::json;
     use std::os::unix::fs::PermissionsExt;
+
+    /// 测试用排他 `flock` 持有者：独立打开描述符模拟「另一个进程的写者」。
+    ///
+    /// daemon 测试直接调 `libc::flock` 造文件锁——被测的正是跨描述符/
+    /// 跨进程争用，用同一套内核语义才等价。
+    struct ExclusiveFlock {
+        file: std::fs::File,
+    }
+
+    impl ExclusiveFlock {
+        fn acquire(path: &std::path::Path) -> Self {
+            use std::os::unix::io::AsRawFd;
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .read(true)
+                .append(true)
+                .open(path)
+                .expect("open audit holder");
+            // SAFETY: flock 只作用于本描述符，参数与返回值均无指针解引用。
+            let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+            assert_eq!(rc, 0, "flock LOCK_EX on audit log");
+            Self { file }
+        }
+    }
+
+    impl Drop for ExclusiveFlock {
+        fn drop(&mut self) {
+            use std::os::unix::io::AsRawFd;
+            // SAFETY: 同上，关闭锁随描述符释放，这里显式解锁让断言更直观。
+            unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
+        }
+    }
+
+    /// 在一条真实 `serve_stream` 连接上跑一条请求并带回响应。
+    ///
+    /// 用 duplex 传输：编解码、读循环、门禁与写响应都是生产路径，只有字节
+    /// 来源被替换，免得为一条探测拉起整个 socket 监听。
+    async fn respond_once(daemon: Arc<Mutex<Daemon>>, gate: Gate, request: &str) -> Response {
+        let (server, mut client) = tokio::io::duplex(4096);
+        let (reader, writer) = tokio::io::split(server);
+        let out = Arc::new(Mutex::new(writer));
+        let serving = tokio::spawn(async move {
+            serve_stream(&daemon, &gate, reader, out, None, None, false).await;
+        });
+        client
+            .write_all(request.as_bytes())
+            .await
+            .expect("write request");
+        let mut line = String::new();
+        BufReader::new(&mut client)
+            .read_line(&mut line)
+            .await
+            .expect("read response");
+        let response = Response::from_line(&line).expect("response json");
+        drop(client);
+        serving.await.expect("serve task");
+        response
+    }
+
+    /// `security.status` 对同一操作的结论：快路径与判定查询必须同源。
+    async fn status_decision(daemon: &Arc<Mutex<Daemon>>, operation: &str) -> String {
+        let mut d = daemon.lock().await;
+        let resp = dispatch::dispatch(
+            &mut d,
+            &Request::new(
+                99,
+                method::SECURITY_STATUS,
+                json!({ "operation": operation }),
+            ),
+        )
+        .await;
+        let result = resp.result.expect("security.status result");
+        result["check"]["decision"]
+            .as_str()
+            .expect("decision string")
+            .to_string()
+    }
+
+    /// 快路径必须走与 dispatch 同一门禁：黑名单命中时返回拒绝、审计留 deny、
+    /// `security.status` 给同一结论（C-104 / C-105 / C-107）。
+    #[tokio::test]
+    async fn ping_fast_path_denies_like_dispatch_and_audits() {
+        let (daemon, _sandbox) = TestDaemon::start(Duration::from_secs(1)).await.into_parts();
+        daemon
+            .security
+            .write_config()
+            .permissions
+            .deny
+            .insert("daemon.ping".into(), true);
+        let gate = Gate::new(&daemon.security, &daemon.caller_id);
+        let daemon = Arc::new(Mutex::new(daemon));
+
+        let resp = respond_once(
+            Arc::clone(&daemon),
+            gate,
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"daemon.ping\"}\n",
+        )
+        .await;
+        assert_eq!(resp.id, 1);
+        assert_eq!(
+            resp.error.expect("denied ping must return an error").code,
+            RpcErrorCode::Denied as i32
+        );
+        assert_eq!(status_decision(&daemon, "daemon.ping").await, "deny");
+
+        let d = daemon.lock().await;
+        let denies = d.security.audit.query("", "daemon.ping", "deny", None);
+        assert_eq!(denies.len(), 1, "deny must be recorded once: {denies:?}");
+        let executions = d.security.audit.query("", "daemon.ping", "allow", None);
+        assert!(
+            executions.is_empty(),
+            "denied ping must not leave an execution record: {executions:?}"
+        );
+    }
+
+    /// 确认覆盖对快路径同样生效：回执是「需确认」，判定查询与审计一致。
+    #[tokio::test]
+    async fn ping_fast_path_requires_confirmation_like_dispatch() {
+        let (daemon, _sandbox) = TestDaemon::start(Duration::from_secs(1)).await.into_parts();
+        daemon
+            .security
+            .write_config()
+            .operations
+            .confirm
+            .insert("daemon.ping".into(), ConfirmMode::Always);
+        let gate = Gate::new(&daemon.security, &daemon.caller_id);
+        let daemon = Arc::new(Mutex::new(daemon));
+
+        let resp = respond_once(
+            Arc::clone(&daemon),
+            gate,
+            "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"daemon.ping\"}\n",
+        )
+        .await;
+        assert_eq!(resp.id, 2);
+        assert_eq!(
+            resp.error
+                .expect("confirm override must short-circuit")
+                .code,
+            RpcErrorCode::ConfirmationRequired as i32
+        );
+        assert_eq!(status_decision(&daemon, "daemon.ping").await, "confirm");
+
+        let d = daemon.lock().await;
+        let confirms = d.security.audit.query("", "daemon.ping", "confirm", None);
+        assert_eq!(
+            confirms.len(),
+            1,
+            "confirm decision must be recorded once: {confirms:?}"
+        );
+    }
+
+    /// 放行路径与 dispatch 一样双记录：门禁 allow + 执行 allow(result=true)。
+    #[tokio::test]
+    async fn ping_fast_path_allows_and_records_execution() {
+        let (daemon, _sandbox) = TestDaemon::start(Duration::from_secs(1)).await.into_parts();
+        let gate = Gate::new(&daemon.security, &daemon.caller_id);
+        let daemon = Arc::new(Mutex::new(daemon));
+
+        let resp = respond_once(
+            Arc::clone(&daemon),
+            gate,
+            "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"daemon.ping\"}\n",
+        )
+        .await;
+        assert_eq!(resp.id, 3);
+        let result = resp.result.expect("allowed ping result");
+        assert_eq!(result["service"], "agent-shell-daemon");
+        assert_eq!(status_decision(&daemon, "daemon.ping").await, "allow");
+
+        let d = daemon.lock().await;
+        let entries = d.security.audit.query("", "daemon.ping", "allow", None);
+        assert_eq!(entries.len(), 2, "gate + execution: {entries:?}");
+        assert!(
+            entries.iter().any(|e| !e.result),
+            "gate record: {entries:?}"
+        );
+        assert!(
+            entries.iter().any(|e| e.result),
+            "execution record: {entries:?}"
+        );
+    }
+
+    /// 门禁判定不依赖业务状态锁：锁被长命令占着时，deny 仍须在探测预算内
+    /// 返回，且证据与 `security.status` 一致。
+    #[tokio::test]
+    async fn ping_gate_runs_while_state_lock_is_held() {
+        let (daemon, _sandbox) = TestDaemon::start(Duration::from_secs(1)).await.into_parts();
+        daemon
+            .security
+            .write_config()
+            .permissions
+            .deny
+            .insert("daemon.ping".into(), true);
+        let gate = Gate::new(&daemon.security, &daemon.caller_id);
+        let daemon = Arc::new(Mutex::new(daemon));
+        let (server, mut client) = tokio::io::duplex(4096);
+        let (reader, writer) = tokio::io::split(server);
+        let out = Arc::new(Mutex::new(writer));
+        let serving = tokio::spawn({
+            let daemon = Arc::clone(&daemon);
+            async move { serve_stream(&daemon, &gate, reader, out, None, None, false).await }
+        });
+
+        let guard = daemon.lock().await;
+        client
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"daemon.ping\"}\n")
+            .await
+            .expect("write ping");
+        let mut line = String::new();
+        tokio::time::timeout(
+            Duration::from_millis(300),
+            BufReader::new(&mut client).read_line(&mut line),
+        )
+        .await
+        .expect("gate must answer while the state lock is held")
+        .expect("read ping response");
+        drop(guard);
+
+        let resp = Response::from_line(&line).expect("ping response");
+        assert_eq!(
+            resp.error.expect("denied ping must return an error").code,
+            RpcErrorCode::Denied as i32
+        );
+        drop(client);
+        serving.await.expect("serve task");
+    }
+
+    /// 在 `connections` 条真实 `serve_stream` 连接上并发各发 `per_connection`
+    /// 条 ping；返回后才允许断言，保证所有审计写入已经完成。
+    async fn ping_over_concurrent_connections(
+        daemon: &Arc<Mutex<Daemon>>,
+        gate: &Gate,
+        connections: usize,
+        per_connection: usize,
+    ) {
+        let mut tasks = Vec::new();
+        for connection in 0..connections {
+            let daemon = Arc::clone(daemon);
+            let gate = gate.clone();
+            tasks.push(tokio::spawn(async move {
+                let (server, mut client) = tokio::io::duplex(64 * 1024);
+                let (reader, writer) = tokio::io::split(server);
+                let out = Arc::new(Mutex::new(writer));
+                let serving = tokio::spawn(async move {
+                    serve_stream(&daemon, &gate, reader, out, None, None, false).await;
+                });
+                for i in 0..per_connection {
+                    let request = format!(
+                        "{{\"jsonrpc\":\"2.0\",\"id\":{},\"method\":\"daemon.ping\"}}\n",
+                        connection * per_connection + i + 1
+                    );
+                    client
+                        .write_all(request.as_bytes())
+                        .await
+                        .expect("write ping");
+                    let mut line = String::new();
+                    BufReader::new(&mut client)
+                        .read_line(&mut line)
+                        .await
+                        .expect("read ping response");
+                    Response::from_line(&line).expect("ping response");
+                }
+                drop(client);
+                serving.await.expect("serve task");
+            }));
+        }
+        for task in tasks {
+            task.await.expect("connection task");
+        }
+    }
+
+    /// 全部审计文件（旧主日志 + 各进程分段）的非空行必须逐行可解析——拼行会
+    /// 在这里显形。
+    fn assert_audit_lines_parse(path: &std::path::Path, expected: usize) {
+        let mut lines = 0;
+        for file in agent_shell_core::audit::audit_files(path) {
+            let raw = std::fs::read_to_string(&file).expect("read audit log");
+            for line in raw.lines().filter(|l| !l.trim().is_empty()) {
+                serde_json::from_str::<agent_shell_core::audit::AuditEntry>(line)
+                    .unwrap_or_else(|e| panic!("不可解析的审计行 {line:?}: {e}"));
+                lines += 1;
+            }
+        }
+        assert_eq!(lines, expected, "审计记录条数不符（拼行或丢失）");
+    }
+
+    /// 多连接并发落审计时每条记录独占一行、查询不丢。
+    ///
+    /// 三态各跑一轮并发连接：deny / confirm 每请求一条，allow 为「门禁 allow
+    /// + 执行 allow」各一条；每轮都核对原始行可解析与 `security.audit` 过滤
+    /// 结果，覆盖门禁与执行记录在不同 runtime 线程交错落盘的路径（C-107）。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_connections_keep_audit_records_whole() {
+        let (daemon, sandbox) = TestDaemon::start(Duration::from_secs(1)).await.into_parts();
+        let gate = Gate::new(&daemon.security, &daemon.caller_id);
+        let daemon = Arc::new(Mutex::new(daemon));
+        let audit_path = sandbox.audit_path();
+        let connections = 3;
+        let per_connection = 40;
+
+        // deny：每请求一条 deny，无执行记录。
+        {
+            let d = daemon.lock().await;
+            d.security
+                .write_config()
+                .permissions
+                .deny
+                .insert("daemon.ping".into(), true);
+        }
+        ping_over_concurrent_connections(&daemon, &gate, connections, per_connection).await;
+        assert_audit_lines_parse(&audit_path, connections * per_connection);
+        {
+            let d = daemon.lock().await;
+            assert_eq!(
+                d.security
+                    .audit
+                    .query("", "daemon.ping", "deny", None)
+                    .len(),
+                connections * per_connection,
+                "deny 每请求一条且查询不丢"
+            );
+            assert!(d
+                .security
+                .audit
+                .query("", "daemon.ping", "allow", None)
+                .is_empty());
+        }
+
+        // confirm：每请求一条 confirm。
+        {
+            let d = daemon.lock().await;
+            let mut config = d.security.write_config();
+            config.permissions.deny.clear();
+            config
+                .operations
+                .confirm
+                .insert("daemon.ping".into(), ConfirmMode::Always);
+        }
+        ping_over_concurrent_connections(&daemon, &gate, connections, per_connection).await;
+        assert_audit_lines_parse(&audit_path, connections * per_connection * 2);
+        {
+            let d = daemon.lock().await;
+            assert_eq!(
+                d.security
+                    .audit
+                    .query("", "daemon.ping", "confirm", None)
+                    .len(),
+                connections * per_connection,
+                "confirm 每请求一条且查询不丢"
+            );
+        }
+
+        // allow：每请求两条（门禁判定 + 执行结果），查询不丢。
+        {
+            let d = daemon.lock().await;
+            let mut config = d.security.write_config();
+            config.operations.confirm.clear();
+        }
+        ping_over_concurrent_connections(&daemon, &gate, connections, per_connection).await;
+        assert_audit_lines_parse(&audit_path, connections * per_connection * 4);
+        {
+            let d = daemon.lock().await;
+            let entries = d.security.audit.query("", "daemon.ping", "allow", None);
+            assert_eq!(
+                entries.len(),
+                connections * per_connection * 2,
+                "allow 两步记录都在且查询不丢"
+            );
+            assert_eq!(
+                entries.iter().filter(|e| !e.result).count(),
+                connections * per_connection,
+                "门禁判定各一条"
+            );
+            assert_eq!(
+                entries.iter().filter(|e| e.result).count(),
+                connections * per_connection,
+                "执行结果各一条"
+            );
+            assert_eq!(
+                d.security
+                    .audit
+                    .query("", "daemon.ping", "deny", None)
+                    .len()
+                    + d.security
+                        .audit
+                        .query("", "daemon.ping", "confirm", None)
+                        .len(),
+                connections * per_connection * 2,
+                "前两轮记录也仍在文件中"
+            );
+        }
+    }
 
     /// 客户端在订阅响应写出之前消失时，订阅仍必须被回收。
     ///
@@ -420,6 +888,7 @@ mod tests {
     async fn subscription_is_reclaimed_when_response_write_fails() {
         // 沙箱随本测试存活：`serve_stream` 期间的门禁审计落沙箱内。
         let (daemon, _sandbox) = TestDaemon::start(Duration::from_secs(1)).await.into_parts();
+        let gate = Gate::new(&daemon.security, &daemon.caller_id);
         let daemon = Arc::new(Mutex::new(daemon));
         let (server, mut client) = tokio::io::duplex(4096);
         client
@@ -432,13 +901,198 @@ mod tests {
         let (reader, writer) = tokio::io::split(server);
         let out = Arc::new(Mutex::new(writer));
         // `transient = false`：本用例关心订阅注销，不涉及退出日志形态。
-        serve_stream(&daemon, reader, out, None, None, false).await;
+        serve_stream(&daemon, &gate, reader, out, None, None, false).await;
 
         assert_eq!(
             daemon.lock().await.hub.subscriber_count(),
             0,
             "订阅必须在连接退出时注销（响应写失败也不例外）"
         );
+    }
+
+    /// 默认入口的可应答判定（ADR-017）：一条长命令占着状态锁时，ping 仍须
+    /// 立即应答。若探测也排在同一把锁后面，端点会被误判为不可应答，
+    /// 命令转而派生瞬态实例——同一用户会话里出现第二个服务实例。
+    #[tokio::test]
+    async fn ping_answers_while_state_lock_is_held() {
+        let (daemon, _sandbox) = TestDaemon::start(Duration::from_secs(1)).await.into_parts();
+        let gate = Gate::new(&daemon.security, &daemon.caller_id);
+        let daemon = Arc::new(Mutex::new(daemon));
+        let (server, mut client) = tokio::io::duplex(4096);
+        let (reader, writer) = tokio::io::split(server);
+        let out = Arc::new(Mutex::new(writer));
+        let serving = tokio::spawn({
+            let daemon = Arc::clone(&daemon);
+            let gate = gate.clone();
+            async move { serve_stream(&daemon, &gate, reader, out, None, None, false).await }
+        });
+
+        // 模拟长命令：状态锁在整个判定窗口内被占用。
+        let guard = daemon.lock().await;
+        client
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"daemon.ping\"}\n")
+            .await
+            .expect("write ping");
+        let mut line = String::new();
+        let read = tokio::time::timeout(
+            Duration::from_millis(300),
+            BufReader::new(&mut client).read_line(&mut line),
+        )
+        .await
+        .expect("ping must be answered while the state lock is held")
+        .expect("read ping response");
+        drop(guard);
+        assert_ne!(read, 0, "connection closed before ping response");
+
+        let resp = Response::from_line(&line).expect("ping response");
+        assert_eq!(resp.id, 7);
+        assert_eq!(
+            resp.result.as_ref().and_then(|v| v.get("service")),
+            Some(&serde_json::json!("agent-shell-daemon"))
+        );
+        drop(client);
+        serving.await.expect("serve task");
+    }
+
+    /// 旧主日志被另一个进程/描述符持锁时，`daemon.ping` 仍须在探测预算内应答，
+    /// 且记录立刻落到本进程自己的分段里（不丢记录、也不等旧锁）。
+    ///
+    /// CLI 的「可应答」判定只有 500 ms（[`RESIDENT_PROBE_TIMEOUT`]）。审计排在
+    /// ping 应答路径上；若退回共享主日志 + 文件锁，另一实例短暂持锁就会让健康
+    /// 常驻实例错过窗口、被误判为不可应答而派生瞬态——默认入口的行为漂移
+    /// （C-154 同类约束）。本用例同时覆盖与既有 `audit.jsonl` 的共存。
+    #[tokio::test]
+    async fn ping_answers_and_keeps_audit_when_foreign_lock_is_held() {
+        let (daemon, sandbox) = TestDaemon::start(Duration::from_secs(1)).await.into_parts();
+        let gate = Gate::new(&daemon.security, &daemon.caller_id);
+        let audit_path = sandbox.audit_path();
+        let daemon = Arc::new(Mutex::new(daemon));
+
+        // 独立打开描述符持排他锁：与另一个进程的写者等价（flock 按描述符）。
+        let guard = ExclusiveFlock::acquire(&audit_path);
+
+        let (server, mut client) = tokio::io::duplex(4096);
+        let (reader, writer) = tokio::io::split(server);
+        let out = Arc::new(Mutex::new(writer));
+        let serving = tokio::spawn({
+            let daemon = Arc::clone(&daemon);
+            let gate = gate.clone();
+            async move { serve_stream(&daemon, &gate, reader, out, None, None, false).await }
+        });
+        client
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":41,\"method\":\"daemon.ping\"}\n")
+            .await
+            .expect("write ping");
+        let mut line = String::new();
+        let read = tokio::time::timeout(
+            Duration::from_millis(500),
+            BufReader::new(&mut client).read_line(&mut line),
+        )
+        .await
+        .expect("ping must answer within the probe budget while the audit lock is held")
+        .expect("read ping response");
+        assert_ne!(read, 0, "connection closed before ping response");
+        let resp = Response::from_line(&line).expect("ping response");
+        assert_eq!(resp.id, 41);
+        assert_eq!(
+            resp.result.as_ref().and_then(|v| v.get("service")),
+            Some(&serde_json::json!("agent-shell-daemon"))
+        );
+        drop(client);
+        serving.await.expect("serve task");
+
+        // 记录在判定返回前已同步追加到本进程分段：不用等旧锁释放。
+        let entries = daemon.lock().await.security.audit.read_all();
+        assert_eq!(
+            entries
+                .iter()
+                .filter(|e| e.op == "daemon.ping" && e.decision == "allow")
+                .count(),
+            2,
+            "旧锁被持住时门禁与执行记录仍须完整落盘: {entries:?}"
+        );
+        assert!(
+            std::fs::metadata(&audit_path).is_ok_and(|meta| meta.len() == 0),
+            "新机制不得向被锁住的旧主日志追加字节"
+        );
+
+        drop(guard);
+        let after = daemon.lock().await.security.audit.read_all();
+        assert_eq!(after.len(), 2, "锁释放后不得补写出重复行: {after:?}");
+        assert_eq!(
+            daemon
+                .lock()
+                .await
+                .security
+                .audit
+                .query("", "daemon.ping", "allow", Some(true))
+                .len(),
+            1,
+            "执行结果记录必须可按维度查到"
+        );
+    }
+
+    /// 退出不等待审计锁：记录在判定返回时已写入本进程分段，`shutdown` 有界
+    /// 返回，且不迁移、不改写、不删除任何审计文件（C-107 / C-154）。
+    #[tokio::test]
+    async fn shutdown_is_bounded_and_keeps_written_audit_records() {
+        let (daemon, sandbox) = TestDaemon::start(Duration::from_secs(1)).await.into_parts();
+        let gate = Gate::new(&daemon.security, &daemon.caller_id);
+        let audit_path = sandbox.audit_path();
+        let daemon = Arc::new(Mutex::new(daemon));
+
+        let guard = ExclusiveFlock::acquire(&audit_path);
+        let (server, mut client) = tokio::io::duplex(4096);
+        let (reader, writer) = tokio::io::split(server);
+        let out = Arc::new(Mutex::new(writer));
+        let serving = tokio::spawn({
+            let daemon = Arc::clone(&daemon);
+            async move { serve_stream(&daemon, &gate, reader, out, None, None, false).await }
+        });
+        client
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":42,\"method\":\"daemon.ping\"}\n")
+            .await
+            .expect("write ping");
+        let mut line = String::new();
+        BufReader::new(&mut client)
+            .read_line(&mut line)
+            .await
+            .expect("read ping response");
+        drop(client);
+        serving.await.expect("serve task");
+
+        let files_before = agent_shell_core::audit::audit_files(&audit_path);
+        let bytes_before: Vec<Vec<u8>> = files_before
+            .iter()
+            .map(|file| std::fs::read(file).expect("read audit file"))
+            .collect();
+
+        // 旧锁仍被占用：退出不得等它，也不得写出旁路文件或改写主日志。
+        let started = Instant::now();
+        shutdown(&daemon).await;
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(300),
+            "退出不得等待外部审计锁，实际 {elapsed:?}"
+        );
+        let files_after = agent_shell_core::audit::audit_files(&audit_path);
+        assert_eq!(files_before, files_after, "退出不得迁移或删除审计文件");
+        let bytes_after: Vec<Vec<u8>> = files_after
+            .iter()
+            .map(|file| std::fs::read(file).expect("read audit file"))
+            .collect();
+        assert_eq!(bytes_before, bytes_after, "退出不得改写已落盘记录");
+
+        let entries = daemon.lock().await.security.audit.read_all();
+        assert_eq!(entries.len(), 2, "退出后记录必须可查: {entries:?}");
+        assert_eq!(
+            entries
+                .iter()
+                .filter(|entry| entry.op == "daemon.ping" && entry.decision == "allow")
+                .count(),
+            2
+        );
+        drop(guard);
     }
 
     /// 合成器夹具：`close_window` 进入后永不返回，模拟挂死的后端。
@@ -638,15 +1292,18 @@ mod tests {
             agent_shell_core::types::DesktopEnvironment::GNOME,
             event::EventSource::MutterExtension,
         );
+        let gate = Gate::new(&daemon.security, &daemon.caller_id);
         let daemon = Arc::new(Mutex::new(daemon));
 
         // 连接 A：close 进入后端后挂住，直到预算耗尽才返回错误。
         let (a_server, a_client) = tokio::io::duplex(4096);
         let (a_reader, a_writer) = tokio::io::split(a_server);
         let a_daemon = Arc::clone(&daemon);
+        let a_gate = gate.clone();
         let a_task = tokio::spawn(async move {
             serve_stream(
                 &a_daemon,
+                &a_gate,
                 a_reader,
                 Arc::new(Mutex::new(a_writer)),
                 None,
@@ -671,9 +1328,11 @@ mod tests {
         let (b_server, b_client) = tokio::io::duplex(4096);
         let (b_reader, b_writer) = tokio::io::split(b_server);
         let b_daemon = Arc::clone(&daemon);
+        let b_gate = gate.clone();
         let b_task = tokio::spawn(async move {
             serve_stream(
                 &b_daemon,
+                &b_gate,
                 b_reader,
                 Arc::new(Mutex::new(b_writer)),
                 None,

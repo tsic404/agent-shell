@@ -20,6 +20,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::path::PathBuf;
 use std::str::FromStr;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 /// 权限分级（§21.21.1）。`#[repr(u8)]` + derive 使 L0 < L1 < … < L4，
@@ -306,10 +307,69 @@ impl AgentShellConfig {
 }
 
 /// 安全判定核心（§21.21.3）。持配置 + 审计日志器，router 层唯一入口。
+///
+/// 配置在 `Arc<RwLock<_>>` 里：`SecurityManager` 的克隆共享同一份实时策略。
+/// daemon 的请求入口与连接级探测快路径因此读到同一个真值，而不是两份可能
+/// 漂移的副本——`security.status` 说什么，快路径就按什么判。
 #[derive(Clone, Debug)]
 pub struct SecurityManager {
-    pub config: AgentShellConfig,
+    config: Arc<RwLock<AgentShellConfig>>,
     pub audit: AuditLogger,
+}
+
+/// 判定顺序（§21.21.3 伪代码）：黑名单最优先，其次 per-op 确认覆盖，
+/// 最后才是白名单级别；三者都作用在同一份配置上。
+impl AgentShellConfig {
+    fn build_decision(&self, agent_id: &str, op: &Operation) -> PermissionDecision {
+        if let Some(reason) = self.is_denied(op) {
+            return PermissionDecision::Deny(reason);
+        }
+        if let Some(mode) = self.confirm_mode(op) {
+            return PermissionDecision::Confirm(mode);
+        }
+        if op.level() > self.agent_level(agent_id) {
+            return PermissionDecision::Confirm(ConfirmMode::Always);
+        }
+        PermissionDecision::Allow
+    }
+
+    /// agent 的最高自动放行级别：白名单精确匹配 > `"*"` 通配 > 默认
+    /// （`default_confirm_level` 低一级——达到默认级别即需确认）。
+    pub fn agent_level(&self, agent_id: &str) -> PermissionLevel {
+        let allow = &self.permissions.allow;
+        let granted = allow
+            .get(agent_id)
+            .or_else(|| allow.get("*"))
+            .and_then(|levels| levels.iter().max().copied());
+        granted.unwrap_or_else(|| {
+            self.security
+                .default_confirm_level
+                .below()
+                .unwrap_or(PermissionLevel::L0)
+        })
+    }
+
+    /// 黑名单匹配：任一 `true` 模式命中操作名即拒绝。
+    fn is_denied(&self, op: &Operation) -> Option<String> {
+        for (pattern, deny) in &self.permissions.deny {
+            if *deny && glob_matches(pattern, op.name()) {
+                return Some(format!("operation {op} denied by policy"));
+            }
+        }
+        None
+    }
+
+    /// 操作确认覆盖：先精确名匹配，再 glob 模式匹配（字典序确定性）。
+    fn confirm_mode(&self, op: &Operation) -> Option<ConfirmMode> {
+        let confirm = &self.operations.confirm;
+        if let Some(mode) = confirm.get(op.name()) {
+            return Some(*mode);
+        }
+        confirm
+            .iter()
+            .find(|(pattern, _)| glob_matches(pattern, op.name()))
+            .map(|(_, mode)| *mode)
+    }
 }
 
 impl SecurityManager {
@@ -328,42 +388,51 @@ impl SecurityManager {
             .map(expand_home)
             .unwrap_or_else(AuditLogger::default_path);
         Self {
-            config,
+            config: Arc::new(RwLock::new(config)),
             audit: AuditLogger::new(path),
         }
+    }
+
+    /// 配置读句柄：判定、状态查询与审计开关都从这里读同一份真值。
+    pub fn read_config(&self) -> std::sync::RwLockReadGuard<'_, AgentShellConfig> {
+        self.config.read().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// 配置写句柄：`grant`/`revoke` 与单测策略覆盖共用。
+    pub fn write_config(&self) -> std::sync::RwLockWriteGuard<'_, AgentShellConfig> {
+        self.config.write().unwrap_or_else(|e| e.into_inner())
     }
 
     /// 判定入口（§21.21.3 伪代码顺序）。判定结果落审计旁路；执行结果由
     /// 调用方在 handler 返回后经 [`SecurityManager::record_execution`] 落盘。
     pub fn check_permission(&self, agent_id: &str, op: &Operation) -> PermissionDecision {
-        let decision = self.decide(agent_id, op);
-        self.record(agent_id, op, &decision);
+        let config = self.read_config();
+        let decision = config.build_decision(agent_id, op);
+        self.record(&config, agent_id, op, &decision);
         decision
     }
 
     /// 纯判定（不落审计；单元测试/复用用）。
     pub fn decide(&self, agent_id: &str, op: &Operation) -> PermissionDecision {
-        // 1. 黑名单 → Deny（永远最优先）。
-        if let Some(reason) = self.is_denied(op) {
-            return PermissionDecision::Deny(reason);
-        }
-        // 2. 操作确认覆盖 → Confirm。
-        if let Some(mode) = self.confirm_mode(op) {
-            return PermissionDecision::Confirm(mode);
-        }
-        // 3. 白名单级别不足 → Confirm。
-        if op.level() > self.agent_level(agent_id) {
-            return PermissionDecision::Confirm(ConfirmMode::Always);
-        }
-        // 4. 默认允许。
-        PermissionDecision::Allow
+        self.read_config().build_decision(agent_id, op)
+    }
+
+    /// agent 的最高自动放行级别（判定逻辑的只读视图）。
+    pub fn agent_level(&self, agent_id: &str) -> PermissionLevel {
+        self.read_config().agent_level(agent_id)
     }
 
     /// 审计旁路：只记门禁判定——`allow` / `confirm` / `deny`，`result` 恒为
     /// `false`（未执行态）。真实执行结果由 [`SecurityManager::record_execution`]
     /// 在 handler 返回后追加，二者独立、先后有序。
-    fn record(&self, agent_id: &str, op: &Operation, decision: &PermissionDecision) {
-        if !self.config.security.audit_log {
+    fn record(
+        &self,
+        config: &AgentShellConfig,
+        agent_id: &str,
+        op: &Operation,
+        decision: &PermissionDecision,
+    ) {
+        if !config.security.audit_log {
             return;
         }
         let decision_str = match decision {
@@ -378,69 +447,28 @@ impl SecurityManager {
     /// `result`（成功 `true`，失败 `false`），使 `decision=allow` 不再与
     /// 「已执行」划等号——后端不可用等运行期失败同样留下 allow+false 痕迹。
     pub fn record_execution(&self, agent_id: &str, op: &Operation, success: bool) {
-        if !self.config.security.audit_log {
+        if !self.read_config().security.audit_log {
             return;
         }
         self.audit.log(agent_id, op.name(), "allow", success);
     }
 
-    /// agent 的最高自动放行级别：白名单精确匹配 > `"*"` 通配 > 默认
-    /// （`default_confirm_level` 低一级——达到默认级别即需确认）。
-    pub fn agent_level(&self, agent_id: &str) -> PermissionLevel {
-        let allow = &self.config.permissions.allow;
-        let granted = allow
-            .get(agent_id)
-            .or_else(|| allow.get("*"))
-            .and_then(|levels| levels.iter().max().copied());
-        granted.unwrap_or_else(|| {
-            self.config
-                .security
-                .default_confirm_level
-                .below()
-                .unwrap_or(PermissionLevel::L0)
-        })
-    }
-
-    /// 黑名单匹配：任一 `true` 模式命中操作名即拒绝。
-    fn is_denied(&self, op: &Operation) -> Option<String> {
-        for (pattern, deny) in &self.config.permissions.deny {
-            if *deny && glob_matches(pattern, op.name()) {
-                return Some(format!("operation {op} denied by policy"));
-            }
-        }
-        None
-    }
-
-    /// 操作确认覆盖：先精确名匹配，再 glob 模式匹配（字典序确定性）。
-    fn confirm_mode(&self, op: &Operation) -> Option<ConfirmMode> {
-        let confirm = &self.config.operations.confirm;
-        if let Some(mode) = confirm.get(op.name()) {
-            return Some(*mode);
-        }
-        confirm
-            .iter()
-            .find(|(pattern, _)| glob_matches(pattern, op.name()))
-            .map(|(_, mode)| *mode)
-    }
-
     /// 授权：把 agent 的白名单设为 L0..=level（覆盖旧值）并持久化。
-    pub fn grant(&mut self, agent_id: &str, level: PermissionLevel) -> Result<(), String> {
-        let old = self.config.permissions.allow.get(agent_id).cloned();
-        self.config
+    pub fn grant(&self, agent_id: &str, level: PermissionLevel) -> Result<(), String> {
+        let mut config = self.write_config();
+        let old = config.permissions.allow.get(agent_id).cloned();
+        config
             .permissions
             .allow
             .insert(agent_id.to_string(), level.up_to());
-        if let Err(e) = self.config.save() {
+        if let Err(e) = config.save() {
             // 持久化失败回滚内存态，保持配置真值不变。
             match old {
                 Some(v) => {
-                    self.config
-                        .permissions
-                        .allow
-                        .insert(agent_id.to_string(), v);
+                    config.permissions.allow.insert(agent_id.to_string(), v);
                 }
                 None => {
-                    self.config.permissions.allow.remove(agent_id);
+                    config.permissions.allow.remove(agent_id);
                 }
             }
             return Err(e);
@@ -449,15 +477,13 @@ impl SecurityManager {
     }
 
     /// 撤销：移除 agent 的白名单条目并持久化。
-    pub fn revoke(&mut self, agent_id: &str) -> Result<(), String> {
-        let old = self.config.permissions.allow.remove(agent_id);
-        if let Err(e) = self.config.save() {
+    pub fn revoke(&self, agent_id: &str) -> Result<(), String> {
+        let mut config = self.write_config();
+        let old = config.permissions.allow.remove(agent_id);
+        if let Err(e) = config.save() {
             // 持久化失败回滚内存态，保持配置真值不变。
             if let Some(v) = old {
-                self.config
-                    .permissions
-                    .allow
-                    .insert(agent_id.to_string(), v);
+                config.permissions.allow.insert(agent_id.to_string(), v);
             }
             return Err(e);
         }
@@ -539,9 +565,12 @@ mod tests {
 
     #[test]
     fn deny_wins_over_everything() {
-        let mut m = default_manager();
-        m.config.permissions.deny.insert("input.*".into(), true);
-        m.config
+        let m = default_manager();
+        m.write_config()
+            .permissions
+            .deny
+            .insert("input.*".into(), true);
+        m.write_config()
             .operations
             .confirm
             .insert("input.send".into(), ConfirmMode::Once);
@@ -558,12 +587,12 @@ mod tests {
 
     #[test]
     fn confirm_override_precedes_whitelist() {
-        let mut m = default_manager();
-        m.config
+        let m = default_manager();
+        m.write_config()
             .permissions
             .allow
             .insert("trusted".into(), vec![PermissionLevel::L4]);
-        m.config
+        m.write_config()
             .operations
             .confirm
             .insert("poweroff".into(), ConfirmMode::Always);
@@ -575,8 +604,8 @@ mod tests {
 
     #[test]
     fn whitelist_raises_agent_level() {
-        let mut m = default_manager();
-        m.config
+        let m = default_manager();
+        m.write_config()
             .permissions
             .allow
             .insert("trusted".into(), vec![PermissionLevel::L3]);
@@ -681,22 +710,22 @@ mod tests {
     fn grant_rolls_back_on_save_failure() {
         let _guard = ENV_LOCK.lock().unwrap();
         let (old, blocker) = block_config_writes();
-        let mut m = default_manager();
+        let m = default_manager();
 
         // 无旧值：授权失败后不得残留白名单条目。
         let err = m.grant("agent-x", PermissionLevel::L3).unwrap_err();
         assert!(err.contains("create"), "unexpected error: {err}");
-        assert!(!m.config.permissions.allow.contains_key("agent-x"));
+        assert!(!m.write_config().permissions.allow.contains_key("agent-x"));
 
         // 有旧值：授权失败后旧值必须还原。
-        m.config
+        m.write_config()
             .permissions
             .allow
             .insert("agent-x".into(), vec![PermissionLevel::L1]);
         let err = m.grant("agent-x", PermissionLevel::L3).unwrap_err();
         assert!(err.contains("create"), "unexpected error: {err}");
         assert_eq!(
-            m.config.permissions.allow.get("agent-x"),
+            m.write_config().permissions.allow.get("agent-x"),
             Some(&vec![PermissionLevel::L1])
         );
 
@@ -707,8 +736,8 @@ mod tests {
     fn revoke_rolls_back_on_save_failure() {
         let _guard = ENV_LOCK.lock().unwrap();
         let (old, blocker) = block_config_writes();
-        let mut m = default_manager();
-        m.config
+        let m = default_manager();
+        m.write_config()
             .permissions
             .allow
             .insert("agent-y".into(), vec![PermissionLevel::L2]);
@@ -716,7 +745,7 @@ mod tests {
         let err = m.revoke("agent-y").unwrap_err();
         assert!(err.contains("create"), "unexpected error: {err}");
         assert_eq!(
-            m.config.permissions.allow.get("agent-y"),
+            m.write_config().permissions.allow.get("agent-y"),
             Some(&vec![PermissionLevel::L2])
         );
 

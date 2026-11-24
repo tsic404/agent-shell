@@ -31,6 +31,11 @@ impl Sandbox {
         self.root.path().join("agent-shell").join("audit.jsonl")
     }
 
+    /// 沙箱内全部审计文件（旧主日志 + 各进程分段）的原始文本。
+    pub(crate) fn audit_text(&self) -> String {
+        audit_text_at(&self.audit_path())
+    }
+
     /// 单测专用安全配置：默认配置 + 审计落沙箱。
     ///
     /// 用默认配置而非宿主 `config.toml`：宿主已授予的级别与自定义审计路径不得
@@ -56,6 +61,15 @@ impl Sandbox {
         edit(&mut config);
         SecurityManager::with_config(config)
     }
+}
+
+/// 某个审计锚点对应文件的原始文本拼接（测试断言用）。
+pub(crate) fn audit_text_at(anchor: &Path) -> String {
+    let mut text = String::new();
+    for file in agent_shell_core::audit::audit_files(anchor) {
+        text.push_str(&std::fs::read_to_string(file).unwrap_or_default());
+    }
+    text
 }
 
 /// 沙箱与安全入口同生死的单测夹具。

@@ -5,6 +5,7 @@
 //! 确定性候选链，请求仍走真实 `dispatch` 与真实 dispatcher（降级、能力缺口、
 //! 错误映射都在生产路径上）。
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use agent_shell_core::component::ComponentHealth;
@@ -35,10 +36,16 @@ pub enum SetupBehaviour {
     Ready,
     /// 仅缺本次操作能力（能力缺口，不摘除候选）。
     CapabilityGap(&'static str),
+    /// 授权等待中（弹窗尚未确认）：不摘除候选，下一条命令可重试。
+    PendingPermission,
+    /// 首次建立等待授权（Pending），之后用户确认、同一条会话可用。
+    PendingThenReady,
     /// 通道不可用：授权被拒（不重试，直接降级）。
     Permission,
     /// 通道不可用：后端结构性缺失（直接降级）。
     BackendUnavailable,
+    /// 通道建立永不返回（复刻 portal 弹窗无人应答）。
+    Hang,
 }
 
 /// 记录型输入后端。
@@ -47,6 +54,9 @@ pub struct RecordingInput {
     name: &'static str,
     available: bool,
     setup: SetupBehaviour,
+    degraded_reason: Option<&'static str>,
+    /// `PendingThenReady` 剩余待授权次数（首次为 1，之后为 0）。
+    pending_remaining: Arc<AtomicUsize>,
     calls: Arc<Mutex<Vec<RecordedOp>>>,
 }
 
@@ -57,6 +67,8 @@ impl RecordingInput {
             name,
             available: true,
             setup: SetupBehaviour::Ready,
+            degraded_reason: None,
+            pending_remaining: Arc::new(AtomicUsize::new(0)),
             calls: Arc::new(Mutex::new(Vec::new())),
         }
     }
@@ -67,6 +79,8 @@ impl RecordingInput {
             name,
             available: false,
             setup: SetupBehaviour::Ready,
+            degraded_reason: None,
+            pending_remaining: Arc::new(AtomicUsize::new(0)),
             calls: Arc::new(Mutex::new(Vec::new())),
         }
     }
@@ -74,6 +88,15 @@ impl RecordingInput {
     /// 覆盖通道建立行为。
     pub fn with_setup(mut self, setup: SetupBehaviour) -> Self {
         self.setup = setup;
+        if matches!(setup, SetupBehaviour::PendingThenReady) {
+            self.pending_remaining.store(1, Ordering::SeqCst);
+        }
+        self
+    }
+
+    /// 覆盖健康报告：可用但尚未就绪（如 libei 会话未建立）。
+    pub fn with_degraded(mut self, reason: &'static str) -> Self {
+        self.degraded_reason = Some(reason);
         self
     }
 
@@ -103,7 +126,16 @@ impl InputService for RecordingInput {
     }
 
     async fn health(&self) -> ComponentHealth {
-        if self.available {
+        if matches!(self.setup, SetupBehaviour::PendingThenReady) {
+            return if self.pending_remaining.load(Ordering::SeqCst) > 0 {
+                ComponentHealth::Degraded("portal RemoteDesktop 授权待确认（会话已保留）".into())
+            } else {
+                ComponentHealth::Healthy
+            };
+        }
+        if let Some(reason) = self.degraded_reason {
+            ComponentHealth::Degraded(reason.to_string())
+        } else if self.available {
             ComponentHealth::Healthy
         } else {
             ComponentHealth::Degraded("fixture candidate unavailable".into())
@@ -116,12 +148,27 @@ impl InputService for RecordingInput {
             SetupBehaviour::CapabilityGap(reason) => {
                 Err(SetupFailure::CapabilityGap(reason.to_string()))
             }
+            SetupBehaviour::PendingPermission => Err(SetupFailure::Pending(
+                AgentShellError::Permission("fixture authorization pending".into()),
+            )),
+            SetupBehaviour::PendingThenReady => {
+                if self.pending_remaining.swap(0, Ordering::SeqCst) > 0 {
+                    Err(SetupFailure::Pending(AgentShellError::Permission(
+                        "fixture authorization pending".into(),
+                    )))
+                } else {
+                    Ok(())
+                }
+            }
             SetupBehaviour::Permission => Err(SetupFailure::Unavailable(
                 AgentShellError::Permission("fixture authorization denied".into()),
             )),
             SetupBehaviour::BackendUnavailable => Err(SetupFailure::Unavailable(
                 AgentShellError::BackendUnavailable("fixture channel unavailable".into()),
             )),
+            SetupBehaviour::Hang => {
+                std::future::pending::<std::result::Result<(), SetupFailure>>().await
+            }
         }
     }
 

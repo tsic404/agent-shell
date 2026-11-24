@@ -258,6 +258,15 @@ const CACHE_TTL: Duration = Duration::from_secs(2);
 /// 窗口写操作预算：单条命令默认上限，后端挂死时按超时失败而非扣住串行化槽位。
 const WINDOW_OP_BUDGET: Duration = agent_shell_core::fallback::DEFAULT_COMMAND_TIMEOUT;
 
+/// `input.send` 命令预算：低于 C-154 的单命令 5s，给 RPC 往返留余量。
+///
+/// 覆盖 `click --at` 的 move+click 两次注入与 portal/EIS 会话建立——任何一次
+/// 建立过程都不得把整条命令拖过 CLI 的调用预算。
+pub const INPUT_COMMAND_BUDGET: Duration = Duration::from_millis(4000);
+
+/// `a11y.action` 命令预算：定位/遍历与动作（含坐标降级的输入链）整体封顶。
+pub const A11Y_ACTION_BUDGET: Duration = Duration::from_millis(4000);
+
 /// daemon 会话状态。
 pub struct Daemon {
     compositor: Option<std::sync::Arc<CompositorBackend>>,
@@ -277,7 +286,8 @@ pub struct Daemon {
     pub portal_sessions: std::sync::Arc<crate::portal_sessions::PortalSessionManager>,
     /// IME 会话（§22.8 D7）。
     pub ime_session: crate::ime_session::ImeSession,
-    /// 安全判定（§22.7 D6）：daemon 层唯一权限入口。
+    /// 安全判定（§22.7 D6）：daemon 层唯一权限入口。克隆共享同一份策略
+    /// （见 `SecurityManager`），连接级快路径与业务 dispatch 因此同源。
     pub security: agent_shell_core::security::SecurityManager,
     /// 发起调用的 agent 身份。由宿主编排层在启动 CLI/MCP 前经
     /// `AGENT_SHELL_AGENT_ID` 注入，子进程经 fork/exec 继承；未设置回落 `"*"`。
@@ -309,6 +319,10 @@ pub struct Daemon {
     pub subscriptions: Vec<event::EventSubscription>,
     /// 窗口写操作预算（默认取单命令上限；测试可缩短以覆盖超时分支）。
     pub window_op_budget: Duration,
+    /// 输入注入命令预算（默认取 [`INPUT_COMMAND_BUDGET`]；测试可缩短）。
+    pub input_budget: Duration,
+    /// 无障碍动作命令预算（默认取 [`A11Y_ACTION_BUDGET`]；测试可缩短）。
+    pub a11y_action_budget: Duration,
     /// 事件归一化管线是否已启动（首次 `events subscribe` 时惰性装配；
     /// compositor 原始事件队列仅可消费一次，二次订阅不重复取流）。
     event_pipeline_started: bool,
@@ -459,6 +473,8 @@ impl Daemon {
             ring: EventRing::default(),
             subscriptions: Vec::new(),
             window_op_budget: WINDOW_OP_BUDGET,
+            input_budget: INPUT_COMMAND_BUDGET,
+            a11y_action_budget: A11Y_ACTION_BUDGET,
             event_pipeline_started: false,
         }
     }
@@ -1137,6 +1153,8 @@ mod tests {
             ring: EventRing::default(),
             subscriptions: Vec::new(),
             window_op_budget: WINDOW_OP_BUDGET,
+            input_budget: INPUT_COMMAND_BUDGET,
+            a11y_action_budget: A11Y_ACTION_BUDGET,
             event_pipeline_started: false,
         }
     }

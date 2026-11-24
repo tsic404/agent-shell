@@ -20,6 +20,7 @@ pub mod events;
 pub mod input;
 pub mod journey;
 pub mod portal;
+pub mod remote_desktop;
 
 pub use a11y::{element, FakeA11y};
 pub use atspi_tree::{serve_application, serve_registry, MockAction, NodeSpec};
@@ -28,6 +29,7 @@ pub use compositor::{window, workspace, FakeCompositor, FakeDesktop};
 pub use events::RecordingRawSource;
 pub use input::{RecordedOp, RecordingInput, SetupBehaviour};
 pub use portal::{PortalBehaviour, ScreenshotMock};
+pub use remote_desktop::{serve_remote_desktop, EisLog, FakeEis, PortalCalls, RemoteDesktopMock};
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
