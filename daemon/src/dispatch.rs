@@ -797,14 +797,36 @@ async fn input_send(d: &mut Daemon, req: &Request) -> RpcResult {
 async fn screenshot_capture(daemon: &mut Daemon, req: &Request) -> RpcResult {
     let p: CaptureParams = serde_json::from_value(params_of(req)?.clone())
         .map_err(|e| (RpcErrorCode::InvalidParams, format!("bad params: {e}")))?;
+    // 等待预算只影响门户确认界面的等待；默认值与 CLI 的 `--wait` 一致。
+    let wait_ms = p
+        .wait_ms
+        .unwrap_or(agent_shell_rpc::DEFAULT_CAPTURE_WAIT_MS);
+    if !(agent_shell_rpc::MIN_CAPTURE_WAIT_MS..=agent_shell_rpc::MAX_CAPTURE_WAIT_MS)
+        .contains(&wait_ms)
+    {
+        return Err((
+            RpcErrorCode::InvalidParams,
+            format!(
+                "screenshot wait_ms must be between {} and {}",
+                agent_shell_rpc::MIN_CAPTURE_WAIT_MS,
+                agent_shell_rpc::MAX_CAPTURE_WAIT_MS
+            ),
+        ));
+    }
     let capture = daemon.capture.as_ref().ok_or_else(|| {
         (
             RpcErrorCode::BackendUnavailable,
             "capture unavailable (no portal backend and no DISPLAY)".into(),
         )
     })?;
-    let r = crate::capture::capture_to_file(capture, p.window.as_deref(), p.area, &p.output_path)
-        .await?;
+    let r = crate::capture::capture_to_file(
+        capture,
+        p.window.as_deref(),
+        p.area,
+        &p.output_path,
+        std::time::Duration::from_millis(wait_ms),
+    )
+    .await?;
     Ok(serde_json::to_value(r).expect("CaptureResult serializable"))
 }
 

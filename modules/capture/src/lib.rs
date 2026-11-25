@@ -31,6 +31,7 @@ pub use cache::CaptureCache;
 pub use portal_screencast::SCREENCAST_CLEANUP_BUDGET;
 #[cfg(feature = "portal-screencast")]
 pub use portal_screencast::{PersistMode, ScreenCastCapture, ScreenCastOptions, ScreenCastSession};
+pub use portal_screenshot::{ScreenshotAttempt, ScreenshotBudget};
 pub use portal_screenshot::{ScreenshotPortal, SCREENSHOT_MAX_ATTEMPTS, SCREENSHOT_TIMEOUT};
 pub use types::{CaptureTarget, Frame, PixelFormat};
 pub use x11::X11Capture;
@@ -77,6 +78,14 @@ pub const PORTAL_SCREENCAST_PROBE_BUDGET: std::time::Duration = std::time::Durat
 /// 端到端捕获截止：portal 段 + x11 兜底整体封顶 4s，低于 C-154 的 5s
 /// 命令预算，给进程启动与 RPC 往返留 1s。
 pub const CAPTURE_END_TO_END_BUDGET: std::time::Duration = std::time::Duration::from_secs(4);
+
+/// 交互截图级的默认确认等待：留给用户在门户确认界面点击的时间。
+///
+/// GNOME 的 portal Screenshot（含 `interactive=false`）先弹出确认框，用户
+/// 点击后才发 Response；静默探测只在固定 1s 内判定「能否不经确认落盘」，
+/// 确认等待属于交互回退级自己的预算。取值与静默探测的 1s 相加仍低于 C-154
+/// 的 5s 命令预算；需要更长时间时可经 `--wait` 显式放宽。
+pub const DEFAULT_CAPTURE_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// 健康体检的非交互探测截止：与端到端捕获同一上限，保证 doctor 不被任何
 /// 单个后端拖住，后续 RPC 也不会因 daemon 状态锁被占而排队。
@@ -266,11 +275,21 @@ impl CaptureDispatcher {
     ///
     /// ScreenCast 优先 `restore_token` 静默恢复（无弹窗）；`interactive=true` 允许
     /// 弹窗授权，`interactive=false` 无 token 则直接降级 Screenshot/X11。交互路径
-    /// 端到端受 [`CAPTURE_END_TO_END_BUDGET`] 封顶、portal 段受 [`PORTAL_PROBE_BUDGET`]
-    /// 截断，随后降级 x11（原生 X11 会话）或快速失败（Wayland/无 x11）——
-    /// 全程保证 5s 命令预算内出结果。
+    /// 使用 [`DEFAULT_CAPTURE_WAIT`] 等待用户在门户确认界面点击；随后降级 x11
+    /// （原生 X11 会话）或快速失败（Wayland/无 x11）。
     pub async fn capture(&self, target: CaptureTarget, interactive: bool) -> Result<CapturedFrame> {
-        self.capture_impl(target, interactive, false).await
+        self.capture_with_wait(target, interactive, DEFAULT_CAPTURE_WAIT)
+            .await
+    }
+
+    /// 与 [`Self::capture`] 相同，确认等待预算由调用方给定。
+    pub async fn capture_with_wait(
+        &self,
+        target: CaptureTarget,
+        interactive: bool,
+        wait: std::time::Duration,
+    ) -> Result<CapturedFrame> {
+        self.capture_impl(target, interactive, false, wait).await
     }
 
     /// 区域裁剪所需的原始像素捕获（`--area` 路径）：静默 Screenshot → ScreenCast → X11。
@@ -281,7 +300,18 @@ impl CaptureDispatcher {
     /// 原生 X11 会话抓 X11 root 帧；Wayland 会话快速失败并给出 portal 段真实
     /// 原因（而非冒充「参数非法」）。
     pub async fn capture_pixels(&self, target: CaptureTarget, interactive: bool) -> Result<Frame> {
-        match self.capture_impl(target, interactive, true).await? {
+        self.capture_pixels_with_wait(target, interactive, DEFAULT_CAPTURE_WAIT)
+            .await
+    }
+
+    /// 与 [`Self::capture_pixels`] 相同，确认等待预算由调用方给定。
+    pub async fn capture_pixels_with_wait(
+        &self,
+        target: CaptureTarget,
+        interactive: bool,
+        wait: std::time::Duration,
+    ) -> Result<Frame> {
+        match self.capture_impl(target, interactive, true, wait).await? {
             CapturedFrame::Pixels(frame) => Ok(frame),
             CapturedFrame::Png(_) => Err(AgentShellError::Capture(
                 "capture_pixels: portal Screenshot PNG not decoded to pixels".into(),
@@ -299,10 +329,11 @@ impl CaptureDispatcher {
         target: CaptureTarget,
         interactive: bool,
         require_pixels: bool,
+        wait: std::time::Duration,
     ) -> Result<CapturedFrame> {
         capture_with_budget(
-            CAPTURE_END_TO_END_BUDGET,
-            self.capture_portal_then_fallback(target, interactive, require_pixels),
+            end_to_end_budget(interactive, wait),
+            self.capture_portal_then_fallback(target, interactive, require_pixels, wait),
         )
         .await
     }
@@ -317,12 +348,13 @@ impl CaptureDispatcher {
         target: CaptureTarget,
         interactive: bool,
         require_pixels: bool,
+        wait: std::time::Duration,
     ) -> Result<CapturedFrame> {
         let portal = capture_with_budget(
-            PORTAL_PROBE_BUDGET,
+            end_to_end_budget(interactive, wait),
             // portal 段的异步状态机随功能组合增长；装箱后不进入调用方的
             // 栈上 future，避免小栈线程在构造阶段溢栈。
-            Box::pin(self.capture_portal(target, interactive, require_pixels)),
+            Box::pin(self.capture_portal(target, interactive, require_pixels, wait)),
         )
         .await;
         match portal {
@@ -349,6 +381,12 @@ impl CaptureDispatcher {
     /// `require_pixels`（区域裁剪）不再是能力缺口：静默 Screenshot 的 PNG 在
     /// 本地解码为原始像素帧（[`decode_png_frame`]）后同样可裁剪。
     ///
+    /// `wait` 是交互截图级的确认等待预算：GNOME 的 portal Screenshot（含
+    /// `interactive=false`）在方法返回后才等用户点击确认框。静默探测保持固定
+    /// 的短预算，确认等待只属于回退到交互级的这一层；两者不叠加到同一次调用。
+    /// 确认等待耗尽时返回可区分的权限错误，不再发起下一级界面（只会再叠一个
+    /// 无人应答的框）。
+    ///
     /// 全部失败返回 `BackendUnavailable`，由调用方降级 x11 或快速失败。
     async fn capture_portal(
         &self,
@@ -356,14 +394,56 @@ impl CaptureDispatcher {
         _target: CaptureTarget,
         interactive: bool,
         require_pixels: bool,
+        wait: std::time::Duration,
     ) -> Result<CapturedFrame> {
+        let segment_deadline = tokio::time::Instant::now() + end_to_end_budget(interactive, wait);
+
+        // 交互级要留出的最小可执行窗口。段预算只有 `wait` 加一级静默探测，若
+        // 静默探测仍独占自己的 1s 固定上限，末尾再扣返回余量后，`--wait` 取
+        // 合法最小值（500ms，CLI `--wait 0` 的钳制值）时交互级只剩零预算，
+        // 连立即成功的门户都发不出请求。前序各级因此只能用到「段截止减返回
+        // 余量减本窗口」，各自的固定上限仍是其预算上限（C-154 不放大单次调用）。
+        let interactive_floor = if interactive {
+            CAPTURE_INTERACTIVE_MIN_WINDOW.min(wait)
+        } else {
+            std::time::Duration::ZERO
+        };
+        let pre_interactive_deadline = if interactive {
+            segment_deadline
+                .checked_sub(CAPTURE_RETURN_MARGIN + interactive_floor)
+                .unwrap_or(segment_deadline)
+        } else {
+            segment_deadline
+        };
+
         // L1: 静默 portal Screenshot（无弹窗，跨 DE 唯一无需用户点击的路径）。
-        if let Some(frame) = self.screenshot_silent(require_pixels).await {
-            self.set_active(Some(ActiveBackend::ScreenshotPortal));
-            return Ok(frame);
+        // 这一级只判定「门户能否不经确认落盘」，保持固定的短探测预算；确认
+        // 等待属于下一级的可配置预算，不在这里放大单次调用（C-154）。
+        let silent_deadline = (tokio::time::Instant::now() + PORTAL_SILENT_PROBE_BUDGET)
+            .min(pre_interactive_deadline);
+        let silent_budget = ScreenshotBudget {
+            call: PORTAL_SILENT_PROBE_BUDGET,
+            deadline: silent_deadline,
+            attempts: 1,
+        };
+        let mut confirmation_pending = false;
+        match self.screenshot_silent(require_pixels, silent_budget).await {
+            PortalAttempt::Captured(frame) => {
+                self.set_active(Some(ActiveBackend::ScreenshotPortal));
+                return Ok(frame);
+            }
+            PortalAttempt::AwaitingConfirmation(cause) => {
+                // 门户已受理请求并在等确认：再发起 ScreenCast 只会叠一个无人
+                // 应答的界面，直接把剩下的确认预算交给交互截图级。
+                tracing::debug!("silent portal Screenshot awaiting confirmation: {cause}");
+                confirmation_pending = true;
+            }
+            PortalAttempt::Unavailable => {}
         }
 
         // L2: portal ScreenCast（流式，daemon 复用会话）。feature 关闭时编译期排除。
+        // 待确认只禁止新发交互授权：已有会话与有效恢复令牌仍可静默出图，
+        // 不能因为 Screenshot 在等确认就把整级跳过。
         #[cfg(feature = "portal-screencast")]
         {
             let started = tokio::time::Instant::now();
@@ -371,9 +451,19 @@ impl CaptureDispatcher {
             // Request、关闭已创建的 Session，然后才轮到交互 Screenshot。
             let work_budget =
                 PORTAL_SCREENCAST_PROBE_BUDGET.saturating_sub(SCREENCAST_CLEANUP_BUDGET);
-            let work_deadline = started + work_budget;
+            // 清理也要在交互级开始之前结束：整级的 1s 上限是上限，不是必须
+            // 用满的配额，越小总预算下越要让位给交互回退。
+            let work_deadline = (started + work_budget).min(
+                pre_interactive_deadline
+                    .checked_sub(SCREENCAST_CLEANUP_BUDGET)
+                    .unwrap_or(pre_interactive_deadline),
+            );
             if let Some(session) = self
-                .ensure_screencast_session(_target, interactive, work_deadline)
+                .ensure_screencast_session(
+                    _target,
+                    interactive && !confirmation_pending,
+                    work_deadline,
+                )
                 .await
             {
                 let frame_budget =
@@ -395,19 +485,47 @@ impl CaptureDispatcher {
                 }
                 // 会话未产出可用帧：显式关闭与 worker 退出共享同一个清理
                 // 截止，Drop 不再二次计时，避免挤占交互截图预算。
-                let cleanup_deadline = tokio::time::Instant::now() + SCREENCAST_CLEANUP_BUDGET;
+                let cleanup_deadline = (tokio::time::Instant::now() + SCREENCAST_CLEANUP_BUDGET)
+                    .min(pre_interactive_deadline);
                 session.shutdown_until(cleanup_deadline).await;
                 *self.session.lock().await = None;
                 self.set_active(None);
             }
         }
+        // 无 ScreenCast 级时该标记不再参与判定，保留读取避免编译告警。
+        #[cfg(not(feature = "portal-screencast"))]
+        let _ = confirmation_pending;
 
         // L3: 交互 portal Screenshot（弹授权窗；`interactive=false` 时无免弹窗
         // 选项，不发起，避免静默路径反过来弹窗）。
         if interactive {
             tracing::debug!("silent portal Screenshot unavailable; trying interactive Screenshot");
-            match self.screenshot.capture(true).await {
-                Ok(path) => {
+            // 确认等待用本级自己的可配置预算，且不因前序各级而缩短：前序
+            // 探测的截止已扣掉 [`CAPTURE_RETURN_MARGIN`] 与本级窗口，到这里
+            // 至少还剩 `min(wait, CAPTURE_INTERACTIVE_MIN_WINDOW)`。结论仍
+            // 要在整段封顶之前产出并回传，否则调用方的传输预算会先到，用户
+            // 拿到的是裸传输错误。
+            let deadline = (tokio::time::Instant::now() + wait).min(
+                segment_deadline
+                    .checked_sub(CAPTURE_RETURN_MARGIN)
+                    .unwrap_or(segment_deadline),
+            );
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(AgentShellError::BackendUnavailable(
+                    "portal capture unavailable (Screenshot/ScreenCast unreachable or denied)"
+                        .into(),
+                ));
+            }
+            let budget = ScreenshotBudget {
+                // 单次 D-Bus 方法调用保持通道固定上限；可配置的确认预算只
+                // 覆盖方法返回 Request 之后的等待，不能放大这一次调用。
+                call: portal_screenshot::SCREENSHOT_TIMEOUT_INTERACTIVE.min(remaining),
+                deadline,
+                attempts: 1,
+            };
+            match self.screenshot.capture_with_budget(true, budget).await {
+                ScreenshotAttempt::Captured(path) => {
                     // 校验产物确为可解码的非黑 PNG：DDE 的 xdg-desktop-portal-dde
                     // 委托 KWin 落盘 JPEG（实测 /tmp/kwin_screenshot_*.jpg），
                     // portal 却把「成功」返回成 CapturedFrame::Png，默认流程不会
@@ -428,7 +546,15 @@ impl CaptureDispatcher {
                         }
                     }
                 }
-                Err(e) => tracing::warn!("interactive screenshot portal failed, degrade: {e}"),
+                ScreenshotAttempt::AwaitingConfirmation(cause) => {
+                    if self.wayland_session {
+                        return Err(authorization_not_confirmed(remaining, &cause));
+                    }
+                    tracing::warn!("portal confirmation not completed; falling back: {cause}");
+                }
+                ScreenshotAttempt::Unavailable(e) => {
+                    tracing::warn!("interactive screenshot portal failed, degrade: {e}")
+                }
             }
         }
 
@@ -446,25 +572,24 @@ impl CaptureDispatcher {
     /// 产物校验与降级口径同 [`validated_screenshot_frame`]：非 PNG（DDE 委托
     /// KWin 落盘 JPEG）、损坏、全黑一律判不可用并清理临时文件；解码失败
     /// （合法 PNG 但布局异常）同样清理并返回 `None`，由调用方继续降级链。
-    async fn screenshot_silent(&self, require_pixels: bool) -> Option<CapturedFrame> {
-        let path =
-            match tokio::time::timeout(PORTAL_SILENT_PROBE_BUDGET, self.screenshot.capture(false))
-                .await
-            {
-                Ok(Ok(p)) => p,
-                Ok(Err(e)) => {
-                    tracing::debug!("silent portal Screenshot unavailable: {e}");
-                    return None;
+    async fn screenshot_silent(
+        &self,
+        require_pixels: bool,
+        budget: ScreenshotBudget,
+    ) -> PortalAttempt {
+        match self.screenshot.capture_with_budget(false, budget).await {
+            ScreenshotAttempt::Captured(path) => {
+                match portal_screenshot_result(path, require_pixels) {
+                    Some(frame) => PortalAttempt::Captured(frame),
+                    None => PortalAttempt::Unavailable,
                 }
-                Err(_) => {
-                    tracing::warn!(
-                        "silent portal Screenshot exceeded {}s; treating portal as unavailable",
-                        PORTAL_SILENT_PROBE_BUDGET.as_secs()
-                    );
-                    return None;
-                }
-            };
-        portal_screenshot_result(path, require_pixels)
+            }
+            ScreenshotAttempt::AwaitingConfirmation(e) => PortalAttempt::AwaitingConfirmation(e),
+            ScreenshotAttempt::Unavailable(e) => {
+                tracing::debug!("silent portal Screenshot unavailable: {e}");
+                PortalAttempt::Unavailable
+            }
+        }
     }
 
     /// X11 原生兜底（portal 不可用/超时/拒绝后）。
@@ -510,7 +635,7 @@ impl CaptureDispatcher {
     async fn ensure_screencast_session(
         &self,
         target: CaptureTarget,
-        interactive: bool,
+        allow_new_authorization: bool,
         deadline: tokio::time::Instant,
     ) -> Option<std::sync::Arc<ScreenCastCapture>> {
         if !self.screencast_ok {
@@ -521,9 +646,6 @@ impl CaptureDispatcher {
             .as_ref()
             .and_then(|s| s.get_restore_token())
             .is_some();
-        if !(interactive || has_token) {
-            return None;
-        }
         let slot_budget = deadline.saturating_duration_since(tokio::time::Instant::now());
         let mut guard = match tokio::time::timeout(slot_budget, self.session.lock()).await {
             Ok(guard) => guard,
@@ -533,6 +655,11 @@ impl CaptureDispatcher {
             }
         };
         if guard.is_none() {
+            // 只在允许新授权或持有恢复令牌时建新会话；已有会话在上方直接
+            // 复用。待确认场景二者皆无时静默返回，不叠第二个授权界面。
+            if !(allow_new_authorization || has_token) {
+                return None;
+            }
             let opts = self.build_screencast_options();
             match ScreenCastCapture::start_with_deadline(self.conn.clone(), target, &opts, deadline)
                 .await
@@ -550,7 +677,7 @@ impl CaptureDispatcher {
                 Err(e) => {
                     // 静默恢复失败（token 过期/会话不可用）且非交互时静默降级；
                     // 交互时也继续尝试其它后端。
-                    if interactive {
+                    if allow_new_authorization {
                         tracing::warn!("screencast start failed, degrade: {e}");
                     } else {
                         tracing::debug!("screencast restore/start failed (non-interactive): {e}");
@@ -592,7 +719,13 @@ impl CaptureDispatcher {
         // 的降级顺序一致，doctor 报的「选中后端」才是 `screenshot -f` 实际会走的
         // 那一个。探测只判可用性、不留产物：门户落盘的全屏截图（可能含敏感画面）
         // 在此立即删除，否则每次 doctor 都会在用户图片目录累积一份。
-        if let Some(frame) = self.screenshot_silent(false).await {
+        // 探测不等待确认界面：1s 内没有 Response 即视为非交互不可用。
+        let probe_budget = ScreenshotBudget {
+            call: PORTAL_SILENT_PROBE_BUDGET,
+            deadline: tokio::time::Instant::now() + PORTAL_SILENT_PROBE_BUDGET,
+            attempts: 1,
+        };
+        if let PortalAttempt::Captured(frame) = self.screenshot_silent(false, probe_budget).await {
             if let CapturedFrame::Png(path) = &frame {
                 if let Err(e) = std::fs::remove_file(path) {
                     tracing::debug!("probe screenshot cleanup failed {}: {e}", path.display());
@@ -920,6 +1053,65 @@ enum PortalFallback {
     X11,
     /// 快速失败：Wayland 下拒绝静默抓 XWayland root，或没有任何兜底后端。
     Fail(AgentShellError),
+}
+
+/// 单级 portal 捕获的去向（与 [`ScreenshotAttempt`] 同口径，附带已解码帧）。
+enum PortalAttempt {
+    Captured(CapturedFrame),
+    /// 门户确认界面在预算内没有被确认：可能是方法返回后的 Response 没来
+    /// （GNOME 的确认框），也可能是方法调用本身因确认框阻塞到固定上限。
+    /// 两种形态都是同一次授权确认，调用方一律按「未确认」处理。
+    AwaitingConfirmation(AgentShellError),
+    /// 该级不可用，可继续降级。
+    Unavailable,
+}
+
+/// 端到端预算：交互路径覆盖静默探测与交互级的确认等待，非交互路径沿用
+/// 固定上限。两级预算顺序执行、各自封顶，总和不被任何单次调用放大。
+///
+/// 交互路径的返回值是整段硬上限，确认结论在它之内提前
+/// [`CAPTURE_RETURN_MARGIN`] 产出。调用方的 RPC 预算必须严格大于这里的
+/// 返回值，否则确认结论还没回传就被传输层截断。
+pub fn end_to_end_budget(interactive: bool, wait: std::time::Duration) -> std::time::Duration {
+    if interactive {
+        wait + PORTAL_SILENT_PROBE_BUDGET
+    } else {
+        CAPTURE_END_TO_END_BUDGET
+    }
+}
+
+/// 确认结论的返回余量：交互级的确认截止从整段预算里预留这一段，结论因此
+/// 总是先于整段封顶产出，错误构造、守卫收尾与 RPC 回传都在余量内完成。
+///
+/// 余量取 0 时结论与整段截止同时到期：外层超时会与结论竞争，先丢弃状态机
+/// 再做收尾，调用方的传输预算随后到点，用户看到的是裸传输错误而不是可
+/// 区分的授权未确认。
+pub const CAPTURE_RETURN_MARGIN: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// 交互级的最小可执行窗口：前序静默探测与 ScreenCast 探测都不得占用它。
+///
+/// 段预算 = 确认等待（`--wait`）+ 一级静默探测，末尾还要留出
+/// [`CAPTURE_RETURN_MARGIN`]。`--wait` 允许的最小值是 500ms（CLI `--wait 0`
+/// 的钳制值），此时若静默探测仍可独占自己的 1s 上限，扣掉返回余量后交互级
+/// 恰好为零预算，连立即成功的门户都发不出请求。取最小值同量级，保证任何
+/// 合法等待值下交互回退都可执行；它只是划分前序各级的截止，不放大任何
+/// 单次调用（C-154）。
+pub const CAPTURE_INTERACTIVE_MIN_WINDOW: std::time::Duration =
+    std::time::Duration::from_millis(500);
+
+/// 确认界面在预算内未被确认时的可区分错误。
+///
+/// 不能落到通用的「捕获超出预算」：用户需要知道该确认哪个界面、以及可用
+/// `--wait` 延长等待，而不是把门户界面当成后端不可用。
+fn authorization_not_confirmed(
+    budget: std::time::Duration,
+    cause: &AgentShellError,
+) -> AgentShellError {
+    AgentShellError::Permission(format!(
+        "portal screenshot authorization was not confirmed within {}ms; confirm the desktop's \
+         screenshot prompt and retry with a longer --wait if needed ({cause})",
+        budget.as_millis()
+    ))
 }
 
 /// portal 失败后的降级决策（纯函数，可单测）。
@@ -1314,6 +1506,43 @@ mod tests {
         assert!(
             CAPTURE_END_TO_END_BUDGET < std::time::Duration::from_secs(5),
             "end-to-end deadline must stay under the 5s command budget"
+        );
+    }
+
+    /// 最小合法确认等待下，前序探测不得吃掉交互级的窗口。
+    ///
+    /// RPC 允许的最小 `wait_ms` 是 500ms（CLI `--wait 0` 的钳制值）。段预算
+    /// 只有「确认等待 + 一级静默探测」，若静默探测仍能独占 1s 且末尾再扣返回
+    /// 余量，交互级就只剩零预算，连立即成功的门户都发不出请求。
+    #[test]
+    fn minimum_wait_reserves_an_executable_interactive_window() {
+        let minimum_wait = std::time::Duration::from_millis(500);
+        assert!(
+            CAPTURE_INTERACTIVE_MIN_WINDOW >= minimum_wait,
+            "the interactive floor must cover the smallest legal confirmation wait"
+        );
+
+        let segment = end_to_end_budget(true, minimum_wait);
+        let floor = CAPTURE_INTERACTIVE_MIN_WINDOW.min(minimum_wait);
+        let pre_interactive = segment.saturating_sub(CAPTURE_RETURN_MARGIN + floor);
+        assert!(
+            !pre_interactive.is_zero(),
+            "the minimum wait must leave a non-zero window for the interactive fallback"
+        );
+        assert!(
+            pre_interactive < PORTAL_SILENT_PROBE_BUDGET,
+            "at the minimum wait the silent probe must yield part of its fixed cap"
+        );
+
+        // 正常等待值下静默探测仍可用满自己的固定上限，行为不变。
+        let default_wait = DEFAULT_CAPTURE_WAIT;
+        let default_segment = end_to_end_budget(true, default_wait);
+        let default_pre_interactive = default_segment.saturating_sub(
+            CAPTURE_RETURN_MARGIN + CAPTURE_INTERACTIVE_MIN_WINDOW.min(default_wait),
+        );
+        assert!(
+            default_pre_interactive >= PORTAL_SILENT_PROBE_BUDGET,
+            "the default wait must not shorten the silent probe"
         );
     }
 

@@ -46,11 +46,15 @@ fn capture_route(window: Option<&str>, area: Option<[i32; 4]>) -> CaptureRoute {
 /// 像素帧（`decode_png_frame`），故 `area` 同样走
 /// [`agent_shell_capture::CaptureDispatcher::capture_pixels`]
 /// （静默 Screenshot 解码 → ScreenCast → X11 像素链）。
+///
+/// `wait` 是交互确认界面的等待预算：GNOME 的 portal Screenshot 在方法返回后
+/// 才等用户点击，窗口太短会在确认前放弃。
 pub async fn capture_to_file(
     capture: &CaptureDispatcher,
     window: Option<&str>,
     area: Option<[i32; 4]>,
     path: &str,
+    wait: std::time::Duration,
 ) -> Result<CaptureResult, (RpcErrorCode, String)> {
     match capture_route(window, area) {
         CaptureRoute::Window => {
@@ -65,7 +69,7 @@ pub async fn capture_to_file(
             // 区域裁剪需原始像素帧：静默 Screenshot 的 PNG 由 capture 模块
             // 解码为像素帧，与 ScreenCast / X11 同属像素链。
             let frame = capture
-                .capture_pixels(agent_shell_capture::CaptureTarget::Monitor, true)
+                .capture_pixels_with_wait(agent_shell_capture::CaptureTarget::Monitor, true, wait)
                 .await
                 .map_err(map_capture_err)?;
             write_frame_to_ppm(&frame, area, path)
@@ -74,7 +78,7 @@ pub async fn capture_to_file(
             // 全链降级：静默 Screenshot → ScreenCast → X11 根窗口。
             // ScreenCast 需弹窗授权（§21.22），daemon 场景允许交互。
             let captured = capture
-                .capture(agent_shell_capture::CaptureTarget::Monitor, true)
+                .capture_with_wait(agent_shell_capture::CaptureTarget::Monitor, true, wait)
                 .await
                 .map_err(map_capture_err)?;
             match captured {

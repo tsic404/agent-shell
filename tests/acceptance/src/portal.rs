@@ -32,6 +32,9 @@ pub enum PortalBehaviour {
     /// 立即返回 Request 路径，`delay` 后才写 PNG 并发出成功 Response
     /// （模拟静默探测被 1s 预算取消后，portal 仍完成截图的竞态）。
     LateSuccess(Duration),
+    /// 方法调用挂住，`delay` 后发出成功 Response（模拟 GNOME 确认框阻塞
+    /// 方法调用、用户点 Allow 后出图；方法返回值本身不重要）。
+    ConfirmAfter(Duration),
 }
 
 /// portal Screenshot mock：返回指定 PNG 字节与响应码。
@@ -216,6 +219,41 @@ impl ScreenshotMock {
                 });
                 return zbus::zvariant::OwnedObjectPath::try_from(request_path)
                     .map_err(|e| zbus::fdo::Error::Failed(format!("request path: {e}")));
+            }
+            PortalBehaviour::ConfirmAfter(delay) => {
+                register_screenshot_request(conn, &request_path, self.request_closes.clone())
+                    .await?;
+                let mock = self.clone();
+                let conn = conn.clone();
+                let path = request_path.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(delay).await;
+                    let png = mock.write_late_png(call_index);
+                    let uri = format!("file://{}", png.display());
+                    let mut results: HashMap<String, OwnedValue> = HashMap::new();
+                    results.insert(
+                        "uri".into(),
+                        OwnedValue::try_from(zvariant_string(&uri)).expect("late uri value"),
+                    );
+                    if conn
+                        .emit_signal(
+                            None::<&str>,
+                            path.as_str(),
+                            "org.freedesktop.portal.Request",
+                            "Response",
+                            &(0u32, results),
+                        )
+                        .await
+                        .is_ok()
+                    {
+                        mock.late_responses.fetch_add(1, Ordering::Relaxed);
+                    }
+                    finish_screenshot_request(&conn, &path).await;
+                });
+                // 不返回：portal 的方法调用仍在等确认，成功 Response 只在该
+                // 后台任务释放确认之后发出。
+                let _ = tokio::time::sleep(Duration::from_secs(3600)).await;
+                return Err(zbus::fdo::Error::Failed("portal hang released".into()));
             }
         };
         register_screenshot_request(conn, &request_path, self.request_closes.clone()).await?;

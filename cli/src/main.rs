@@ -124,8 +124,18 @@ async fn dispatch_command(
 /// C-154 的单命令预算：默认 5s；rootd 特权链路（含 pkg/job 的作业链）按
 /// C-144 的分层超时显式放宽，避免把合法的长操作误报为无响应。等待类
 /// 命令的 15s 是其轮询循环预算，单次 `windows.list` 仍须在 5s 内返回。
+///
+/// 截图的交互确认等待由 `--wait` 决定，RPC 预算随等待预算一起放宽，仍低于
+/// C-154 允许的可配置等待类预算。
 fn command_call_timeout(command: &Command) -> std::time::Duration {
     match command {
+        Command::Screenshot(cmd) => {
+            let wait_ms = cmd.wait.saturating_mul(1000).clamp(
+                agent_shell_rpc::MIN_CAPTURE_WAIT_MS,
+                agent_shell_rpc::MAX_CAPTURE_WAIT_MS,
+            );
+            std::time::Duration::from_millis(wait_ms) + SCREENSHOT_RPC_MARGIN
+        }
         Command::Log(_) => LOG_QUERY_TIMEOUT,
         Command::Service(_)
         | Command::Fs(_)
@@ -137,6 +147,10 @@ fn command_call_timeout(command: &Command) -> std::time::Duration {
         _ => client::DEFAULT_COMMAND_TIMEOUT,
     }
 }
+
+/// 截图命令的 RPC 余量：覆盖静默方法调用的 1s 与进程/RPC 往返；
+/// 默认 `--wait 3` 时整条命令仍是 5s 预算。
+const SCREENSHOT_RPC_MARGIN: std::time::Duration = std::time::Duration::from_secs(2);
 
 // ───────────────────────── doctor / info ─────────────────────────
 
@@ -397,7 +411,11 @@ async fn screenshot(c: &mut DaemonClient, cmd: cli::ScreenshotCommand) -> CmdRes
     // --area 接线：X,Y,W,H 直传 daemon 裁剪。非负已在 `dispatch_command`
     // 连接前预校验，此处仅做 Vec → 数组形状转换。
     let area = cmd.area.map(|v| [v[0], v[1], v[2], v[3]]);
-    let r = c.screenshot(cmd.window, area, &cmd.output).await?;
+    let wait_ms = cmd.wait.saturating_mul(1000).clamp(
+        agent_shell_rpc::MIN_CAPTURE_WAIT_MS,
+        agent_shell_rpc::MAX_CAPTURE_WAIT_MS,
+    );
+    let r = c.screenshot(cmd.window, area, &cmd.output, wait_ms).await?;
     println!("saved {} ({}x{})", r.path, r.width, r.height);
     Ok(0)
 }
@@ -1991,6 +2009,30 @@ mod tests {
             Duration::from_secs(5)
         );
         assert_eq!(
+            command_call_timeout(&crate::cli::Command::Screenshot(
+                crate::cli::ScreenshotCommand {
+                    window: None,
+                    area: None,
+                    output: "screenshot.ppm".into(),
+                    wait: 3,
+                }
+            )),
+            Duration::from_secs(5),
+            "默认确认等待仍是 5s 命令预算"
+        );
+        assert_eq!(
+            command_call_timeout(&crate::cli::Command::Screenshot(
+                crate::cli::ScreenshotCommand {
+                    window: None,
+                    area: None,
+                    output: "screenshot.ppm".into(),
+                    wait: 15,
+                }
+            )),
+            Duration::from_secs(17),
+            "显式放宽的确认等待按等待类预算随命令预算一起放宽"
+        );
+        assert_eq!(
             command_call_timeout(&crate::cli::Command::Log(crate::cli::LogCommand {
                 filter: "{}".into(),
             })),
@@ -2023,5 +2065,45 @@ mod tests {
             })),
             Duration::from_secs(91)
         );
+    }
+
+    /// 截图的确认结论必须先于 CLI 预算到达。
+    ///
+    /// daemon 的端到端预算必须严格小于同一次调用的 RPC 预算，且差额能容下
+    /// daemon 在整段预算末尾为结论回传预留的余量；否则传输层会先把可区分的
+    /// 授权未确认截断成裸传输错误。两侧共用同一组常量，任一侧漂移都会在这里
+    /// 失败，而不是等到真机上跑出两种失败面。
+    #[test]
+    fn screenshot_command_budget_outlives_the_daemon_end_to_end_budget() {
+        assert!(
+            agent_shell_capture::CAPTURE_INTERACTIVE_MIN_WINDOW
+                >= Duration::from_millis(agent_shell_rpc::MIN_CAPTURE_WAIT_MS),
+            "the interactive fallback window must cover the smallest legal --wait"
+        );
+        for wait_s in [0u64, 1, 3, 5, 15, 60, 600] {
+            let command = crate::cli::Command::Screenshot(crate::cli::ScreenshotCommand {
+                window: None,
+                area: None,
+                output: "screenshot.png".into(),
+                wait: wait_s,
+            });
+            let wait_ms = wait_s.saturating_mul(1_000).clamp(
+                agent_shell_rpc::MIN_CAPTURE_WAIT_MS,
+                agent_shell_rpc::MAX_CAPTURE_WAIT_MS,
+            );
+            let daemon =
+                agent_shell_capture::end_to_end_budget(true, Duration::from_millis(wait_ms));
+            let client = command_call_timeout(&command);
+            assert!(
+                client > daemon,
+                "wait {wait_s}s: CLI budget {client:?} must exceed the daemon end-to-end budget \
+                 {daemon:?}"
+            );
+            assert!(
+                client >= daemon + agent_shell_capture::CAPTURE_RETURN_MARGIN,
+                "wait {wait_s}s: CLI budget {client:?} must keep the daemon's return margin over \
+                 {daemon:?}"
+            );
+        }
     }
 }

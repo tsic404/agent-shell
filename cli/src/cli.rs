@@ -283,6 +283,9 @@ pub struct ScreenshotCommand {
     /// 输出文件路径
     #[arg(short = 'f', long = "file", default_value = "screenshot.ppm")]
     pub output: String,
+    /// 等待门户确认界面的预算（秒）；只延长确认等待，不放大单次方法调用
+    #[arg(long, default_value_t = 3)]
+    pub wait: u64,
 }
 
 // ───────────────────────── a11y ─────────────────────────

@@ -498,7 +498,19 @@ pub struct CaptureParams {
     pub area: Option<[i32; 4]>,
     /// daemon 侧输出路径（CLI 与 daemon 同机同用户，共享文件系统）。
     pub output_path: String,
+    /// 交互确认等待预算（毫秒）；缺省取 [`DEFAULT_CAPTURE_WAIT_MS`]。
+    ///
+    /// 只延长门户确认界面的等待，不改变单次 RPC 或方法调用的预算。
+    #[serde(default)]
+    pub wait_ms: Option<u64>,
 }
+
+/// 交互捕获确认等待的默认预算（毫秒）。
+pub const DEFAULT_CAPTURE_WAIT_MS: u64 = 3_000;
+/// 确认等待预算下限：过短会让一次确认都来不及完成。
+pub const MIN_CAPTURE_WAIT_MS: u64 = 500;
+/// 确认等待预算上限：与 C-154 的可配置等待预算同量级，避免无界等待。
+pub const MAX_CAPTURE_WAIT_MS: u64 = 120_000;
 
 /// screenshot.capture 结果。
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]

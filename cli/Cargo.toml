@@ -31,6 +31,9 @@ shell-words = "1"
 
 [dev-dependencies]
 tempfile = "3"
+# 仅测试用：断言 CLI 的 RPC 预算严格大于 capture 的 daemon 端到端预算。
+# 关默认特性，与 daemon / acceptance 的跨成员依赖同形，无 PipeWire 头也能编译。
+agent-shell-capture = { path = "../modules/capture", default-features = false }
 # 仅测试用：表驱动守护 EVENT_FILTER_HELP 与 EventFilter::valid_values() 同步。
 agent-shell-event = { workspace = true }
 # 仅测试用：枚举审计分段文件，核对记录确实落盘且可按行解析。
